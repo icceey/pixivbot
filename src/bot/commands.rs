@@ -1,6 +1,6 @@
 use teloxide::utils::command::BotCommands;
 
-#[derive(BotCommands, Clone)]
+#[derive(BotCommands, Clone, Debug)]
 #[command(rename_rule = "lowercase", description = "Supported commands:")]
 pub enum Command {
     #[command(description = "Show help text")]

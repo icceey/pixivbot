@@ -64,20 +64,28 @@ async fn main() -> AppResult<()> {
     info!("✅ Database migrations completed");
 
     // Initialize repository
-    let repo = db::repo::Repo::new(db.clone());
+    let repo = std::sync::Arc::new(db::repo::Repo::new(db.clone()));
     
     // Test database connection
     repo.ping().await?;
     info!("✅ Database ping successful");
     
     // Initialize Pixiv Client
-    // let mut pixiv_client = pixiv::client::PixivClient::new(config.pixiv.clone());
-    // pixiv_client.login().await?; 
+    info!("Initializing Pixiv client...");
+    let mut pixiv_client = pixiv::client::PixivClient::new(config.pixiv.clone())?;
+    pixiv_client.login().await?;
+    let pixiv_client = std::sync::Arc::new(tokio::sync::RwLock::new(pixiv_client));
+    info!("✅ Pixiv client initialized");
     
-    // Start Bot (Commented out for now as it's a blocking call or needs to be spawned)
-    // bot::run(config.telegram).await?;
+    // Create cache directory
+    std::fs::create_dir_all("data/cache")?;
+    info!("✅ Cache directory ready");
 
     info!("PixivBot initialization complete");
+    info!("Starting Telegram Bot...");
+    
+    // Start Bot (this will block)
+    bot::run(config.telegram, repo.clone(), pixiv_client.clone()).await?;
     
     Ok(())
 }
