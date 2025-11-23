@@ -1,17 +1,18 @@
 use crate::error::AppResult;
 use std::path::PathBuf;
-use pixivrs::{HttpClient, utils};
-use tracing::{info, warn};
+use reqwest::Client;
+use tracing::info;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use tokio::io::AsyncWriteExt;
 
 pub struct Downloader {
     cache_dir: PathBuf,
-    http_client: HttpClient,
+    http_client: Client,
 }
 
 impl Downloader {
-    pub fn new(http_client: HttpClient, cache_dir: impl Into<PathBuf>) -> Self {
+    pub fn new(http_client: Client, cache_dir: impl Into<PathBuf>) -> Self {
         Self { 
             cache_dir: cache_dir.into(), 
             http_client 
@@ -23,7 +24,7 @@ impl Downloader {
     pub async fn download(&self, url: &str) -> AppResult<PathBuf> {
         // Generate cache key from URL
         let cache_key = self.generate_cache_key(url);
-        let ext = utils::extract_extension(url).unwrap_or("jpg".to_string());
+        let ext = self.extract_extension(url).unwrap_or("jpg");
         
         // Create hash-prefixed path (first 2 chars of hash for bucketing)
         let prefix = &cache_key[..2];
@@ -41,16 +42,35 @@ impl Downloader {
         
         // Cache miss - download
         info!("Downloading: {}", url);
-        match utils::download(&self.http_client, url, &filepath).await {
-            Ok(_) => {
-                info!("Downloaded to: {:?}", filepath);
-                Ok(filepath)
-            }
-            Err(e) => {
-                warn!("Failed to download {}: {}", url, e);
-                Err(e.into())
-            }
+        let response = self.http_client
+            .get(url)
+            .header("Referer", "https://app-api.pixiv.net/")
+            .send()
+            .await
+            .map_err(|e| crate::error::AppError::Unknown(format!("Download failed: {}", e)))?;
+        
+        if !response.status().is_success() {
+            return Err(crate::error::AppError::Unknown(
+                format!("Download failed with status: {}", response.status())
+            ));
         }
+        
+        let bytes = response.bytes().await
+            .map_err(|e| crate::error::AppError::Unknown(format!("Failed to read response: {}", e)))?;
+        
+        let mut file = tokio::fs::File::create(&filepath).await?;
+        file.write_all(&bytes).await?;
+        
+        info!("Downloaded to: {:?}", filepath);
+        Ok(filepath)
+    }
+    
+    /// Extract file extension from URL
+    fn extract_extension<'a>(&self, url: &'a str) -> Option<&'a str> {
+        url.split('.')
+            .last()
+            .and_then(|ext| ext.split('?').next())
+            .filter(|ext| ext.len() <= 4)
     }
 
     /// Check if URL is already cached

@@ -42,8 +42,8 @@ impl Default for LoggingConfig {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct SchedulerConfig {
-    pub min_interval_ms: u64,
-    pub max_interval_ms: u64,
+    pub min_interval_sec: u64,
+    pub max_interval_sec: u64,
 }
 
 impl Config {

@@ -10,7 +10,7 @@ pub enum AppError {
     Telegram(String),
     
     #[error("Pixiv API error: {0}")]
-    PixivError(#[from] pixivrs::error::PixivError),
+    PixivError(String),
     
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
@@ -20,6 +20,18 @@ pub enum AppError {
 
     #[error("Unknown error: {0}")]
     Unknown(String),
+}
+
+impl From<crate::pixiv_client::Error> for AppError {
+    fn from(err: crate::pixiv_client::Error) -> Self {
+        AppError::PixivError(err.to_string())
+    }
+}
+
+impl From<reqwest::Error> for AppError {
+    fn from(err: reqwest::Error) -> Self {
+        AppError::Unknown(format!("Reqwest error: {}", err))
+    }
 }
 
 pub type AppResult<T> = Result<T, AppError>;

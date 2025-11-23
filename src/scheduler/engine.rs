@@ -15,8 +15,8 @@ pub struct SchedulerEngine {
     repo: Arc<Repo>,
     pixiv_client: Arc<tokio::sync::RwLock<PixivClient>>,
     notifier: Notifier,
-    min_interval_ms: u64,
-    max_interval_ms: u64,
+    min_interval_sec: u64,
+    max_interval_sec: u64,
 }
 
 impl SchedulerEngine {
@@ -25,15 +25,15 @@ impl SchedulerEngine {
         pixiv_client: Arc<tokio::sync::RwLock<PixivClient>>,
         bot: Bot,
         downloader: Arc<Downloader>,
-        min_interval_ms: u64,
-        max_interval_ms: u64,
+        min_interval_sec: u64,
+        max_interval_sec: u64,
     ) -> Self {
         Self {
             repo,
             pixiv_client,
             notifier: Notifier::new(bot, downloader),
-            min_interval_ms,
-            max_interval_ms,
+            min_interval_sec,
+            max_interval_sec,
         }
     }
 
@@ -49,9 +49,9 @@ impl SchedulerEngine {
                 Ok(executed) => {
                     if executed {
                         // Add random delay between tasks to avoid rate limiting
-                        let delay_ms = rand::thread_rng()
-                            .gen_range(self.min_interval_ms..=self.max_interval_ms);
-                        sleep(Duration::from_millis(delay_ms)).await;
+                        let delay_sec = rand::rng()
+                            .random_range(self.min_interval_sec..=self.max_interval_sec);
+                        sleep(Duration::from_secs(delay_sec)).await;
                     }
                 }
                 Err(e) => {
@@ -96,12 +96,12 @@ impl SchedulerEngine {
             task.latest_data.clone()
         };
         
-        // Use system user (0) for scheduler updates
+        // Use task creator as updater (maintains foreign key integrity)
         self.repo.update_task_after_poll(
             task.id,
             next_poll,
             latest_data,
-            0, // scheduler system user
+            task.created_by,
         ).await?;
         
         if let Err(e) = result {
@@ -161,7 +161,7 @@ impl SchedulerEngine {
                 task.id,
                 Utc::now() + chrono::Duration::seconds(task.interval_sec as i64),
                 Some(updated_data),
-                0,
+                task.created_by,
             ).await?;
         }
         
@@ -303,9 +303,9 @@ impl SchedulerEngine {
     /// Apply tag filters to illusts
     fn apply_tag_filters<'a>(
         &self,
-        illusts: &'a [pixivrs::models::app::Illust],
+        illusts: &'a [crate::pixiv_client::Illust],
         filter_tags: &Option<serde_json::Value>,
-    ) -> Vec<&'a pixivrs::models::app::Illust> {
+    ) -> Vec<&'a crate::pixiv_client::Illust> {
         let Some(filters) = filter_tags else {
             return illusts.iter().collect();
         };

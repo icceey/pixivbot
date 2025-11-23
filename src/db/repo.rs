@@ -166,6 +166,7 @@ impl Repo {
     }
 
     /// Update task after polling
+    /// Note: updated_by should be a valid user_id (typically task.created_by)
     pub async fn update_task_after_poll(
         &self,
         task_id: i32,
