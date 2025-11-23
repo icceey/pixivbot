@@ -10,7 +10,7 @@ pub enum AppError {
     Telegram(String),
     
     #[error("Pixiv API error: {0}")]
-    Pixiv(String),
+    PixivError(#[from] pixivrs::error::PixivError),
     
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
