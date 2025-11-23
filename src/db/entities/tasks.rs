@@ -1,0 +1,44 @@
+use sea_orm::entity::prelude::*;
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Deserialize, Serialize)]
+#[sea_orm(table_name = "tasks")]
+pub struct Model {
+    #[sea_orm(primary_key)]
+    pub id: i32,
+    pub r#type: String, // author, ranking
+    #[sea_orm(unique)]
+    pub value: String, // author_id, ranking_mode
+    pub interval_sec: i32,
+    #[sea_orm(indexed)]
+    pub next_poll_at: DateTime,
+    pub last_polled_at: Option<DateTime>,
+    pub latest_data: Option<Json>,
+    pub created_by: i64,
+    pub updated_by: i64,
+}
+
+#[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+pub enum Relation {
+    #[sea_orm(has_many = "super::subscriptions::Entity")]
+    Subscriptions,
+    #[sea_orm(belongs_to = "super::users::Entity", from = "Column::CreatedBy", to = "super::users::Column::Id", on_update = "NoAction", on_delete = "NoAction")]
+    UserCreated,
+    #[sea_orm(belongs_to = "super::users::Entity", from = "Column::UpdatedBy", to = "super::users::Column::Id", on_update = "NoAction", on_delete = "NoAction")]
+    UserUpdated,
+    
+}
+
+impl Related<super::subscriptions::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::Subscriptions.def()
+    }
+}
+
+impl Related<super::users::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::UserCreated.def()
+    }
+}
+
+impl ActiveModelBehavior for ActiveModel {}

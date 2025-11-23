@@ -1,7 +1,6 @@
-use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use serde::Deserialize;
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct Config {
     pub telegram: TelegramConfig,
     pub pixiv: PixivConfig,
@@ -10,54 +9,60 @@ pub struct Config {
     pub scheduler: SchedulerConfig,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct TelegramConfig {
     pub bot_token: String,
     pub owner_id: Option<i64>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct PixivConfig {
     pub refresh_token: String,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct DatabaseConfig {
     pub url: String,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct LoggingConfig {
     pub level: String,
-    pub dir: PathBuf,
+    pub dir: String,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        Self {
+            level: "info".to_string(),
+            dir: "logs".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone)]
 pub struct SchedulerConfig {
     pub min_interval_ms: u64,
     pub max_interval_ms: u64,
 }
 
 impl Config {
-    pub fn load() -> anyhow::Result<Self> {
-        let settings = config::Config::builder()
-            .add_source(config::File::with_name("config"))
-            .add_source(config::Environment::with_prefix("APP"))
-            .build()?;
+    pub fn load() -> Result<Self, config::ConfigError> {
+        let builder = config::Config::builder()
+            .add_source(config::File::with_name("config.toml").required(false))
+            .add_source(config::Environment::with_prefix("PIX").separator("__"));
 
-        let config: Config = settings.try_deserialize()?;
-        Ok(config)
+        builder.build()?.try_deserialize()
     }
-}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_config_load() {
-        // This test will fail without a config file, but it's just for demonstration
-        // In real scenario, you would have a test config file
-        let _config = Config::load();
+    pub fn log_level(&self) -> tracing::Level {
+        match self.logging.level.to_lowercase().as_str() {
+            "error" => tracing::Level::ERROR,
+            "warn" => tracing::Level::WARN,
+            "info" => tracing::Level::INFO,
+            "debug" => tracing::Level::DEBUG,
+            "trace" => tracing::Level::TRACE,
+            _ => tracing::Level::INFO,
+        }
     }
 }

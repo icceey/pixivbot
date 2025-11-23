@@ -1,6 +1,3 @@
-use std::sync::Arc;
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-
 mod config;
 mod error;
 mod db;
@@ -8,91 +5,64 @@ mod pixiv;
 mod bot;
 mod scheduler;
 
-use config::Config;
-use db::establish_connection;
-use bot::BotHandler;
-use scheduler::Scheduler;
-use error::AppError;
+use crate::config::Config;
+use crate::error::AppResult;
+use tracing::info;
+use tracing_subscriber::{prelude::*, EnvFilter};
 
 #[tokio::main]
-async fn main() -> Result<(), AppError> {
+async fn main() -> AppResult<()> {
     // Load configuration
-    let config = Arc::new(Config::load()?);
-    
-    // Initialize logging
-    init_logging(&config)?;
-    
-    tracing::info!("Starting PixivBot v0.1.0");
-    
-    // Establish database connection
-    let db = establish_connection(&config.database).await?;
-    
-    // Create and run bot
-    let bot_handler = BotHandler::new(config.clone(), db.clone());
-    
-    // Create scheduler
-    let scheduler = Scheduler::new(config.clone(), db.clone());
-    
-    // Clone db for cleanup task
-    let cleanup_db = db.clone();
-    
-    // Spawn bot and scheduler tasks
-    let bot_handle = tokio::spawn(async move {
-        bot_handler.run().await;
-    });
-    
-    let scheduler_handle = tokio::spawn(async move {
-        if let Err(e) = scheduler.run().await {
-            tracing::error!("Scheduler error: {:?}", e);
-        }
-    });
-    
-    // Spawn cleanup task (runs once a day)
-    let cleanup_scheduler = Scheduler::new(config.clone(), cleanup_db.clone());
-    let cleanup_handle = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(24 * 3600));
-        
-        loop {
-            interval.tick().await;
-            if let Err(e) = cleanup_scheduler.cleanup_cache().await {
-                tracing::error!("Cache cleanup error: {:?}", e);
-            }
-        }
-    });
-    
-    tracing::info!("All services started");
-    
-    // Wait for tasks to complete (they shouldn't unless there's an error)
-    let _ = tokio::try_join!(bot_handle, scheduler_handle, cleanup_handle);
-    
-    Ok(())
-}
+    let config = Config::load()?;
 
-fn init_logging(config: &Config) -> Result<(), AppError> {
+    // Initialize variables
+    let log_level = config.log_level();
+    let log_dir = &config.logging.dir;
+
     // Create log directory if it doesn't exist
-    std::fs::create_dir_all(&config.logging.dir)?;
-    
-    let log_file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(config.logging.dir.join("pixivbot.log"))?;
-    
-    // Initialize subscriber with both console and file outputs
+    std::fs::create_dir_all(log_dir)?;
+
+    // Setup file appender (daily rotation)
+    let file_appender = tracing_appender::rolling::daily(log_dir, "pixivbot.log");
+    let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
+
+    // Setup stdout layer
+    let stdout_layer = tracing_subscriber::fmt::layer()
+        .with_line_number(true)
+        .with_target(false)
+        .pretty();
+
+    // Setup file layer
+    let file_layer = tracing_subscriber::fmt::layer()
+        .with_ansi(false)
+        .with_writer(non_blocking);
+
+    // Filter layer based on config
+    let filter_layer = EnvFilter::from_default_env()
+        .add_directive(log_level.into());
+
+    // Combine layers
     tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::fmt::layer()
-                .with_target(true)
-                .with_thread_ids(true)
-                .with_file(true)
-                .with_line_number(true)
-                .with_writer(std::io::stdout)
-        )
-        .with(
-            tracing_subscriber::fmt::layer()
-                .json()
-                .with_writer(log_file)
-        )
+        .with(filter_layer)
+        .with(stdout_layer)
+        .with(file_layer)
         .init();
+
+    info!("Starting PixivBot...");
+    info!("Configuration loaded from config.toml (or env)");
+    info!("Logging initialized at level: {}", log_level);
+    info!("Logs are written to: {}", log_dir);
+
+    // Connect to database
+    let _db = db::establish_connection(&config.database.url).await?;
+
     
+    // Initialize Pixiv Client
+    // let mut pixiv_client = pixiv::client::PixivClient::new(config.pixiv.clone());
+    // pixiv_client.login().await?; 
+    
+    // Start Bot (Commented out for now as it's a blocking call or needs to be spawned)
+    // bot::run(config.telegram).await?;
+
     Ok(())
 }

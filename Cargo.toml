@@ -4,51 +4,19 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-# Core async runtime
-tokio = { version = "1", features = ["full"] }
-tokio-cron-scheduler = "0.10"
+anyhow = "1.0.100"
+chrono = { version = "0.4.42", features = ["serde"] }
+config = "0.15.19"
+governor = "0.10.2"
+pixivrs = "0.1.0"
+sea-orm = { version = "1.1.19", features = ["sqlx-sqlite", "runtime-tokio-rustls", "macros", "sqlx-dep"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+teloxide = { version = "0.17.0", features = ["macros"] }
+thiserror = "2.0.17"
+tokio = "1.48.0"
+tokio-cron-scheduler = "0.15.1"
+tracing = "0.1.41"
+tracing-appender = "0.2.3"
+tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 
-# Telegram bot framework
-teloxide = { version = "0.17", features = ["macros"] }
-
-# Pixiv API client
-reqwest = { version = "0.11", features = ["json"] }
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-
-# Database
-sea-orm = { version = "0.12", features = [
-    "sqlx-sqlite",
-    "runtime-tokio-rustls",
-    "macros",
-    "with-chrono",
-    "with-uuid",
-    "with-json",
-] }
-sqlx = "0.7"
-chrono = { version = "0.4", features = ["serde"] }
-
-# Configuration
-config = "0.14"
-toml = "0.8"
-
-# Logging
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
-
-# Error handling
-thiserror = "1.0"
-anyhow = "1.0"
-
-# Rate limiting
-governor = "0.6"
-
-# Utils
-md5 = "0.7"
-
-# File system operations
-walkdir = "2.4"
-filetime = "0.2"
-
-# Random number generation
-rand = "0.8"

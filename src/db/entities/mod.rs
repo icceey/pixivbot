@@ -1,4 +1,5 @@
-pub mod user;
-pub mod chat;
-pub mod task;
-pub mod subscription;
+//! SeaORM Entities (Placeholder)
+pub mod chats;
+pub mod tasks;
+pub mod subscriptions;
+pub mod users;
