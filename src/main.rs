@@ -9,6 +9,7 @@ use crate::config::Config;
 use crate::error::AppResult;
 use tracing::info;
 use tracing_subscriber::{prelude::*, EnvFilter};
+use sea_orm_migration::MigratorTrait;
 
 #[tokio::main]
 async fn main() -> AppResult<()> {
@@ -54,8 +55,20 @@ async fn main() -> AppResult<()> {
     info!("Logs are written to: {}", log_dir);
 
     // Connect to database
-    let _db = db::establish_connection(&config.database.url).await?;
+    let db = db::establish_connection(&config.database.url).await?;
+    info!("Database connection established");
 
+    // Run migrations
+    info!("Running database migrations...");
+    migration::Migrator::up(&db, None).await?;
+    info!("✅ Database migrations completed");
+
+    // Initialize repository
+    let repo = db::repo::Repo::new(db.clone());
+    
+    // Test database connection
+    repo.ping().await?;
+    info!("✅ Database ping successful");
     
     // Initialize Pixiv Client
     // let mut pixiv_client = pixiv::client::PixivClient::new(config.pixiv.clone());
@@ -64,5 +77,7 @@ async fn main() -> AppResult<()> {
     // Start Bot (Commented out for now as it's a blocking call or needs to be spawned)
     // bot::run(config.telegram).await?;
 
+    info!("PixivBot initialization complete");
+    
     Ok(())
 }

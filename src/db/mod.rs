@@ -18,32 +18,6 @@ pub async fn establish_connection(database_url: &str) -> AppResult<DatabaseConne
 
     let connection = Database::connect(opt).await?;
     info!("Connected to database: {}", database_url);
-
-    // Initialise database schema
-    // This example uses a simplified approach. In production, use migrations!
-    create_table_if_not_exists(&connection).await?;
     
     Ok(connection)
-}
-
-async fn create_table_if_not_exists(db: &DatabaseConnection) -> AppResult<()> {
-    use sea_orm::{Schema, ConnectionTrait};
-    
-    let builder = db.get_database_backend();
-    let schema = Schema::new(builder);
-
-    let stmt = schema.create_table_from_entity(entities::users::Entity).if_not_exists().to_owned();
-    let _ = db.execute(builder.build(&stmt)).await;
-
-    let stmt = schema.create_table_from_entity(entities::chats::Entity).if_not_exists().to_owned();
-    let _ = db.execute(builder.build(&stmt)).await;
-
-    let stmt = schema.create_table_from_entity(entities::tasks::Entity).if_not_exists().to_owned();
-    let _ = db.execute(builder.build(&stmt)).await;
-    
-    let stmt = schema.create_table_from_entity(entities::subscriptions::Entity).if_not_exists().to_owned();
-    let _ = db.execute(builder.build(&stmt)).await;
-
-    info!("Database tables initialized.");
-    Ok(())
 }

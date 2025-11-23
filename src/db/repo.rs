@@ -1,4 +1,11 @@
-use sea_orm::{DatabaseConnection, DbErr};
+use sea_orm::{
+    ActiveModelTrait, ColumnTrait, DatabaseConnection, DbErr, EntityTrait, 
+    IntoActiveModel, QueryFilter, QueryOrder, QuerySelect, Set, PaginatorTrait
+};
+use chrono::{DateTime, Utc};
+use serde_json::Value as JsonValue;
+
+use super::entities::{chats, subscriptions, tasks, users};
 
 pub struct Repo {
     db: DatabaseConnection,
@@ -9,8 +16,290 @@ impl Repo {
         Self { db }
     }
 
-    // Placeholder for future DB operations
     pub async fn ping(&self) -> Result<(), DbErr> {
         self.db.ping().await
+    }
+
+    // ==================== Users ====================
+    
+    /// Create or update a user
+    pub async fn upsert_user(
+        &self,
+        user_id: i64,
+        username: Option<String>,
+        is_admin: bool,
+    ) -> Result<users::Model, DbErr> {
+        let now = Utc::now().naive_utc();
+        
+        // Try to find existing user
+        if let Some(existing) = users::Entity::find_by_id(user_id).one(&self.db).await? {
+            // Update existing
+            let mut active: users::ActiveModel = existing.into_active_model();
+            active.username = Set(username);
+            active.is_admin = Set(is_admin);
+            active.update(&self.db).await
+        } else {
+            // Create new
+            let new_user = users::ActiveModel {
+                id: Set(user_id),
+                username: Set(username),
+                is_admin: Set(is_admin),
+                created_at: Set(now),
+            };
+            new_user.insert(&self.db).await
+        }
+    }
+
+    pub async fn get_user(&self, user_id: i64) -> Result<Option<users::Model>, DbErr> {
+        users::Entity::find_by_id(user_id).one(&self.db).await
+    }
+
+    pub async fn set_admin(&self, user_id: i64, is_admin: bool) -> Result<users::Model, DbErr> {
+        let user = users::Entity::find_by_id(user_id)
+            .one(&self.db)
+            .await?
+            .ok_or(DbErr::RecordNotFound(format!("User {} not found", user_id)))?;
+        
+        let mut active: users::ActiveModel = user.into_active_model();
+        active.is_admin = Set(is_admin);
+        active.update(&self.db).await
+    }
+
+    // ==================== Chats ====================
+    
+    /// Create or update a chat
+    pub async fn upsert_chat(
+        &self,
+        chat_id: i64,
+        chat_type: String,
+        title: Option<String>,
+    ) -> Result<chats::Model, DbErr> {
+        let now = Utc::now().naive_utc();
+        
+        if let Some(existing) = chats::Entity::find_by_id(chat_id).one(&self.db).await? {
+            // Update existing
+            let mut active: chats::ActiveModel = existing.into_active_model();
+            active.r#type = Set(chat_type);
+            active.title = Set(title);
+            active.update(&self.db).await
+        } else {
+            // Create new
+            let new_chat = chats::ActiveModel {
+                id: Set(chat_id),
+                r#type: Set(chat_type),
+                title: Set(title),
+                created_at: Set(now),
+            };
+            new_chat.insert(&self.db).await
+        }
+    }
+
+    pub async fn get_chat(&self, chat_id: i64) -> Result<Option<chats::Model>, DbErr> {
+        chats::Entity::find_by_id(chat_id).one(&self.db).await
+    }
+
+    // ==================== Tasks ====================
+    
+    /// Create a new task
+    pub async fn create_task(
+        &self,
+        task_type: String,
+        value: String,
+        interval_sec: i32,
+        next_poll_at: DateTime<Utc>,
+        created_by: i64,
+    ) -> Result<tasks::Model, DbErr> {
+        let new_task = tasks::ActiveModel {
+            r#type: Set(task_type),
+            value: Set(value),
+            interval_sec: Set(interval_sec),
+            next_poll_at: Set(next_poll_at.naive_utc()),
+            last_polled_at: Set(None),
+            latest_data: Set(None),
+            created_by: Set(created_by),
+            updated_by: Set(created_by),
+            ..Default::default()
+        };
+        
+        new_task.insert(&self.db).await
+    }
+
+    /// Find task by type and value
+    pub async fn get_task_by_type_value(
+        &self,
+        task_type: &str,
+        value: &str,
+    ) -> Result<Option<tasks::Model>, DbErr> {
+        tasks::Entity::find()
+            .filter(tasks::Column::Type.eq(task_type))
+            .filter(tasks::Column::Value.eq(value))
+            .one(&self.db)
+            .await
+    }
+
+    /// Get or create a task (for subscription flow)
+    pub async fn get_or_create_task(
+        &self,
+        task_type: String,
+        value: String,
+        interval_sec: i32,
+        created_by: i64,
+    ) -> Result<tasks::Model, DbErr> {
+        if let Some(existing) = self.get_task_by_type_value(&task_type, &value).await? {
+            Ok(existing)
+        } else {
+            let next_poll = Utc::now() + chrono::Duration::seconds(60); // Poll in 1 minute
+            self.create_task(task_type, value, interval_sec, next_poll, created_by).await
+        }
+    }
+
+    /// Get tasks that need to be polled (next_poll_at <= now)
+    pub async fn get_pending_tasks(&self, limit: u64) -> Result<Vec<tasks::Model>, DbErr> {
+        let now = Utc::now().naive_utc();
+        
+        tasks::Entity::find()
+            .filter(tasks::Column::NextPollAt.lte(now))
+            .order_by_asc(tasks::Column::NextPollAt)
+            .limit(limit)
+            .all(&self.db)
+            .await
+    }
+
+    /// Update task after polling
+    pub async fn update_task_after_poll(
+        &self,
+        task_id: i32,
+        next_poll_at: DateTime<Utc>,
+        latest_data: Option<JsonValue>,
+        updated_by: i64,
+    ) -> Result<tasks::Model, DbErr> {
+        let task = tasks::Entity::find_by_id(task_id)
+            .one(&self.db)
+            .await?
+            .ok_or(DbErr::RecordNotFound(format!("Task {} not found", task_id)))?;
+        
+        let now = Utc::now().naive_utc();
+        let mut active: tasks::ActiveModel = task.into_active_model();
+        active.next_poll_at = Set(next_poll_at.naive_utc());
+        active.last_polled_at = Set(Some(now));
+        if latest_data.is_some() {
+            active.latest_data = Set(latest_data);
+        }
+        active.updated_by = Set(updated_by);
+        
+        active.update(&self.db).await
+    }
+
+    /// Delete a task (and cascade delete subscriptions)
+    pub async fn delete_task(&self, task_id: i32) -> Result<(), DbErr> {
+        tasks::Entity::delete_by_id(task_id)
+            .exec(&self.db)
+            .await?;
+        Ok(())
+    }
+
+    // ==================== Subscriptions ====================
+    
+    /// Create a subscription
+    pub async fn create_subscription(
+        &self,
+        chat_id: i64,
+        task_id: i32,
+        filter_tags: Option<JsonValue>,
+    ) -> Result<subscriptions::Model, DbErr> {
+        let now = Utc::now().naive_utc();
+        
+        let new_sub = subscriptions::ActiveModel {
+            chat_id: Set(chat_id),
+            task_id: Set(task_id),
+            filter_tags: Set(filter_tags),
+            created_at: Set(now),
+            ..Default::default()
+        };
+        
+        new_sub.insert(&self.db).await
+    }
+
+    /// Get or create subscription (upsert filter_tags if exists)
+    pub async fn upsert_subscription(
+        &self,
+        chat_id: i64,
+        task_id: i32,
+        filter_tags: Option<JsonValue>,
+    ) -> Result<subscriptions::Model, DbErr> {
+        // Check if subscription exists
+        if let Some(existing) = subscriptions::Entity::find()
+            .filter(subscriptions::Column::ChatId.eq(chat_id))
+            .filter(subscriptions::Column::TaskId.eq(task_id))
+            .one(&self.db)
+            .await?
+        {
+            // Update filter_tags
+            let mut active: subscriptions::ActiveModel = existing.into_active_model();
+            active.filter_tags = Set(filter_tags);
+            active.update(&self.db).await
+        } else {
+            // Create new
+            self.create_subscription(chat_id, task_id, filter_tags).await
+        }
+    }
+
+    /// List all subscriptions for a chat
+    pub async fn list_subscriptions_by_chat(
+        &self,
+        chat_id: i64,
+    ) -> Result<Vec<(subscriptions::Model, tasks::Model)>, DbErr> {
+        subscriptions::Entity::find()
+            .filter(subscriptions::Column::ChatId.eq(chat_id))
+            .find_also_related(tasks::Entity)
+            .all(&self.db)
+            .await
+            .map(|results| {
+                results
+                    .into_iter()
+                    .filter_map(|(sub, task)| task.map(|t| (sub, t)))
+                    .collect()
+            })
+    }
+
+    /// List all subscriptions for a task
+    pub async fn list_subscriptions_by_task(
+        &self,
+        task_id: i32,
+    ) -> Result<Vec<subscriptions::Model>, DbErr> {
+        subscriptions::Entity::find()
+            .filter(subscriptions::Column::TaskId.eq(task_id))
+            .all(&self.db)
+            .await
+    }
+
+    /// Delete a subscription by id
+    pub async fn delete_subscription(&self, sub_id: i32) -> Result<(), DbErr> {
+        subscriptions::Entity::delete_by_id(sub_id)
+            .exec(&self.db)
+            .await?;
+        Ok(())
+    }
+
+    /// Delete subscription by chat and task
+    pub async fn delete_subscription_by_chat_task(
+        &self,
+        chat_id: i64,
+        task_id: i32,
+    ) -> Result<(), DbErr> {
+        subscriptions::Entity::delete_many()
+            .filter(subscriptions::Column::ChatId.eq(chat_id))
+            .filter(subscriptions::Column::TaskId.eq(task_id))
+            .exec(&self.db)
+            .await?;
+        Ok(())
+    }
+
+    /// Count subscriptions for a task
+    pub async fn count_subscriptions_for_task(&self, task_id: i32) -> Result<u64, DbErr> {
+        subscriptions::Entity::find()
+            .filter(subscriptions::Column::TaskId.eq(task_id))
+            .count(&self.db)
+            .await
     }
 }
