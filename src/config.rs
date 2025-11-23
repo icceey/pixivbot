@@ -13,6 +13,12 @@ pub struct Config {
 pub struct TelegramConfig {
     pub bot_token: String,
     pub owner_id: Option<i64>,
+    #[serde(default = "default_bot_mode")]
+    pub bot_mode: String,
+}
+
+fn default_bot_mode() -> String {
+    "private".to_string()
 }
 
 #[derive(Debug, Deserialize, Clone)]

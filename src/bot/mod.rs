@@ -22,8 +22,16 @@ pub async fn run(
 ) -> AppResult<()> {
     info!("Starting Telegram Bot...");
     
+    // Parse bot mode from config
+    let is_public_mode = config.bot_mode.to_lowercase() == "public";
+    
+    info!("Bot mode: {} (new chats will be {} by default)", 
+        config.bot_mode, 
+        if is_public_mode { "enabled" } else { "disabled" }
+    );
+    
     let bot = Bot::new(config.bot_token.clone());
-    let handler = BotHandler::new(bot.clone(), repo, pixiv_client, config.owner_id);
+    let handler = BotHandler::new(bot.clone(), repo, pixiv_client, config.owner_id, is_public_mode);
     
     info!("✅ Bot initialized, starting command handler");
     

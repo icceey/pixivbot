@@ -1,10 +1,11 @@
 use teloxide::prelude::*;
-use teloxide::types::{ParseMode, InputFile};
+use teloxide::types::ParseMode;
 use crate::db::repo::Repo;
+use crate::db::entities::role::UserRole;
 use crate::pixiv::client::PixivClient;
 use crate::bot::Command;
 use std::sync::Arc;
-use tracing::{info, warn, error};
+use tracing::{info, error};
 use serde_json::json;
 
 #[derive(Clone)]
@@ -13,6 +14,7 @@ pub struct BotHandler {
     repo: Arc<Repo>,
     pixiv_client: Arc<tokio::sync::RwLock<PixivClient>>,
     owner_id: Option<i64>,
+    is_public_mode: bool,
 }
 
 impl BotHandler {
@@ -21,12 +23,14 @@ impl BotHandler {
         repo: Arc<Repo>,
         pixiv_client: Arc<tokio::sync::RwLock<PixivClient>>,
         owner_id: Option<i64>,
+        is_public_mode: bool,
     ) -> Self {
         Self {
             bot,
             repo,
             pixiv_client,
             owner_id,
+            is_public_mode,
         }
     }
 
@@ -42,10 +46,22 @@ impl BotHandler {
         info!("Received command from user {} in chat {}: {:?}", user_id, chat_id, cmd);
 
         // Ensure user and chat exist in database
-        if let Err(e) = self.ensure_user_and_chat(&msg).await {
-            let error_msg = format!("Failed to ensure user/chat: {}", e);
-            error!("{}", error_msg);
-            bot.send_message(chat_id, "⚠️ Database error occurred").await?;
+        let (user_role, chat_enabled) = match self.ensure_user_and_chat(&msg).await {
+            Ok(data) => data,
+            Err(e) => {
+                let error_msg = format!("Failed to ensure user/chat: {}", e);
+                error!("{}", error_msg);
+                bot.send_message(chat_id, "⚠️ Database error occurred").await?;
+                return Ok(());
+            }
+        };
+
+        // Check if chat is enabled
+        // Special case: private chat with admin/owner, consider it enabled ()
+        let is_private_chat_with_admin = chat_id.is_user() && user_role.is_admin();
+        
+        if !chat_enabled && !is_private_chat_with_admin {
+            info!("Ignoring command from disabled chat {} (user: {}, role: {:?})", chat_id, user_id, user_role);
             return Ok(());
         }
 
@@ -54,10 +70,42 @@ impl BotHandler {
             Command::Sub(args) => self.handle_sub(bot, chat_id, user_id, args).await,
             Command::Unsub(args) => self.handle_unsub(bot, chat_id, args).await,
             Command::List => self.handle_list(bot, chat_id).await,
+            Command::SetAdmin(args) => {
+                // Only owner can use this command
+                if !user_role.is_owner() {
+                    info!("User {} attempted to use SetAdmin without permission", user_id);
+                    return Ok(()); // Silently ignore
+                }
+                self.handle_set_admin(bot, chat_id, args, true).await
+            }
+            Command::UnsetAdmin(args) => {
+                // Only owner can use this command
+                if !user_role.is_owner() {
+                    info!("User {} attempted to use UnsetAdmin without permission", user_id);
+                    return Ok(()); // Silently ignore
+                }
+                self.handle_set_admin(bot, chat_id, args, false).await
+            }
+            Command::EnableChat(args) => {
+                // Only admin or owner can use this command
+                if !user_role.is_admin() {
+                    info!("User {} attempted to use EnableChat without permission", user_id);
+                    return Ok(()); // Silently ignore
+                }
+                self.handle_enable_chat(bot, chat_id, args, true).await
+            }
+            Command::DisableChat(args) => {
+                // Only admin or owner can use this command
+                if !user_role.is_admin() {
+                    info!("User {} attempted to use DisableChat without permission", user_id);
+                    return Ok(()); // Silently ignore
+                }
+                self.handle_enable_chat(bot, chat_id, args, false).await
+            }
         }
     }
 
-    async fn ensure_user_and_chat(&self, msg: &Message) -> Result<(), String> {
+    async fn ensure_user_and_chat(&self, msg: &Message) -> Result<(UserRole, bool), String> {
         let chat_id = msg.chat.id.0;
         let chat_type = match msg.chat.is_group() || msg.chat.is_supergroup() {
             true => "group",
@@ -65,21 +113,39 @@ impl BotHandler {
         };
         let chat_title = msg.chat.title().map(|s| s.to_string());
 
-        self.repo.upsert_chat(chat_id, chat_type.to_string(), chat_title)
+        // Upsert chat - new chats get enabled status based on bot mode
+        let chat = self.repo.upsert_chat(chat_id, chat_type.to_string(), chat_title, self.is_public_mode)
             .await
             .map_err(|e| e.to_string())?;
 
         if let Some(user) = msg.from.as_ref() {
             let user_id = user.id.0 as i64;
             let username = user.username.clone();
-            let is_admin = self.owner_id.map_or(false, |owner| owner == user_id);
             
-            self.repo.upsert_user(user_id, username, is_admin)
-                .await
-                .map_err(|e| e.to_string())?;
+            // Check if user already exists
+            let user_model = match self.repo.get_user(user_id).await.map_err(|e| e.to_string())? {
+                Some(existing_user) => existing_user,
+                None => {
+                    // New user - determine role
+                    let role = if self.owner_id == Some(user_id) {
+                        UserRole::Owner
+                    } else {
+                        UserRole::User
+                    };
+                    
+                    info!("Creating new user {} with role {:?}", user_id, role);
+                    
+                    self.repo.upsert_user(user_id, username, role)
+                        .await
+                        .map_err(|e| e.to_string())?
+                }
+            };
+            
+            return Ok((user_model.role, chat.enabled));
         }
 
-        Ok(())
+        // If no user info, return default user with chat enabled status
+        Ok((UserRole::User, chat.enabled))
     }
 
     async fn handle_help(&self, bot: Bot, chat_id: ChatId) -> ResponseResult<()> {
@@ -118,7 +184,7 @@ Made with ❤️ using Rust
 "#;
 
         bot.send_message(chat_id, help_text)
-            .parse_mode(ParseMode::Markdown)
+            .parse_mode(ParseMode::MarkdownV2)
             .await?;
         Ok(())
     }
@@ -134,7 +200,7 @@ Made with ❤️ using Rust
         
         if parts.is_empty() {
             bot.send_message(chat_id, "❌ Usage: `/sub author <id>` or `/sub ranking <mode>`")
-                .parse_mode(ParseMode::Markdown)
+                .parse_mode(ParseMode::MarkdownV2)
                 .await?;
             return Ok(());
         }
@@ -147,7 +213,7 @@ Made with ❤️ using Rust
                     chat_id,
                     "❌ Unknown subscription type. Use `author` or `ranking`"
                 )
-                .parse_mode(ParseMode::Markdown)
+                .parse_mode(ParseMode::MarkdownV2)
                 .await?;
                 Ok(())
             }
@@ -163,7 +229,7 @@ Made with ❤️ using Rust
     ) -> ResponseResult<()> {
         if parts.is_empty() {
             bot.send_message(chat_id, "❌ Usage: `/sub author <pixiv_id> [+tag1 -tag2]`")
-                .parse_mode(ParseMode::Markdown)
+                .parse_mode(ParseMode::MarkdownV2)
                 .await?;
             return Ok(());
         }
@@ -229,7 +295,7 @@ Made with ❤️ using Rust
                             chat_id,
                             format!("✅ Successfully subscribed to author `{}`{}", author_id, filter_msg)
                         )
-                        .parse_mode(ParseMode::Markdown)
+                        .parse_mode(ParseMode::MarkdownV2)
                         .await?;
                     }
                     Err(e) => {
@@ -261,7 +327,7 @@ Made with ❤️ using Rust
                 chat_id,
                 "❌ Usage: `/sub ranking <mode>`\nModes: daily, weekly, monthly, daily_r18, etc."
             )
-            .parse_mode(ParseMode::Markdown)
+            .parse_mode(ParseMode::MarkdownV2)
             .await?;
             return Ok(());
         }
@@ -302,7 +368,7 @@ Made with ❤️ using Rust
                             chat_id,
                             format!("✅ Successfully subscribed to `{}` ranking", mode)
                         )
-                        .parse_mode(ParseMode::Markdown)
+                        .parse_mode(ParseMode::MarkdownV2)
                         .await?;
                     }
                     Err(e) => {
@@ -332,7 +398,7 @@ Made with ❤️ using Rust
             Ok(id) => id,
             Err(_) => {
                 bot.send_message(chat_id, "❌ Invalid subscription ID. Use `/list` to see IDs.")
-                    .parse_mode(ParseMode::Markdown)
+                    .parse_mode(ParseMode::MarkdownV2)
                     .await?;
                 return Ok(());
             }
@@ -360,7 +426,7 @@ Made with ❤️ using Rust
             Ok(subscriptions) => {
                 if subscriptions.is_empty() {
                     bot.send_message(chat_id, "📭 You have no active subscriptions.\n\nUse `/sub` to subscribe!")
-                        .parse_mode(ParseMode::Markdown)
+                        .parse_mode(ParseMode::MarkdownV2)
                         .await?;
                     return Ok(());
                 }
@@ -427,13 +493,128 @@ Made with ❤️ using Rust
                 message.push_str("\n💡 Use `/unsub <id>` to unsubscribe");
 
                 bot.send_message(chat_id, message)
-                    .parse_mode(ParseMode::Markdown)
+                    .parse_mode(ParseMode::MarkdownV2)
                     .await?;
             }
             Err(e) => {
                 error!("Failed to list subscriptions: {}", e);
                 bot.send_message(chat_id, "❌ Failed to retrieve subscriptions")
                     .await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn handle_set_admin(
+        &self,
+        bot: Bot,
+        chat_id: ChatId,
+        args: String,
+        is_admin: bool,
+    ) -> ResponseResult<()> {
+        let target_user_id = match args.trim().parse::<i64>() {
+            Ok(id) => id,
+            Err(_) => {
+                bot.send_message(
+                    chat_id,
+                    if is_admin {
+                        "❌ Usage: `/setadmin <user_id>`"
+                    } else {
+                        "❌ Usage: `/unsetadmin <user_id>`"
+                    }
+                )
+                .parse_mode(ParseMode::MarkdownV2)
+                .await?;
+                return Ok(());
+            }
+        };
+
+        let role = if is_admin {
+            UserRole::Admin
+        } else {
+            UserRole::User
+        };
+
+        match self.repo.set_user_role(target_user_id, role).await {
+            Ok(user) => {
+                bot.send_message(
+                    chat_id,
+                    format!(
+                        "✅ Successfully set user `{}` role to **{}**",
+                        user.id,
+                        role
+                    )
+                )
+                .parse_mode(ParseMode::MarkdownV2)
+                .await?;
+                
+                info!("Owner set user {} role to {:?}", target_user_id, role);
+            }
+            Err(e) => {
+                error!("Failed to set user role: {}", e);
+                bot.send_message(
+                    chat_id,
+                    "❌ Failed to set user role. User may not exist yet."
+                )
+                .await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn handle_enable_chat(
+        &self,
+        bot: Bot,
+        current_chat_id: ChatId,
+        args: String,
+        enabled: bool,
+    ) -> ResponseResult<()> {
+        // Parse target chat_id from args, or use current chat_id
+        let target_chat_id = if args.trim().is_empty() {
+            current_chat_id.0
+        } else {
+            match args.trim().parse::<i64>() {
+                Ok(id) => id,
+                Err(_) => {
+                    bot.send_message(
+                        current_chat_id,
+                        if enabled {
+                            "❌ Usage: `/enablechat [chat_id]`"
+                        } else {
+                            "❌ Usage: `/disablechat [chat_id]`"
+                        }
+                    )
+                    .parse_mode(ParseMode::MarkdownV2)
+                    .await?;
+                    return Ok(());
+                }
+            }
+        };
+
+        match self.repo.set_chat_enabled(target_chat_id, enabled).await {
+            Ok(_) => {
+                bot.send_message(
+                    current_chat_id,
+                    if enabled {
+                        format!("✅ Chat `{}` enabled successfully", target_chat_id)
+                    } else {
+                        format!("✅ Chat `{}` disabled successfully", target_chat_id)
+                    }
+                )
+                .parse_mode(ParseMode::MarkdownV2)
+                .await?;
+                
+                info!("Admin {} chat {}", if enabled { "enabled" } else { "disabled" }, target_chat_id);
+            }
+            Err(e) => {
+                error!("Failed to set chat enabled status: {}", e);
+                bot.send_message(
+                    current_chat_id,
+                    "❌ Failed to update chat status"
+                )
+                .await?;
             }
         }
 

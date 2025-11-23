@@ -11,4 +11,12 @@ pub enum Command {
     Unsub(String),
     #[command(description = "List active subscriptions / 列出当前订阅")]
     List,
+    #[command(description = "[Owner Only] Set user as admin / 设置用户为管理员\n  Usage: /setadmin <user_id>")]
+    SetAdmin(String),
+    #[command(description = "[Owner Only] Remove user admin role / 移除用户管理员角色\n  Usage: /unsetadmin <user_id>")]
+    UnsetAdmin(String),
+    #[command(description = "[Admin Only] Enable chat / 启用聊天\n  Usage: /enablechat [chat_id]")]
+    EnableChat(String),
+    #[command(description = "[Admin Only] Disable chat / 禁用聊天\n  Usage: /disablechat [chat_id]")]
+    DisableChat(String),
 }

@@ -20,10 +20,10 @@ impl MigrationTrait for Migration {
                     )
                     .col(ColumnDef::new(Users::Username).string())
                     .col(
-                        ColumnDef::new(Users::IsAdmin)
-                            .boolean()
+                        ColumnDef::new(Users::Role)
+                            .string()
                             .not_null()
-                            .default(false),
+                            .default("user"),
                     )
                     .col(
                         ColumnDef::new(Users::CreatedAt)
@@ -49,6 +49,12 @@ impl MigrationTrait for Migration {
                     )
                     .col(ColumnDef::new(Chats::Type).string().not_null())
                     .col(ColumnDef::new(Chats::Title).string())
+                    .col(
+                        ColumnDef::new(Chats::Enabled)
+                            .boolean()
+                            .not_null()
+                            .default(false),
+                    )
                     .col(
                         ColumnDef::new(Chats::CreatedAt)
                             .timestamp()
@@ -211,7 +217,7 @@ enum Users {
     Table,
     Id,
     Username,
-    IsAdmin,
+    Role,
     CreatedAt,
 }
 
@@ -221,6 +227,7 @@ enum Chats {
     Id,
     Type,
     Title,
+    Enabled,
     CreatedAt,
 }
 

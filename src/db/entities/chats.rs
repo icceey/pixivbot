@@ -8,6 +8,7 @@ pub struct Model {
     pub id: i64,
     pub r#type: String,
     pub title: Option<String>,
+    pub enabled: bool,
     pub created_at: DateTime,
 }
 

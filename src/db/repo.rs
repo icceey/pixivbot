@@ -6,6 +6,7 @@ use chrono::{DateTime, Utc};
 use serde_json::Value as JsonValue;
 
 use super::entities::{chats, subscriptions, tasks, users};
+use super::entities::role::UserRole;
 
 pub struct Repo {
     db: DatabaseConnection,
@@ -27,23 +28,22 @@ impl Repo {
         &self,
         user_id: i64,
         username: Option<String>,
-        is_admin: bool,
+        role: UserRole,
     ) -> Result<users::Model, DbErr> {
         let now = Utc::now().naive_utc();
         
         // Try to find existing user
         if let Some(existing) = users::Entity::find_by_id(user_id).one(&self.db).await? {
-            // Update existing
+            // Update existing (only update username, don't change role)
             let mut active: users::ActiveModel = existing.into_active_model();
             active.username = Set(username);
-            active.is_admin = Set(is_admin);
             active.update(&self.db).await
         } else {
-            // Create new
+            // Create new user with specified role
             let new_user = users::ActiveModel {
                 id: Set(user_id),
                 username: Set(username),
-                is_admin: Set(is_admin),
+                role: Set(role),
                 created_at: Set(now),
             };
             new_user.insert(&self.db).await
@@ -54,14 +54,15 @@ impl Repo {
         users::Entity::find_by_id(user_id).one(&self.db).await
     }
 
-    pub async fn set_admin(&self, user_id: i64, is_admin: bool) -> Result<users::Model, DbErr> {
+    /// Set user role
+    pub async fn set_user_role(&self, user_id: i64, role: UserRole) -> Result<users::Model, DbErr> {
         let user = users::Entity::find_by_id(user_id)
             .one(&self.db)
             .await?
             .ok_or(DbErr::RecordNotFound(format!("User {} not found", user_id)))?;
         
         let mut active: users::ActiveModel = user.into_active_model();
-        active.is_admin = Set(is_admin);
+        active.role = Set(role);
         active.update(&self.db).await
     }
 
@@ -73,25 +74,39 @@ impl Repo {
         chat_id: i64,
         chat_type: String,
         title: Option<String>,
+        default_enabled: bool,
     ) -> Result<chats::Model, DbErr> {
         let now = Utc::now().naive_utc();
         
         if let Some(existing) = chats::Entity::find_by_id(chat_id).one(&self.db).await? {
-            // Update existing
+            // Update existing (keep enabled status)
             let mut active: chats::ActiveModel = existing.into_active_model();
             active.r#type = Set(chat_type);
             active.title = Set(title);
             active.update(&self.db).await
         } else {
-            // Create new
+            // Create new with default enabled status
             let new_chat = chats::ActiveModel {
                 id: Set(chat_id),
                 r#type: Set(chat_type),
                 title: Set(title),
+                enabled: Set(default_enabled),
                 created_at: Set(now),
             };
             new_chat.insert(&self.db).await
         }
+    }
+
+    /// Enable or disable a chat
+    pub async fn set_chat_enabled(&self, chat_id: i64, enabled: bool) -> Result<chats::Model, DbErr> {
+        let chat = chats::Entity::find_by_id(chat_id)
+            .one(&self.db)
+            .await?
+            .ok_or(DbErr::RecordNotFound(format!("Chat {} not found", chat_id)))?;
+        
+        let mut active: chats::ActiveModel = chat.into_active_model();
+        active.enabled = Set(enabled);
+        active.update(&self.db).await
     }
 
     pub async fn get_chat(&self, chat_id: i64) -> Result<Option<chats::Model>, DbErr> {

@@ -170,14 +170,44 @@ impl SchedulerEngine {
         
         // Notify each subscriber
         for subscription in subscriptions {
+            let chat_id = ChatId(subscription.chat_id);
+            
+            // Check if chat is enabled or if it's an admin/owner private chat
+            let should_notify = match self.repo.get_chat(subscription.chat_id).await {
+                Ok(Some(chat)) if chat.enabled => true,
+                Ok(Some(_chat)) => {
+                    // Chat is disabled, check if it's admin/owner private chat
+                    match self.repo.get_user(subscription.chat_id).await {
+                        Ok(Some(user)) if user.role.is_admin() => {
+                            info!("Chat {} is disabled but user is admin/owner, allowing notification", chat_id);
+                            true
+                        }
+                        _ => {
+                            info!("Skipping notification to disabled chat {}", chat_id);
+                            false
+                        }
+                    }
+                }
+                Ok(None) => {
+                    info!("Chat {} not found, skipping", chat_id);
+                    false
+                }
+                Err(e) => {
+                    error!("Failed to get chat {}: {}", chat_id, e);
+                    false
+                }
+            };
+            
+            if !should_notify {
+                continue;
+            }
+            
             // Apply tag filters
             let filtered_illusts = self.apply_tag_filters(&new_illusts, &subscription.filter_tags);
             
             if filtered_illusts.is_empty() {
                 continue;
             }
-            
-            let chat_id = ChatId(subscription.chat_id);
             
             for illust in filtered_illusts {
                 let caption = format!(
@@ -260,6 +290,36 @@ impl SchedulerEngine {
         // Notify each subscriber
         for subscription in subscriptions {
             let chat_id = ChatId(subscription.chat_id);
+            
+            // Check if chat is enabled or if it's an admin/owner private chat
+            let should_notify = match self.repo.get_chat(subscription.chat_id).await {
+                Ok(Some(chat)) if chat.enabled => true,
+                Ok(Some(_chat)) => {
+                    // Chat is disabled, check if it's admin/owner private chat
+                    match self.repo.get_user(subscription.chat_id).await {
+                        Ok(Some(user)) if user.role.is_admin() => {
+                            info!("Chat {} is disabled but user is admin/owner, allowing notification", chat_id);
+                            true
+                        }
+                        _ => {
+                            info!("Skipping notification to disabled chat {}", chat_id);
+                            false
+                        }
+                    }
+                }
+                Ok(None) => {
+                    info!("Chat {} not found, skipping", chat_id);
+                    false
+                }
+                Err(e) => {
+                    error!("Failed to get chat {}: {}", chat_id, e);
+                    false
+                }
+            };
+            
+            if !should_notify {
+                continue;
+            }
             
             let message = format!(
                 "📊 **{} Ranking** - Top 10\n\n",

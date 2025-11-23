@@ -22,7 +22,7 @@ impl Notifier {
         
         match self.bot
             .send_message(chat_id, message)
-            .parse_mode(ParseMode::Markdown)
+            .parse_mode(ParseMode::MarkdownV2)
             .await
         {
             Ok(_) => {
