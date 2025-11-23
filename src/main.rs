@@ -82,10 +82,31 @@ async fn main() -> AppResult<()> {
     info!("✅ Cache directory ready");
 
     info!("PixivBot initialization complete");
-    info!("Starting Telegram Bot...");
+    
+    // Initialize scheduler
+    let scheduler_config = config.scheduler.clone();
+    let scheduler = scheduler::SchedulerEngine::new(
+        repo.clone(),
+        pixiv_client.clone(),
+        teloxide::Bot::new(config.telegram.bot_token.clone()),
+        scheduler_config.min_interval_ms,
+        scheduler_config.max_interval_ms,
+    );
+    
+    info!("✅ Scheduler initialized");
+    
+    // Spawn scheduler in background
+    let scheduler_handle = tokio::spawn(async move {
+        scheduler.run().await;
+    });
+    
+    info!("🤖 Starting Telegram Bot...");
     
     // Start Bot (this will block)
     bot::run(config.telegram, repo.clone(), pixiv_client.clone()).await?;
+    
+    // If bot exits, wait for scheduler
+    let _ = scheduler_handle.await;
     
     Ok(())
 }

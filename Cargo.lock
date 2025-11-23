@@ -2161,6 +2161,7 @@ dependencies = [
  "governor",
  "migration",
  "pixivrs",
+ "rand 0.9.2",
  "sea-orm",
  "sea-orm-migration",
  "serde",
