@@ -7,6 +7,7 @@ use crate::config::TelegramConfig;
 use crate::error::AppResult;
 use crate::db::repo::Repo;
 use crate::pixiv::client::PixivClient;
+use crate::pixiv::downloader::Downloader;
 use std::sync::Arc;
 use tracing::info;
 
@@ -17,6 +18,7 @@ pub async fn run(
     config: TelegramConfig,
     repo: Arc<Repo>,
     pixiv_client: Arc<tokio::sync::RwLock<PixivClient>>,
+    _downloader: Arc<Downloader>, // Not used in bot commands, only in scheduler
 ) -> AppResult<()> {
     info!("Starting Telegram Bot...");
     

@@ -1,5 +1,6 @@
 use crate::db::repo::Repo;
 use crate::pixiv::client::PixivClient;
+use crate::pixiv::downloader::Downloader;
 use crate::bot::notifier::Notifier;
 use std::sync::Arc;
 use tokio::time::{sleep, Duration};
@@ -23,13 +24,14 @@ impl SchedulerEngine {
         repo: Arc<Repo>,
         pixiv_client: Arc<tokio::sync::RwLock<PixivClient>>,
         bot: Bot,
+        downloader: Arc<Downloader>,
         min_interval_ms: u64,
         max_interval_ms: u64,
     ) -> Self {
         Self {
             repo,
             pixiv_client,
-            notifier: Notifier::new(bot),
+            notifier: Notifier::new(bot, downloader),
             min_interval_ms,
             max_interval_ms,
         }
@@ -178,9 +180,8 @@ impl SchedulerEngine {
             let chat_id = ChatId(subscription.chat_id);
             
             for illust in filtered_illusts {
-                let message = format!(
-                    "🎨 New artwork from artist {}\n\n**{}**\nby {}\n\n👁 {} views | ❤️ {} bookmarks\n🔗 https://pixiv.net/artworks/{}",
-                    author_id,
+                let caption = format!(
+                    "🎨 {}\nby {}\n👁 {} | ❤️ {}\n🔗 pixiv.net/artworks/{}",
                     illust.title,
                     illust.user.name,
                     illust.total_view,
@@ -188,7 +189,15 @@ impl SchedulerEngine {
                     illust.id
                 );
                 
-                if let Err(e) = self.notifier.notify(chat_id, &message).await {
+                // Get image URL - prefer original from meta_single_page, fallback to large
+                let image_url = if let Some(original_url) = &illust.meta_single_page.original_image_url {
+                    original_url.as_str()
+                } else {
+                    // Fallback to large image
+                    illust.image_urls.large.as_str()
+                };
+                
+                if let Err(e) = self.notifier.notify_with_image(chat_id, image_url, Some(&caption)).await {
                     error!("Failed to notify chat {}: {}", chat_id, e);
                 }
                 
@@ -264,8 +273,8 @@ impl SchedulerEngine {
             
             // Send top illusts (limit to 10)
             for (index, illust) in illusts.iter().take(10).enumerate() {
-                let rank_message = format!(
-                    "{}. **{}**\nby {}\n❤️ {} bookmarks\n🔗 https://pixiv.net/artworks/{}",
+                let caption = format!(
+                    "{}. {}\nby {}\n❤️ {} bookmarks\n🔗 pixiv.net/artworks/{}",
                     index + 1,
                     illust.title,
                     illust.user.name,
@@ -273,7 +282,14 @@ impl SchedulerEngine {
                     illust.id
                 );
                 
-                if let Err(e) = self.notifier.notify(chat_id, &rank_message).await {
+                // Get image URL
+                let image_url = if let Some(original_url) = &illust.meta_single_page.original_image_url {
+                    original_url.as_str()
+                } else {
+                    illust.image_urls.large.as_str()
+                };
+                
+                if let Err(e) = self.notifier.notify_with_image(chat_id, image_url, Some(&caption)).await {
                     error!("Failed to notify chat {}: {}", chat_id, e);
                 }
                 

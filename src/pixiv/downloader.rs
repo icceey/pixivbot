@@ -11,8 +11,11 @@ pub struct Downloader {
 }
 
 impl Downloader {
-    pub fn new(cache_dir: PathBuf, http_client: HttpClient) -> Self {
-        Self { cache_dir, http_client }
+    pub fn new(http_client: HttpClient, cache_dir: impl Into<PathBuf>) -> Self {
+        Self { 
+            cache_dir: cache_dir.into(), 
+            http_client 
+        }
     }
 
     /// Download image and cache locally

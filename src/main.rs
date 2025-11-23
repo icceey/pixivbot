@@ -80,15 +80,26 @@ async fn main() -> AppResult<()> {
     // Create cache directory
     std::fs::create_dir_all("data/cache")?;
     info!("✅ Cache directory ready");
+    
+    // Initialize Downloader (reuse HttpClient from pixivrs)
+    let http_client = pixivrs::HttpClient::new()?;
+    let downloader = std::sync::Arc::new(
+        pixiv::downloader::Downloader::new(http_client, "data/cache")
+    );
+    info!("✅ Downloader initialized");
 
     info!("PixivBot initialization complete");
+    
+    // Initialize Telegram Bot
+    let bot = teloxide::Bot::new(config.telegram.bot_token.clone());
     
     // Initialize scheduler
     let scheduler_config = config.scheduler.clone();
     let scheduler = scheduler::SchedulerEngine::new(
         repo.clone(),
         pixiv_client.clone(),
-        teloxide::Bot::new(config.telegram.bot_token.clone()),
+        bot.clone(),
+        downloader.clone(),
         scheduler_config.min_interval_ms,
         scheduler_config.max_interval_ms,
     );
@@ -103,7 +114,7 @@ async fn main() -> AppResult<()> {
     info!("🤖 Starting Telegram Bot...");
     
     // Start Bot (this will block)
-    bot::run(config.telegram, repo.clone(), pixiv_client.clone()).await?;
+    bot::run(config.telegram, repo.clone(), pixiv_client.clone(), downloader.clone()).await?;
     
     // If bot exits, wait for scheduler
     let _ = scheduler_handle.await;

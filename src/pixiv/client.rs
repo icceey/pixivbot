@@ -46,21 +46,44 @@ impl PixivClient {
         Ok(())
     }
 
-    /// Get latest illusts from an author (simplified: get user bookmarks or search)
+    /// Get latest illusts from an author using search by user ID
+    /// Note: pixivrs doesn't have direct user_illusts method, so we use search
     pub async fn get_user_illusts(
         &self,
         user_id: u64,
-        _limit: usize,
+        limit: usize,
     ) -> AppResult<Vec<Illust>> {
+        use pixivrs::{Filter, SearchTarget, Sort};
+        
         info!("Fetching illusts for user {}", user_id);
         
-        // Note: pixivrs might not have direct user_illusts method
-        // We'll use illust_detail as a workaround for now
-        // In production, you'd need to check the actual API
+        let app_client = self.app_client.read().await;
         
-        // For now, return empty vector as placeholder
-        warn!("get_user_illusts needs proper implementation with actual pixivrs API");
-        Ok(Vec::new())
+        // Search for illusts by this user ID
+        // Using PartialMatchForTags with user:XXXXX pattern
+        let query = format!("user:{}", user_id);
+        
+        match app_client.search_illust(
+            &query,
+            SearchTarget::PartialMatchForTags,
+            Sort::DateDesc,
+            None,       // duration
+            None,       // start_date
+            None,       // end_date
+            Filter::ForIOS,
+            Some(0),    // ai_type: filter AI works
+            Some(0),    // offset
+        ).await {
+            Ok(response) => {
+                let illusts: Vec<_> = response.illusts.into_iter().take(limit).collect();
+                info!("Fetched {} illusts for user {} via search", illusts.len(), user_id);
+                Ok(illusts)
+            }
+            Err(e) => {
+                warn!("Failed to fetch user illusts for {}: {}", user_id, e);
+                Err(e.into())
+            }
+        }
     }
 
     /// Get ranking illusts
