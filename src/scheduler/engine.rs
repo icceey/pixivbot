@@ -210,24 +210,26 @@ impl SchedulerEngine {
             }
             
             for illust in filtered_illusts {
+                let page_info = if illust.is_multi_page() {
+                    format!(" ({} pages)", illust.page_count)
+                } else {
+                    String::new()
+                };
+                
                 let caption = format!(
-                    "🎨 {}\nby {}\n👁 {} | ❤️ {}\n🔗 pixiv.net/artworks/{}",
+                    "🎨 {}{}\nby {}\n👁 {} | ❤️ {}\n🔗 pixiv.net/artworks/{}",
                     illust.title,
+                    page_info,
                     illust.user.name,
                     illust.total_view,
                     illust.total_bookmarks,
                     illust.id
                 );
                 
-                // Get image URL - prefer original from meta_single_page, fallback to large
-                let image_url = if let Some(original_url) = &illust.meta_single_page.original_image_url {
-                    original_url.as_str()
-                } else {
-                    // Fallback to large image
-                    illust.image_urls.large.as_str()
-                };
+                // 获取所有图片URL (支持单图和多图)
+                let image_urls = illust.get_all_image_urls();
                 
-                if let Err(e) = self.notifier.notify_with_image(chat_id, image_url, Some(&caption)).await {
+                if let Err(e) = self.notifier.notify_with_images(chat_id, &image_urls, Some(&caption)).await {
                     error!("Failed to notify chat {}: {}", chat_id, e);
                 }
                 

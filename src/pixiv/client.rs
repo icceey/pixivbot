@@ -69,14 +69,13 @@ impl PixivClient {
         Ok(response.illust)
     }
 
-    /// Get image download URL from illust
-    pub fn get_image_url(&self, illust: &Illust) -> String {
-        // Prefer original quality from meta_single_page
-        if let Some(original_url) = &illust.meta_single_page.original_image_url {
-            return original_url.clone();
-        }
-        
-        // Fallback to large image
-        illust.image_urls.large.clone()
+    /// 获取作品的所有图片URL (支持单图和多图)
+    pub fn get_image_urls(&self, illust: &Illust) -> Vec<String> {
+        illust.get_all_image_urls()
+    }
+    
+    /// 获取作品的第一张图片URL (用于预览)
+    pub fn get_first_image_url(&self, illust: &Illust) -> String {
+        illust.get_first_image_url()
     }
 }

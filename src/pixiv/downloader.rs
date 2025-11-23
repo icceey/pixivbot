@@ -65,6 +65,36 @@ impl Downloader {
         Ok(filepath)
     }
     
+    /// 批量下载多张图片 (用于多图作品)
+    /// 返回所有下载成功的文件路径
+    pub async fn download_all(&self, urls: &[String]) -> AppResult<Vec<PathBuf>> {
+        info!("Batch downloading {} images", urls.len());
+        
+        let mut paths = Vec::with_capacity(urls.len());
+        
+        for (idx, url) in urls.iter().enumerate() {
+            match self.download(url).await {
+                Ok(path) => {
+                    info!("Downloaded {}/{}: {:?}", idx + 1, urls.len(), path);
+                    paths.push(path);
+                }
+                Err(e) => {
+                    // 继续下载其他图片,不因一张失败而中断
+                    tracing::warn!("Failed to download image {}/{} ({}): {}", idx + 1, urls.len(), url, e);
+                }
+            }
+        }
+        
+        if paths.is_empty() {
+            return Err(crate::error::AppError::Unknown(
+                "All images failed to download".to_string()
+            ));
+        }
+        
+        info!("Batch download complete: {}/{} successful", paths.len(), urls.len());
+        Ok(paths)
+    }
+    
     /// Extract file extension from URL
     fn extract_extension<'a>(&self, url: &'a str) -> Option<&'a str> {
         url.split('.')
