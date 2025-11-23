@@ -125,7 +125,7 @@ impl Notifier {
             let batch_caption = if batch_idx == 0 {
                 caption.map(|s| s.to_string())
             } else if total_batches > 1 {
-                Some(format!("(continued {}/{})", batch_idx + 1, total_batches))
+                Some(format!("\\(continued {}/{}\\)", batch_idx + 1, total_batches))
             } else {
                 None
             };
@@ -165,7 +165,7 @@ impl Notifier {
         let mut request = self.bot.send_photo(chat_id, input_file);
         
         if let Some(cap) = caption {
-            request = request.caption(cap);
+            request = request.caption(cap).parse_mode(ParseMode::MarkdownV2);
         }
         
         match request.await {
@@ -204,7 +204,7 @@ impl Notifier {
                 // 只在第一张图片上添加标题
                 if idx == 0 {
                     if let Some(cap) = caption {
-                        photo = photo.caption(cap);
+                        photo = photo.caption(cap).parse_mode(ParseMode::MarkdownV2);
                     }
                 }
                 

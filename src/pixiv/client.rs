@@ -78,4 +78,14 @@ impl PixivClient {
     pub fn get_first_image_url(&self, illust: &Illust) -> String {
         illust.get_first_image_url()
     }
+
+    /// 获取用户详情
+    pub async fn get_user_detail(&self, user_id: u64) -> AppResult<pixiv_client::User> {
+        info!("Fetching user detail for {}", user_id);
+        
+        let response = self.client.user_detail(user_id).await?;
+        
+        info!("Successfully fetched user detail: {} ({})", response.user.name, response.user.id);
+        Ok(response.user)
+    }
 }

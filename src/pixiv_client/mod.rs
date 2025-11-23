@@ -10,5 +10,5 @@ mod auth;
 mod client;
 
 pub use error::{Error, Result};
-pub use models::{Illust, User, ImageUrls, MetaSinglePage, IllustDetail};
+pub use models::{Illust, User, ImageUrls, MetaSinglePage, IllustDetail, UserDetail};
 pub use client::PixivClient;

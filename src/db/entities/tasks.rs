@@ -16,6 +16,7 @@ pub struct Model {
     pub latest_data: Option<Json>,
     pub created_by: i64,
     pub updated_by: i64,
+    pub author_name: Option<String>, // 作者名字（仅 type="author" 时有值）
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

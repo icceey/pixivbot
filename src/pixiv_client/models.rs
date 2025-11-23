@@ -134,3 +134,9 @@ pub struct Ranking {
     pub illusts: Vec<Illust>,
     pub next_url: Option<String>,
 }
+
+/// 用户详情响应
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct UserDetail {
+    pub user: User,
+}

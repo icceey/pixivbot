@@ -234,14 +234,35 @@ Made with ❤️ using Rust
             return Ok(());
         }
 
-        let author_id = parts[0];
+        let author_id_str = parts[0];
         
         // Validate it's a number
-        if author_id.parse::<u64>().is_err() {
-            bot.send_message(chat_id, "❌ Author ID must be a number")
-                .await?;
-            return Ok(());
-        }
+        let author_id = match author_id_str.parse::<u64>() {
+            Ok(id) => id,
+            Err(_) => {
+                bot.send_message(chat_id, "❌ Author ID must be a number")
+                    .await?;
+                return Ok(());
+            }
+        };
+
+        // Verify author exists and get author name
+        let author_name = {
+            let pixiv = self.pixiv_client.read().await;
+            match pixiv.get_user_detail(author_id).await {
+                Ok(user) => user.name,
+                Err(e) => {
+                    error!("Failed to get user detail for {}: {}", author_id, e);
+                    bot.send_message(
+                        chat_id, 
+                        format!("❌ Author ID `{}` not found or invalid\\. Please check the ID\\.", author_id)
+                    )
+                    .parse_mode(ParseMode::MarkdownV2)
+                    .await?;
+                    return Ok(());
+                }
+            }
+        };
 
         // Parse filter tags
         let mut include_tags = Vec::new();
@@ -269,9 +290,10 @@ Made with ❤️ using Rust
         // Create or get task
         match self.repo.get_or_create_task(
             "author".to_string(),
-            author_id.to_string(),
+            author_id_str.to_string(),
             4 * 3600, // 4 hours interval
             user_id,
+            Some(author_name.clone()),
         ).await {
             Ok(task) => {
                 // Create subscription
@@ -291,9 +313,32 @@ Made with ❤️ using Rust
                             String::new()
                         };
                         
+                        // Escape special characters for MarkdownV2
+                        let escaped_name = author_name
+                            .replace('\\', "\\\\")
+                            .replace('_', "\\_")
+                            .replace('*', "\\*")
+                            .replace('[', "\\[")
+                            .replace(']', "\\]")
+                            .replace('(', "\\(")
+                            .replace(')', "\\)")
+                            .replace('~', "\\~")
+                            .replace('`', "\\`")
+                            .replace('>', "\\>")
+                            .replace('#', "\\#")
+                            .replace('+', "\\+")
+                            .replace('-', "\\-")
+                            .replace('=', "\\=")
+                            .replace('|', "\\|")
+                            .replace('{', "\\{")
+                            .replace('}', "\\}")
+                            .replace('.', "\\.")
+                            .replace('!', "\\!");
+                        
                         bot.send_message(
                             chat_id,
-                            format!("✅ Successfully subscribed to author `{}`{}", author_id, filter_msg)
+                            format!("✅ Successfully subscribed to author *{}* \\(ID: `{}`\\){}", 
+                                escaped_name, author_id, filter_msg)
                         )
                         .parse_mode(ParseMode::MarkdownV2)
                         .await?;
@@ -355,6 +400,7 @@ Made with ❤️ using Rust
             mode.to_string(),
             24 * 3600, // 24 hours interval
             user_id,
+            None, // No author_name for ranking tasks
         ).await {
             Ok(task) => {
                 // Create subscription
@@ -440,6 +486,38 @@ Made with ❤️ using Rust
                         _ => "❓",
                     };
                     
+                    // 构建显示名称：对于 author 类型显示作者名字，否则显示 value
+                    // 需要对 MarkdownV2 特殊字符进行转义
+                    let display_name = if task.r#type == "author" {
+                        if let Some(ref name) = task.author_name {
+                            let escaped_name = name
+                                .replace('\\', "\\\\")
+                                .replace('_', "\\_")
+                                .replace('*', "\\*")
+                                .replace('[', "\\[")
+                                .replace(']', "\\]")
+                                .replace('(', "\\(")
+                                .replace(')', "\\)")
+                                .replace('~', "\\~")
+                                .replace('`', "\\`")
+                                .replace('>', "\\>")
+                                .replace('#', "\\#")
+                                .replace('+', "\\+")
+                                .replace('-', "\\-")
+                                .replace('=', "\\=")
+                                .replace('|', "\\|")
+                                .replace('{', "\\{")
+                                .replace('}', "\\}")
+                                .replace('.', "\\.")
+                                .replace('!', "\\!");
+                            format!("{} \\(ID: {}\\)", escaped_name, task.value)
+                        } else {
+                            format!("ID: {}", task.value)
+                        }
+                    } else {
+                        task.value.replace('_', "\\_")
+                    };
+                    
                     let filter_info = if let Some(tags) = &sub.filter_tags {
                         if let Ok(filter) = serde_json::from_value::<serde_json::Value>(tags.clone()) {
                             let include = filter.get("include")
@@ -481,11 +559,10 @@ Made with ❤️ using Rust
                     };
 
                     message.push_str(&format!(
-                        "{} **[{}]** {} `{}`{}\n",
+                        "{} **[{}]** {}{}\n",
                         type_emoji,
                         sub.id,
-                        task.r#type,
-                        task.value,
+                        display_name,
                         filter_info
                     ));
                 }

@@ -123,6 +123,7 @@ impl Repo {
         interval_sec: i32,
         next_poll_at: DateTime<Utc>,
         created_by: i64,
+        author_name: Option<String>,
     ) -> Result<tasks::Model, DbErr> {
         let new_task = tasks::ActiveModel {
             r#type: Set(task_type),
@@ -133,6 +134,7 @@ impl Repo {
             latest_data: Set(None),
             created_by: Set(created_by),
             updated_by: Set(created_by),
+            author_name: Set(author_name),
             ..Default::default()
         };
         
@@ -159,12 +161,13 @@ impl Repo {
         value: String,
         interval_sec: i32,
         created_by: i64,
+        author_name: Option<String>,
     ) -> Result<tasks::Model, DbErr> {
         if let Some(existing) = self.get_task_by_type_value(&task_type, &value).await? {
             Ok(existing)
         } else {
             let next_poll = Utc::now() + chrono::Duration::seconds(60); // Poll in 1 minute
-            self.create_task(task_type, value, interval_sec, next_poll, created_by).await
+            self.create_task(task_type, value, interval_sec, next_poll, created_by, author_name).await
         }
     }
 

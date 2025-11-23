@@ -158,4 +158,16 @@ impl PixivClient {
 
         self.get("/v1/illust/ranking", &params).await
     }
+
+    /// 获取用户详情
+    /// 
+    /// # 参数
+    /// - `user_id`: 用户 ID
+    pub async fn user_detail(&self, user_id: u64) -> Result<UserDetail> {
+        let params = vec![
+            ("user_id", user_id.to_string()),
+            ("filter", "for_ios".to_string()),
+        ];
+        self.get("/v1/user/detail", &params).await
+    }
 }
