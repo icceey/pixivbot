@@ -2,6 +2,7 @@ use crate::db::repo::Repo;
 use crate::pixiv::client::PixivClient;
 use crate::pixiv::downloader::Downloader;
 use crate::bot::notifier::Notifier;
+use crate::utils::{html, markdown};
 use std::sync::Arc;
 use tokio::time::{sleep, Duration};
 use tracing::{info, warn, error};
@@ -10,29 +11,6 @@ use teloxide::Bot;
 use teloxide::prelude::*;
 use serde_json::json;
 use rand::Rng;
-
-/// Escape special characters for Telegram MarkdownV2
-fn escape_markdown_v2(text: &str) -> String {
-    text.replace('\\', "\\\\")
-        .replace('_', "\\_")
-        .replace('*', "\\*")
-        .replace('[', "\\[")
-        .replace(']', "\\]")
-        .replace('(', "\\(")
-        .replace(')', "\\)")
-        .replace('~', "\\~")
-        .replace('`', "\\`")
-        .replace('>', "\\>")
-        .replace('#', "\\#")
-        .replace('+', "\\+")
-        .replace('-', "\\-")
-        .replace('=', "\\=")
-        .replace('|', "\\|")
-        .replace('{', "\\{")
-        .replace('}', "\\}")
-        .replace('.', "\\.")
-        .replace('!', "\\!")
-}
 
 pub struct SchedulerEngine {
     repo: Arc<Repo>,
@@ -239,54 +217,34 @@ impl SchedulerEngine {
                     String::new()
                 };
                 
-                // 构建描述部分（简单去除HTML标签）
-                let description = if !illust.caption.is_empty() {
-                    let mut clean_caption = illust.caption
-                        .replace("<br />", "\n")
-                        .replace("<br>", "\n")
-                        .replace("<p>", "")
-                        .replace("</p>", "\n")
-                        .replace("<strong>", "")
-                        .replace("</strong>", "")
-                        .replace("<em>", "")
-                        .replace("</em>", "")
-                        .replace("&nbsp;", " ")
-                        .replace("&amp;", "&")
-                        .replace("&lt;", "<")
-                        .replace("&gt;", ">");
-                    
-                    // 移除 <a ...>...</a> 标签及其内容
-                    let re = regex::Regex::new(r"<a\s+[^>]*>.*?</a>").unwrap();
-                    clean_caption = re.replace_all(&clean_caption, "").to_string();
-                    
-                    let clean_text = clean_caption.trim();
-                    if clean_text.is_empty() {
+                // 构建描述和标签部分
+                let description = {
+                    let clean = html::clean_description(&illust.caption);
+                    if clean.is_empty() {
                         String::new()
                     } else {
-                        format!("\n\n{}", escape_markdown_v2(clean_text))
+                        format!("\n\n{}", markdown::escape(&clean))
                     }
-                } else {
-                    String::new()
                 };
                 
-                // 构建标签部分
-                let tags = if !illust.tags.is_empty() {
-                    let tag_list: Vec<String> = illust.tags.iter()
-                        .map(|tag| {
-                            let tag_name = escape_markdown_v2(&tag.name.replace(' ', "_"));
-                            format!("\\#{}", tag_name)
-                        })
-                        .collect();
-                    format!("\n\n{}", tag_list.join("  "))
-                } else {
-                    String::new()
+                let tags = {
+                    let tag_names: Vec<&str> = illust.tags.iter().map(|t| t.name.as_str()).collect();
+                    let formatted = html::format_tags(&tag_names);
+                    if formatted.is_empty() {
+                        String::new()
+                    } else {
+                        let escaped: Vec<String> = formatted.iter()
+                            .map(|t| format!("\\#{}", markdown::escape(t)))
+                            .collect();
+                        format!("\n\n{}", escaped.join("  "))
+                    }
                 };
                 
                 let caption = format!(
                     "🎨 {}{}\nby {}{}\n\n👀 {} \\| ❤️ {} \\| 🔗 [source](https://pixiv\\.net/artworks/{}){}", 
-                    escape_markdown_v2(&illust.title),
+                    markdown::escape(&illust.title),
                     page_info,
-                    escape_markdown_v2(&illust.user.name),
+                    markdown::escape(&illust.user.name),
                     description,
                     illust.total_view,
                     illust.total_bookmarks,
@@ -403,54 +361,34 @@ impl SchedulerEngine {
             
             // Send top illusts (limit to 10)
             for (index, illust) in illusts.iter().take(10).enumerate() {
-                // 构建描述部分（简单去除HTML标签）
-                let description = if !illust.caption.is_empty() {
-                    let mut clean_caption = illust.caption
-                        .replace("<br />", "\n")
-                        .replace("<br>", "\n")
-                        .replace("<p>", "")
-                        .replace("</p>", "\n")
-                        .replace("<strong>", "")
-                        .replace("</strong>", "")
-                        .replace("<em>", "")
-                        .replace("</em>", "")
-                        .replace("&nbsp;", " ")
-                        .replace("&amp;", "&")
-                        .replace("&lt;", "<")
-                        .replace("&gt;", ">");
-                    
-                    // 移除 <a ...>...</a> 标签及其内容
-                    let re = regex::Regex::new(r"<a\s+[^>]*>.*?</a>").unwrap();
-                    clean_caption = re.replace_all(&clean_caption, "").to_string();
-                    
-                    let clean_text = clean_caption.trim();
-                    if clean_text.is_empty() {
+                // 构建描述和标签部分
+                let description = {
+                    let clean = html::clean_description(&illust.caption);
+                    if clean.is_empty() {
                         String::new()
                     } else {
-                        format!("\n\n{}", escape_markdown_v2(clean_text))
+                        format!("\n\n{}", markdown::escape(&clean))
                     }
-                } else {
-                    String::new()
                 };
                 
-                // 构建标签部分
-                let tags = if !illust.tags.is_empty() {
-                    let tag_list: Vec<String> = illust.tags.iter()
-                        .map(|tag| {
-                            let tag_name = escape_markdown_v2(&tag.name.replace(' ', "_"));
-                            format!("\\#{}", tag_name)
-                        })
-                        .collect();
-                    format!("\n\n{}", tag_list.join("  "))
-                } else {
-                    String::new()
+                let tags = {
+                    let tag_names: Vec<&str> = illust.tags.iter().map(|t| t.name.as_str()).collect();
+                    let formatted = html::format_tags(&tag_names);
+                    if formatted.is_empty() {
+                        String::new()
+                    } else {
+                        let escaped: Vec<String> = formatted.iter()
+                            .map(|t| format!("\\#{}", markdown::escape(t)))
+                            .collect();
+                        format!("\n\n{}", escaped.join("  "))
+                    }
                 };
                 
                 let caption = format!(
                     "{}\\.  {}\nby {}{}\n\n❤️ {} \\| 🔗 [source](https://pixiv\\.net/artworks/{}){}", 
                     index + 1,
-                    escape_markdown_v2(&illust.title),
-                    escape_markdown_v2(&illust.user.name),
+                    markdown::escape(&illust.title),
+                    markdown::escape(&illust.user.name),
                     description,
                     illust.total_bookmarks,
                     illust.id,

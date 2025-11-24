@@ -14,5 +14,5 @@ level = "info"
 dir = "./logs"
 
 [scheduler]
-min_interval_sec = 30
-max_interval_sec = 60
+min_interval_sec = 60
+max_interval_sec = 120

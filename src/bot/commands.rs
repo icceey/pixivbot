@@ -7,7 +7,7 @@ pub enum Command {
     Help,
     #[command(description = "Subscribe to author or ranking / 订阅作者或排行榜\n  Usage: /sub author:123456 or /sub ranking:daily")]
     Sub(String),
-    #[command(description = "Unsubscribe from task / 取消订阅\n  Usage: /unsub author:123456")]
+    #[command(description = "Unsubscribe from author / 取消订阅作者\n  Usage: /unsub <author_id>")]
     Unsub(String),
     #[command(description = "List active subscriptions / 列出当前订阅")]
     List,

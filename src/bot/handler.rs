@@ -4,6 +4,7 @@ use crate::db::repo::Repo;
 use crate::db::entities::role::UserRole;
 use crate::pixiv::client::PixivClient;
 use crate::bot::Command;
+use crate::utils::markdown;
 use std::sync::Arc;
 use tracing::{info, error};
 use serde_json::json;
@@ -150,36 +151,36 @@ impl BotHandler {
 
     async fn handle_help(&self, bot: Bot, chat_id: ChatId) -> ResponseResult<()> {
         let help_text = r#"
-📚 **PixivBot Help**
+📚 *PixivBot Help*
 
 *Available Commands:*
 
-📌 `/sub author <pixiv_id> [+tag1 -tag2]`
+📌 `/sub author <pixiv_id> [+tag1 \-tag2]`
    Subscribe to a Pixiv author
-   - `<pixiv_id>`: Pixiv user ID (numbers only)
-   - `+tag`: Include only works with this tag
-   - `-tag`: Exclude works with this tag
-   - Example: `/sub author 123456 +原神 -R-18`
+   \- `<pixiv_id>`: Pixiv user ID \(numbers only\)
+   \- `\+tag`: Include only works with this tag
+   \- `\-tag`: Exclude works with this tag
+   \- Example: `/sub author 123456 \+原神 \-R\-18`
 
 📊 `/sub ranking <mode>`
    Subscribe to Pixiv ranking
-   - Modes: `daily`, `weekly`, `monthly`
-   - R18 variants: `daily_r18`, `weekly_r18`
-   - Gender-specific: `daily_male`, `daily_female`
-   - Example: `/sub ranking daily`
+   \- Modes: `daily`, `weekly`, `monthly`
+   \- R18 variants: `daily_r18`, `weekly_r18`
+   \- Gender\-specific: `daily_male`, `daily_female`
+   \- Example: `/sub ranking daily`
 
 📋 `/list`
    List all your active subscriptions
 
-🗑 `/unsub <subscription_id>`
-   Unsubscribe from a subscription
-   - Get ID from `/list` command
-   - Example: `/unsub 5`
+🗑 `/unsub <author_id>`
+   Unsubscribe from an author subscription
+   \- Use author ID \(Pixiv user ID\)
+   \- Example: `/unsub 123456`
 
 ❓ `/help`
    Show this help message
 
----
+\-\-\-
 Made with ❤️ using Rust
 "#;
 
@@ -313,32 +314,10 @@ Made with ❤️ using Rust
                             String::new()
                         };
                         
-                        // Escape special characters for MarkdownV2
-                        let escaped_name = author_name
-                            .replace('\\', "\\\\")
-                            .replace('_', "\\_")
-                            .replace('*', "\\*")
-                            .replace('[', "\\[")
-                            .replace(']', "\\]")
-                            .replace('(', "\\(")
-                            .replace(')', "\\)")
-                            .replace('~', "\\~")
-                            .replace('`', "\\`")
-                            .replace('>', "\\>")
-                            .replace('#', "\\#")
-                            .replace('+', "\\+")
-                            .replace('-', "\\-")
-                            .replace('=', "\\=")
-                            .replace('|', "\\|")
-                            .replace('{', "\\{")
-                            .replace('}', "\\}")
-                            .replace('.', "\\.")
-                            .replace('!', "\\!");
-                        
                         bot.send_message(
                             chat_id,
                             format!("✅ Successfully subscribed to author *{}* \\(ID: `{}`\\){}", 
-                                escaped_name, author_id, filter_msg)
+                                markdown::escape(&author_name), author_id, filter_msg)
                         )
                         .parse_mode(ParseMode::MarkdownV2)
                         .await?;
@@ -440,26 +419,58 @@ Made with ❤️ using Rust
         chat_id: ChatId,
         args: String,
     ) -> ResponseResult<()> {
-        let sub_id = match args.trim().parse::<i32>() {
-            Ok(id) => id,
-            Err(_) => {
-                bot.send_message(chat_id, "❌ Invalid subscription ID. Use `/list` to see IDs.")
-                    .parse_mode(ParseMode::MarkdownV2)
-                    .await?;
-                return Ok(());
-            }
-        };
+        let author_id = args.trim();
+        
+        if author_id.is_empty() {
+            bot.send_message(chat_id, "❌ Usage: `/unsub <author_id>`")
+                .parse_mode(ParseMode::MarkdownV2)
+                .await?;
+            return Ok(());
+        }
 
-        match self.repo.delete_subscription(sub_id).await {
-            Ok(_) => {
-                // Check if task still has subscriptions
-                // (This is automatically handled by the database cascade, but we could add cleanup)
-                bot.send_message(chat_id, "✅ Successfully unsubscribed")
+        // Find task by author ID
+        match self.repo.get_task_by_type_value("author", author_id).await {
+            Ok(Some(task)) => {
+                // Delete subscription for this chat and task
+                match self.repo.delete_subscription_by_chat_task(chat_id.0, task.id).await {
+                    Ok(_) => {
+                        // Check if task still has other subscriptions
+                        match self.repo.count_subscriptions_for_task(task.id).await {
+                            Ok(count) => {
+                                if count == 0 {
+                                    // No more subscriptions, delete the task
+                                    if let Err(e) = self.repo.delete_task(task.id).await {
+                                        error!("Failed to delete task {}: {}", task.id, e);
+                                    } else {
+                                        info!("Deleted task {} (author {}) - no more subscriptions", task.id, author_id);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                error!("Failed to count subscriptions for task {}: {}", task.id, e);
+                            }
+                        }
+                        
+                        bot.send_message(chat_id, format!("✅ Successfully unsubscribed from author `{}`", author_id))
+                            .parse_mode(ParseMode::MarkdownV2)
+                            .await?;
+                    }
+                    Err(e) => {
+                        error!("Failed to delete subscription: {}", e);
+                        bot.send_message(chat_id, "❌ Failed to unsubscribe\\. You may not be subscribed to this author\\.")
+                            .parse_mode(ParseMode::MarkdownV2)
+                            .await?;
+                    }
+                }
+            }
+            Ok(None) => {
+                bot.send_message(chat_id, format!("❌ Author `{}` not found in your subscriptions", author_id))
+                    .parse_mode(ParseMode::MarkdownV2)
                     .await?;
             }
             Err(e) => {
-                error!("Failed to delete subscription: {}", e);
-                bot.send_message(chat_id, "❌ Failed to unsubscribe. Invalid ID?")
+                error!("Failed to get task: {}", e);
+                bot.send_message(chat_id, "❌ Database error occurred")
                     .await?;
             }
         }
@@ -471,83 +482,68 @@ Made with ❤️ using Rust
         match self.repo.list_subscriptions_by_chat(chat_id.0).await {
             Ok(subscriptions) => {
                 if subscriptions.is_empty() {
-                    bot.send_message(chat_id, "📭 You have no active subscriptions.\n\nUse `/sub` to subscribe!")
+                    bot.send_message(chat_id, "📭 You have no active subscriptions\\.\n\nUse `/sub` to subscribe\\!")
                         .parse_mode(ParseMode::MarkdownV2)
                         .await?;
                     return Ok(());
                 }
 
-                let mut message = "📋 **Your Subscriptions:**\n\n".to_string();
+                let mut message = "📋 *Your Subscriptions:*\n\n".to_string();
                 
                 for (sub, task) in subscriptions {
                     let type_emoji = match task.r#type.as_str() {
-                        "author" => "👤",
+                        "author" => "🎨",
                         "ranking" => "📊",
                         _ => "❓",
                     };
                     
                     // 构建显示名称：对于 author 类型显示作者名字，否则显示 value
-                    // 需要对 MarkdownV2 特殊字符进行转义
-                    let display_name = if task.r#type == "author" {
+                    // 使用代码块格式使得ID可以复制
+                    let display_info = if task.r#type == "author" {
                         if let Some(ref name) = task.author_name {
-                            let escaped_name = name
-                                .replace('\\', "\\\\")
-                                .replace('_', "\\_")
-                                .replace('*', "\\*")
-                                .replace('[', "\\[")
-                                .replace(']', "\\]")
-                                .replace('(', "\\(")
-                                .replace(')', "\\)")
-                                .replace('~', "\\~")
-                                .replace('`', "\\`")
-                                .replace('>', "\\>")
-                                .replace('#', "\\#")
-                                .replace('+', "\\+")
-                                .replace('-', "\\-")
-                                .replace('=', "\\=")
-                                .replace('|', "\\|")
-                                .replace('{', "\\{")
-                                .replace('}', "\\}")
-                                .replace('.', "\\.")
-                                .replace('!', "\\!");
-                            format!("{} \\(ID: {}\\)", escaped_name, task.value)
+                            format!("{} \\| ID: `{}`", markdown::escape(name), task.value)
                         } else {
-                            format!("ID: {}", task.value)
+                            format!("ID: `{}`", task.value)
                         }
                     } else {
                         task.value.replace('_', "\\_")
                     };
                     
-                    let filter_info = if let Some(tags) = &sub.filter_tags {
-                        if let Ok(filter) = serde_json::from_value::<serde_json::Value>(tags.clone()) {
-                            let include = filter.get("include")
-                                .and_then(|v| v.as_array())
-                                .map(|arr| arr.iter()
-                                    .filter_map(|v| v.as_str())
-                                    .map(|s| format!("+{}", s))
-                                    .collect::<Vec<_>>()
-                                    .join(" "))
-                                .unwrap_or_default();
-                            
-                            let exclude = filter.get("exclude")
-                                .and_then(|v| v.as_array())
-                                .map(|arr| arr.iter()
-                                    .filter_map(|v| v.as_str())
-                                    .map(|s| format!("-{}", s))
-                                    .collect::<Vec<_>>()
-                                    .join(" "))
-                                .unwrap_or_default();
-                            
-                            let mut filters = Vec::new();
-                            if !include.is_empty() {
-                                filters.push(include);
-                            }
-                            if !exclude.is_empty() {
-                                filters.push(exclude);
-                            }
-                            
-                            if !filters.is_empty() {
-                                format!(" 🏷 `{}`", filters.join(" "))
+                    let filter_info = if task.r#type == "author" {
+                        // Show filter tags for author subscriptions
+                        if let Some(tags) = &sub.filter_tags {
+                            if let Ok(filter) = serde_json::from_value::<serde_json::Value>(tags.clone()) {
+                                let include = filter.get("include")
+                                    .and_then(|v| v.as_array())
+                                    .map(|arr| arr.iter()
+                                        .filter_map(|v| v.as_str())
+                                        .map(|s| format!("\\+{}", s.replace('-', "\\-")))
+                                        .collect::<Vec<_>>()
+                                        .join(" "))
+                                    .unwrap_or_default();
+                                
+                                let exclude = filter.get("exclude")
+                                    .and_then(|v| v.as_array())
+                                    .map(|arr| arr.iter()
+                                        .filter_map(|v| v.as_str())
+                                        .map(|s| format!("\\-{}", s.replace('-', "\\-")))
+                                        .collect::<Vec<_>>()
+                                        .join(" "))
+                                    .unwrap_or_default();
+                                
+                                let mut filters = Vec::new();
+                                if !include.is_empty() {
+                                    filters.push(include);
+                                }
+                                if !exclude.is_empty() {
+                                    filters.push(exclude);
+                                }
+                                
+                                if !filters.is_empty() {
+                                    format!("\n  🏷 Tags: {}", filters.join(" "))
+                                } else {
+                                    String::new()
+                                }
                             } else {
                                 String::new()
                             }
@@ -559,15 +555,14 @@ Made with ❤️ using Rust
                     };
 
                     message.push_str(&format!(
-                        "{} **[{}]** {}{}\n",
+                        "{} {}{}\n",
                         type_emoji,
-                        sub.id,
-                        display_name,
+                        display_info,
                         filter_info
                     ));
                 }
 
-                message.push_str("\n💡 Use `/unsub <id>` to unsubscribe");
+                message.push_str("\n💡 Use `/unsub <author_id>` to unsubscribe");
 
                 bot.send_message(chat_id, message)
                     .parse_mode(ParseMode::MarkdownV2)

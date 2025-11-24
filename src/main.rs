@@ -5,6 +5,7 @@ mod pixiv;
 mod pixiv_client;
 mod bot;
 mod scheduler;
+mod utils;
 
 use crate::config::Config;
 use crate::error::AppResult;
