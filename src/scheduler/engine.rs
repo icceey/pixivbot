@@ -262,7 +262,7 @@ impl SchedulerEngine {
                 }
                 
                 // Small delay between messages
-                sleep(Duration::from_millis(1500)).await;
+                sleep(Duration::from_millis(2000)).await;
             }
         }
         
@@ -410,7 +410,7 @@ impl SchedulerEngine {
                     error!("Failed to notify chat {}: {}", chat_id, e);
                 }
                 
-                sleep(Duration::from_millis(500)).await;
+                sleep(Duration::from_millis(2000)).await;
             }
         }
         

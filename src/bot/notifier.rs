@@ -95,7 +95,9 @@ impl Notifier {
         
         // 单图: 使用单图发送方式
         if image_urls.len() == 1 {
-            return self.notify_with_image(chat_id, &image_urls[0], caption, has_spoiler).await;
+            let result = self.notify_with_image(chat_id, &image_urls[0], caption, has_spoiler).await;
+            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+            return result;
         }
         
         info!("Downloading and sending {} images to chat {}", image_urls.len(), chat_id);
@@ -133,6 +135,7 @@ impl Notifier {
             };
             
             let batch_paths: Vec<PathBuf> = chunk.to_vec();
+            let batch_size = batch_paths.len();
             
             if let Err(e) = self.send_media_group(
                 chat_id, 
@@ -145,10 +148,8 @@ impl Notifier {
                 continue;
             }
             
-            // 批次间稍微延迟,避免触发 Telegram 速率限制
-            if batch_idx < total_batches - 1 {
-                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-            }
+            let cooldown_secs = (batch_size * 2) as u64;
+            tokio::time::sleep(tokio::time::Duration::from_secs(cooldown_secs)).await;
         }
         
         info!("✅ All {} image(s) sent in {} batch(es)", total_images, total_batches);
