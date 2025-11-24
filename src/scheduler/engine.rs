@@ -18,6 +18,7 @@ pub struct SchedulerEngine {
     notifier: Notifier,
     min_interval_sec: u64,
     max_interval_sec: u64,
+    sensitive_tags: Vec<String>,
 }
 
 impl SchedulerEngine {
@@ -28,6 +29,7 @@ impl SchedulerEngine {
         downloader: Arc<Downloader>,
         min_interval_sec: u64,
         max_interval_sec: u64,
+        sensitive_tags: Vec<String>,
     ) -> Self {
         Self {
             repo,
@@ -35,6 +37,7 @@ impl SchedulerEngine {
             notifier: Notifier::new(bot, downloader),
             min_interval_sec,
             max_interval_sec,
+            sensitive_tags,
         }
     }
 
@@ -173,29 +176,33 @@ impl SchedulerEngine {
         for subscription in subscriptions {
             let chat_id = ChatId(subscription.chat_id);
             
-            // Check if chat is enabled or if it's an admin/owner private chat
-            let should_notify = match self.repo.get_chat(subscription.chat_id).await {
-                Ok(Some(chat)) if chat.enabled => true,
-                Ok(Some(_chat)) => {
-                    // Chat is disabled, check if it's admin/owner private chat
-                    match self.repo.get_user(subscription.chat_id).await {
-                        Ok(Some(user)) if user.role.is_admin() => {
-                            info!("Chat {} is disabled but user is admin/owner, allowing notification", chat_id);
-                            true
-                        }
-                        _ => {
-                            info!("Skipping notification to disabled chat {}", chat_id);
-                            false
-                        }
-                    }
-                }
+            // Get chat settings
+            let chat = match self.repo.get_chat(subscription.chat_id).await {
+                Ok(Some(chat)) => chat,
                 Ok(None) => {
                     info!("Chat {} not found, skipping", chat_id);
-                    false
+                    continue;
                 }
                 Err(e) => {
                     error!("Failed to get chat {}: {}", chat_id, e);
-                    false
+                    continue;
+                }
+            };
+            
+            // Check if chat is enabled or if it's an admin/owner private chat
+            let should_notify = if chat.enabled {
+                true
+            } else {
+                // Chat is disabled, check if it's admin/owner private chat
+                match self.repo.get_user(subscription.chat_id).await {
+                    Ok(Some(user)) if user.role.is_admin() => {
+                        info!("Chat {} is disabled but user is admin/owner, allowing notification", chat_id);
+                        true
+                    }
+                    _ => {
+                        info!("Skipping notification to disabled chat {}", chat_id);
+                        false
+                    }
                 }
             };
             
@@ -203,8 +210,11 @@ impl SchedulerEngine {
                 continue;
             }
             
-            // Apply tag filters
-            let filtered_illusts = self.apply_tag_filters(&new_illusts, &subscription.filter_tags);
+            // Apply subscription tag filters
+            let mut filtered_illusts = self.apply_tag_filters(&new_illusts, &subscription.filter_tags);
+            
+            // Apply chat-level excluded tags
+            filtered_illusts = self.apply_chat_excluded_tags(filtered_illusts, &chat.excluded_tags);
             
             if filtered_illusts.is_empty() {
                 continue;
@@ -217,6 +227,9 @@ impl SchedulerEngine {
                     String::new()
                 };
                 
+                // Check if this illust has sensitive tags for spoiler
+                let has_spoiler = chat.blur_sensitive_tags && self.has_sensitive_tags(illust);
+                
                 // 构建描述和标签部分
                 let description = {
                     let clean = html::clean_description(&illust.caption);
@@ -227,18 +240,7 @@ impl SchedulerEngine {
                     }
                 };
                 
-                let tags = {
-                    let tag_names: Vec<&str> = illust.tags.iter().map(|t| t.name.as_str()).collect();
-                    let formatted = html::format_tags(&tag_names);
-                    if formatted.is_empty() {
-                        String::new()
-                    } else {
-                        let escaped: Vec<String> = formatted.iter()
-                            .map(|t| format!("\\#{}", markdown::escape(t)))
-                            .collect();
-                        format!("\n\n{}", escaped.join("  "))
-                    }
-                };
+                let tags = self.format_tags(illust);
                 
                 let caption = format!(
                     "🎨 {}{}\nby {}{}\n\n👀 {} \\| ❤️ {} \\| 🔗 [source](https://pixiv\\.net/artworks/{}){}", 
@@ -255,7 +257,7 @@ impl SchedulerEngine {
                 // 获取所有图片URL (支持单图和多图)
                 let image_urls = illust.get_all_image_urls();
                 
-                if let Err(e) = self.notifier.notify_with_images(chat_id, &image_urls, Some(&caption)).await {
+                if let Err(e) = self.notifier.notify_with_images(chat_id, &image_urls, Some(&caption), has_spoiler).await {
                     error!("Failed to notify chat {}: {}", chat_id, e);
                 }
                 
@@ -319,29 +321,33 @@ impl SchedulerEngine {
         for subscription in subscriptions {
             let chat_id = ChatId(subscription.chat_id);
             
-            // Check if chat is enabled or if it's an admin/owner private chat
-            let should_notify = match self.repo.get_chat(subscription.chat_id).await {
-                Ok(Some(chat)) if chat.enabled => true,
-                Ok(Some(_chat)) => {
-                    // Chat is disabled, check if it's admin/owner private chat
-                    match self.repo.get_user(subscription.chat_id).await {
-                        Ok(Some(user)) if user.role.is_admin() => {
-                            info!("Chat {} is disabled but user is admin/owner, allowing notification", chat_id);
-                            true
-                        }
-                        _ => {
-                            info!("Skipping notification to disabled chat {}", chat_id);
-                            false
-                        }
-                    }
-                }
+            // Get chat settings
+            let chat = match self.repo.get_chat(subscription.chat_id).await {
+                Ok(Some(chat)) => chat,
                 Ok(None) => {
                     info!("Chat {} not found, skipping", chat_id);
-                    false
+                    continue;
                 }
                 Err(e) => {
                     error!("Failed to get chat {}: {}", chat_id, e);
-                    false
+                    continue;
+                }
+            };
+            
+            // Check if chat is enabled or if it's an admin/owner private chat
+            let should_notify = if chat.enabled {
+                true
+            } else {
+                // Chat is disabled, check if it's admin/owner private chat
+                match self.repo.get_user(subscription.chat_id).await {
+                    Ok(Some(user)) if user.role.is_admin() => {
+                        info!("Chat {} is disabled but user is admin/owner, allowing notification", chat_id);
+                        true
+                    }
+                    _ => {
+                        info!("Skipping notification to disabled chat {}", chat_id);
+                        false
+                    }
                 }
             };
             
@@ -359,8 +365,17 @@ impl SchedulerEngine {
                 continue;
             }
             
+            // Apply chat-level excluded tags filter
+            let filtered_illusts: Vec<&crate::pixiv_client::Illust> = self.apply_chat_excluded_tags(
+                illusts.iter().collect(),
+                &chat.excluded_tags
+            );
+            
             // Send top illusts (limit to 10)
-            for (index, illust) in illusts.iter().take(10).enumerate() {
+            for (index, illust) in filtered_illusts.iter().take(10).enumerate() {
+                // Check if this illust has sensitive tags for spoiler
+                let has_spoiler = chat.blur_sensitive_tags && self.has_sensitive_tags(illust);
+                
                 // 构建描述和标签部分
                 let description = {
                     let clean = html::clean_description(&illust.caption);
@@ -371,18 +386,7 @@ impl SchedulerEngine {
                     }
                 };
                 
-                let tags = {
-                    let tag_names: Vec<&str> = illust.tags.iter().map(|t| t.name.as_str()).collect();
-                    let formatted = html::format_tags(&tag_names);
-                    if formatted.is_empty() {
-                        String::new()
-                    } else {
-                        let escaped: Vec<String> = formatted.iter()
-                            .map(|t| format!("\\#{}", markdown::escape(t)))
-                            .collect();
-                        format!("\n\n{}", escaped.join("  "))
-                    }
-                };
+                let tags = self.format_tags(illust);
                 
                 let caption = format!(
                     "{}\\.  {}\nby {}{}\n\n❤️ {} \\| 🔗 [source](https://pixiv\\.net/artworks/{}){}", 
@@ -402,7 +406,7 @@ impl SchedulerEngine {
                     illust.image_urls.large.as_str()
                 };
                 
-                if let Err(e) = self.notifier.notify_with_image(chat_id, image_url, Some(&caption)).await {
+                if let Err(e) = self.notifier.notify_with_image(chat_id, image_url, Some(&caption), has_spoiler).await {
                     error!("Failed to notify chat {}: {}", chat_id, e);
                 }
                 
@@ -442,19 +446,19 @@ impl SchedulerEngine {
                 .map(|tag| tag.name.to_lowercase())
                 .collect();
             
-            // Check exclude tags first (must not contain any)
+            // Check exclude tags first (must not contain any - exact match)
             if !exclude_tags.is_empty() {
                 for exclude_tag in &exclude_tags {
-                    if illust_tags.iter().any(|t| t.contains(exclude_tag)) {
+                    if illust_tags.iter().any(|t| t == exclude_tag) {
                         return false;
                     }
                 }
             }
             
-            // Check include tags (must contain at least one if specified)
+            // Check include tags (must contain at least one if specified - exact match)
             if !include_tags.is_empty() {
                 for include_tag in &include_tags {
-                    if illust_tags.iter().any(|t| t.contains(include_tag)) {
+                    if illust_tags.iter().any(|t| t == include_tag) {
                         return true;
                     }
                 }
@@ -463,5 +467,73 @@ impl SchedulerEngine {
             
             true
         }).collect()
+    }
+
+    /// Apply chat-level excluded tags filter (exact match, case-insensitive)
+    fn apply_chat_excluded_tags<'a>(
+        &self,
+        illusts: Vec<&'a crate::pixiv_client::Illust>,
+        chat_excluded_tags: &Option<serde_json::Value>,
+    ) -> Vec<&'a crate::pixiv_client::Illust> {
+        let Some(tags) = chat_excluded_tags else {
+            return illusts;
+        };
+        
+        let excluded: Vec<String> = if let Ok(tag_array) = serde_json::from_value::<Vec<String>>(tags.clone()) {
+            tag_array.iter().map(|s| s.to_lowercase()).collect()
+        } else {
+            return illusts;
+        };
+        
+        if excluded.is_empty() {
+            return illusts;
+        }
+        
+        illusts.into_iter().filter(|illust| {
+            let illust_tags: Vec<String> = illust.tags.iter()
+                .map(|tag| tag.name.to_lowercase())
+                .collect();
+            
+            // Must not contain any excluded tag (exact match)
+            for exclude_tag in &excluded {
+                if illust_tags.iter().any(|t| t == exclude_tag) {
+                    return false;
+                }
+            }
+            
+            true
+        }).collect()
+    }
+
+    /// Check if illust contains sensitive tags (exact match, case-insensitive)
+    fn has_sensitive_tags(&self, illust: &crate::pixiv_client::Illust) -> bool {
+        let illust_tags: Vec<String> = illust.tags.iter()
+            .map(|tag| tag.name.to_lowercase())
+            .collect();
+        
+        for sensitive_tag in &self.sensitive_tags {
+            let sensitive_lower = sensitive_tag.to_lowercase();
+            if illust_tags.iter().any(|t| t == &sensitive_lower) {
+                return true;
+            }
+        }
+        
+        false
+    }
+
+    /// Format tags for display (no blur on tags, blur is on images)
+    fn format_tags(&self, illust: &crate::pixiv_client::Illust) -> String {
+        let tag_names: Vec<&str> = illust.tags.iter().map(|t| t.name.as_str()).collect();
+        let formatted = html::format_tags(&tag_names);
+        
+        if formatted.is_empty() {
+            return String::new();
+        }
+        
+        let escaped: Vec<String> = formatted.iter()
+            .map(|t| format!("\\#{}", markdown::escape(t)))
+            .collect();
+        
+        format!("\n\n{}", escaped.join("  "))
     }
 }

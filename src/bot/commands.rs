@@ -19,4 +19,12 @@ pub enum Command {
     EnableChat(String),
     #[command(description = "[Admin Only] Disable chat / 禁用聊天\n  Usage: /disablechat [chat_id]")]
     DisableChat(String),
+    #[command(description = "Enable/disable sensitive content blur / 启用或禁用敏感内容模糊\n  Usage: /blursensitive <on|off>")]
+    BlurSensitive(String),
+    #[command(description = "Set excluded tags / 设置排除的标签\n  Usage: /excludetags <tag1,tag2,...>")]
+    ExcludeTags(String),
+    #[command(description = "Clear all excluded tags / 清除所有排除的标签")]
+    ClearExcludedTags,
+    #[command(description = "Show chat settings / 显示聊天设置")]
+    Settings,
 }

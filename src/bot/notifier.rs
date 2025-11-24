@@ -58,13 +58,14 @@ impl Notifier {
         chat_id: ChatId,
         image_url: &str,
         caption: Option<&str>,
+        has_spoiler: bool,
     ) -> AppResult<()> {
-        info!("Downloading and sending image to chat {}: {}", chat_id, image_url);
+        info!("Downloading and sending image to chat {}: {} (spoiler: {})", chat_id, image_url, has_spoiler);
         
         // Download the image first
         match self.downloader.download(image_url).await {
             Ok(local_path) => {
-                self.send_photo_file(chat_id, local_path, caption).await
+                self.send_photo_file(chat_id, local_path, caption, has_spoiler).await
             }
             Err(e) => {
                 warn!("Failed to download image {}: {}, falling back to text", image_url, e);
@@ -86,6 +87,7 @@ impl Notifier {
         chat_id: ChatId,
         image_urls: &[String],
         caption: Option<&str>,
+        has_spoiler: bool,
     ) -> AppResult<()> {
         if image_urls.is_empty() {
             return Err(crate::error::AppError::Unknown("No images to send".to_string()));
@@ -93,7 +95,7 @@ impl Notifier {
         
         // 单图: 使用单图发送方式
         if image_urls.len() == 1 {
-            return self.notify_with_image(chat_id, &image_urls[0], caption).await;
+            return self.notify_with_image(chat_id, &image_urls[0], caption, has_spoiler).await;
         }
         
         info!("Downloading and sending {} images to chat {}", image_urls.len(), chat_id);
@@ -135,7 +137,8 @@ impl Notifier {
             if let Err(e) = self.send_media_group(
                 chat_id, 
                 batch_paths, 
-                batch_caption.as_deref()
+                batch_caption.as_deref(),
+                has_spoiler
             ).await {
                 warn!("Failed to send batch {}/{}: {}", batch_idx + 1, total_batches, e);
                 // 继续发送剩余批次
@@ -158,14 +161,19 @@ impl Notifier {
         chat_id: ChatId,
         file_path: PathBuf,
         caption: Option<&str>,
+        has_spoiler: bool,
     ) -> AppResult<()> {
-        info!("Sending photo from {:?} to chat {}", file_path, chat_id);
+        info!("Sending photo from {:?} to chat {} (spoiler: {})", file_path, chat_id, has_spoiler);
         
         let input_file = InputFile::file(&file_path);
         let mut request = self.bot.send_photo(chat_id, input_file);
         
         if let Some(cap) = caption {
             request = request.caption(cap).parse_mode(ParseMode::MarkdownV2);
+        }
+        
+        if has_spoiler {
+            request = request.has_spoiler(true);
         }
         
         match request.await {
@@ -186,8 +194,9 @@ impl Notifier {
         chat_id: ChatId,
         file_paths: Vec<PathBuf>,
         caption: Option<&str>,
+        has_spoiler: bool,
     ) -> AppResult<()> {
-        info!("Sending media group with {} photos to chat {}", file_paths.len(), chat_id);
+        info!("Sending media group with {} photos to chat {} (spoiler: {})", file_paths.len(), chat_id, has_spoiler);
         
         if file_paths.is_empty() {
             return Err(crate::error::AppError::Unknown("No files to send".to_string()));
@@ -206,6 +215,11 @@ impl Notifier {
                     if let Some(cap) = caption {
                         photo = photo.caption(cap).parse_mode(ParseMode::MarkdownV2);
                     }
+                }
+                
+                // Apply has_spoiler to all photos in the media group
+                if has_spoiler {
+                    photo = photo.spoiler();
                 }
                 
                 InputMedia::Photo(photo)

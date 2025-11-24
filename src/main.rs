@@ -101,6 +101,7 @@ async fn main() -> AppResult<()> {
     
     // Initialize scheduler
     let scheduler_config = config.scheduler.clone();
+    let sensitive_tags = config.content.sensitive_tags.clone();
     let scheduler = scheduler::SchedulerEngine::new(
         repo.clone(),
         pixiv_client.clone(),
@@ -108,6 +109,7 @@ async fn main() -> AppResult<()> {
         downloader.clone(),
         scheduler_config.min_interval_sec,
         scheduler_config.max_interval_sec,
+        sensitive_tags,
     );
     
     info!("✅ Scheduler initialized");

@@ -14,5 +14,9 @@ level = "info"
 dir = "./logs"
 
 [scheduler]
-min_interval_sec = 60
-max_interval_sec = 120
+min_interval_sec = 30
+max_interval_sec = 60
+
+[content]
+# Sensitive tags that can be blurred per chat setting
+sensitive_tags = ["R-18", "R-18G", "NSFW"]

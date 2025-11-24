@@ -7,6 +7,8 @@ pub struct Config {
     pub database: DatabaseConfig,
     pub logging: LoggingConfig,
     pub scheduler: SchedulerConfig,
+    #[serde(default)]
+    pub content: ContentConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -50,6 +52,24 @@ impl Default for LoggingConfig {
 pub struct SchedulerConfig {
     pub min_interval_sec: u64,
     pub max_interval_sec: u64,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct ContentConfig {
+    #[serde(default)]
+    pub sensitive_tags: Vec<String>,
+}
+
+impl Default for ContentConfig {
+    fn default() -> Self {
+        Self {
+            sensitive_tags: vec![
+                "R-18".to_string(),
+                "R-18G".to_string(),
+                "NSFW".to_string(),
+            ],
+        }
+    }
 }
 
 impl Config {

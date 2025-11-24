@@ -85,12 +85,14 @@ impl Repo {
             active.title = Set(title);
             active.update(&self.db).await
         } else {
-            // Create new with default enabled status
+            // Create new with default enabled status and blur enabled by default
             let new_chat = chats::ActiveModel {
                 id: Set(chat_id),
                 r#type: Set(chat_type),
                 title: Set(title),
                 enabled: Set(default_enabled),
+                blur_sensitive_tags: Set(true),  // Default to enabled
+                excluded_tags: Set(None),
                 created_at: Set(now),
             };
             new_chat.insert(&self.db).await
@@ -106,6 +108,30 @@ impl Repo {
         
         let mut active: chats::ActiveModel = chat.into_active_model();
         active.enabled = Set(enabled);
+        active.update(&self.db).await
+    }
+
+    /// Set blur_sensitive_tags for a chat
+    pub async fn set_blur_sensitive_tags(&self, chat_id: i64, blur: bool) -> Result<chats::Model, DbErr> {
+        let chat = chats::Entity::find_by_id(chat_id)
+            .one(&self.db)
+            .await?
+            .ok_or(DbErr::RecordNotFound(format!("Chat {} not found", chat_id)))?;
+        
+        let mut active: chats::ActiveModel = chat.into_active_model();
+        active.blur_sensitive_tags = Set(blur);
+        active.update(&self.db).await
+    }
+
+    /// Set excluded tags for a chat
+    pub async fn set_excluded_tags(&self, chat_id: i64, tags: Option<JsonValue>) -> Result<chats::Model, DbErr> {
+        let chat = chats::Entity::find_by_id(chat_id)
+            .one(&self.db)
+            .await?
+            .ok_or(DbErr::RecordNotFound(format!("Chat {} not found", chat_id)))?;
+        
+        let mut active: chats::ActiveModel = chat.into_active_model();
+        active.excluded_tags = Set(tags);
         active.update(&self.db).await
     }
 

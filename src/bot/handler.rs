@@ -103,6 +103,10 @@ impl BotHandler {
                 }
                 self.handle_enable_chat(bot, chat_id, args, false).await
             }
+            Command::BlurSensitive(args) => self.handle_blur_sensitive(bot, chat_id, args).await,
+            Command::ExcludeTags(args) => self.handle_exclude_tags(bot, chat_id, args).await,
+            Command::ClearExcludedTags => self.handle_clear_excluded_tags(bot, chat_id).await,
+            Command::Settings => self.handle_settings(bot, chat_id).await,
         }
     }
 
@@ -176,6 +180,20 @@ impl BotHandler {
    Unsubscribe from an author subscription
    \- Use author ID \(Pixiv user ID\)
    \- Example: `/unsub 123456`
+
+⚙️ `/settings`
+   Show current chat settings
+
+🔒 `/blursensitive <on|off>`
+   Enable or disable sensitive tag blur
+   \- Example: `/blursensitive on`
+
+🚫 `/excludetags <tag1,tag2,...>`
+   Set globally excluded tags for this chat
+   \- Example: `/excludetags R\-18,gore`
+
+🗑 `/clearexcludedtags`
+   Clear all excluded tags
 
 ❓ `/help`
    Show this help message
@@ -687,6 +705,188 @@ Made with ❤️ using Rust
                     "❌ Failed to update chat status"
                 )
                 .await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn handle_blur_sensitive(
+        &self,
+        bot: Bot,
+        chat_id: ChatId,
+        args: String,
+    ) -> ResponseResult<()> {
+        let arg = args.trim().to_lowercase();
+        
+        let blur = match arg.as_str() {
+            "on" | "true" | "1" | "yes" => true,
+            "off" | "false" | "0" | "no" => false,
+            _ => {
+                bot.send_message(
+                    chat_id,
+                    "❌ Usage: `/blursensitive <on|off>`"
+                )
+                .parse_mode(ParseMode::MarkdownV2)
+                .await?;
+                return Ok(());
+            }
+        };
+
+        match self.repo.set_blur_sensitive_tags(chat_id.0, blur).await {
+            Ok(_) => {
+                bot.send_message(
+                    chat_id,
+                    if blur {
+                        "✅ Sensitive content blur **enabled**"
+                    } else {
+                        "✅ Sensitive content blur **disabled**"
+                    }
+                )
+                .parse_mode(ParseMode::MarkdownV2)
+                .await?;
+                
+                info!("Chat {} set blur_sensitive_tags to {}", chat_id, blur);
+            }
+            Err(e) => {
+                error!("Failed to set blur_sensitive_tags: {}", e);
+                bot.send_message(chat_id, "❌ Failed to update settings")
+                    .await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn handle_exclude_tags(
+        &self,
+        bot: Bot,
+        chat_id: ChatId,
+        args: String,
+    ) -> ResponseResult<()> {
+        let arg = args.trim();
+        
+        if arg.is_empty() {
+            bot.send_message(
+                chat_id,
+                "❌ Usage: `/excludetags <tag1,tag2,...>`"
+            )
+            .parse_mode(ParseMode::MarkdownV2)
+            .await?;
+            return Ok(());
+        }
+        
+        let tags: Vec<String> = arg
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        
+        if tags.is_empty() {
+            bot.send_message(
+                chat_id,
+                "❌ No valid tags provided"
+            )
+            .await?;
+            return Ok(());
+        }
+        
+        let excluded_tags = Some(json!(tags));
+
+        match self.repo.set_excluded_tags(chat_id.0, excluded_tags.clone()).await {
+            Ok(_) => {
+                let tag_list: Vec<String> = tags.iter()
+                    .map(|s| format!("`{}`", markdown::escape(s)))
+                    .collect();
+                
+                let message = format!("✅ Excluded tags updated: {}", tag_list.join(", "));
+                
+                bot.send_message(chat_id, message)
+                    .parse_mode(ParseMode::MarkdownV2)
+                    .await?;
+                
+                info!("Chat {} set excluded_tags", chat_id);
+            }
+            Err(e) => {
+                error!("Failed to set excluded_tags: {}", e);
+                bot.send_message(chat_id, "❌ Failed to update settings")
+                    .await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn handle_clear_excluded_tags(
+        &self,
+        bot: Bot,
+        chat_id: ChatId,
+    ) -> ResponseResult<()> {
+        match self.repo.set_excluded_tags(chat_id.0, None).await {
+            Ok(_) => {
+                bot.send_message(chat_id, "✅ Excluded tags cleared")
+                    .await?;
+                
+                info!("Chat {} cleared excluded_tags", chat_id);
+            }
+            Err(e) => {
+                error!("Failed to clear excluded_tags: {}", e);
+                bot.send_message(chat_id, "❌ Failed to update settings")
+                    .await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn handle_settings(
+        &self,
+        bot: Bot,
+        chat_id: ChatId,
+    ) -> ResponseResult<()> {
+        match self.repo.get_chat(chat_id.0).await {
+            Ok(Some(chat)) => {
+                let blur_status = if chat.blur_sensitive_tags {
+                    "**Enabled**"
+                } else {
+                    "**Disabled**"
+                };
+                
+                let excluded_tags = if let Some(tags) = chat.excluded_tags {
+                    if let Ok(tag_array) = serde_json::from_value::<Vec<String>>(tags) {
+                        if tag_array.is_empty() {
+                            "None".to_string()
+                        } else {
+                            tag_array.iter()
+                                .map(|s| format!("`{}`", markdown::escape(s)))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        }
+                    } else {
+                        "None".to_string()
+                    }
+                } else {
+                    "None".to_string()
+                };
+                
+                let message = format!(
+                    "⚙️ *Chat Settings*\n\n🔒 Sensitive content blur: {}\n🚫 Excluded tags: {}",
+                    blur_status,
+                    excluded_tags
+                );
+                
+                bot.send_message(chat_id, message)
+                    .parse_mode(ParseMode::MarkdownV2)
+                    .await?;
+            }
+            Ok(None) => {
+                bot.send_message(chat_id, "❌ Chat not found")
+                    .await?;
+            }
+            Err(e) => {
+                error!("Failed to get chat settings: {}", e);
+                bot.send_message(chat_id, "❌ Failed to retrieve settings")
+                    .await?;
             }
         }
 

@@ -9,6 +9,8 @@ pub struct Model {
     pub r#type: String,
     pub title: Option<String>,
     pub enabled: bool,
+    pub blur_sensitive_tags: bool,
+    pub excluded_tags: Option<Json>,
     pub created_at: DateTime,
 }
 
