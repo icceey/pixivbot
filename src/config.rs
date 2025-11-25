@@ -50,8 +50,27 @@ impl Default for LoggingConfig {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct SchedulerConfig {
-    pub min_interval_sec: u64,
-    pub max_interval_sec: u64,
+    /// Tick interval in seconds (how often to check for pending tasks)
+    #[serde(default = "default_tick_interval_sec")]
+    pub tick_interval_sec: u64,
+    /// Minimum random interval in seconds between task executions (default: 30 min)
+    #[serde(default = "default_min_task_interval_sec")]
+    pub min_task_interval_sec: u64,
+    /// Maximum random interval in seconds between task executions (default: 40 min)
+    #[serde(default = "default_max_task_interval_sec")]
+    pub max_task_interval_sec: u64,
+}
+
+fn default_tick_interval_sec() -> u64 {
+    30
+}
+
+fn default_min_task_interval_sec() -> u64 {
+    30 * 60  // 30 minutes
+}
+
+fn default_max_task_interval_sec() -> u64 {
+    40 * 60  // 40 minutes
 }
 
 #[derive(Debug, Deserialize, Clone)]

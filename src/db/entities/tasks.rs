@@ -9,7 +9,6 @@ pub struct Model {
     pub r#type: String, // author, ranking
     #[sea_orm(unique)]
     pub value: String, // author_id, ranking_mode
-    pub interval_sec: i32,
     #[sea_orm(indexed)]
     pub next_poll_at: DateTime,
     pub last_polled_at: Option<DateTime>,

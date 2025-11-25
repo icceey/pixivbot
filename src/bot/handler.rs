@@ -293,7 +293,6 @@ Made with ❤️ using Rust
             match self.repo.get_or_create_task(
                 "author".to_string(),
                 author_id_str.to_string(),
-                4 * 3600, // 4 hours interval
                 user_id,
                 Some(author_name.clone()),
             ).await {
@@ -393,7 +392,6 @@ Made with ❤️ using Rust
         match self.repo.get_or_create_task(
             "ranking".to_string(),
             mode.to_string(),
-            24 * 3600, // 24 hours interval
             user_id,
             None, // No author_name for ranking tasks
         ).await {

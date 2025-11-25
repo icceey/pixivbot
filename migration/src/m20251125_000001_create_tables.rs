@@ -56,6 +56,13 @@ impl MigrationTrait for Migration {
                             .default(false),
                     )
                     .col(
+                        ColumnDef::new(Chats::BlurSensitiveTags)
+                            .boolean()
+                            .not_null()
+                            .default(true),
+                    )
+                    .col(ColumnDef::new(Chats::ExcludedTags).json())
+                    .col(
                         ColumnDef::new(Chats::CreatedAt)
                             .timestamp()
                             .not_null()
@@ -65,7 +72,7 @@ impl MigrationTrait for Migration {
             )
             .await?;
 
-        // Create tasks table
+        // Create tasks table (without interval_sec)
         manager
             .create_table(
                 Table::create()
@@ -80,7 +87,7 @@ impl MigrationTrait for Migration {
                     )
                     .col(ColumnDef::new(Tasks::Type).string().not_null())
                     .col(ColumnDef::new(Tasks::Value).string().not_null())
-                    .col(ColumnDef::new(Tasks::IntervalSec).integer().not_null())
+                    .col(ColumnDef::new(Tasks::AuthorName).string())
                     .col(
                         ColumnDef::new(Tasks::NextPollAt)
                             .timestamp()
@@ -228,6 +235,8 @@ enum Chats {
     Type,
     Title,
     Enabled,
+    BlurSensitiveTags,
+    ExcludedTags,
     CreatedAt,
 }
 
@@ -237,7 +246,7 @@ enum Tasks {
     Id,
     Type,
     Value,
-    IntervalSec,
+    AuthorName,
     NextPollAt,
     LastPolledAt,
     LatestData,

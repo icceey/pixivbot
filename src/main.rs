@@ -113,8 +113,9 @@ async fn main() -> AppResult<()> {
         pixiv_client.clone(),
         bot.clone(),
         downloader.clone(),
-        scheduler_config.min_interval_sec,
-        scheduler_config.max_interval_sec,
+        scheduler_config.tick_interval_sec,
+        scheduler_config.min_task_interval_sec,
+        scheduler_config.max_task_interval_sec,
         sensitive_tags,
     );
     

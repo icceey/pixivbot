@@ -14,8 +14,12 @@ level = "info"
 dir = "./logs"
 
 [scheduler]
-min_interval_sec = 30
-max_interval_sec = 60
+# Tick interval in seconds (how often to check for pending tasks)
+tick_interval_sec = 30
+# Random interval range for task execution (in seconds)
+# Default: 30-40 minutes
+min_task_interval_sec = 1800
+max_task_interval_sec = 2400
 
 [content]
 # Sensitive tags that can be blurred per chat setting

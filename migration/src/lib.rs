@@ -1,8 +1,6 @@
 pub use sea_orm_migration::prelude::*;
 
-mod m20250123_000001_create_tables;
-mod m20251124_000001_add_author_name;
-mod m20251124_000002_add_chat_content_settings;
+mod m20251125_000001_create_tables;
 
 pub struct Migrator;
 
@@ -10,9 +8,7 @@ pub struct Migrator;
 impl MigratorTrait for Migrator {
     fn migrations() -> Vec<Box<dyn MigrationTrait>> {
         vec![
-            Box::new(m20250123_000001_create_tables::Migration),
-            Box::new(m20251124_000001_add_author_name::Migration),
-            Box::new(m20251124_000002_add_chat_content_settings::Migration),
+            Box::new(m20251125_000001_create_tables::Migration),
         ]
     }
 }

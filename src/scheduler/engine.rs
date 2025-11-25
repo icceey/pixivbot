@@ -16,8 +16,9 @@ pub struct SchedulerEngine {
     repo: Arc<Repo>,
     pixiv_client: Arc<tokio::sync::RwLock<PixivClient>>,
     notifier: Notifier,
-    min_interval_sec: u64,
-    max_interval_sec: u64,
+    tick_interval_sec: u64,
+    min_task_interval_sec: u64,
+    max_task_interval_sec: u64,
     sensitive_tags: Vec<String>,
 }
 
@@ -27,16 +28,18 @@ impl SchedulerEngine {
         pixiv_client: Arc<tokio::sync::RwLock<PixivClient>>,
         bot: Bot,
         downloader: Arc<Downloader>,
-        min_interval_sec: u64,
-        max_interval_sec: u64,
+        tick_interval_sec: u64,
+        min_task_interval_sec: u64,
+        max_task_interval_sec: u64,
         sensitive_tags: Vec<String>,
     ) -> Self {
         Self {
             repo,
             pixiv_client,
             notifier: Notifier::new(bot, downloader),
-            min_interval_sec,
-            max_interval_sec,
+            tick_interval_sec,
+            min_task_interval_sec,
+            max_task_interval_sec,
             sensitive_tags,
         }
     }
@@ -46,34 +49,22 @@ impl SchedulerEngine {
         info!("🚀 Scheduler engine started");
         
         loop {
-            // Tick every second
-            sleep(Duration::from_secs(1)).await;
+            // Wait for tick interval before checking for tasks
+            sleep(Duration::from_secs(self.tick_interval_sec)).await;
             
-            match self.tick().await {
-                Ok(executed) => {
-                    if executed {
-                        // Add random delay between tasks to avoid rate limiting
-                        let delay_sec = rand::rng()
-                            .random_range(self.min_interval_sec..=self.max_interval_sec);
-                        sleep(Duration::from_secs(delay_sec)).await;
-                    }
-                }
-                Err(e) => {
-                    error!("Scheduler tick error: {}", e);
-                    sleep(Duration::from_secs(5)).await; // Back off on error
-                }
+            if let Err(e) = self.tick().await {
+                error!("Scheduler tick error: {}", e);
             }
         }
     }
 
     /// Single tick - fetch and execute one pending task
-    /// Returns true if a task was executed
-    async fn tick(&self) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    async fn tick(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Get one pending task
         let tasks = self.repo.get_pending_tasks(1).await?;
         
         if tasks.is_empty() {
-            return Ok(false);
+            return Ok(());
         }
         
         let task = &tasks[0];
@@ -89,8 +80,10 @@ impl SchedulerEngine {
             }
         };
         
-        // Calculate next poll time
-        let next_poll = Local::now() + chrono::Duration::seconds(task.interval_sec as i64);
+        // Calculate next poll time with random interval
+        let random_interval_sec = rand::rng()
+            .random_range(self.min_task_interval_sec..=self.max_task_interval_sec);
+        let next_poll = Local::now() + chrono::Duration::seconds(random_interval_sec as i64);
         
         // Update task status
         let latest_data = if result.is_ok() {
@@ -112,7 +105,7 @@ impl SchedulerEngine {
             error!("Task execution failed: {}", e);
         }
         
-        Ok(true)
+        Ok(())
     }
 
     /// Execute author subscription task
@@ -156,6 +149,8 @@ impl SchedulerEngine {
         
         // Update latest_data with newest illust ID
         if let Some(newest) = new_illusts.first() {
+            let random_interval_sec = rand::rng()
+                .random_range(self.min_task_interval_sec..=self.max_task_interval_sec);
             let updated_data = json!({
                 "latest_illust_id": newest.id,
                 "last_check": Local::now().to_rfc3339(),
@@ -163,7 +158,7 @@ impl SchedulerEngine {
             
             self.repo.update_task_after_poll(
                 task.id,
-                Local::now() + chrono::Duration::seconds(task.interval_sec as i64),
+                Local::now() + chrono::Duration::seconds(random_interval_sec as i64),
                 Some(updated_data),
                 task.created_by,
             ).await?;
@@ -302,6 +297,8 @@ impl SchedulerEngine {
         }
         
         // Update latest_data
+        let random_interval_sec = rand::rng()
+            .random_range(self.min_task_interval_sec..=self.max_task_interval_sec);
         let updated_data = json!({
             "date": today,
             "last_check": Local::now().to_rfc3339(),
@@ -309,7 +306,7 @@ impl SchedulerEngine {
         
         self.repo.update_task_after_poll(
             task.id,
-            Local::now() + chrono::Duration::seconds(task.interval_sec as i64),
+            Local::now() + chrono::Duration::seconds(random_interval_sec as i64),
             Some(updated_data),
             0,
         ).await?;
