@@ -6,7 +6,7 @@ use crate::utils::{html, markdown};
 use std::sync::Arc;
 use tokio::time::{sleep, Duration};
 use tracing::{info, warn, error};
-use chrono::Utc;
+use chrono::Local;
 use teloxide::Bot;
 use teloxide::prelude::*;
 use serde_json::json;
@@ -90,7 +90,7 @@ impl SchedulerEngine {
         };
         
         // Calculate next poll time
-        let next_poll = Utc::now() + chrono::Duration::seconds(task.interval_sec as i64);
+        let next_poll = Local::now() + chrono::Duration::seconds(task.interval_sec as i64);
         
         // Update task status
         let latest_data = if result.is_ok() {
@@ -158,12 +158,12 @@ impl SchedulerEngine {
         if let Some(newest) = new_illusts.first() {
             let updated_data = json!({
                 "latest_illust_id": newest.id,
-                "last_check": Utc::now().to_rfc3339(),
+                "last_check": Local::now().to_rfc3339(),
             });
             
             self.repo.update_task_after_poll(
                 task.id,
-                Utc::now() + chrono::Duration::seconds(task.interval_sec as i64),
+                Local::now() + chrono::Duration::seconds(task.interval_sec as i64),
                 Some(updated_data),
                 task.created_by,
             ).await?;
@@ -293,7 +293,7 @@ impl SchedulerEngine {
             .and_then(|data| data.get("date"))
             .and_then(|v| v.as_str());
         
-        let today = Utc::now().format("%Y-%m-%d").to_string();
+        let today = Local::now().format("%Y-%m-%d").to_string();
         
         // Only notify if it's a new day or first run
         if last_date == Some(today.as_str()) {
@@ -304,12 +304,12 @@ impl SchedulerEngine {
         // Update latest_data
         let updated_data = json!({
             "date": today,
-            "last_check": Utc::now().to_rfc3339(),
+            "last_check": Local::now().to_rfc3339(),
         });
         
         self.repo.update_task_after_poll(
             task.id,
-            Utc::now() + chrono::Duration::seconds(task.interval_sec as i64),
+            Local::now() + chrono::Duration::seconds(task.interval_sec as i64),
             Some(updated_data),
             0,
         ).await?;

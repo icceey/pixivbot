@@ -26,5 +26,5 @@ tokio = "1.48.0"
 tokio-cron-scheduler = "0.15.1"
 tracing = "0.1.41"
 tracing-appender = "0.2.3"
-tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3.20", features = ["env-filter", "chrono"] }
 
