@@ -2,7 +2,7 @@ use sea_orm::{
     ActiveModelTrait, ColumnTrait, DatabaseConnection, DbErr, EntityTrait, 
     IntoActiveModel, QueryFilter, QueryOrder, QuerySelect, Set, PaginatorTrait
 };
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Local};
 use serde_json::Value as JsonValue;
 
 use super::entities::{chats, subscriptions, tasks, users};
@@ -30,7 +30,7 @@ impl Repo {
         username: Option<String>,
         role: UserRole,
     ) -> Result<users::Model, DbErr> {
-        let now = Utc::now().naive_utc();
+        let now = Local::now().naive_local();
         
         // Try to find existing user
         if let Some(existing) = users::Entity::find_by_id(user_id).one(&self.db).await? {
@@ -76,7 +76,7 @@ impl Repo {
         title: Option<String>,
         default_enabled: bool,
     ) -> Result<chats::Model, DbErr> {
-        let now = Utc::now().naive_utc();
+        let now = Local::now().naive_local();
         
         if let Some(existing) = chats::Entity::find_by_id(chat_id).one(&self.db).await? {
             // Update existing (keep enabled status)
@@ -147,7 +147,7 @@ impl Repo {
         task_type: String,
         value: String,
         interval_sec: i32,
-        next_poll_at: DateTime<Utc>,
+        next_poll_at: DateTime<Local>,
         created_by: i64,
         author_name: Option<String>,
     ) -> Result<tasks::Model, DbErr> {
@@ -155,7 +155,7 @@ impl Repo {
             r#type: Set(task_type),
             value: Set(value),
             interval_sec: Set(interval_sec),
-            next_poll_at: Set(next_poll_at.naive_utc()),
+            next_poll_at: Set(next_poll_at.naive_local()),
             last_polled_at: Set(None),
             latest_data: Set(None),
             created_by: Set(created_by),
@@ -192,14 +192,14 @@ impl Repo {
         if let Some(existing) = self.get_task_by_type_value(&task_type, &value).await? {
             Ok(existing)
         } else {
-            let next_poll = Utc::now() + chrono::Duration::seconds(60); // Poll in 1 minute
+            let next_poll = Local::now() + chrono::Duration::seconds(60); // Poll in 1 minute
             self.create_task(task_type, value, interval_sec, next_poll, created_by, author_name).await
         }
     }
 
     /// Get tasks that need to be polled (next_poll_at <= now)
     pub async fn get_pending_tasks(&self, limit: u64) -> Result<Vec<tasks::Model>, DbErr> {
-        let now = Utc::now().naive_utc();
+        let now = Local::now().naive_local();
         
         tasks::Entity::find()
             .filter(tasks::Column::NextPollAt.lte(now))
@@ -214,7 +214,7 @@ impl Repo {
     pub async fn update_task_after_poll(
         &self,
         task_id: i32,
-        next_poll_at: DateTime<Utc>,
+        next_poll_at: DateTime<Local>,
         latest_data: Option<JsonValue>,
         updated_by: i64,
     ) -> Result<tasks::Model, DbErr> {
@@ -223,9 +223,9 @@ impl Repo {
             .await?
             .ok_or(DbErr::RecordNotFound(format!("Task {} not found", task_id)))?;
         
-        let now = Utc::now().naive_utc();
+        let now = Local::now().naive_local();
         let mut active: tasks::ActiveModel = task.into_active_model();
-        active.next_poll_at = Set(next_poll_at.naive_utc());
+        active.next_poll_at = Set(next_poll_at.naive_local());
         active.last_polled_at = Set(Some(now));
         if latest_data.is_some() {
             active.latest_data = Set(latest_data);
@@ -252,7 +252,7 @@ impl Repo {
         task_id: i32,
         filter_tags: Option<JsonValue>,
     ) -> Result<subscriptions::Model, DbErr> {
-        let now = Utc::now().naive_utc();
+        let now = Local::now().naive_local();
         
         let new_sub = subscriptions::ActiveModel {
             chat_id: Set(chat_id),
