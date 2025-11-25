@@ -85,7 +85,7 @@ src/
 | :--- | :--- | :--- | :--- |
 | `id` | Integer | PK, Auto Inc | 内部 ID |
 | `type` | String | Not Null | `author` (画师), `ranking` (热榜) |
-| `value` | String | Not Null | 目标值 (如画师ID `"114514"` 或榜单模式 `"daily"`) |
+| `value` | String | Not Null | 目标值 (如画师ID `"114514"` 或榜单模式 `"day"`) |
 | `interval_sec` | Integer | Not Null | 基础轮询间隔 (秒)。画师默认 4小时，热榜 24小时。 |
 | `next_poll_at` | DateTime | Index | **调度关键字段**。下次需执行抓取的时间。 |
 | `last_polled_at`| DateTime | Nullable | 上次执行时间 |
@@ -246,7 +246,7 @@ sequenceDiagram
     *   **推送**: 匹配通过则加入发送队列。
 
 #### 热榜订阅 (`ranking`)
-1.  **抓取**: 获取指定模式 (e.g., `daily`) 的最新榜单。
+1.  **抓取**: 获取指定模式 (e.g., `day`) 的最新榜单。
 2.  **比对**: 检查榜单日期是否新于 `tasks.latest_data`。
 3.  **策略**: 热榜通常包含 50+ 张图，不宜全部推送。
     *   默认策略：推送 Top 10。
@@ -256,7 +256,7 @@ sequenceDiagram
 *   `/sub author <id> [tags...]`: 订阅画师。支持附带 tag 参数。
     *   Bot 检查 `tasks` 表，没有则创建 Task (设定初始 `next_poll_at` 为立刻或稍后)。
     *   在 `chats` 和 `subscriptions` 表插入记录。
-*   `/sub ranking <daily|weekly>`: 订阅热榜。
+*   `/sub ranking <day|week>`: 订阅热榜。
 *   `/list`: 列出当前 Chat 的所有订阅。
     *   显示格式：`[ID] 类型 - 名称 (过滤器)`。
 *   `/unsub <id>`: 根据 list 中的 ID 取消订阅。

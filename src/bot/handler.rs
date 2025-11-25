@@ -170,10 +170,9 @@ impl BotHandler {
 
 📊 `/subrank <mode>`
    Subscribe to Pixiv ranking
-   \- Modes: `daily`, `weekly`, `monthly`
-   \- R18 variants: `daily_r18`, `weekly_r18`
-   \- Gender\-specific: `daily_male`, `daily_female`
-   \- Example: `/subrank daily`
+   - Modes: `day`, `week`, `month`, `day_male`, `day_female`, `week_original`, `week_rookie`, `day_manga`
+   - R18 variants: `day_r18`, `week_r18`, `week_r18g`, `day_male_r18`, `day_female_r18`
+   - Example: `/subrank day`
 
 📋 `/list`
    List all your active subscriptions
@@ -185,7 +184,7 @@ impl BotHandler {
 
 🗑 `/unsubrank <mode>`
    Unsubscribe from ranking subscription
-   \- Example: `/unsubrank daily`
+   \- Example: `/unsubrank day`
 
 ⚙️ `/settings`
    Show current chat settings
@@ -366,17 +365,19 @@ Made with ❤️ using Rust
         if mode.is_empty() {
             bot.send_message(
                 chat_id,
-                "❌ Usage: `/subrank <mode>`\nModes: daily, weekly, monthly, daily\\_r18, etc\\."
+                "❌ Usage: `/subrank <mode>`\nModes: day, week, month, day\\_r18, etc\\."
             )
             .parse_mode(ParseMode::MarkdownV2)
             .await?;
             return Ok(());
         }
         let valid_modes = vec![
-            "daily", "weekly", "monthly",
-            "daily_r18", "weekly_r18",
-            "daily_male", "daily_female",
-            "daily_male_r18", "daily_female_r18",
+            "day", "week", "month",
+            "day_male", "day_female",
+            "week_original", "week_rookie",
+            "day_manga",
+            "day_r18", "week_r18", "week_r18g",
+            "day_male_r18", "day_female_r18",
         ];
 
         if !valid_modes.contains(&mode) {

@@ -308,7 +308,7 @@ impl SchedulerEngine {
             task.id,
             Local::now() + chrono::Duration::seconds(random_interval_sec as i64),
             Some(updated_data),
-            0,
+            task.updated_by,
         ).await?;
         
         // Get all subscriptions
