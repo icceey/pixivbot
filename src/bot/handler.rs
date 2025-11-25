@@ -68,8 +68,10 @@ impl BotHandler {
 
         match cmd {
             Command::Help => self.handle_help(bot, chat_id).await,
-            Command::Sub(args) => self.handle_sub(bot, chat_id, user_id, args).await,
-            Command::Unsub(args) => self.handle_unsub(bot, chat_id, args).await,
+            Command::Sub(args) => self.handle_sub_author(bot, chat_id, user_id, args).await,
+            Command::SubRank(args) => self.handle_sub_ranking_cmd(bot, chat_id, user_id, args).await,
+            Command::Unsub(args) => self.handle_unsub_author(bot, chat_id, args).await,
+            Command::UnsubRank(args) => self.handle_unsub_ranking(bot, chat_id, args).await,
             Command::List => self.handle_list(bot, chat_id).await,
             Command::SetAdmin(args) => {
                 // Only owner can use this command
@@ -159,27 +161,31 @@ impl BotHandler {
 
 *Available Commands:*
 
-📌 `/sub author <pixiv_id> [+tag1 \-tag2]`
-   Subscribe to a Pixiv author
-   \- `<pixiv_id>`: Pixiv user ID \(numbers only\)
+📌 `/sub <id,...> [+tag1 \-tag2]`
+   Subscribe to Pixiv author\(s\)
+   \- `<id,...>`: Comma\-separated Pixiv user IDs
    \- `\+tag`: Include only works with this tag
    \- `\-tag`: Exclude works with this tag
-   \- Example: `/sub author 123456 \+原神 \-R\-18`
+   \- Example: `/sub 123456,789012 \+原神 \-R\-18`
 
-📊 `/sub ranking <mode>`
+📊 `/subrank <mode>`
    Subscribe to Pixiv ranking
    \- Modes: `daily`, `weekly`, `monthly`
    \- R18 variants: `daily_r18`, `weekly_r18`
    \- Gender\-specific: `daily_male`, `daily_female`
-   \- Example: `/sub ranking daily`
+   \- Example: `/subrank daily`
 
 📋 `/list`
    List all your active subscriptions
 
-🗑 `/unsub <author_id>`
-   Unsubscribe from an author subscription
-   \- Use author ID \(Pixiv user ID\)
-   \- Example: `/unsub 123456`
+🗑 `/unsub <author_id,...>`
+   Unsubscribe from author subscription\(s\)
+   \- Use comma\-separated author IDs \(Pixiv user ID\)
+   \- Example: `/unsub 123456,789012`
+
+🗑 `/unsubrank <mode>`
+   Unsubscribe from ranking subscription
+   \- Example: `/unsubrank daily`
 
 ⚙️ `/settings`
    Show current chat settings
@@ -208,7 +214,7 @@ Made with ❤️ using Rust
         Ok(())
     }
 
-    async fn handle_sub(
+    async fn handle_sub_author(
         &self,
         bot: Bot,
         chat_id: ChatId,
@@ -218,72 +224,23 @@ Made with ❤️ using Rust
         let parts: Vec<&str> = args.split_whitespace().collect();
         
         if parts.is_empty() {
-            bot.send_message(chat_id, "❌ Usage: `/sub author <id>` or `/sub ranking <mode>`")
+            bot.send_message(chat_id, "❌ Usage: `/sub <id,...> [+tag1 -tag2]`")
                 .parse_mode(ParseMode::MarkdownV2)
                 .await?;
             return Ok(());
         }
 
-        match parts[0] {
-            "author" => self.handle_sub_author(bot, chat_id, user_id, &parts[1..]).await,
-            "ranking" => self.handle_sub_ranking(bot, chat_id, user_id, &parts[1..]).await,
-            _ => {
-                bot.send_message(
-                    chat_id,
-                    "❌ Unknown subscription type. Use `author` or `ranking`"
-                )
-                .parse_mode(ParseMode::MarkdownV2)
-                .await?;
-                Ok(())
-            }
-        }
-    }
-
-    async fn handle_sub_author(
-        &self,
-        bot: Bot,
-        chat_id: ChatId,
-        user_id: i64,
-        parts: &[&str],
-    ) -> ResponseResult<()> {
-        if parts.is_empty() {
-            bot.send_message(chat_id, "❌ Usage: `/sub author <pixiv_id> [+tag1 -tag2]`")
-                .parse_mode(ParseMode::MarkdownV2)
-                .await?;
-            return Ok(());
-        }
-
-        let author_id_str = parts[0];
+        // First part is comma-separated IDs
+        let ids_str = parts[0];
+        let author_ids: Vec<&str> = ids_str.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
         
-        // Validate it's a number
-        let author_id = match author_id_str.parse::<u64>() {
-            Ok(id) => id,
-            Err(_) => {
-                bot.send_message(chat_id, "❌ Author ID must be a number")
-                    .await?;
-                return Ok(());
-            }
-        };
+        if author_ids.is_empty() {
+            bot.send_message(chat_id, "❌ Please provide at least one author ID")
+                .await?;
+            return Ok(());
+        }
 
-        // Verify author exists and get author name
-        let author_name = {
-            let pixiv = self.pixiv_client.read().await;
-            match pixiv.get_user_detail(author_id).await {
-                Ok(user) => user.name,
-                Err(e) => {
-                    error!("Failed to get user detail for {}: {}", author_id, e);
-                    bot.send_message(
-                        chat_id, 
-                        format!("❌ Author ID `{}` not found or invalid\\. Please check the ID\\.", author_id)
-                    )
-                    .parse_mode(ParseMode::MarkdownV2)
-                    .await?;
-                    return Ok(());
-                }
-            }
-        };
-
-        // Parse filter tags
+        // Parse filter tags (shared by all authors in this batch)
         let mut include_tags = Vec::new();
         let mut exclude_tags = Vec::new();
         
@@ -306,75 +263,116 @@ Made with ❤️ using Rust
             None
         };
 
-        // Create or get task
-        match self.repo.get_or_create_task(
-            "author".to_string(),
-            author_id_str.to_string(),
-            4 * 3600, // 4 hours interval
-            user_id,
-            Some(author_name.clone()),
-        ).await {
-            Ok(task) => {
-                // Create subscription
-                match self.repo.upsert_subscription(
-                    chat_id.0,
-                    task.id,
-                    filter_tags.clone(),
-                ).await {
-                    Ok(_) => {
-                        let filter_msg = if let Some(tags) = filter_tags {
-                            format!(
-                                "\n🏷 Filters: Include: {:?}, Exclude: {:?}",
-                                tags.get("include"),
-                                tags.get("exclude")
-                            )
-                        } else {
-                            String::new()
-                        };
-                        
-                        bot.send_message(
-                            chat_id,
-                            format!("✅ Successfully subscribed to author *{}* \\(ID: `{}`\\){}", 
-                                markdown::escape(&author_name), author_id, filter_msg)
-                        )
-                        .parse_mode(ParseMode::MarkdownV2)
-                        .await?;
-                    }
+        let mut success_list: Vec<String> = Vec::new();
+        let mut failed_list: Vec<String> = Vec::new();
+
+        for author_id_str in author_ids {
+            // Validate it's a number
+            let author_id = match author_id_str.parse::<u64>() {
+                Ok(id) => id,
+                Err(_) => {
+                    failed_list.push(format!("`{}` \\(invalid ID\\)", author_id_str));
+                    continue;
+                }
+            };
+
+            // Verify author exists and get author name
+            let author_name = {
+                let pixiv = self.pixiv_client.read().await;
+                match pixiv.get_user_detail(author_id).await {
+                    Ok(user) => user.name,
                     Err(e) => {
-                        error!("Failed to create subscription: {}", e);
-                        bot.send_message(chat_id, "❌ Failed to create subscription")
-                            .await?;
+                        error!("Failed to get user detail for {}: {}", author_id, e);
+                        failed_list.push(format!("`{}` \\(not found\\)", author_id));
+                        continue;
                     }
                 }
-            }
-            Err(e) => {
-                error!("Failed to create task: {}", e);
-                bot.send_message(chat_id, "❌ Failed to create subscription task")
-                    .await?;
+            };
+
+            // Create or get task
+            match self.repo.get_or_create_task(
+                "author".to_string(),
+                author_id_str.to_string(),
+                4 * 3600, // 4 hours interval
+                user_id,
+                Some(author_name.clone()),
+            ).await {
+                Ok(task) => {
+                    // Create subscription
+                    match self.repo.upsert_subscription(
+                        chat_id.0,
+                        task.id,
+                        filter_tags.clone(),
+                    ).await {
+                        Ok(_) => {
+                            success_list.push(format!("*{}* \\(ID: `{}`\\)", markdown::escape(&author_name), author_id));
+                        }
+                        Err(e) => {
+                            error!("Failed to create subscription for {}: {}", author_id, e);
+                            failed_list.push(format!("`{}` \\(subscription error\\)", author_id));
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to create task for {}: {}", author_id, e);
+                    failed_list.push(format!("`{}` \\(task error\\)", author_id));
+                }
             }
         }
+
+        // Build response message
+        let mut response = String::new();
+        
+        if !success_list.is_empty() {
+            response.push_str("✅ Successfully subscribed to:\n");
+            for author in &success_list {
+                response.push_str(&format!("  • {}\n", author));
+            }
+            
+            if let Some(ref tags) = filter_tags {
+                response.push_str(&format!(
+                    "\n🏷 Filters: Include: {:?}, Exclude: {:?}",
+                    tags.get("include"),
+                    tags.get("exclude")
+                ));
+            }
+        }
+        
+        if !failed_list.is_empty() {
+            if !response.is_empty() {
+                response.push_str("\n\n");
+            }
+            response.push_str("❌ Failed to subscribe to:\n");
+            for author in &failed_list {
+                response.push_str(&format!("  • {}\n", author));
+            }
+        }
+
+        bot.send_message(chat_id, response)
+            .parse_mode(ParseMode::MarkdownV2)
+            .await?;
 
         Ok(())
     }
 
-    async fn handle_sub_ranking(
+    async fn handle_sub_ranking_cmd(
         &self,
         bot: Bot,
         chat_id: ChatId,
         user_id: i64,
-        parts: &[&str],
+        args: String,
     ) -> ResponseResult<()> {
-        if parts.is_empty() {
+        let mode = args.trim();
+        
+        if mode.is_empty() {
             bot.send_message(
                 chat_id,
-                "❌ Usage: `/sub ranking <mode>`\nModes: daily, weekly, monthly, daily_r18, etc."
+                "❌ Usage: `/subrank <mode>`\nModes: daily, weekly, monthly, daily\\_r18, etc\\."
             )
             .parse_mode(ParseMode::MarkdownV2)
             .await?;
             return Ok(());
         }
-
-        let mode = parts[0];
         let valid_modes = vec![
             "daily", "weekly", "monthly",
             "daily_r18", "weekly_r18",
@@ -409,7 +407,7 @@ Made with ❤️ using Rust
                     Ok(_) => {
                         bot.send_message(
                             chat_id,
-                            format!("✅ Successfully subscribed to `{}` ranking", mode)
+                            format!("✅ Successfully subscribed to `{}` ranking", mode.replace('_', "\\_"))
                         )
                         .parse_mode(ParseMode::MarkdownV2)
                         .await?;
@@ -431,23 +429,111 @@ Made with ❤️ using Rust
         Ok(())
     }
 
-    async fn handle_unsub(
+    async fn handle_unsub_author(
         &self,
         bot: Bot,
         chat_id: ChatId,
         args: String,
     ) -> ResponseResult<()> {
-        let author_id = args.trim();
+        let ids_str = args.trim();
         
-        if author_id.is_empty() {
-            bot.send_message(chat_id, "❌ Usage: `/unsub <author_id>`")
+        if ids_str.is_empty() {
+            bot.send_message(chat_id, "❌ Usage: `/unsub <author_id,...>`")
                 .parse_mode(ParseMode::MarkdownV2)
                 .await?;
             return Ok(());
         }
 
-        // Find task by author ID
-        match self.repo.get_task_by_type_value("author", author_id).await {
+        let author_ids: Vec<&str> = ids_str.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+        
+        let mut success_list: Vec<String> = Vec::new();
+        let mut failed_list: Vec<String> = Vec::new();
+
+        for author_id in author_ids {
+            // Find task by author ID
+            match self.repo.get_task_by_type_value("author", author_id).await {
+                Ok(Some(task)) => {
+                    // Delete subscription for this chat and task
+                    match self.repo.delete_subscription_by_chat_task(chat_id.0, task.id).await {
+                        Ok(_) => {
+                            // Check if task still has other subscriptions
+                            match self.repo.count_subscriptions_for_task(task.id).await {
+                                Ok(count) => {
+                                    if count == 0 {
+                                        // No more subscriptions, delete the task
+                                        if let Err(e) = self.repo.delete_task(task.id).await {
+                                            error!("Failed to delete task {}: {}", task.id, e);
+                                        } else {
+                                            info!("Deleted task {} (author {}) - no more subscriptions", task.id, author_id);
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    error!("Failed to count subscriptions for task {}: {}", task.id, e);
+                                }
+                            }
+                            success_list.push(format!("`{}`", author_id));
+                        }
+                        Err(e) => {
+                            error!("Failed to delete subscription for {}: {}", author_id, e);
+                            failed_list.push(format!("`{}` (not subscribed)", author_id));
+                        }
+                    }
+                }
+                Ok(None) => {
+                    failed_list.push(format!("`{}` (not found)", author_id));
+                }
+                Err(e) => {
+                    error!("Failed to get task for {}: {}", author_id, e);
+                    failed_list.push(format!("`{}` (error)", author_id));
+                }
+            }
+        }
+
+        // Build response message
+        let mut response = String::new();
+        
+        if !success_list.is_empty() {
+            response.push_str("✅ Successfully unsubscribed from:\n");
+            for author in &success_list {
+                response.push_str(&format!("  • {}\n", author));
+            }
+        }
+        
+        if !failed_list.is_empty() {
+            if !response.is_empty() {
+                response.push_str("\n");
+            }
+            response.push_str("❌ Failed to unsubscribe from:\n");
+            for author in &failed_list {
+                response.push_str(&format!("  • {}\n", author));
+            }
+        }
+
+        bot.send_message(chat_id, response)
+            .parse_mode(ParseMode::MarkdownV2)
+            .await?;
+
+        Ok(())
+    }
+
+    async fn handle_unsub_ranking(
+        &self,
+        bot: Bot,
+        chat_id: ChatId,
+        args: String,
+    ) -> ResponseResult<()> {
+        let mode = args.trim();
+        
+        if mode.is_empty() {
+            bot.send_message(chat_id, "❌ Usage: `/unsubrank <mode>`")
+                .parse_mode(ParseMode::MarkdownV2)
+                .await?;
+            return Ok(());
+        }
+
+        // Find task by ranking mode
+        match self.repo.get_task_by_type_value("ranking", mode).await {
             Ok(Some(task)) => {
                 // Delete subscription for this chat and task
                 match self.repo.delete_subscription_by_chat_task(chat_id.0, task.id).await {
@@ -460,7 +546,7 @@ Made with ❤️ using Rust
                                     if let Err(e) = self.repo.delete_task(task.id).await {
                                         error!("Failed to delete task {}: {}", task.id, e);
                                     } else {
-                                        info!("Deleted task {} (author {}) - no more subscriptions", task.id, author_id);
+                                        info!("Deleted task {} (ranking {}) - no more subscriptions", task.id, mode);
                                     }
                                 }
                             }
@@ -469,20 +555,20 @@ Made with ❤️ using Rust
                             }
                         }
                         
-                        bot.send_message(chat_id, format!("✅ Successfully unsubscribed from author `{}`", author_id))
+                        bot.send_message(chat_id, format!("✅ Successfully unsubscribed from `{}` ranking", mode.replace('_', "\\_")))
                             .parse_mode(ParseMode::MarkdownV2)
                             .await?;
                     }
                     Err(e) => {
                         error!("Failed to delete subscription: {}", e);
-                        bot.send_message(chat_id, "❌ Failed to unsubscribe\\. You may not be subscribed to this author\\.")
+                        bot.send_message(chat_id, "❌ Failed to unsubscribe\\. You may not be subscribed to this ranking\\.")
                             .parse_mode(ParseMode::MarkdownV2)
                             .await?;
                     }
                 }
             }
             Ok(None) => {
-                bot.send_message(chat_id, format!("❌ Author `{}` not found in your subscriptions", author_id))
+                bot.send_message(chat_id, format!("❌ Ranking `{}` not found in your subscriptions", mode.replace('_', "\\_")))
                     .parse_mode(ParseMode::MarkdownV2)
                     .await?;
             }
@@ -580,7 +666,7 @@ Made with ❤️ using Rust
                     ));
                 }
 
-                message.push_str("\n💡 Use `/unsub <author_id>` to unsubscribe");
+                message.push_str("\n💡 Use `/unsub <id>` or `/unsubrank <mode>` to unsubscribe");
 
                 bot.send_message(chat_id, message)
                     .parse_mode(ParseMode::MarkdownV2)

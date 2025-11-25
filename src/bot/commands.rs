@@ -5,10 +5,14 @@ use teloxide::utils::command::BotCommands;
 pub enum Command {
     #[command(description = "Show help text / 显示帮助信息")]
     Help,
-    #[command(description = "Subscribe to author or ranking / 订阅作者或排行榜\n  Usage: /sub author:123456 or /sub ranking:daily")]
+    #[command(description = "Subscribe to author(s) / 订阅作者\n  Usage: /sub <id,...> [+tag1 -tag2]")]
     Sub(String),
-    #[command(description = "Unsubscribe from author / 取消订阅作者\n  Usage: /unsub <author_id>")]
+    #[command(description = "Subscribe to ranking / 订阅排行榜\n  Usage: /subrank <mode>")]
+    SubRank(String),
+    #[command(description = "Unsubscribe from author(s) / 取消订阅作者\n  Usage: /unsub <author_id,...>")]
     Unsub(String),
+    #[command(description = "Unsubscribe from ranking / 取消订阅排行榜\n  Usage: /unsubrank <mode>")]
+    UnsubRank(String),
     #[command(description = "List active subscriptions / 列出当前订阅")]
     List,
     #[command(description = "[Owner Only] Set user as admin / 设置用户为管理员\n  Usage: /setadmin <user_id>")]
