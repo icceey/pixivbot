@@ -297,8 +297,6 @@ impl SchedulerEngine {
         }
         
         // Update latest_data
-        let random_interval_sec = rand::rng()
-            .random_range(self.min_task_interval_sec..=self.max_task_interval_sec);
         let updated_data = json!({
             "date": today,
             "last_check": Local::now().to_rfc3339(),
@@ -306,7 +304,7 @@ impl SchedulerEngine {
         
         self.repo.update_task_after_poll(
             task.id,
-            Local::now() + chrono::Duration::seconds(random_interval_sec as i64),
+            Local::now() + chrono::Duration::seconds(86400),
             Some(updated_data),
             task.updated_by,
         ).await?;
@@ -353,8 +351,8 @@ impl SchedulerEngine {
             }
             
             let message = format!(
-                "📊 **{} Ranking** - Top 10\n\n",
-                mode.replace('_', " ").to_uppercase()
+                "📊 *{} Ranking* \\- Top 10\n\n",
+                markdown::escape(&mode.replace('_', " ").to_uppercase())
             );
             
             if let Err(e) = self.notifier.notify(chat_id, &message).await {
