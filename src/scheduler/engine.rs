@@ -2,7 +2,7 @@ use crate::db::repo::Repo;
 use crate::pixiv::client::PixivClient;
 use crate::pixiv::downloader::Downloader;
 use crate::bot::notifier::Notifier;
-use crate::utils::{html, markdown};
+use crate::utils::{markdown, html};
 use std::sync::Arc;
 use tokio::time::{sleep, Duration};
 use tracing::{info, warn, error};
@@ -226,24 +226,13 @@ impl SchedulerEngine {
                 // Check if this illust has sensitive tags for spoiler
                 let has_spoiler = chat.blur_sensitive_tags && self.has_sensitive_tags(illust);
                 
-                // 构建描述和标签部分
-                let description = {
-                    let clean = html::clean_description(&illust.caption);
-                    if clean.is_empty() {
-                        String::new()
-                    } else {
-                        format!("\n\n{}", markdown::escape(&clean))
-                    }
-                };
-                
                 let tags = self.format_tags(illust);
                 
                 let caption = format!(
-                    "🎨 {}{}\nby {}{}\n\n👀 {} \\| ❤️ {} \\| 🔗 [source](https://pixiv\\.net/artworks/{}){}", 
+                    "🎨 {}{}\nby {}\n\n👀 {} \\| ❤️ {} \\| 🔗 [source](https://pixiv\\.net/artworks/{}){}", 
                     markdown::escape(&illust.title),
                     page_info,
                     markdown::escape(&illust.user.name),
-                    description,
                     illust.total_view,
                     illust.total_bookmarks,
                     illust.id,
