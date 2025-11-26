@@ -283,22 +283,50 @@ impl SchedulerEngine {
         
         info!("Found {} ranking illusts for mode {}", illusts.len(), mode);
         
-        // Get last ranking date
-        let last_date = task.latest_data.as_ref()
-            .and_then(|data| data.get("date"))
-            .and_then(|v| v.as_str());
+        // Get previously pushed illust IDs from latest_data
+        let pushed_ids: Vec<u64> = task.latest_data.as_ref()
+            .and_then(|data| data.get("pushed_ids"))
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter()
+                .filter_map(|v| v.as_u64())
+                .collect())
+            .unwrap_or_default();
         
-        let today = Local::now().format("%Y-%m-%d").to_string();
+        // Filter out illusts that have already been pushed
+        let new_illusts: Vec<&crate::pixiv_client::Illust> = illusts.iter()
+            .filter(|illust| !pushed_ids.contains(&illust.id))
+            .collect();
         
-        // Only notify if it's a new day or first run
-        if last_date == Some(today.as_str()) {
-            info!("Ranking for {} already sent today", mode);
+        if new_illusts.is_empty() {
+            info!("No new ranking illusts for mode {} (all {} already pushed)", mode, illusts.len());
+            // Still update the task poll time
+            self.repo.update_task_after_poll(
+                task.id,
+                Local::now() + chrono::Duration::seconds(86400),
+                task.latest_data.clone(),
+                task.updated_by,
+            ).await?;
             return Ok(());
         }
         
-        // Update latest_data
+        info!("Found {} new ranking illusts for mode {} ({} already pushed)", 
+              new_illusts.len(), mode, pushed_ids.len());
+        
+        // Collect new illust IDs
+        let new_ids: Vec<u64> = new_illusts.iter().map(|i| i.id).collect();
+        
+        // Update latest_data with pushed IDs (keep existing + add new)
+        let mut all_pushed_ids = pushed_ids.clone();
+        all_pushed_ids.extend(new_ids);
+        
+        // Keep only the last 100 IDs to prevent unbounded growth
+        if all_pushed_ids.len() > 100 {
+            all_pushed_ids = all_pushed_ids.into_iter().rev().take(100).collect();
+            all_pushed_ids.reverse();
+        }
+        
         let updated_data = json!({
-            "date": today,
+            "pushed_ids": all_pushed_ids,
             "last_check": Local::now().to_rfc3339(),
         });
         
@@ -350,9 +378,22 @@ impl SchedulerEngine {
                 continue;
             }
             
+            // Apply chat-level excluded tags filter
+            let filtered_illusts: Vec<&crate::pixiv_client::Illust> = self.apply_chat_excluded_tags(
+                new_illusts.clone(),
+                &chat.excluded_tags
+            );
+            
+            if filtered_illusts.is_empty() {
+                info!("No illusts to send to chat {} after filtering", chat_id);
+                continue;
+            }
+            
+            // Send title message first
             let message = format!(
-                "📊 *{} Ranking* \\- Top 10\n\n",
-                markdown::escape(&mode.replace('_', " ").to_uppercase())
+                "📊 *{} Ranking* \\- {} new\\!\n",
+                markdown::escape(&mode.replace('_', " ").to_uppercase()),
+                filtered_illusts.len()
             );
             
             if let Err(e) = self.notifier.notify(chat_id, &message).await {
@@ -360,52 +401,46 @@ impl SchedulerEngine {
                 continue;
             }
             
-            // Apply chat-level excluded tags filter
-            let filtered_illusts: Vec<&crate::pixiv_client::Illust> = self.apply_chat_excluded_tags(
-                illusts.iter().collect(),
-                &chat.excluded_tags
-            );
+            // Check if any illust has sensitive tags for spoiler
+            let has_spoiler = chat.blur_sensitive_tags && 
+                filtered_illusts.iter().any(|illust| self.has_sensitive_tags(illust));
             
-            // Send top illusts (limit to 10)
-            for (index, illust) in filtered_illusts.iter().take(10).enumerate() {
-                // Check if this illust has sensitive tags for spoiler
-                let has_spoiler = chat.blur_sensitive_tags && self.has_sensitive_tags(illust);
-                
-                // 构建描述和标签部分
-                let description = {
-                    let clean = html::clean_description(&illust.caption);
-                    if clean.is_empty() {
-                        String::new()
-                    } else {
-                        format!("\n\n{}", markdown::escape(&clean))
-                    }
+            // Prepare image URLs and captions
+            let mut image_urls: Vec<String> = Vec::new();
+            let mut captions: Vec<String> = Vec::new();
+            
+            for (index, illust) in filtered_illusts.iter().enumerate() {
+                // Get image URL
+                let image_url = if let Some(original_url) = &illust.meta_single_page.original_image_url {
+                    original_url.clone()
+                } else {
+                    illust.image_urls.large.clone()
                 };
+                image_urls.push(image_url);
                 
+                // Build caption for this image
                 let tags = self.format_tags(illust);
                 
                 let caption = format!(
-                    "{}\\.  {}\nby {}{}\n\n❤️ {} \\| 🔗 [source](https://pixiv\\.net/artworks/{}){}", 
+                    "{}\\.  {}\nby {}\n\n❤️ {} \\| 🔗 [source](https://pixiv\\.net/artworks/{}){}", 
                     index + 1,
                     markdown::escape(&illust.title),
                     markdown::escape(&illust.user.name),
-                    description,
                     illust.total_bookmarks,
                     illust.id,
                     tags
                 );
-                
-                // Get image URL
-                let image_url = if let Some(original_url) = &illust.meta_single_page.original_image_url {
-                    original_url.as_str()
-                } else {
-                    illust.image_urls.large.as_str()
-                };
-                
-                if let Err(e) = self.notifier.notify_with_image(chat_id, image_url, Some(&caption), has_spoiler).await {
-                    error!("Failed to notify chat {}: {}", chat_id, e);
-                }
-                
-                sleep(Duration::from_millis(2000)).await;
+                captions.push(caption);
+            }
+            
+            // Send as media group with individual captions
+            if let Err(e) = self.notifier.notify_with_individual_captions(
+                chat_id, 
+                &image_urls, 
+                &captions,
+                has_spoiler
+            ).await {
+                error!("Failed to send ranking media group to chat {}: {}", chat_id, e);
             }
         }
         
