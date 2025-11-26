@@ -1,16 +1,16 @@
+use crate::bot::notifier::Notifier;
 use crate::db::repo::Repo;
 use crate::pixiv::client::PixivClient;
 use crate::pixiv::downloader::Downloader;
-use crate::bot::notifier::Notifier;
-use crate::utils::{markdown, html};
-use std::sync::Arc;
-use tokio::time::{sleep, Duration};
-use tracing::{info, warn, error};
+use crate::utils::{html, markdown};
 use chrono::Local;
-use teloxide::Bot;
-use teloxide::prelude::*;
-use serde_json::json;
 use rand::Rng;
+use serde_json::json;
+use std::sync::Arc;
+use teloxide::prelude::*;
+use teloxide::Bot;
+use tokio::time::{sleep, Duration};
+use tracing::{error, info, warn};
 
 pub struct SchedulerEngine {
     repo: Arc<Repo>,
@@ -23,6 +23,7 @@ pub struct SchedulerEngine {
 }
 
 impl SchedulerEngine {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         repo: Arc<Repo>,
         pixiv_client: Arc<tokio::sync::RwLock<PixivClient>>,
@@ -47,11 +48,11 @@ impl SchedulerEngine {
     /// Main scheduler loop - runs indefinitely
     pub async fn run(&self) {
         info!("🚀 Scheduler engine started");
-        
+
         loop {
             // Wait for tick interval before checking for tasks
             sleep(Duration::from_secs(self.tick_interval_sec)).await;
-            
+
             if let Err(e) = self.tick().await {
                 error!("Scheduler tick error: {}", e);
             }
@@ -62,14 +63,17 @@ impl SchedulerEngine {
     async fn tick(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Get one pending task
         let tasks = self.repo.get_pending_tasks(1).await?;
-        
+
         if tasks.is_empty() {
             return Ok(());
         }
-        
+
         let task = &tasks[0];
-        info!("⚙️  Executing task [{}] {} {}", task.id, task.r#type, task.value);
-        
+        info!(
+            "⚙️  Executing task [{}] {} {}",
+            task.id, task.r#type, task.value
+        );
+
         // Execute based on task type
         let result = match task.r#type.as_str() {
             "author" => self.execute_author_task(task).await,
@@ -79,25 +83,27 @@ impl SchedulerEngine {
                 Ok(())
             }
         };
-        
+
         // Note: task's latest_data and next_poll_at are updated inside execute_*_task methods
         // We only log errors here, no need to update task again
         if let Err(e) = result {
             error!("Task execution failed: {}", e);
-            
+
             // On error, still update the poll time to avoid immediate retry
-            let random_interval_sec = rand::rng()
-                .random_range(self.min_task_interval_sec..=self.max_task_interval_sec);
+            let random_interval_sec =
+                rand::rng().random_range(self.min_task_interval_sec..=self.max_task_interval_sec);
             let next_poll = Local::now() + chrono::Duration::seconds(random_interval_sec as i64);
-            
-            self.repo.update_task_after_poll(
-                task.id,
-                next_poll,
-                task.latest_data.clone(),
-                task.created_by,
-            ).await?;
+
+            self.repo
+                .update_task_after_poll(
+                    task.id,
+                    next_poll,
+                    task.latest_data.clone(),
+                    task.created_by,
+                )
+                .await?;
         }
-        
+
         Ok(())
     }
 
@@ -107,71 +113,94 @@ impl SchedulerEngine {
         task: &crate::db::entities::tasks::Model,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let author_id: u64 = task.value.parse()?;
-        
+
         // Get latest illusts
         let pixiv = self.pixiv_client.read().await;
         let illusts = pixiv.get_user_illusts(author_id, 10).await?;
         drop(pixiv);
-        
+
         if illusts.is_empty() {
             info!("No illusts found for author {}", author_id);
-            let random_interval_sec = rand::rng()
-                .random_range(self.min_task_interval_sec..=self.max_task_interval_sec);
+            let random_interval_sec =
+                rand::rng().random_range(self.min_task_interval_sec..=self.max_task_interval_sec);
             let next_poll = Local::now() + chrono::Duration::seconds(random_interval_sec as i64);
-            self.repo.update_task_after_poll(task.id, next_poll, task.latest_data.clone(), task.created_by).await?;
+            self.repo
+                .update_task_after_poll(
+                    task.id,
+                    next_poll,
+                    task.latest_data.clone(),
+                    task.created_by,
+                )
+                .await?;
             return Ok(());
         }
-        
+
         // Get latest illust ID from task data
-        let last_illust_id = task.latest_data.as_ref()
+        let last_illust_id = task
+            .latest_data
+            .as_ref()
             .and_then(|data| data.get("latest_illust_id"))
             .and_then(|v| v.as_u64());
-        
+
         // Find new illusts
         let new_illusts: Vec<_> = if let Some(last_id) = last_illust_id {
-            illusts.into_iter()
+            illusts
+                .into_iter()
                 .take_while(|illust| illust.id != last_id)
                 .collect()
         } else {
             // First run - only send the latest one
             illusts.into_iter().take(1).collect()
         };
-        
+
         if new_illusts.is_empty() {
             info!("No new illusts for author {}", author_id);
-            let random_interval_sec = rand::rng()
-                .random_range(self.min_task_interval_sec..=self.max_task_interval_sec);
+            let random_interval_sec =
+                rand::rng().random_range(self.min_task_interval_sec..=self.max_task_interval_sec);
             let next_poll = Local::now() + chrono::Duration::seconds(random_interval_sec as i64);
-            self.repo.update_task_after_poll(task.id, next_poll, task.latest_data.clone(), task.created_by).await?;
+            self.repo
+                .update_task_after_poll(
+                    task.id,
+                    next_poll,
+                    task.latest_data.clone(),
+                    task.created_by,
+                )
+                .await?;
             return Ok(());
         }
-        
-        info!("Found {} new illusts for author {}", new_illusts.len(), author_id);
-        
+
+        info!(
+            "Found {} new illusts for author {}",
+            new_illusts.len(),
+            author_id
+        );
+
         // Update latest_data with newest illust ID
         if let Some(newest) = new_illusts.first() {
-            let random_interval_sec = rand::rng()
-                .random_range(self.min_task_interval_sec..=self.max_task_interval_sec);
+            let random_interval_sec =
+                rand::rng().random_range(self.min_task_interval_sec..=self.max_task_interval_sec);
             let updated_data = json!({
                 "latest_illust_id": newest.id,
                 "last_check": Local::now().to_rfc3339(),
             });
-            
-            self.repo.update_task_after_poll(
-                task.id,
-                Local::now() + chrono::Duration::seconds(random_interval_sec as i64),
-                Some(updated_data),
-                task.created_by,
-            ).await?;
+
+            self.repo
+                .update_task_after_poll(
+                    task.id,
+                    Local::now() + chrono::Duration::seconds(random_interval_sec as i64),
+                    Some(updated_data),
+                    task.created_by,
+                )
+                .await?;
         }
-        
+
         // Get all subscriptions for this task
         let subscriptions = self.repo.list_subscriptions_by_task(task.id).await?;
-        
+
         // Notify each subscriber
         for subscription in subscriptions {
             let chat_id = ChatId(subscription.chat_id);
-            
+
             // Get chat settings
             let chat = match self.repo.get_chat(subscription.chat_id).await {
                 Ok(Some(chat)) => chat,
@@ -184,7 +213,7 @@ impl SchedulerEngine {
                     continue;
                 }
             };
-            
+
             // Check if chat is enabled or if it's an admin/owner private chat
             let should_notify = if chat.enabled {
                 true
@@ -192,7 +221,10 @@ impl SchedulerEngine {
                 // Chat is disabled, check if it's admin/owner private chat
                 match self.repo.get_user(subscription.chat_id).await {
                     Ok(Some(user)) if user.role.is_admin() => {
-                        info!("Chat {} is disabled but user is admin/owner, allowing notification", chat_id);
+                        info!(
+                            "Chat {} is disabled but user is admin/owner, allowing notification",
+                            chat_id
+                        );
                         true
                     }
                     _ => {
@@ -201,35 +233,36 @@ impl SchedulerEngine {
                     }
                 }
             };
-            
+
             if !should_notify {
                 continue;
             }
-            
+
             // Apply subscription tag filters
-            let mut filtered_illusts = self.apply_tag_filters(&new_illusts, &subscription.filter_tags);
-            
+            let mut filtered_illusts =
+                self.apply_tag_filters(&new_illusts, &subscription.filter_tags);
+
             // Apply chat-level excluded tags
             filtered_illusts = self.apply_chat_excluded_tags(filtered_illusts, &chat.excluded_tags);
-            
+
             if filtered_illusts.is_empty() {
                 continue;
             }
-            
+
             for illust in filtered_illusts {
                 let page_info = if illust.is_multi_page() {
                     format!(" \\({} photos\\)", illust.page_count)
                 } else {
                     String::new()
                 };
-                
+
                 // Check if this illust has sensitive tags for spoiler
                 let has_spoiler = chat.blur_sensitive_tags && self.has_sensitive_tags(illust);
-                
+
                 let tags = self.format_tags(illust);
-                
+
                 let caption = format!(
-                    "🎨 {}{}\nby {}\n\n👀 {} \\| ❤️ {} \\| 🔗 [source](https://pixiv\\.net/artworks/{}){}", 
+                    "🎨 {}{}\nby {}\n\n👀 {} \\| ❤️ {} \\| 🔗 [来源](https://pixiv\\.net/artworks/{}){}", 
                     markdown::escape(&illust.title),
                     page_info,
                     markdown::escape(&illust.user.name),
@@ -238,19 +271,23 @@ impl SchedulerEngine {
                     illust.id,
                     tags
                 );
-                
+
                 // 获取所有图片URL (支持单图和多图)
                 let image_urls = illust.get_all_image_urls();
-                
-                if let Err(e) = self.notifier.notify_with_images(chat_id, &image_urls, Some(&caption), has_spoiler).await {
+
+                if let Err(e) = self
+                    .notifier
+                    .notify_with_images(chat_id, &image_urls, Some(&caption), has_spoiler)
+                    .await
+                {
                     error!("Failed to notify chat {}: {}", chat_id, e);
                 }
-                
+
                 // Small delay between messages
                 sleep(Duration::from_millis(2000)).await;
             }
         }
-        
+
         Ok(())
     }
 
@@ -260,80 +297,93 @@ impl SchedulerEngine {
         task: &crate::db::entities::tasks::Model,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let mode = &task.value;
-        
+
         // Get ranking
         let pixiv = self.pixiv_client.read().await;
         let illusts = pixiv.get_ranking(mode, None, 10).await?;
         drop(pixiv);
-        
+
         if illusts.is_empty() {
             info!("No ranking illusts found for mode {}", mode);
             return Ok(());
         }
-        
+
         info!("Found {} ranking illusts for mode {}", illusts.len(), mode);
-        
+
         // Get previously pushed illust IDs from latest_data
-        let pushed_ids: Vec<u64> = task.latest_data.as_ref()
+        let pushed_ids: Vec<u64> = task
+            .latest_data
+            .as_ref()
             .and_then(|data| data.get("pushed_ids"))
             .and_then(|v| v.as_array())
-            .map(|arr| arr.iter()
-                .filter_map(|v| v.as_u64())
-                .collect())
+            .map(|arr| arr.iter().filter_map(|v| v.as_u64()).collect())
             .unwrap_or_default();
-        
+
         // Filter out illusts that have already been pushed
-        let new_illusts: Vec<&crate::pixiv_client::Illust> = illusts.iter()
+        let new_illusts: Vec<&crate::pixiv_client::Illust> = illusts
+            .iter()
             .filter(|illust| !pushed_ids.contains(&illust.id))
             .collect();
-        
+
         if new_illusts.is_empty() {
-            info!("No new ranking illusts for mode {} (all {} already pushed)", mode, illusts.len());
+            info!(
+                "No new ranking illusts for mode {} (all {} already pushed)",
+                mode,
+                illusts.len()
+            );
             // Still update the task poll time
-            self.repo.update_task_after_poll(
-                task.id,
-                Local::now() + chrono::Duration::seconds(86400),
-                task.latest_data.clone(),
-                task.updated_by,
-            ).await?;
+            self.repo
+                .update_task_after_poll(
+                    task.id,
+                    Local::now() + chrono::Duration::seconds(86400),
+                    task.latest_data.clone(),
+                    task.updated_by,
+                )
+                .await?;
             return Ok(());
         }
-        
-        info!("Found {} new ranking illusts for mode {} ({} already pushed)", 
-              new_illusts.len(), mode, pushed_ids.len());
-        
+
+        info!(
+            "Found {} new ranking illusts for mode {} ({} already pushed)",
+            new_illusts.len(),
+            mode,
+            pushed_ids.len()
+        );
+
         // Collect new illust IDs
         let new_ids: Vec<u64> = new_illusts.iter().map(|i| i.id).collect();
-        
+
         // Update latest_data with pushed IDs (keep existing + add new)
         let mut all_pushed_ids = pushed_ids.clone();
         all_pushed_ids.extend(new_ids);
-        
+
         // Keep only the last 100 IDs to prevent unbounded growth
         if all_pushed_ids.len() > 100 {
             let skip_count = all_pushed_ids.len() - 100;
             all_pushed_ids = all_pushed_ids.into_iter().skip(skip_count).collect();
         }
-        
+
         let updated_data = json!({
             "pushed_ids": all_pushed_ids,
             "last_check": Local::now().to_rfc3339(),
         });
-        
-        self.repo.update_task_after_poll(
-            task.id,
-            Local::now() + chrono::Duration::seconds(86400),
-            Some(updated_data),
-            task.updated_by,
-        ).await?;
-        
+
+        self.repo
+            .update_task_after_poll(
+                task.id,
+                Local::now() + chrono::Duration::seconds(86400),
+                Some(updated_data),
+                task.updated_by,
+            )
+            .await?;
+
         // Get all subscriptions
         let subscriptions = self.repo.list_subscriptions_by_task(task.id).await?;
-        
+
         // Notify each subscriber
         for subscription in subscriptions {
             let chat_id = ChatId(subscription.chat_id);
-            
+
             // Get chat settings
             let chat = match self.repo.get_chat(subscription.chat_id).await {
                 Ok(Some(chat)) => chat,
@@ -346,7 +396,7 @@ impl SchedulerEngine {
                     continue;
                 }
             };
-            
+
             // Check if chat is enabled or if it's an admin/owner private chat
             let should_notify = if chat.enabled {
                 true
@@ -354,7 +404,10 @@ impl SchedulerEngine {
                 // Chat is disabled, check if it's admin/owner private chat
                 match self.repo.get_user(subscription.chat_id).await {
                     Ok(Some(user)) if user.role.is_admin() => {
-                        info!("Chat {} is disabled but user is admin/owner, allowing notification", chat_id);
+                        info!(
+                            "Chat {} is disabled but user is admin/owner, allowing notification",
+                            chat_id
+                        );
                         true
                     }
                     _ => {
@@ -363,56 +416,57 @@ impl SchedulerEngine {
                     }
                 }
             };
-            
+
             if !should_notify {
                 continue;
             }
-            
+
             // Apply chat-level excluded tags filter
-            let filtered_illusts: Vec<&crate::pixiv_client::Illust> = self.apply_chat_excluded_tags(
-                new_illusts.clone(),
-                &chat.excluded_tags
-            );
-            
+            let filtered_illusts: Vec<&crate::pixiv_client::Illust> =
+                self.apply_chat_excluded_tags(new_illusts.clone(), &chat.excluded_tags);
+
             if filtered_illusts.is_empty() {
                 info!("No illusts to send to chat {} after filtering", chat_id);
                 continue;
             }
-            
+
             // Send title message first
             let message = format!(
                 "📊 *{} Ranking* \\- {} new\\!\n",
                 markdown::escape(&mode.replace('_', " ").to_uppercase()),
                 filtered_illusts.len()
             );
-            
+
             if let Err(e) = self.notifier.notify(chat_id, &message).await {
                 error!("Failed to notify chat {}: {}", chat_id, e);
                 continue;
             }
-            
+
             // Check if any illust has sensitive tags for spoiler
-            let has_spoiler = chat.blur_sensitive_tags && 
-                filtered_illusts.iter().any(|illust| self.has_sensitive_tags(illust));
-            
+            let has_spoiler = chat.blur_sensitive_tags
+                && filtered_illusts
+                    .iter()
+                    .any(|illust| self.has_sensitive_tags(illust));
+
             // Prepare image URLs and captions
             let mut image_urls: Vec<String> = Vec::new();
             let mut captions: Vec<String> = Vec::new();
-            
+
             for (index, illust) in filtered_illusts.iter().enumerate() {
                 // Get image URL
-                let image_url = if let Some(original_url) = &illust.meta_single_page.original_image_url {
-                    original_url.clone()
-                } else {
-                    illust.image_urls.large.clone()
-                };
+                let image_url =
+                    if let Some(original_url) = &illust.meta_single_page.original_image_url {
+                        original_url.clone()
+                    } else {
+                        illust.image_urls.large.clone()
+                    };
                 image_urls.push(image_url);
-                
+
                 // Build caption for this image
                 let tags = self.format_tags(illust);
-                
+
                 let caption = format!(
-                    "{}\\.  {}\nby {}\n\n❤️ {} \\| 🔗 [source](https://pixiv\\.net/artworks/{}){}", 
+                    "{}\\.  {}\nby {}\n\n❤️ {} \\| 🔗 [来源](https://pixiv\\.net/artworks/{}){}",
                     index + 1,
                     markdown::escape(&illust.title),
                     markdown::escape(&illust.user.name),
@@ -422,18 +476,20 @@ impl SchedulerEngine {
                 );
                 captions.push(caption);
             }
-            
+
             // Send as media group with individual captions
-            if let Err(e) = self.notifier.notify_with_individual_captions(
-                chat_id, 
-                &image_urls, 
-                &captions,
-                has_spoiler
-            ).await {
-                error!("Failed to send ranking media group to chat {}: {}", chat_id, e);
+            if let Err(e) = self
+                .notifier
+                .notify_with_individual_captions(chat_id, &image_urls, &captions, has_spoiler)
+                .await
+            {
+                error!(
+                    "Failed to send ranking media group to chat {}: {}",
+                    chat_id, e
+                );
             }
         }
-        
+
         Ok(())
     }
 
@@ -446,47 +502,58 @@ impl SchedulerEngine {
         let Some(filters) = filter_tags else {
             return illusts.iter().collect();
         };
-        
-        let include_tags: Vec<String> = filters.get("include")
+
+        let include_tags: Vec<String> = filters
+            .get("include")
             .and_then(|v| v.as_array())
-            .map(|arr| arr.iter()
-                .filter_map(|v| v.as_str().map(|s| s.to_lowercase()))
-                .collect())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_lowercase()))
+                    .collect()
+            })
             .unwrap_or_default();
-        
-        let exclude_tags: Vec<String> = filters.get("exclude")
+
+        let exclude_tags: Vec<String> = filters
+            .get("exclude")
             .and_then(|v| v.as_array())
-            .map(|arr| arr.iter()
-                .filter_map(|v| v.as_str().map(|s| s.to_lowercase()))
-                .collect())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_lowercase()))
+                    .collect()
+            })
             .unwrap_or_default();
-        
-        illusts.iter().filter(|illust| {
-            let illust_tags: Vec<String> = illust.tags.iter()
-                .map(|tag| tag.name.to_lowercase())
-                .collect();
-            
-            // Check exclude tags first (must not contain any - exact match)
-            if !exclude_tags.is_empty() {
-                for exclude_tag in &exclude_tags {
-                    if illust_tags.iter().any(|t| t == exclude_tag) {
-                        return false;
+
+        illusts
+            .iter()
+            .filter(|illust| {
+                let illust_tags: Vec<String> = illust
+                    .tags
+                    .iter()
+                    .map(|tag| tag.name.to_lowercase())
+                    .collect();
+
+                // Check exclude tags first (must not contain any - exact match)
+                if !exclude_tags.is_empty() {
+                    for exclude_tag in &exclude_tags {
+                        if illust_tags.iter().any(|t| t == exclude_tag) {
+                            return false;
+                        }
                     }
                 }
-            }
-            
-            // Check include tags (must contain at least one if specified - exact match)
-            if !include_tags.is_empty() {
-                for include_tag in &include_tags {
-                    if illust_tags.iter().any(|t| t == include_tag) {
-                        return true;
+
+                // Check include tags (must contain at least one if specified - exact match)
+                if !include_tags.is_empty() {
+                    for include_tag in &include_tags {
+                        if illust_tags.iter().any(|t| t == include_tag) {
+                            return true;
+                        }
                     }
+                    return false;
                 }
-                return false;
-            }
-            
-            true
-        }).collect()
+
+                true
+            })
+            .collect()
     }
 
     /// Apply chat-level excluded tags filter (exact match, case-insensitive)
@@ -498,46 +565,54 @@ impl SchedulerEngine {
         let Some(tags) = chat_excluded_tags else {
             return illusts;
         };
-        
-        let excluded: Vec<String> = if let Ok(tag_array) = serde_json::from_value::<Vec<String>>(tags.clone()) {
-            tag_array.iter().map(|s| s.to_lowercase()).collect()
-        } else {
-            return illusts;
-        };
-        
+
+        let excluded: Vec<String> =
+            if let Ok(tag_array) = serde_json::from_value::<Vec<String>>(tags.clone()) {
+                tag_array.iter().map(|s| s.to_lowercase()).collect()
+            } else {
+                return illusts;
+            };
+
         if excluded.is_empty() {
             return illusts;
         }
-        
-        illusts.into_iter().filter(|illust| {
-            let illust_tags: Vec<String> = illust.tags.iter()
-                .map(|tag| tag.name.to_lowercase())
-                .collect();
-            
-            // Must not contain any excluded tag (exact match)
-            for exclude_tag in &excluded {
-                if illust_tags.iter().any(|t| t == exclude_tag) {
-                    return false;
+
+        illusts
+            .into_iter()
+            .filter(|illust| {
+                let illust_tags: Vec<String> = illust
+                    .tags
+                    .iter()
+                    .map(|tag| tag.name.to_lowercase())
+                    .collect();
+
+                // Must not contain any excluded tag (exact match)
+                for exclude_tag in &excluded {
+                    if illust_tags.iter().any(|t| t == exclude_tag) {
+                        return false;
+                    }
                 }
-            }
-            
-            true
-        }).collect()
+
+                true
+            })
+            .collect()
     }
 
     /// Check if illust contains sensitive tags (exact match, case-insensitive)
     fn has_sensitive_tags(&self, illust: &crate::pixiv_client::Illust) -> bool {
-        let illust_tags: Vec<String> = illust.tags.iter()
+        let illust_tags: Vec<String> = illust
+            .tags
+            .iter()
             .map(|tag| tag.name.to_lowercase())
             .collect();
-        
+
         for sensitive_tag in &self.sensitive_tags {
             let sensitive_lower = sensitive_tag.to_lowercase();
             if illust_tags.iter().any(|t| t == &sensitive_lower) {
                 return true;
             }
         }
-        
+
         false
     }
 
@@ -545,15 +620,16 @@ impl SchedulerEngine {
     fn format_tags(&self, illust: &crate::pixiv_client::Illust) -> String {
         let tag_names: Vec<&str> = illust.tags.iter().map(|t| t.name.as_str()).collect();
         let formatted = html::format_tags(&tag_names);
-        
+
         if formatted.is_empty() {
             return String::new();
         }
-        
-        let escaped: Vec<String> = formatted.iter()
+
+        let escaped: Vec<String> = formatted
+            .iter()
             .map(|t| format!("\\#{}", markdown::escape(t)))
             .collect();
-        
+
         format!("\n\n{}", escaped.join("  "))
     }
 }

@@ -1,6 +1,6 @@
+use super::role::UserRole;
 use sea_orm::entity::prelude::*;
 use serde::{Deserialize, Serialize};
-use super::role::UserRole;
 
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Deserialize, Serialize)]
 #[sea_orm(table_name = "users")]

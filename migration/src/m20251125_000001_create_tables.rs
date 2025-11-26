@@ -88,11 +88,7 @@ impl MigrationTrait for Migration {
                     .col(ColumnDef::new(Tasks::Type).string().not_null())
                     .col(ColumnDef::new(Tasks::Value).string().not_null())
                     .col(ColumnDef::new(Tasks::AuthorName).string())
-                    .col(
-                        ColumnDef::new(Tasks::NextPollAt)
-                            .timestamp()
-                            .not_null(),
-                    )
+                    .col(ColumnDef::new(Tasks::NextPollAt).timestamp().not_null())
                     .col(ColumnDef::new(Tasks::LastPolledAt).timestamp())
                     .col(ColumnDef::new(Tasks::LatestData).json())
                     .col(ColumnDef::new(Tasks::CreatedBy).big_integer().not_null())
@@ -156,7 +152,11 @@ impl MigrationTrait for Migration {
                             .auto_increment()
                             .primary_key(),
                     )
-                    .col(ColumnDef::new(Subscriptions::ChatId).big_integer().not_null())
+                    .col(
+                        ColumnDef::new(Subscriptions::ChatId)
+                            .big_integer()
+                            .not_null(),
+                    )
                     .col(ColumnDef::new(Subscriptions::TaskId).integer().not_null())
                     .col(ColumnDef::new(Subscriptions::FilterTags).json())
                     .col(

@@ -1,5 +1,5 @@
 //! Pixiv API 数据模型
-//! 
+//!
 //! 只包含项目需要的字段，参考 [pixivpy](https://github.com/upbit/pixivpy) 的 pixivpy3/models.py
 
 use serde::{Deserialize, Serialize};
@@ -82,7 +82,7 @@ impl Illust {
     pub fn is_multi_page(&self) -> bool {
         self.page_count > 1
     }
-    
+
     /// 获取所有图片的原图 URL
     /// 单图返回1个URL,多图返回所有页的URL
     pub fn get_all_image_urls(&self) -> Vec<String> {
@@ -90,22 +90,25 @@ impl Illust {
             // 多图: 从 meta_pages 获取每页的图片
             self.meta_pages
                 .iter()
-                .map(|page| page.image_urls.original
-                    .clone()
-                    .unwrap_or_else(|| page.image_urls.large.clone()))
+                .map(|page| {
+                    page.image_urls
+                        .original
+                        .clone()
+                        .unwrap_or_else(|| page.image_urls.large.clone())
+                })
                 .collect()
         } else {
             // 单图: 优先使用 original_image_url,否则用 large
-            vec![
-                self.meta_single_page
-                    .original_image_url
-                    .clone()
-                    .unwrap_or_else(|| self.image_urls.large.clone())
-            ]
+            vec![self
+                .meta_single_page
+                .original_image_url
+                .clone()
+                .unwrap_or_else(|| self.image_urls.large.clone())]
         }
     }
-    
+
     /// 获取第一张图片的URL (用于缩略图或预览)
+    #[allow(dead_code)]
     pub fn get_first_image_url(&self) -> String {
         if let Some(original) = &self.meta_single_page.original_image_url {
             original.clone()
@@ -116,6 +119,7 @@ impl Illust {
 }
 
 /// 作品详情响应
+#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct IllustDetail {
     pub illust: Illust,

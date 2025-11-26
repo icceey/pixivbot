@@ -1,5 +1,5 @@
 //! Pixiv OAuth 认证模块
-//! 
+//!
 //! 参考 [pixivpy](https://github.com/upbit/pixivpy) 的 pixivpy3/api.py auth() 方法实现
 
 use crate::pixiv_client::error::{Error, Result};
@@ -66,7 +66,7 @@ pub async fn auth_with_refresh_token(
     let text = response.text().await?;
 
     if !status.is_success() {
-        return Err(Error::AuthError(format!(
+        return Err(Error::Auth(format!(
             "Authentication failed ({}): {}",
             status, text
         )));

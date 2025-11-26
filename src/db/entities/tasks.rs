@@ -22,11 +22,22 @@ pub struct Model {
 pub enum Relation {
     #[sea_orm(has_many = "super::subscriptions::Entity")]
     Subscriptions,
-    #[sea_orm(belongs_to = "super::users::Entity", from = "Column::CreatedBy", to = "super::users::Column::Id", on_update = "NoAction", on_delete = "NoAction")]
+    #[sea_orm(
+        belongs_to = "super::users::Entity",
+        from = "Column::CreatedBy",
+        to = "super::users::Column::Id",
+        on_update = "NoAction",
+        on_delete = "NoAction"
+    )]
     UserCreated,
-    #[sea_orm(belongs_to = "super::users::Entity", from = "Column::UpdatedBy", to = "super::users::Column::Id", on_update = "NoAction", on_delete = "NoAction")]
+    #[sea_orm(
+        belongs_to = "super::users::Entity",
+        from = "Column::UpdatedBy",
+        to = "super::users::Column::Id",
+        on_update = "NoAction",
+        on_delete = "NoAction"
+    )]
     UserUpdated,
-    
 }
 
 impl Related<super::subscriptions::Entity> for Entity {

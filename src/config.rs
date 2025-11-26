@@ -66,11 +66,11 @@ fn default_tick_interval_sec() -> u64 {
 }
 
 fn default_min_task_interval_sec() -> u64 {
-    30 * 60  // 30 minutes
+    30 * 60 // 30 minutes
 }
 
 fn default_max_task_interval_sec() -> u64 {
-    40 * 60  // 40 minutes
+    40 * 60 // 40 minutes
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -82,11 +82,7 @@ pub struct ContentConfig {
 impl Default for ContentConfig {
     fn default() -> Self {
         Self {
-            sensitive_tags: vec![
-                "R-18".to_string(),
-                "R-18G".to_string(),
-                "NSFW".to_string(),
-            ],
+            sensitive_tags: vec!["R-18".to_string(), "R-18G".to_string(), "NSFW".to_string()],
         }
     }
 }

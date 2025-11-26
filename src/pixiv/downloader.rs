@@ -1,10 +1,10 @@
 use crate::error::AppResult;
-use std::path::PathBuf;
 use reqwest::Client;
-use tracing::info;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::path::PathBuf;
 use tokio::io::AsyncWriteExt;
+use tracing::info;
 
 pub struct Downloader {
     cache_dir: PathBuf,
@@ -13,9 +13,9 @@ pub struct Downloader {
 
 impl Downloader {
     pub fn new(http_client: Client, cache_dir: impl Into<PathBuf>) -> Self {
-        Self { 
-            cache_dir: cache_dir.into(), 
-            http_client 
+        Self {
+            cache_dir: cache_dir.into(),
+            http_client,
         }
     }
 
@@ -25,53 +25,56 @@ impl Downloader {
         // Generate cache key from URL
         let cache_key = self.generate_cache_key(url);
         let ext = self.extract_extension(url).unwrap_or("jpg");
-        
+
         // Create hash-prefixed path (first 2 chars of hash for bucketing)
         let prefix = &cache_key[..2];
         let cache_subdir = self.cache_dir.join(prefix);
         std::fs::create_dir_all(&cache_subdir)?;
-        
+
         let filename = format!("{}_{}.{}", cache_key, self.safe_url_slug(url), ext);
         let filepath = cache_subdir.join(filename);
-        
+
         // Check cache hit
         if filepath.exists() {
             info!("Cache hit for: {}", url);
             return Ok(filepath);
         }
-        
+
         // Cache miss - download
         info!("Downloading: {}", url);
-        let response = self.http_client
+        let response = self
+            .http_client
             .get(url)
             .header("Referer", "https://app-api.pixiv.net/")
             .send()
             .await
             .map_err(|e| crate::error::AppError::Unknown(format!("Download failed: {}", e)))?;
-        
+
         if !response.status().is_success() {
-            return Err(crate::error::AppError::Unknown(
-                format!("Download failed with status: {}", response.status())
-            ));
+            return Err(crate::error::AppError::Unknown(format!(
+                "Download failed with status: {}",
+                response.status()
+            )));
         }
-        
-        let bytes = response.bytes().await
-            .map_err(|e| crate::error::AppError::Unknown(format!("Failed to read response: {}", e)))?;
-        
+
+        let bytes = response.bytes().await.map_err(|e| {
+            crate::error::AppError::Unknown(format!("Failed to read response: {}", e))
+        })?;
+
         let mut file = tokio::fs::File::create(&filepath).await?;
         file.write_all(&bytes).await?;
-        
+
         info!("Downloaded to: {:?}", filepath);
         Ok(filepath)
     }
-    
+
     /// 批量下载多张图片 (用于多图作品)
     /// 返回所有下载成功的文件路径
     pub async fn download_all(&self, urls: &[String]) -> AppResult<Vec<PathBuf>> {
         info!("Batch downloading {} images", urls.len());
-        
+
         let mut paths = Vec::with_capacity(urls.len());
-        
+
         for (idx, url) in urls.iter().enumerate() {
             match self.download(url).await {
                 Ok(path) => {
@@ -80,35 +83,46 @@ impl Downloader {
                 }
                 Err(e) => {
                     // 继续下载其他图片,不因一张失败而中断
-                    tracing::warn!("Failed to download image {}/{} ({}): {}", idx + 1, urls.len(), url, e);
+                    tracing::warn!(
+                        "Failed to download image {}/{} ({}): {}",
+                        idx + 1,
+                        urls.len(),
+                        url,
+                        e
+                    );
                 }
             }
         }
-        
+
         if paths.is_empty() {
             return Err(crate::error::AppError::Unknown(
-                "All images failed to download".to_string()
+                "All images failed to download".to_string(),
             ));
         }
-        
-        info!("Batch download complete: {}/{} successful", paths.len(), urls.len());
+
+        info!(
+            "Batch download complete: {}/{} successful",
+            paths.len(),
+            urls.len()
+        );
         Ok(paths)
     }
-    
+
     /// Extract file extension from URL
     fn extract_extension<'a>(&self, url: &'a str) -> Option<&'a str> {
         url.split('.')
-            .last()
+            .next_back()
             .and_then(|ext| ext.split('?').next())
             .filter(|ext| ext.len() <= 4)
     }
 
     /// Check if URL is already cached
+    #[allow(dead_code)]
     pub fn is_cached(&self, url: &str) -> bool {
         let cache_key = self.generate_cache_key(url);
         let prefix = &cache_key[..2];
         let cache_subdir = self.cache_dir.join(prefix);
-        
+
         if let Ok(entries) = std::fs::read_dir(cache_subdir) {
             for entry in entries.flatten() {
                 if let Some(name) = entry.file_name().to_str() {
@@ -131,7 +145,7 @@ impl Downloader {
     /// Create a safe URL slug (last part of path)
     fn safe_url_slug(&self, url: &str) -> String {
         url.split('/')
-            .last()
+            .next_back()
             .unwrap_or("image")
             .chars()
             .take(20)
@@ -140,18 +154,22 @@ impl Downloader {
     }
 
     /// Clean up old cache files (older than days_threshold)
+    #[allow(dead_code)]
     pub async fn cleanup_cache(&self, days_threshold: u64) -> AppResult<usize> {
         use std::time::{SystemTime, UNIX_EPOCH};
-        
-        info!("Starting cache cleanup (threshold: {} days)", days_threshold);
+
+        info!(
+            "Starting cache cleanup (threshold: {} days)",
+            days_threshold
+        );
         let threshold_secs = days_threshold * 24 * 60 * 60;
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?
+            .map_err(std::io::Error::other)?
             .as_secs();
-        
+
         let mut deleted_count = 0;
-        
+
         if let Ok(entries) = std::fs::read_dir(&self.cache_dir) {
             for entry in entries.flatten() {
                 if entry.path().is_dir() {
@@ -162,10 +180,10 @@ impl Downloader {
                                 if let Ok(modified) = metadata.modified() {
                                     if let Ok(duration) = modified.duration_since(UNIX_EPOCH) {
                                         let file_time = duration.as_secs();
-                                        if now - file_time > threshold_secs {
-                                            if std::fs::remove_file(file.path()).is_ok() {
-                                                deleted_count += 1;
-                                            }
+                                        if now - file_time > threshold_secs
+                                            && std::fs::remove_file(file.path()).is_ok()
+                                        {
+                                            deleted_count += 1;
                                         }
                                     }
                                 }
@@ -175,7 +193,7 @@ impl Downloader {
                 }
             }
         }
-        
+
         info!("Cache cleanup complete. Deleted {} files", deleted_count);
         Ok(deleted_count)
     }

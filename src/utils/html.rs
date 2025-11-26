@@ -1,12 +1,12 @@
 /// Extract tag names from tags and format for display
-/// 
+///
 /// Converts tag names by replacing spaces with underscores.
 /// Does NOT add hashtags or markdown escaping - that should be done by the caller.
-/// 
+///
 /// # Example
 /// ```
 /// use pixivbot::utils::html::format_tags;
-/// 
+///
 /// let tags = vec!["原神", "Genshin Impact"];
 /// let formatted = format_tags(&tags);
 /// // Returns: vec!["原神", "Genshin_Impact"]

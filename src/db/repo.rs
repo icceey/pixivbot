@@ -1,12 +1,12 @@
-use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseConnection, DbErr, EntityTrait, 
-    IntoActiveModel, QueryFilter, QueryOrder, QuerySelect, Set, PaginatorTrait
-};
 use chrono::{DateTime, Local};
+use sea_orm::{
+    ActiveModelTrait, ColumnTrait, DatabaseConnection, DbErr, EntityTrait, IntoActiveModel,
+    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set,
+};
 use serde_json::Value as JsonValue;
 
-use super::entities::{chats, subscriptions, tasks, users};
 use super::entities::role::UserRole;
+use super::entities::{chats, subscriptions, tasks, users};
 
 pub struct Repo {
     db: DatabaseConnection,
@@ -22,7 +22,7 @@ impl Repo {
     }
 
     // ==================== Users ====================
-    
+
     /// Create or update a user
     pub async fn upsert_user(
         &self,
@@ -31,7 +31,7 @@ impl Repo {
         role: UserRole,
     ) -> Result<users::Model, DbErr> {
         let now = Local::now().naive_local();
-        
+
         // Try to find existing user
         if let Some(existing) = users::Entity::find_by_id(user_id).one(&self.db).await? {
             // Update existing (only update username, don't change role)
@@ -57,9 +57,7 @@ impl Repo {
     /// 获取所有管理员用户（包括 Admin 和 Owner）
     pub async fn get_admin_users(&self) -> Result<Vec<users::Model>, DbErr> {
         users::Entity::find()
-            .filter(
-                users::Column::Role.is_in([UserRole::Admin, UserRole::Owner])
-            )
+            .filter(users::Column::Role.is_in([UserRole::Admin, UserRole::Owner]))
             .all(&self.db)
             .await
     }
@@ -70,14 +68,14 @@ impl Repo {
             .one(&self.db)
             .await?
             .ok_or(DbErr::RecordNotFound(format!("User {} not found", user_id)))?;
-        
+
         let mut active: users::ActiveModel = user.into_active_model();
         active.role = Set(role);
         active.update(&self.db).await
     }
 
     // ==================== Chats ====================
-    
+
     /// Create or update a chat
     pub async fn upsert_chat(
         &self,
@@ -87,7 +85,7 @@ impl Repo {
         default_enabled: bool,
     ) -> Result<chats::Model, DbErr> {
         let now = Local::now().naive_local();
-        
+
         if let Some(existing) = chats::Entity::find_by_id(chat_id).one(&self.db).await? {
             // Update existing (keep enabled status)
             let mut active: chats::ActiveModel = existing.into_active_model();
@@ -101,7 +99,7 @@ impl Repo {
                 r#type: Set(chat_type),
                 title: Set(title),
                 enabled: Set(default_enabled),
-                blur_sensitive_tags: Set(true),  // Default to enabled
+                blur_sensitive_tags: Set(true), // Default to enabled
                 excluded_tags: Set(None),
                 created_at: Set(now),
             };
@@ -110,36 +108,48 @@ impl Repo {
     }
 
     /// Enable or disable a chat
-    pub async fn set_chat_enabled(&self, chat_id: i64, enabled: bool) -> Result<chats::Model, DbErr> {
+    pub async fn set_chat_enabled(
+        &self,
+        chat_id: i64,
+        enabled: bool,
+    ) -> Result<chats::Model, DbErr> {
         let chat = chats::Entity::find_by_id(chat_id)
             .one(&self.db)
             .await?
             .ok_or(DbErr::RecordNotFound(format!("Chat {} not found", chat_id)))?;
-        
+
         let mut active: chats::ActiveModel = chat.into_active_model();
         active.enabled = Set(enabled);
         active.update(&self.db).await
     }
 
     /// Set blur_sensitive_tags for a chat
-    pub async fn set_blur_sensitive_tags(&self, chat_id: i64, blur: bool) -> Result<chats::Model, DbErr> {
+    pub async fn set_blur_sensitive_tags(
+        &self,
+        chat_id: i64,
+        blur: bool,
+    ) -> Result<chats::Model, DbErr> {
         let chat = chats::Entity::find_by_id(chat_id)
             .one(&self.db)
             .await?
             .ok_or(DbErr::RecordNotFound(format!("Chat {} not found", chat_id)))?;
-        
+
         let mut active: chats::ActiveModel = chat.into_active_model();
         active.blur_sensitive_tags = Set(blur);
         active.update(&self.db).await
     }
 
     /// Set excluded tags for a chat
-    pub async fn set_excluded_tags(&self, chat_id: i64, tags: Option<JsonValue>) -> Result<chats::Model, DbErr> {
+    pub async fn set_excluded_tags(
+        &self,
+        chat_id: i64,
+        tags: Option<JsonValue>,
+    ) -> Result<chats::Model, DbErr> {
         let chat = chats::Entity::find_by_id(chat_id)
             .one(&self.db)
             .await?
             .ok_or(DbErr::RecordNotFound(format!("Chat {} not found", chat_id)))?;
-        
+
         let mut active: chats::ActiveModel = chat.into_active_model();
         active.excluded_tags = Set(tags);
         active.update(&self.db).await
@@ -150,7 +160,7 @@ impl Repo {
     }
 
     // ==================== Tasks ====================
-    
+
     /// Create a new task
     pub async fn create_task(
         &self,
@@ -171,7 +181,7 @@ impl Repo {
             author_name: Set(author_name),
             ..Default::default()
         };
-        
+
         new_task.insert(&self.db).await
     }
 
@@ -200,14 +210,15 @@ impl Repo {
             Ok(existing)
         } else {
             let next_poll = Local::now() + chrono::Duration::seconds(60); // Poll in 1 minute
-            self.create_task(task_type, value, next_poll, created_by, author_name).await
+            self.create_task(task_type, value, next_poll, created_by, author_name)
+                .await
         }
     }
 
     /// Get tasks that need to be polled (next_poll_at <= now)
     pub async fn get_pending_tasks(&self, limit: u64) -> Result<Vec<tasks::Model>, DbErr> {
         let now = Local::now().naive_local();
-        
+
         tasks::Entity::find()
             .filter(tasks::Column::NextPollAt.lte(now))
             .order_by_asc(tasks::Column::NextPollAt)
@@ -229,7 +240,7 @@ impl Repo {
             .one(&self.db)
             .await?
             .ok_or(DbErr::RecordNotFound(format!("Task {} not found", task_id)))?;
-        
+
         let now = Local::now().naive_local();
         let mut active: tasks::ActiveModel = task.into_active_model();
         active.next_poll_at = Set(next_poll_at.naive_local());
@@ -238,20 +249,18 @@ impl Repo {
             active.latest_data = Set(latest_data);
         }
         active.updated_by = Set(updated_by);
-        
+
         active.update(&self.db).await
     }
 
     /// Delete a task (and cascade delete subscriptions)
     pub async fn delete_task(&self, task_id: i32) -> Result<(), DbErr> {
-        tasks::Entity::delete_by_id(task_id)
-            .exec(&self.db)
-            .await?;
+        tasks::Entity::delete_by_id(task_id).exec(&self.db).await?;
         Ok(())
     }
 
     // ==================== Subscriptions ====================
-    
+
     /// Create a subscription
     pub async fn create_subscription(
         &self,
@@ -260,7 +269,7 @@ impl Repo {
         filter_tags: Option<JsonValue>,
     ) -> Result<subscriptions::Model, DbErr> {
         let now = Local::now().naive_local();
-        
+
         let new_sub = subscriptions::ActiveModel {
             chat_id: Set(chat_id),
             task_id: Set(task_id),
@@ -268,7 +277,7 @@ impl Repo {
             created_at: Set(now),
             ..Default::default()
         };
-        
+
         new_sub.insert(&self.db).await
     }
 
@@ -292,7 +301,8 @@ impl Repo {
             active.update(&self.db).await
         } else {
             // Create new
-            self.create_subscription(chat_id, task_id, filter_tags).await
+            self.create_subscription(chat_id, task_id, filter_tags)
+                .await
         }
     }
 
@@ -326,6 +336,7 @@ impl Repo {
     }
 
     /// Delete a subscription by id
+    #[allow(dead_code)]
     pub async fn delete_subscription(&self, sub_id: i32) -> Result<(), DbErr> {
         subscriptions::Entity::delete_by_id(sub_id)
             .exec(&self.db)

@@ -1,16 +1,16 @@
 pub mod commands;
-pub mod notifier;
 mod handler;
+pub mod notifier;
 
-use teloxide::prelude::*;
-use teloxide::types::BotCommandScope;
 use crate::config::TelegramConfig;
-use crate::error::AppResult;
-use crate::db::repo::Repo;
 use crate::db::entities::role::UserRole;
+use crate::db::repo::Repo;
+use crate::error::AppResult;
 use crate::pixiv::client::PixivClient;
 use crate::pixiv::downloader::Downloader;
 use std::sync::Arc;
+use teloxide::prelude::*;
+use teloxide::types::BotCommandScope;
 use tracing::info;
 
 pub use commands::Command;
@@ -23,18 +23,29 @@ pub async fn run(
     _downloader: Arc<Downloader>, // Not used in bot commands, only in scheduler
 ) -> AppResult<()> {
     info!("Starting Telegram Bot...");
-    
+
     // Parse bot mode from config
     let is_public_mode = config.bot_mode.to_lowercase() == "public";
-    
-    info!("Bot mode: {} (new chats will be {} by default)", 
-        config.bot_mode, 
-        if is_public_mode { "enabled" } else { "disabled" }
+
+    info!(
+        "Bot mode: {} (new chats will be {} by default)",
+        config.bot_mode,
+        if is_public_mode {
+            "enabled"
+        } else {
+            "disabled"
+        }
     );
-    
+
     let bot = Bot::new(config.bot_token.clone());
-    let handler = BotHandler::new(bot.clone(), repo.clone(), pixiv_client, config.owner_id, is_public_mode);
-    
+    let handler = BotHandler::new(
+        bot.clone(),
+        repo.clone(),
+        pixiv_client,
+        config.owner_id,
+        is_public_mode,
+    );
+
     info!("✅ Bot initialized, starting command handler");
 
     // 设置命令可见性
@@ -42,12 +53,10 @@ pub async fn run(
 
     Command::repl(bot, move |bot: Bot, msg: Message, cmd: Command| {
         let handler = handler.clone();
-        async move {
-            handler.handle_command(bot, msg, cmd).await
-        }
+        async move { handler.handle_command(bot, msg, cmd).await }
     })
     .await;
-    
+
     Ok(())
 }
 
@@ -76,7 +85,7 @@ async fn setup_commands(bot: &Bot, repo: &Repo) {
                     UserRole::Admin => Command::admin_commands(),
                     UserRole::User => continue, // 不应该出现，但以防万一
                 };
-                
+
                 if let Err(e) = bot
                     .set_my_commands(commands)
                     .scope(BotCommandScope::Chat {
@@ -84,7 +93,12 @@ async fn setup_commands(bot: &Bot, repo: &Repo) {
                     })
                     .await
                 {
-                    tracing::warn!("Failed to set commands for {:?} {}: {}", user.role, user.id, e);
+                    tracing::warn!(
+                        "Failed to set commands for {:?} {}: {}",
+                        user.role,
+                        user.id,
+                        e
+                    );
                 } else {
                     info!("✅ Set {:?} commands for user_id: {}", user.role, user.id);
                 }

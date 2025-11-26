@@ -1,3 +1,3 @@
 pub mod client;
-pub mod model;
 pub mod downloader;
+pub mod model;

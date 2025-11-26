@@ -49,19 +49,23 @@ impl PixivClient {
 
     /// 使用 refresh_token 进行认证
     pub async fn login(&self) -> Result<()> {
-        let auth_response = auth::auth_with_refresh_token(&self.client, &self.refresh_token).await?;
-        
+        let auth_response =
+            auth::auth_with_refresh_token(&self.client, &self.refresh_token).await?;
+
         // 计算过期时间点
         let expires_at = Instant::now() + Duration::from_secs(auth_response.expires_in);
-        
+
         let mut token_info = self.token_info.write().await;
         *token_info = Some(TokenInfo {
             access_token: auth_response.access_token,
             expires_at,
         });
-        
-        tracing::info!("Token refreshed, expires in {} seconds", auth_response.expires_in);
-        
+
+        tracing::info!(
+            "Token refreshed, expires in {} seconds",
+            auth_response.expires_in
+        );
+
         Ok(())
     }
 
@@ -86,12 +90,12 @@ impl PixivClient {
     /// 构建请求头
     async fn build_headers(&self) -> Result<HeaderMap> {
         let mut headers = HeaderMap::new();
-        
+
         // 设置 User-Agent
         headers.insert(USER_AGENT, HeaderValue::from_static(USER_AGENT_VALUE));
         headers.insert("App-OS", HeaderValue::from_static("ios"));
         headers.insert("App-OS-Version", HeaderValue::from_static("14.6"));
-        
+
         // 设置 Authorization
         let token_info = self.token_info.read().await;
         if let Some(ref info) = *token_info {
@@ -102,9 +106,11 @@ impl PixivClient {
                     .map_err(|e| Error::Other(format!("Invalid auth header: {}", e)))?,
             );
         } else {
-            return Err(Error::AuthError("Not authenticated, call login() first".to_string()));
+            return Err(Error::Auth(
+                "Not authenticated, call login() first".to_string(),
+            ));
         }
-        
+
         Ok(headers)
     }
 
@@ -116,7 +122,7 @@ impl PixivClient {
     ) -> Result<T> {
         // 确保 token 有效，必要时自动刷新
         self.ensure_token_valid().await?;
-        
+
         let url = format!("{}{}", APP_API_HOST, path);
         let headers = self.build_headers().await?;
 
@@ -132,7 +138,7 @@ impl PixivClient {
         let text = response.text().await?;
 
         if !status.is_success() {
-            return Err(Error::ApiError {
+            return Err(Error::Api {
                 message: text,
                 status: status.as_u16(),
             });
@@ -143,7 +149,7 @@ impl PixivClient {
     }
 
     /// 获取用户作品列表
-    /// 
+    ///
     /// # 参数
     /// - `user_id`: 画师 ID
     /// - `illust_type`: 作品类型 ("illust", "manga" 或 None 表示全部)
@@ -171,13 +177,14 @@ impl PixivClient {
     }
 
     /// 获取作品详情
+    #[allow(dead_code)]
     pub async fn illust_detail(&self, illust_id: u64) -> Result<IllustDetail> {
         let params = vec![("illust_id", illust_id.to_string())];
         self.get("/v1/illust/detail", &params).await
     }
 
     /// 获取排行榜
-    /// 
+    ///
     /// # 参数
     /// - `mode`: 排行榜模式 (day, week, month, day_male, day_female, etc.)
     /// - `date`: 日期 (YYYY-MM-DD 格式，None 表示最新)
@@ -205,7 +212,7 @@ impl PixivClient {
     }
 
     /// 获取用户详情
-    /// 
+    ///
     /// # 参数
     /// - `user_id`: 用户 ID
     pub async fn user_detail(&self, user_id: u64) -> Result<UserDetail> {

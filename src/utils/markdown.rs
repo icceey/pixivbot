@@ -1,15 +1,15 @@
 /// Escape special characters for Telegram MarkdownV2 format
-/// 
+///
 /// This function escapes all special characters that have meaning in Telegram's MarkdownV2:
 /// _ * [ ] ( ) ~ ` > # + - = | { } . !
-/// 
+///
 /// Use this when you need to display user-generated content (like titles, names, tags)
 /// in Telegram messages with MarkdownV2 parse mode.
-/// 
+///
 /// # Example
 /// ```
 /// use pixivbot::utils::markdown::escape;
-/// 
+///
 /// let title = "Hello *World*!";
 /// let escaped = escape(title);
 /// assert_eq!(escaped, "Hello \\*World\\*\\!");

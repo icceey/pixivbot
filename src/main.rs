@@ -1,18 +1,18 @@
+mod bot;
 mod config;
-mod error;
 mod db;
+mod error;
 mod pixiv;
 mod pixiv_client;
-mod bot;
 mod scheduler;
 mod utils;
 
 use crate::config::Config;
 use crate::error::AppResult;
-use tracing::{info, error};
-use tracing_subscriber::{prelude::*, EnvFilter};
-use tracing_subscriber::fmt::time::ChronoLocal;
 use sea_orm_migration::MigratorTrait;
+use tracing::{error, info};
+use tracing_subscriber::fmt::time::ChronoLocal;
+use tracing_subscriber::{prelude::*, EnvFilter};
 
 #[tokio::main]
 async fn main() -> AppResult<()> {
@@ -75,36 +75,37 @@ async fn main() -> AppResult<()> {
 
     // Initialize repository
     let repo = std::sync::Arc::new(db::repo::Repo::new(db.clone()));
-    
+
     // Test database connection
     repo.ping().await?;
     info!("✅ Database ping successful");
-    
+
     // Initialize Pixiv Client
     info!("Initializing Pixiv client...");
     let mut pixiv_client = pixiv::client::PixivClient::new(config.pixiv.clone())?;
     pixiv_client.login().await?;
     let pixiv_client = std::sync::Arc::new(tokio::sync::RwLock::new(pixiv_client));
     info!("✅ Pixiv client initialized");
-    
+
     // Create cache directory
     std::fs::create_dir_all("data/cache")?;
     info!("✅ Cache directory ready");
-    
+
     // Initialize Downloader (use reqwest client)
     let http_client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()?;
-    let downloader = std::sync::Arc::new(
-        pixiv::downloader::Downloader::new(http_client, "data/cache")
-    );
+    let downloader = std::sync::Arc::new(pixiv::downloader::Downloader::new(
+        http_client,
+        "data/cache",
+    ));
     info!("✅ Downloader initialized");
 
     info!("PixivBot initialization complete");
-    
+
     // Initialize Telegram Bot
     let bot = teloxide::Bot::new(config.telegram.bot_token.clone());
-    
+
     // Initialize scheduler
     let scheduler_config = config.scheduler.clone();
     let sensitive_tags = config.content.sensitive_tags.clone();
@@ -118,39 +119,48 @@ async fn main() -> AppResult<()> {
         scheduler_config.max_task_interval_sec,
         sensitive_tags,
     );
-    
+
     info!("✅ Scheduler initialized");
-    
+
     // Spawn scheduler in background
     let scheduler_handle = tokio::spawn(async move {
         scheduler.run().await;
     });
-    
+
     info!("🤖 Starting Telegram Bot...");
-    
+
     // Setup Ctrl+C handler
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
     tokio::spawn(async move {
-        tokio::signal::ctrl_c().await.expect("Failed to listen for Ctrl+C");
+        tokio::signal::ctrl_c()
+            .await
+            .expect("Failed to listen for Ctrl+C");
         info!("Received Ctrl+C, shutting down...");
         let _ = shutdown_tx.send(()).await;
     });
-    
+
     // Start Bot in a separate task (non-blocking)
     let bot_handle = tokio::spawn(async move {
-        if let Err(e) = bot::run(config.telegram, repo.clone(), pixiv_client.clone(), downloader.clone()).await {
+        if let Err(e) = bot::run(
+            config.telegram,
+            repo.clone(),
+            pixiv_client.clone(),
+            downloader.clone(),
+        )
+        .await
+        {
             error!("Bot error: {:?}", e);
         }
     });
-    
+
     // Wait for shutdown signal
     shutdown_rx.recv().await;
     info!("Shutting down gracefully...");
-    
+
     // Abort tasks
     bot_handle.abort();
     scheduler_handle.abort();
-    
+
     info!("✅ Shutdown complete");
     Ok(())
 }

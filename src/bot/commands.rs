@@ -44,8 +44,14 @@ impl Command {
             BotCommand::new("unsub", "取消订阅作者 - /unsub <author_id,...>"),
             BotCommand::new("unsubrank", "取消订阅排行榜 - /unsubrank <mode>"),
             BotCommand::new("list", "列出当前订阅"),
-            BotCommand::new("blursensitive", "启用或禁用敏感内容模糊 - /blursensitive <on|off>"),
-            BotCommand::new("excludetags", "设置排除的标签 - /excludetags <tag1,tag2,...>"),
+            BotCommand::new(
+                "blursensitive",
+                "启用或禁用敏感内容模糊 - /blursensitive <on|off>",
+            ),
+            BotCommand::new(
+                "excludetags",
+                "设置排除的标签 - /excludetags <tag1,tag2,...>",
+            ),
             BotCommand::new("clearexcludedtags", "清除所有排除的标签"),
             BotCommand::new("settings", "显示聊天设置"),
         ]

@@ -2,10 +2,10 @@
 pub mod entities;
 pub mod repo;
 
-use sea_orm::{Database, DatabaseConnection, ConnectOptions};
 use crate::error::AppResult;
-use tracing::info;
+use sea_orm::{ConnectOptions, Database, DatabaseConnection};
 use std::time::Duration;
+use tracing::info;
 
 pub async fn establish_connection(database_url: &str) -> AppResult<DatabaseConnection> {
     let mut opt = ConnectOptions::new(database_url);
@@ -18,6 +18,6 @@ pub async fn establish_connection(database_url: &str) -> AppResult<DatabaseConne
 
     let connection = Database::connect(opt).await?;
     info!("Connected to database: {}", database_url);
-    
+
     Ok(connection)
 }
