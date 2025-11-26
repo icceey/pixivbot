@@ -80,29 +80,22 @@ impl SchedulerEngine {
             }
         };
         
-        // Calculate next poll time with random interval
-        let random_interval_sec = rand::rng()
-            .random_range(self.min_task_interval_sec..=self.max_task_interval_sec);
-        let next_poll = Local::now() + chrono::Duration::seconds(random_interval_sec as i64);
-        
-        // Update task status
-        let latest_data = if result.is_ok() {
-            // Keep existing latest_data or set empty
-            task.latest_data.clone()
-        } else {
-            task.latest_data.clone()
-        };
-        
-        // Use task creator as updater (maintains foreign key integrity)
-        self.repo.update_task_after_poll(
-            task.id,
-            next_poll,
-            latest_data,
-            task.created_by,
-        ).await?;
-        
+        // Note: task's latest_data and next_poll_at are updated inside execute_*_task methods
+        // We only log errors here, no need to update task again
         if let Err(e) = result {
             error!("Task execution failed: {}", e);
+            
+            // On error, still update the poll time to avoid immediate retry
+            let random_interval_sec = rand::rng()
+                .random_range(self.min_task_interval_sec..=self.max_task_interval_sec);
+            let next_poll = Local::now() + chrono::Duration::seconds(random_interval_sec as i64);
+            
+            self.repo.update_task_after_poll(
+                task.id,
+                next_poll,
+                task.latest_data.clone(),
+                task.created_by,
+            ).await?;
         }
         
         Ok(())
@@ -122,6 +115,10 @@ impl SchedulerEngine {
         
         if illusts.is_empty() {
             info!("No illusts found for author {}", author_id);
+            let random_interval_sec = rand::rng()
+                .random_range(self.min_task_interval_sec..=self.max_task_interval_sec);
+            let next_poll = Local::now() + chrono::Duration::seconds(random_interval_sec as i64);
+            self.repo.update_task_after_poll(task.id, next_poll, task.latest_data.clone(), task.created_by).await?;
             return Ok(());
         }
         
@@ -142,6 +139,10 @@ impl SchedulerEngine {
         
         if new_illusts.is_empty() {
             info!("No new illusts for author {}", author_id);
+            let random_interval_sec = rand::rng()
+                .random_range(self.min_task_interval_sec..=self.max_task_interval_sec);
+            let next_poll = Local::now() + chrono::Duration::seconds(random_interval_sec as i64);
+            self.repo.update_task_after_poll(task.id, next_poll, task.latest_data.clone(), task.created_by).await?;
             return Ok(());
         }
         
