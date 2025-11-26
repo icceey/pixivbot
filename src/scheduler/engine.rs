@@ -321,8 +321,8 @@ impl SchedulerEngine {
         
         // Keep only the last 100 IDs to prevent unbounded growth
         if all_pushed_ids.len() > 100 {
-            all_pushed_ids = all_pushed_ids.into_iter().rev().take(100).collect();
-            all_pushed_ids.reverse();
+            let skip_count = all_pushed_ids.len() - 100;
+            all_pushed_ids = all_pushed_ids.into_iter().skip(skip_count).collect();
         }
         
         let updated_data = json!({

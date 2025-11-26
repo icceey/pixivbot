@@ -239,8 +239,8 @@ impl Notifier {
         }
     }
     
-    /// 发送媒体组，每张图片有自己的 caption (用于热榜推送)
-    /// 超过10张时自动分批发送多条消息 (Telegram 单条限制10张)
+    /// Send media group with individual caption for each photo (for ranking push)
+    /// Automatically splits into multiple messages when over 10 images (Telegram limit)
     pub async fn notify_with_individual_captions(
         &self,
         chat_id: ChatId,
@@ -256,7 +256,7 @@ impl Notifier {
             return Err(crate::error::AppError::Unknown("Image URLs and captions count mismatch".to_string()));
         }
         
-        // 单图: 使用单图发送方式
+        // Single image: use single image method
         if image_urls.len() == 1 {
             let result = self.notify_with_image(chat_id, &image_urls[0], Some(&captions[0]), has_spoiler).await;
             tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
@@ -265,7 +265,7 @@ impl Notifier {
         
         info!("Downloading and sending {} images with individual captions to chat {}", image_urls.len(), chat_id);
         
-        // 批量下载
+        // Batch download
         let local_paths = match self.downloader.download_all(image_urls).await {
             Ok(paths) => paths,
             Err(e) => {
@@ -275,35 +275,30 @@ impl Notifier {
             }
         };
         
-        // Telegram 限制: 媒体组最多10张图片,超过则分批发送
+        // Telegram limit: max 10 images per media group, split into batches if over
         const MAX_IMAGES_PER_GROUP: usize = 10;
         let total_images = local_paths.len();
         
-        // Combine paths with their captions
-        let items: Vec<_> = local_paths.into_iter()
-            .zip(captions.iter().cloned())
+        let chunks: Vec<_> = local_paths.chunks(MAX_IMAGES_PER_GROUP)
+            .zip(captions.chunks(MAX_IMAGES_PER_GROUP))
             .collect();
-        
-        let chunks: Vec<_> = items.chunks(MAX_IMAGES_PER_GROUP).collect();
         let total_batches = chunks.len();
         
         info!("Sending {} images in {} batch(es)", total_images, total_batches);
         
-        for (batch_idx, chunk) in chunks.into_iter().enumerate() {
-            let batch_paths: Vec<PathBuf> = chunk.iter().map(|(p, _)| p.clone()).collect();
-            let batch_captions: Vec<String> = chunk.iter().map(|(_, c)| c.clone()).collect();
-            let batch_size = batch_paths.len();
+        for (batch_idx, (path_chunk, caption_chunk)) in chunks.into_iter().enumerate() {
+            let batch_size = path_chunk.len();
             
             if let Err(e) = self.send_media_group_with_individual_captions(
                 chat_id, 
-                batch_paths, 
-                &batch_captions,
+                path_chunk,
+                caption_chunk,
                 has_spoiler,
                 batch_idx,
                 total_batches,
             ).await {
                 warn!("Failed to send batch {}/{}: {}", batch_idx + 1, total_batches, e);
-                // 继续发送剩余批次
+                // Continue with remaining batches
                 continue;
             }
             
@@ -315,11 +310,11 @@ impl Notifier {
         Ok(())
     }
     
-    /// 发送媒体组，每张图片有自己的 caption
+    /// Send media group with individual caption for each photo
     async fn send_media_group_with_individual_captions(
         &self,
         chat_id: ChatId,
-        file_paths: Vec<PathBuf>,
+        file_paths: &[PathBuf],
         captions: &[String],
         has_spoiler: bool,
         batch_idx: usize,
@@ -332,18 +327,18 @@ impl Notifier {
             return Err(crate::error::AppError::Unknown("No files to send".to_string()));
         }
         
-        // 构建媒体组，每张图片有自己的 caption
+        // Build media group with individual caption for each photo
         let media: Vec<InputMedia> = file_paths
-            .into_iter()
+            .iter()
             .zip(captions.iter())
             .enumerate()
             .map(|(idx, (path, caption))| {
                 let input_file = InputFile::file(path);
                 let mut photo = InputMediaPhoto::new(input_file);
                 
-                // 每张图片设置自己的 caption
+                // Set individual caption for each photo
                 let final_caption = if batch_idx > 0 && idx == 0 {
-                    // 非第一批的第一张图添加批次标记
+                    // Add batch marker to first photo of non-first batches
                     format!("\\(continued {}/{}\\)\n\n{}", batch_idx + 1, total_batches, caption)
                 } else {
                     caption.clone()
