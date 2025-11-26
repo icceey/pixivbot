@@ -3,6 +3,7 @@ pub mod notifier;
 mod handler;
 
 use teloxide::prelude::*;
+use teloxide::utils::command::BotCommands;
 use crate::config::TelegramConfig;
 use crate::error::AppResult;
 use crate::db::repo::Repo;
@@ -34,7 +35,14 @@ pub async fn run(
     let handler = BotHandler::new(bot.clone(), repo, pixiv_client, config.owner_id, is_public_mode);
     
     info!("✅ Bot initialized, starting command handler");
-    
+
+    // TODO 临时设置所有命令可见
+    let cmds = Command::bot_commands();
+    let r = bot.set_my_commands(cmds);
+    if let Err(e) = r.await {
+        tracing::warn!("Failed to set bot commands: {}", e);
+    }
+
     Command::repl(bot, move |bot: Bot, msg: Message, cmd: Command| {
         let handler = handler.clone();
         async move {

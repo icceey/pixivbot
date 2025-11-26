@@ -52,7 +52,7 @@ impl BotHandler {
             Err(e) => {
                 let error_msg = format!("Failed to ensure user/chat: {}", e);
                 error!("{}", error_msg);
-                bot.send_message(chat_id, "⚠️ Database error occurred").await?;
+                bot.send_message(chat_id, "⚠️ 数据库错误").await?;
                 return Ok(());
             }
         };
@@ -157,54 +157,42 @@ impl BotHandler {
 
     async fn handle_help(&self, bot: Bot, chat_id: ChatId) -> ResponseResult<()> {
         let help_text = r#"
-📚 *PixivBot Help*
+📚 *PixivBot 帮助*
 
-*Available Commands:*
+*可用命令:*
 
 📌 `/sub <id,...> [+tag1 \-tag2]`
-   Subscribe to Pixiv author\(s\)
-   \- `<id,...>`: Comma\-separated Pixiv user IDs
-   \- `\+tag`: Include only works with this tag
-   \- `\-tag`: Exclude works with this tag
-   \- Example: `/sub 123456,789012 \+原神 \-R\-18`
+   订阅 Pixiv 作者
+   \- `<id,...>`: 以逗号分隔的 Pixiv 用户 ID
+   \- `\+tag`: 仅包含带有此标签的作品
+   \- `\-tag`: 排除带有此标签的作品
+   \- 示例: `/sub 123456,789012 \+原神 \-R\-18`
 
 📊 `/subrank <mode>`
-   Subscribe to Pixiv ranking
-   - Modes: `day`, `week`, `month`, `day_male`, `day_female`, `week_original`, `week_rookie`, `day_manga`
-   - R18 variants: `day_r18`, `week_r18`, `week_r18g`, `day_male_r18`, `day_female_r18`
-   - Example: `/subrank day`
-
-📋 `/list`
-   List all your active subscriptions
+   订阅 Pixiv 排行榜
+   \- 模式: `day`, `week`, `month`, `day_male`, `day_female`, `week_original`, `week_rookie`, `day_manga`
+   \- R18 模式: `day_r18`, `week_r18`, `week_r18g`, `day_male_r18`, `day_female_r18`
+   \- 示例: `/subrank day`
 
 🗑 `/unsub <author_id,...>`
-   Unsubscribe from author subscription\(s\)
-   \- Use comma\-separated author IDs \(Pixiv user ID\)
-   \- Example: `/unsub 123456,789012`
+   取消订阅作者
+   \- 使用逗号分隔的作者 ID \(Pixiv 用户 ID\)
+   \- 示例: `/unsub 123456,789012`
 
 🗑 `/unsubrank <mode>`
-   Unsubscribe from ranking subscription
-   \- Example: `/unsubrank day`
-
-⚙️ `/settings`
-   Show current chat settings
+   取消订阅排行榜
+   \- 示例: `/unsubrank day`
 
 🔒 `/blursensitive <on|off>`
-   Enable or disable sensitive tag blur
-   \- Example: `/blursensitive on`
+   启用或禁用敏感内容模糊
+   \- 示例: `/blursensitive on`
 
 🚫 `/excludetags <tag1,tag2,...>`
-   Set globally excluded tags for this chat
-   \- Example: `/excludetags R\-18,gore`
+   设置此聊天的全局排除标签
+   \- 示例: `/excludetags R\-18,gore`
 
 🗑 `/clearexcludedtags`
-   Clear all excluded tags
-
-❓ `/help`
-   Show this help message
-
-\-\-\-
-Made with ❤️ using Rust
+   清除所有排除的标签
 "#;
 
         bot.send_message(chat_id, help_text)
@@ -223,7 +211,7 @@ Made with ❤️ using Rust
         let parts: Vec<&str> = args.split_whitespace().collect();
         
         if parts.is_empty() {
-            bot.send_message(chat_id, "❌ Usage: `/sub <id,...> [+tag1 -tag2]`")
+            bot.send_message(chat_id, "❌ 用法: `/sub <id,...> [+tag1 -tag2]`")
                 .parse_mode(ParseMode::MarkdownV2)
                 .await?;
             return Ok(());
@@ -234,7 +222,7 @@ Made with ❤️ using Rust
         let author_ids: Vec<&str> = ids_str.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
         
         if author_ids.is_empty() {
-            bot.send_message(chat_id, "❌ Please provide at least one author ID")
+            bot.send_message(chat_id, "❌ 请提供至少一个作者 ID")
                 .await?;
             return Ok(());
         }
@@ -270,7 +258,7 @@ Made with ❤️ using Rust
             let author_id = match author_id_str.parse::<u64>() {
                 Ok(id) => id,
                 Err(_) => {
-                    failed_list.push(format!("`{}` \\(invalid ID\\)", author_id_str));
+                    failed_list.push(format!("`{}` \\(无效 ID\\)", author_id_str));
                     continue;
                 }
             };
@@ -282,7 +270,7 @@ Made with ❤️ using Rust
                     Ok(user) => user.name,
                     Err(e) => {
                         error!("Failed to get user detail for {}: {}", author_id, e);
-                        failed_list.push(format!("`{}` \\(not found\\)", author_id));
+                        failed_list.push(format!("`{}` \\(未找到\\)", author_id));
                         continue;
                     }
                 }
@@ -307,13 +295,13 @@ Made with ❤️ using Rust
                         }
                         Err(e) => {
                             error!("Failed to create subscription for {}: {}", author_id, e);
-                            failed_list.push(format!("`{}` \\(subscription error\\)", author_id));
+                            failed_list.push(format!("`{}` \\(订阅失败\\)", author_id));
                         }
                     }
                 }
                 Err(e) => {
                     error!("Failed to create task for {}: {}", author_id, e);
-                    failed_list.push(format!("`{}` \\(task error\\)", author_id));
+                    failed_list.push(format!("`{}` \\(任务创建失败\\)", author_id));
                 }
             }
         }
@@ -322,14 +310,14 @@ Made with ❤️ using Rust
         let mut response = String::new();
         
         if !success_list.is_empty() {
-            response.push_str("✅ Successfully subscribed to:\n");
+            response.push_str("✅ 成功订阅:\n");
             for author in &success_list {
                 response.push_str(&format!("  • {}\n", author));
             }
             
             if let Some(ref tags) = filter_tags {
                 response.push_str(&format!(
-                    "\n🏷 Filters: Include: {:?}, Exclude: {:?}",
+                    "\n🏷 过滤器: 包含: {:?}, 排除: {:?}",
                     tags.get("include"),
                     tags.get("exclude")
                 ));
@@ -340,7 +328,7 @@ Made with ❤️ using Rust
             if !response.is_empty() {
                 response.push_str("\n\n");
             }
-            response.push_str("❌ Failed to subscribe to:\n");
+            response.push_str("❌ 订阅失败:\n");
             for author in &failed_list {
                 response.push_str(&format!("  • {}\n", author));
             }
@@ -365,7 +353,7 @@ Made with ❤️ using Rust
         if mode.is_empty() {
             bot.send_message(
                 chat_id,
-                "❌ Usage: `/subrank <mode>`\nModes: day, week, month, day\\_r18, etc\\."
+                "❌ 用法: `/subrank <mode>`\n模式: day, week, month, day\\_r18 等"
             )
             .parse_mode(ParseMode::MarkdownV2)
             .await?;
@@ -383,7 +371,7 @@ Made with ❤️ using Rust
         if !valid_modes.contains(&mode) {
             bot.send_message(
                 chat_id,
-                format!("❌ Invalid ranking mode. Valid modes: {}", valid_modes.join(", "))
+                format!("❌ 无效的排行榜模式。有效模式: {}", valid_modes.join(", "))
             )
             .await?;
             return Ok(());
@@ -406,21 +394,21 @@ Made with ❤️ using Rust
                     Ok(_) => {
                         bot.send_message(
                             chat_id,
-                            format!("✅ Successfully subscribed to `{}` ranking", mode.replace('_', "\\_"))
+                            format!("✅ 成功订阅 `{}` 排行榜", mode.replace('_', "\\_"))
                         )
                         .parse_mode(ParseMode::MarkdownV2)
                         .await?;
                     }
                     Err(e) => {
                         error!("Failed to create subscription: {}", e);
-                        bot.send_message(chat_id, "❌ Failed to create subscription")
+                        bot.send_message(chat_id, "❌ 创建订阅失败")
                             .await?;
                     }
                 }
             }
             Err(e) => {
                 error!("Failed to create task: {}", e);
-                bot.send_message(chat_id, "❌ Failed to create subscription task")
+                bot.send_message(chat_id, "❌ 创建订阅任务失败")
                     .await?;
             }
         }
@@ -437,7 +425,7 @@ Made with ❤️ using Rust
         let ids_str = args.trim();
         
         if ids_str.is_empty() {
-            bot.send_message(chat_id, "❌ Usage: `/unsub <author_id,...>`")
+            bot.send_message(chat_id, "❌ 用法: `/unsub <author_id,...>`")
                 .parse_mode(ParseMode::MarkdownV2)
                 .await?;
             return Ok(());
@@ -475,16 +463,16 @@ Made with ❤️ using Rust
                         }
                         Err(e) => {
                             error!("Failed to delete subscription for {}: {}", author_id, e);
-                            failed_list.push(format!("`{}` (not subscribed)", author_id));
+                            failed_list.push(format!("`{}` (未订阅)", author_id));
                         }
                     }
                 }
                 Ok(None) => {
-                    failed_list.push(format!("`{}` (not found)", author_id));
+                    failed_list.push(format!("`{}` (未找到)", author_id));
                 }
                 Err(e) => {
                     error!("Failed to get task for {}: {}", author_id, e);
-                    failed_list.push(format!("`{}` (error)", author_id));
+                    failed_list.push(format!("`{}` (错误)", author_id));
                 }
             }
         }
@@ -493,7 +481,7 @@ Made with ❤️ using Rust
         let mut response = String::new();
         
         if !success_list.is_empty() {
-            response.push_str("✅ Successfully unsubscribed from:\n");
+            response.push_str("✅ 成功取消订阅:\n");
             for author in &success_list {
                 response.push_str(&format!("  • {}\n", author));
             }
@@ -503,7 +491,7 @@ Made with ❤️ using Rust
             if !response.is_empty() {
                 response.push_str("\n");
             }
-            response.push_str("❌ Failed to unsubscribe from:\n");
+            response.push_str("❌ 取消订阅失败:\n");
             for author in &failed_list {
                 response.push_str(&format!("  • {}\n", author));
             }
@@ -525,7 +513,7 @@ Made with ❤️ using Rust
         let mode = args.trim();
         
         if mode.is_empty() {
-            bot.send_message(chat_id, "❌ Usage: `/unsubrank <mode>`")
+            bot.send_message(chat_id, "❌ 用法: `/unsubrank <mode>`")
                 .parse_mode(ParseMode::MarkdownV2)
                 .await?;
             return Ok(());
@@ -554,26 +542,26 @@ Made with ❤️ using Rust
                             }
                         }
                         
-                        bot.send_message(chat_id, format!("✅ Successfully unsubscribed from `{}` ranking", mode.replace('_', "\\_")))
+                        bot.send_message(chat_id, format!("✅ 成功取消订阅 `{}` 排行榜", mode.replace('_', "\\_")))
                             .parse_mode(ParseMode::MarkdownV2)
                             .await?;
                     }
                     Err(e) => {
                         error!("Failed to delete subscription: {}", e);
-                        bot.send_message(chat_id, "❌ Failed to unsubscribe\\. You may not be subscribed to this ranking\\.")
+                        bot.send_message(chat_id, "❌ 取消订阅失败。您可能未订阅此排行榜。")
                             .parse_mode(ParseMode::MarkdownV2)
                             .await?;
                     }
                 }
             }
             Ok(None) => {
-                bot.send_message(chat_id, format!("❌ Ranking `{}` not found in your subscriptions", mode.replace('_', "\\_")))
+                bot.send_message(chat_id, format!("❌ 未在您的订阅中找到 `{}` 排行榜", mode.replace('_', "\\_")))
                     .parse_mode(ParseMode::MarkdownV2)
                     .await?;
             }
             Err(e) => {
                 error!("Failed to get task: {}", e);
-                bot.send_message(chat_id, "❌ Database error occurred")
+                bot.send_message(chat_id, "❌ 数据库错误")
                     .await?;
             }
         }
@@ -585,13 +573,13 @@ Made with ❤️ using Rust
         match self.repo.list_subscriptions_by_chat(chat_id.0).await {
             Ok(subscriptions) => {
                 if subscriptions.is_empty() {
-                    bot.send_message(chat_id, "📭 You have no active subscriptions\\.\n\nUse `/sub` to subscribe\\!")
+                    bot.send_message(chat_id, "📭 您没有生效的订阅。\n\n使用 `/sub` 开始订阅！")
                         .parse_mode(ParseMode::MarkdownV2)
                         .await?;
                     return Ok(());
                 }
 
-                let mut message = "📋 *Your Subscriptions:*\n\n".to_string();
+                let mut message = "📋 *您的订阅:*\n\n".to_string();
                 
                 for (sub, task) in subscriptions {
                     let type_emoji = match task.r#type.as_str() {
@@ -665,7 +653,7 @@ Made with ❤️ using Rust
                     ));
                 }
 
-                message.push_str("\n💡 Use `/unsub <id>` or `/unsubrank <mode>` to unsubscribe");
+                message.push_str("\n💡 使用 `/unsub <id>` 或 `/unsubrank <mode>` 取消订阅");
 
                 bot.send_message(chat_id, message)
                     .parse_mode(ParseMode::MarkdownV2)
@@ -673,7 +661,7 @@ Made with ❤️ using Rust
             }
             Err(e) => {
                 error!("Failed to list subscriptions: {}", e);
-                bot.send_message(chat_id, "❌ Failed to retrieve subscriptions")
+                bot.send_message(chat_id, "❌ 获取订阅列表失败")
                     .await?;
             }
         }
@@ -694,9 +682,9 @@ Made with ❤️ using Rust
                 bot.send_message(
                     chat_id,
                     if is_admin {
-                        "❌ Usage: `/setadmin <user_id>`"
+                        "❌ 用法: `/setadmin <user_id>`"
                     } else {
-                        "❌ Usage: `/unsetadmin <user_id>`"
+                        "❌ 用法: `/unsetadmin <user_id>`"
                     }
                 )
                 .parse_mode(ParseMode::MarkdownV2)
@@ -716,7 +704,7 @@ Made with ❤️ using Rust
                 bot.send_message(
                     chat_id,
                     format!(
-                        "✅ Successfully set user `{}` role to **{}**",
+                        "✅ 成功将用户 `{}` 的角色设置为 **{}**",
                         user.id,
                         role
                     )
@@ -730,7 +718,7 @@ Made with ❤️ using Rust
                 error!("Failed to set user role: {}", e);
                 bot.send_message(
                     chat_id,
-                    "❌ Failed to set user role. User may not exist yet."
+                    "❌ 设置用户角色失败。用户可能不存在。"
                 )
                 .await?;
             }
@@ -756,9 +744,9 @@ Made with ❤️ using Rust
                     bot.send_message(
                         current_chat_id,
                         if enabled {
-                            "❌ Usage: `/enablechat [chat_id]`"
+                            "❌ 用法: `/enablechat [chat_id]`"
                         } else {
-                            "❌ Usage: `/disablechat [chat_id]`"
+                            "❌ 用法: `/disablechat [chat_id]`"
                         }
                     )
                     .parse_mode(ParseMode::MarkdownV2)
@@ -773,9 +761,9 @@ Made with ❤️ using Rust
                 bot.send_message(
                     current_chat_id,
                     if enabled {
-                        format!("✅ Chat `{}` enabled successfully", target_chat_id)
+                        format!("✅ 聊天 `{}` 已成功启用", target_chat_id)
                     } else {
-                        format!("✅ Chat `{}` disabled successfully", target_chat_id)
+                        format!("✅ 聊天 `{}` 已成功禁用", target_chat_id)
                     }
                 )
                 .parse_mode(ParseMode::MarkdownV2)
@@ -787,7 +775,7 @@ Made with ❤️ using Rust
                 error!("Failed to set chat enabled status: {}", e);
                 bot.send_message(
                     current_chat_id,
-                    "❌ Failed to update chat status"
+                    "❌ 更新聊天状态失败"
                 )
                 .await?;
             }
@@ -810,7 +798,7 @@ Made with ❤️ using Rust
             _ => {
                 bot.send_message(
                     chat_id,
-                    "❌ Usage: `/blursensitive <on|off>`"
+                    "❌ 用法: `/blursensitive <on|off>`"
                 )
                 .parse_mode(ParseMode::MarkdownV2)
                 .await?;
@@ -823,9 +811,9 @@ Made with ❤️ using Rust
                 bot.send_message(
                     chat_id,
                     if blur {
-                        "✅ Sensitive content blur **enabled**"
+                        "✅ 敏感内容模糊已**启用**"
                     } else {
-                        "✅ Sensitive content blur **disabled**"
+                        "✅ 敏感内容模糊已**禁用**"
                     }
                 )
                 .parse_mode(ParseMode::MarkdownV2)
@@ -835,7 +823,7 @@ Made with ❤️ using Rust
             }
             Err(e) => {
                 error!("Failed to set blur_sensitive_tags: {}", e);
-                bot.send_message(chat_id, "❌ Failed to update settings")
+                bot.send_message(chat_id, "❌ 更新设置失败")
                     .await?;
             }
         }
@@ -854,7 +842,7 @@ Made with ❤️ using Rust
         if arg.is_empty() {
             bot.send_message(
                 chat_id,
-                "❌ Usage: `/excludetags <tag1,tag2,...>`"
+                "❌ 用法: `/excludetags <tag1,tag2,...>`"
             )
             .parse_mode(ParseMode::MarkdownV2)
             .await?;
@@ -870,7 +858,7 @@ Made with ❤️ using Rust
         if tags.is_empty() {
             bot.send_message(
                 chat_id,
-                "❌ No valid tags provided"
+                "❌ 未提供有效的标签"
             )
             .await?;
             return Ok(());
@@ -884,7 +872,7 @@ Made with ❤️ using Rust
                     .map(|s| format!("`{}`", markdown::escape(s)))
                     .collect();
                 
-                let message = format!("✅ Excluded tags updated: {}", tag_list.join(", "));
+                let message = format!("✅ 排除标签已更新: {}", tag_list.join(", "));
                 
                 bot.send_message(chat_id, message)
                     .parse_mode(ParseMode::MarkdownV2)
@@ -894,7 +882,7 @@ Made with ❤️ using Rust
             }
             Err(e) => {
                 error!("Failed to set excluded_tags: {}", e);
-                bot.send_message(chat_id, "❌ Failed to update settings")
+                bot.send_message(chat_id, "❌ 更新设置失败")
                     .await?;
             }
         }
@@ -909,14 +897,14 @@ Made with ❤️ using Rust
     ) -> ResponseResult<()> {
         match self.repo.set_excluded_tags(chat_id.0, None).await {
             Ok(_) => {
-                bot.send_message(chat_id, "✅ Excluded tags cleared")
+                bot.send_message(chat_id, "✅ 排除标签已清除")
                     .await?;
                 
                 info!("Chat {} cleared excluded_tags", chat_id);
             }
             Err(e) => {
                 error!("Failed to clear excluded_tags: {}", e);
-                bot.send_message(chat_id, "❌ Failed to update settings")
+                bot.send_message(chat_id, "❌ 更新设置失败")
                     .await?;
             }
         }
@@ -932,15 +920,15 @@ Made with ❤️ using Rust
         match self.repo.get_chat(chat_id.0).await {
             Ok(Some(chat)) => {
                 let blur_status = if chat.blur_sensitive_tags {
-                    "**Enabled**"
+                    "**已启用**"
                 } else {
-                    "**Disabled**"
+                    "**已禁用**"
                 };
                 
                 let excluded_tags = if let Some(tags) = chat.excluded_tags {
                     if let Ok(tag_array) = serde_json::from_value::<Vec<String>>(tags) {
                         if tag_array.is_empty() {
-                            "None".to_string()
+                            "无".to_string()
                         } else {
                             tag_array.iter()
                                 .map(|s| format!("`{}`", markdown::escape(s)))
@@ -948,14 +936,14 @@ Made with ❤️ using Rust
                                 .join(", ")
                         }
                     } else {
-                        "None".to_string()
+                        "无".to_string()
                     }
                 } else {
-                    "None".to_string()
+                    "无".to_string()
                 };
                 
                 let message = format!(
-                    "⚙️ *Chat Settings*\n\n🔒 Sensitive content blur: {}\n🚫 Excluded tags: {}",
+                    "⚙️ *聊天设置*\n\n🔒 敏感内容模糊: {}\n🚫 排除标签: {}",
                     blur_status,
                     excluded_tags
                 );
@@ -965,12 +953,12 @@ Made with ❤️ using Rust
                     .await?;
             }
             Ok(None) => {
-                bot.send_message(chat_id, "❌ Chat not found")
+                bot.send_message(chat_id, "❌ 未找到聊天")
                     .await?;
             }
             Err(e) => {
                 error!("Failed to get chat settings: {}", e);
-                bot.send_message(chat_id, "❌ Failed to retrieve settings")
+                bot.send_message(chat_id, "❌ 获取设置失败")
                     .await?;
             }
         }
