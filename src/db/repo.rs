@@ -54,6 +54,16 @@ impl Repo {
         users::Entity::find_by_id(user_id).one(&self.db).await
     }
 
+    /// 获取所有管理员用户（包括 Admin 和 Owner）
+    pub async fn get_admin_users(&self) -> Result<Vec<users::Model>, DbErr> {
+        users::Entity::find()
+            .filter(
+                users::Column::Role.is_in([UserRole::Admin, UserRole::Owner])
+            )
+            .all(&self.db)
+            .await
+    }
+
     /// Set user role
     pub async fn set_user_role(&self, user_id: i64, role: UserRole) -> Result<users::Model, DbErr> {
         let user = users::Entity::find_by_id(user_id)

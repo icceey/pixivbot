@@ -758,16 +758,26 @@ impl BotHandler {
 
         match self.repo.set_chat_enabled(target_chat_id, enabled).await {
             Ok(_) => {
-                bot.send_message(
-                    current_chat_id,
-                    if enabled {
+                // 判断是否是当前聊天
+                let is_current_chat = target_chat_id == current_chat_id.0;
+                
+                let message = if enabled {
+                    if is_current_chat {
+                        "✅ 当前聊天已成功启用".to_string()
+                    } else {
                         format!("✅ 聊天 `{}` 已成功启用", target_chat_id)
+                    }
+                } else {
+                    if is_current_chat {
+                        "✅ 当前聊天已成功禁用".to_string()
                     } else {
                         format!("✅ 聊天 `{}` 已成功禁用", target_chat_id)
                     }
-                )
-                .parse_mode(ParseMode::MarkdownV2)
-                .await?;
+                };
+                
+                bot.send_message(current_chat_id, message)
+                    .parse_mode(ParseMode::MarkdownV2)
+                    .await?;
                 
                 info!("Admin {} chat {}", if enabled { "enabled" } else { "disabled" }, target_chat_id);
             }
