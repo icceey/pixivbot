@@ -36,9 +36,9 @@ async fn main() -> AppResult<()> {
     // Setup stdout layer with local time
     let stdout_layer = tracing_subscriber::fmt::layer()
         .with_line_number(true)
+        .with_file(true)
         .with_target(false)
-        .with_timer(local_timer.clone())
-        .pretty();
+        .with_timer(local_timer.clone());
 
     // Setup file layer with local time
     let file_layer = tracing_subscriber::fmt::layer()
