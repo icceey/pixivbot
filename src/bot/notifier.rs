@@ -17,6 +17,7 @@ impl Notifier {
     }
 
     /// Send text notification with Markdown formatting
+    #[allow(dead_code)]
     pub async fn notify(&self, chat_id: ChatId, message: &str) -> AppResult<()> {
         info!("Sending notification to chat {}", chat_id);
 
