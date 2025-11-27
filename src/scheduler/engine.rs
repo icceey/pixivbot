@@ -430,17 +430,12 @@ impl SchedulerEngine {
                 continue;
             }
 
-            // Send title message first
-            let message = format!(
-                "📊 *{} Ranking* \\- {} new\\!\n",
+            // Build title to prepend to first image caption
+            let title = format!(
+                "📊 *{} Ranking* \\- {} new\\!\n\n",
                 markdown::escape(&mode.replace('_', " ").to_uppercase()),
                 filtered_illusts.len()
             );
-
-            if let Err(e) = self.notifier.notify(chat_id, &message).await {
-                error!("Failed to notify chat {}: {}", chat_id, e);
-                continue;
-            }
 
             // Check if any illust has sensitive tags for spoiler
             let has_spoiler = chat.blur_sensitive_tags
@@ -465,7 +460,7 @@ impl SchedulerEngine {
                 // Build caption for this image
                 let tags = self.format_tags(illust);
 
-                let caption = format!(
+                let base_caption = format!(
                     "{}\\.  {}\nby {}\n\n❤️ {} \\| 🔗 [来源](https://pixiv\\.net/artworks/{}){}",
                     index + 1,
                     markdown::escape(&illust.title),
@@ -474,6 +469,13 @@ impl SchedulerEngine {
                     illust.id,
                     tags
                 );
+
+                // Prepend title to first image caption
+                let caption = if index == 0 {
+                    format!("{}{}", title, base_caption)
+                } else {
+                    base_caption
+                };
                 captions.push(caption);
             }
 
