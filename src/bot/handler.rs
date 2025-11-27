@@ -126,6 +126,17 @@ impl BotHandler {
             Command::ExcludeTags(args) => self.handle_exclude_tags(bot, chat_id, args).await,
             Command::ClearExcludedTags => self.handle_clear_excluded_tags(bot, chat_id).await,
             Command::Settings => self.handle_settings(bot, chat_id).await,
+            Command::Info => {
+                // Only admin/owner in private chat can use this command
+                if !user_role.is_admin() || !chat_id.is_user() {
+                    info!(
+                        "User {} attempted to use Info without permission (role: {:?}, is_private: {})",
+                        user_id, user_role, chat_id.is_user()
+                    );
+                    return Ok(()); // Silently ignore
+                }
+                self.handle_info(bot, chat_id).await
+            }
         }
     }
 
@@ -1024,6 +1035,29 @@ impl BotHandler {
                 bot.send_message(chat_id, "❌ 获取设置失败").await?;
             }
         }
+
+        Ok(())
+    }
+
+    async fn handle_info(&self, bot: Bot, chat_id: ChatId) -> ResponseResult<()> {
+        // Gather statistics
+        let admin_count = self.repo.count_admin_users().await.unwrap_or(0);
+        let enabled_chat_count = self.repo.count_enabled_chats().await.unwrap_or(0);
+        let subscription_count = self.repo.count_all_subscriptions().await.unwrap_or(0);
+        let task_count = self.repo.count_all_tasks().await.unwrap_or(0);
+
+        let message = format!(
+            "📊 *PixivBot 状态信息*\n\n\
+            👥 管理员人数: `{}`\n\
+            💬 启用的聊天数: `{}`\n\
+            📋 订阅数: `{}`\n\
+            📝 任务数: `{}`",
+            admin_count, enabled_chat_count, subscription_count, task_count
+        );
+
+        bot.send_message(chat_id, message)
+            .parse_mode(ParseMode::MarkdownV2)
+            .await?;
 
         Ok(())
     }

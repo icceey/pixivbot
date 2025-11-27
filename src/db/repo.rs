@@ -365,4 +365,32 @@ impl Repo {
             .count(&self.db)
             .await
     }
+
+    // ==================== Statistics ====================
+
+    /// Count all admin users (Admin + Owner)
+    pub async fn count_admin_users(&self) -> Result<u64, DbErr> {
+        users::Entity::find()
+            .filter(users::Column::Role.is_in([UserRole::Admin, UserRole::Owner]))
+            .count(&self.db)
+            .await
+    }
+
+    /// Count enabled chats
+    pub async fn count_enabled_chats(&self) -> Result<u64, DbErr> {
+        chats::Entity::find()
+            .filter(chats::Column::Enabled.eq(true))
+            .count(&self.db)
+            .await
+    }
+
+    /// Count all subscriptions
+    pub async fn count_all_subscriptions(&self) -> Result<u64, DbErr> {
+        subscriptions::Entity::find().count(&self.db).await
+    }
+
+    /// Count all tasks
+    pub async fn count_all_tasks(&self) -> Result<u64, DbErr> {
+        tasks::Entity::find().count(&self.db).await
+    }
 }
