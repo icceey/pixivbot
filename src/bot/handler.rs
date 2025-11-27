@@ -2,6 +2,7 @@ use crate::bot::Command;
 use crate::db::entities::role::UserRole;
 use crate::db::repo::Repo;
 use crate::pixiv::client::PixivClient;
+use crate::pixiv::model::RankingMode;
 use crate::utils::markdown;
 use serde_json::json;
 use std::sync::Arc;
@@ -381,48 +382,42 @@ impl BotHandler {
         user_id: i64,
         args: String,
     ) -> ResponseResult<()> {
-        let mode = args.trim();
+        let mode_str = args.trim();
 
-        if mode.is_empty() {
+        if mode_str.is_empty() {
+            let available_modes = RankingMode::all_modes().join(", ");
             bot.send_message(
                 chat_id,
-                "❌ 用法: `/subrank <mode>`\n模式: day, week, month, day\\_r18 等",
+                format!("❌ 用法: `/subrank <mode>`\n可用模式: {}", available_modes),
             )
             .parse_mode(ParseMode::MarkdownV2)
             .await?;
             return Ok(());
         }
-        let valid_modes = vec![
-            "day",
-            "week",
-            "month",
-            "day_male",
-            "day_female",
-            "week_original",
-            "week_rookie",
-            "day_manga",
-            "day_r18",
-            "week_r18",
-            "week_r18g",
-            "day_male_r18",
-            "day_female_r18",
-        ];
 
-        if !valid_modes.contains(&mode) {
-            bot.send_message(
-                chat_id,
-                format!("❌ 无效的排行榜模式。有效模式: {}", valid_modes.join(", ")),
-            )
-            .await?;
-            return Ok(());
-        }
+        // 解析排行榜模式
+        let mode = match RankingMode::from_str(mode_str) {
+            Some(mode) => mode,
+            None => {
+                let available_modes = RankingMode::all_modes().join(", ");
+                bot.send_message(
+                    chat_id,
+                    format!("❌ 无效的排行榜模式。可用模式: {}", available_modes),
+                )
+                .await?;
+                return Ok(());
+            }
+        };
+
+        // 使用模式字符串创建任务
+        let mode_str_for_db = mode.as_str();
 
         // Create or get task
         match self
             .repo
             .get_or_create_task(
                 "ranking".to_string(),
-                mode.to_string(),
+                mode_str_for_db.to_string(),
                 user_id,
                 None, // No author_name for ranking tasks
             )
@@ -436,12 +431,9 @@ impl BotHandler {
                     .await
                 {
                     Ok(_) => {
-                        bot.send_message(
-                            chat_id,
-                            format!("✅ 成功订阅 `{}` 排行榜", mode.replace('_', "\\_")),
-                        )
-                        .parse_mode(ParseMode::MarkdownV2)
-                        .await?;
+                        bot.send_message(chat_id, format!("✅ 成功订阅 {}", mode.display_name()))
+                            .parse_mode(ParseMode::MarkdownV2)
+                            .await?;
                     }
                     Err(e) => {
                         error!("Failed to create subscription: {}", e);
@@ -563,17 +555,37 @@ impl BotHandler {
         chat_id: ChatId,
         args: String,
     ) -> ResponseResult<()> {
-        let mode = args.trim();
+        let mode_str = args.trim();
 
-        if mode.is_empty() {
+        if mode_str.is_empty() {
             bot.send_message(chat_id, "❌ 用法: `/unsubrank <mode>`")
                 .parse_mode(ParseMode::MarkdownV2)
                 .await?;
             return Ok(());
         }
 
+        // 解析排行榜模式
+        let mode = match RankingMode::from_str(mode_str) {
+            Some(mode) => mode,
+            None => {
+                let available_modes = RankingMode::all_modes().join(", ");
+                bot.send_message(
+                    chat_id,
+                    format!("❌ 无效的排行榜模式。可用模式: {}", available_modes),
+                )
+                .await?;
+                return Ok(());
+            }
+        };
+
+        let mode_str_for_db = mode.as_str();
+
         // Find task by ranking mode
-        match self.repo.get_task_by_type_value("ranking", mode).await {
+        match self
+            .repo
+            .get_task_by_type_value("ranking", mode_str_for_db)
+            .await
+        {
             Ok(Some(task)) => {
                 // Delete subscription for this chat and task
                 match self
@@ -592,7 +604,7 @@ impl BotHandler {
                                     } else {
                                         info!(
                                             "Deleted task {} (ranking {}) - no more subscriptions",
-                                            task.id, mode
+                                            task.id, mode_str_for_db
                                         );
                                     }
                                 }
@@ -604,7 +616,7 @@ impl BotHandler {
 
                         bot.send_message(
                             chat_id,
-                            format!("✅ 成功取消订阅 `{}` 排行榜", mode.replace('_', "\\_")),
+                            format!("✅ 成功取消订阅 {}", mode.display_name()),
                         )
                         .parse_mode(ParseMode::MarkdownV2)
                         .await?;
@@ -620,10 +632,7 @@ impl BotHandler {
             Ok(None) => {
                 bot.send_message(
                     chat_id,
-                    format!(
-                        "❌ 未在您的订阅中找到 `{}` 排行榜",
-                        mode.replace('_', "\\_")
-                    ),
+                    format!("❌ 未在您的订阅中找到 {}", mode.display_name()),
                 )
                 .parse_mode(ParseMode::MarkdownV2)
                 .await?;
@@ -656,13 +665,24 @@ impl BotHandler {
                         _ => "❓",
                     };
 
-                    // 构建显示名称：对于 author 类型显示作者名字，否则显示 value
+                    // 构建显示名称：对于 author 类型显示作者名字，对于 ranking 类型显示排行榜类型和模式
                     // 使用代码块格式使得ID可以复制
                     let display_info = if task.r#type == "author" {
                         if let Some(ref name) = task.author_name {
                             format!("{} \\| ID: `{}`", markdown::escape(name), task.value)
                         } else {
                             format!("ID: `{}`", task.value)
+                        }
+                    } else if task.r#type == "ranking" {
+                        // 对于排行榜，显示友好的排行榜名称
+                        match RankingMode::from_str(&task.value) {
+                            Some(mode) => {
+                                format!("排行榜 \\({}\\)", mode.display_name())
+                            }
+                            None => {
+                                // 如果无法解析，显示原始值
+                                format!("排行榜 \\({}\\)", task.value.replace('_', "\\_"))
+                            }
                         }
                     } else {
                         task.value.replace('_', "\\_")
