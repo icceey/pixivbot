@@ -674,14 +674,22 @@ impl BotHandler {
                             format!("ID: `{}`", task.value)
                         }
                     } else if task.r#type == "ranking" {
-                        // 对于排行榜，显示友好的排行榜名称
+                        // 对于排行榜，显示友好的排行榜名称和模式
                         match RankingMode::from_str(&task.value) {
                             Some(mode) => {
-                                format!("排行榜 \\({}\\)", mode.display_name())
+                                format!(
+                                    "排行榜 \\({}\\) \\| MODE: `{}`",
+                                    mode.display_name(),
+                                    mode.as_str()
+                                )
                             }
                             None => {
                                 // 如果无法解析，显示原始值
-                                format!("排行榜 \\({}\\)", task.value.replace('_', "\\_"))
+                                format!(
+                                    "排行榜 \\({}\\) \\| MODE: `{}`",
+                                    task.value.replace('_', "\\_"),
+                                    task.value
+                                )
                             }
                         }
                     } else {
