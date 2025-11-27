@@ -43,7 +43,7 @@ impl Default for LoggingConfig {
     fn default() -> Self {
         Self {
             level: "info".to_string(),
-            dir: "logs".to_string(),
+            dir: "data/logs".to_string(),
         }
     }
 }

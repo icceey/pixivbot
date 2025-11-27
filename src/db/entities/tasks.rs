@@ -12,7 +12,6 @@ pub struct Model {
     #[sea_orm(indexed)]
     pub next_poll_at: DateTime,
     pub last_polled_at: Option<DateTime>,
-    pub latest_data: Option<Json>,
     pub created_by: i64,
     pub updated_by: i64,
     pub author_name: Option<String>, // 作者名字（仅 type="author" 时有值）

@@ -17,6 +17,7 @@ pub use commands::Command;
 pub use handler::BotHandler;
 
 pub async fn run(
+    bot: Bot,
     config: TelegramConfig,
     repo: Arc<Repo>,
     pixiv_client: Arc<tokio::sync::RwLock<PixivClient>>,
@@ -37,7 +38,6 @@ pub async fn run(
         }
     );
 
-    let bot = Bot::new(config.bot_token.clone());
     let handler = BotHandler::new(
         bot.clone(),
         repo.clone(),

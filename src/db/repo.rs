@@ -175,7 +175,6 @@ impl Repo {
             value: Set(value),
             next_poll_at: Set(next_poll_at.naive_local()),
             last_polled_at: Set(None),
-            latest_data: Set(None),
             created_by: Set(created_by),
             updated_by: Set(created_by),
             author_name: Set(author_name),
@@ -233,7 +232,6 @@ impl Repo {
         &self,
         task_id: i32,
         next_poll_at: DateTime<Local>,
-        latest_data: Option<JsonValue>,
         updated_by: i64,
     ) -> Result<tasks::Model, DbErr> {
         let task = tasks::Entity::find_by_id(task_id)
@@ -245,9 +243,6 @@ impl Repo {
         let mut active: tasks::ActiveModel = task.into_active_model();
         active.next_poll_at = Set(next_poll_at.naive_local());
         active.last_polled_at = Set(Some(now));
-        if latest_data.is_some() {
-            active.latest_data = Set(latest_data);
-        }
         active.updated_by = Set(updated_by);
 
         active.update(&self.db).await
@@ -364,5 +359,52 @@ impl Repo {
             .filter(subscriptions::Column::TaskId.eq(task_id))
             .count(&self.db)
             .await
+    }
+
+    /// Update subscription's latest_data (push state)
+    pub async fn update_subscription_latest_data(
+        &self,
+        subscription_id: i32,
+        latest_data: Option<JsonValue>,
+    ) -> Result<subscriptions::Model, DbErr> {
+        let subscription = subscriptions::Entity::find_by_id(subscription_id)
+            .one(&self.db)
+            .await?
+            .ok_or(DbErr::RecordNotFound(format!(
+                "Subscription {} not found",
+                subscription_id
+            )))?;
+
+        let mut active: subscriptions::ActiveModel = subscription.into_active_model();
+        active.latest_data = Set(latest_data);
+        active.update(&self.db).await
+    }
+
+    // ==================== Statistics ====================
+
+    /// Count all admin users (Admin + Owner)
+    pub async fn count_admin_users(&self) -> Result<u64, DbErr> {
+        users::Entity::find()
+            .filter(users::Column::Role.is_in([UserRole::Admin, UserRole::Owner]))
+            .count(&self.db)
+            .await
+    }
+
+    /// Count enabled chats
+    pub async fn count_enabled_chats(&self) -> Result<u64, DbErr> {
+        chats::Entity::find()
+            .filter(chats::Column::Enabled.eq(true))
+            .count(&self.db)
+            .await
+    }
+
+    /// Count all subscriptions
+    pub async fn count_all_subscriptions(&self) -> Result<u64, DbErr> {
+        subscriptions::Entity::find().count(&self.db).await
+    }
+
+    /// Count all tasks
+    pub async fn count_all_tasks(&self) -> Result<u64, DbErr> {
+        tasks::Entity::find().count(&self.db).await
     }
 }

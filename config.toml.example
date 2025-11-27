@@ -11,7 +11,7 @@ url = "sqlite:./data/pixivbot.db?mode=rwc"
 
 [logging]
 level = "info"
-dir = "./logs"
+dir = "./data/logs"
 
 [scheduler]
 # Tick interval in seconds (how often to check for pending tasks)
