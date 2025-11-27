@@ -84,7 +84,7 @@ impl SchedulerEngine {
             }
         };
 
-        // Note: task's latest_data and next_poll_at are updated inside execute_*_task methods
+        // Note: task's next_poll_at is updated inside execute_*_task methods
         // We only log errors here, no need to update task again
         if let Err(e) = result {
             error!("Task execution failed: {}", e);
@@ -95,12 +95,7 @@ impl SchedulerEngine {
             let next_poll = Local::now() + chrono::Duration::seconds(random_interval_sec as i64);
 
             self.repo
-                .update_task_after_poll(
-                    task.id,
-                    next_poll,
-                    task.latest_data.clone(),
-                    task.created_by,
-                )
+                .update_task_after_poll(task.id, next_poll, task.created_by)
                 .await?;
         }
 
@@ -125,79 +120,26 @@ impl SchedulerEngine {
                 rand::rng().random_range(self.min_task_interval_sec..=self.max_task_interval_sec);
             let next_poll = Local::now() + chrono::Duration::seconds(random_interval_sec as i64);
             self.repo
-                .update_task_after_poll(
-                    task.id,
-                    next_poll,
-                    task.latest_data.clone(),
-                    task.created_by,
-                )
+                .update_task_after_poll(task.id, next_poll, task.created_by)
                 .await?;
             return Ok(());
-        }
-
-        // Get latest illust ID from task data
-        let last_illust_id = task
-            .latest_data
-            .as_ref()
-            .and_then(|data| data.get("latest_illust_id"))
-            .and_then(|v| v.as_u64());
-
-        // Find new illusts
-        let new_illusts: Vec<_> = if let Some(last_id) = last_illust_id {
-            illusts
-                .into_iter()
-                .take_while(|illust| illust.id != last_id)
-                .collect()
-        } else {
-            // First run - only send the latest one
-            illusts.into_iter().take(1).collect()
-        };
-
-        if new_illusts.is_empty() {
-            info!("No new illusts for author {}", author_id);
-            let random_interval_sec =
-                rand::rng().random_range(self.min_task_interval_sec..=self.max_task_interval_sec);
-            let next_poll = Local::now() + chrono::Duration::seconds(random_interval_sec as i64);
-            self.repo
-                .update_task_after_poll(
-                    task.id,
-                    next_poll,
-                    task.latest_data.clone(),
-                    task.created_by,
-                )
-                .await?;
-            return Ok(());
-        }
-
-        info!(
-            "Found {} new illusts for author {}",
-            new_illusts.len(),
-            author_id
-        );
-
-        // Update latest_data with newest illust ID
-        if let Some(newest) = new_illusts.first() {
-            let random_interval_sec =
-                rand::rng().random_range(self.min_task_interval_sec..=self.max_task_interval_sec);
-            let updated_data = json!({
-                "latest_illust_id": newest.id,
-                "last_check": Local::now().to_rfc3339(),
-            });
-
-            self.repo
-                .update_task_after_poll(
-                    task.id,
-                    Local::now() + chrono::Duration::seconds(random_interval_sec as i64),
-                    Some(updated_data),
-                    task.created_by,
-                )
-                .await?;
         }
 
         // Get all subscriptions for this task
         let subscriptions = self.repo.list_subscriptions_by_task(task.id).await?;
 
-        // Notify each subscriber
+        if subscriptions.is_empty() {
+            info!("No subscriptions for author task {}", task.id);
+            let random_interval_sec =
+                rand::rng().random_range(self.min_task_interval_sec..=self.max_task_interval_sec);
+            let next_poll = Local::now() + chrono::Duration::seconds(random_interval_sec as i64);
+            self.repo
+                .update_task_after_poll(task.id, next_poll, task.created_by)
+                .await?;
+            return Ok(());
+        }
+
+        // Process each subscription with its own push state
         for subscription in subscriptions {
             let chat_id = ChatId(subscription.chat_id);
 
@@ -218,7 +160,6 @@ impl SchedulerEngine {
             let should_notify = if chat.enabled {
                 true
             } else {
-                // Chat is disabled, check if it's admin/owner private chat
                 match self.repo.get_user(subscription.chat_id).await {
                     Ok(Some(user)) if user.role.is_admin() => {
                         info!(
@@ -238,12 +179,62 @@ impl SchedulerEngine {
                 continue;
             }
 
+            // Get this subscription's last pushed illust ID
+            let last_illust_id = subscription
+                .latest_data
+                .as_ref()
+                .and_then(|data| data.get("latest_illust_id"))
+                .and_then(|v| v.as_u64());
+
+            // Find new illusts for this subscription
+            let new_illusts: Vec<_> = if let Some(last_id) = last_illust_id {
+                illusts
+                    .iter()
+                    .take_while(|illust| illust.id != last_id)
+                    .collect()
+            } else {
+                // First run for this subscription - only send the latest one
+                illusts.iter().take(1).collect()
+            };
+
+            if new_illusts.is_empty() {
+                continue;
+            }
+
+            info!(
+                "Found {} new illusts for subscription {} (chat {})",
+                new_illusts.len(),
+                subscription.id,
+                chat_id
+            );
+
             // Apply subscription tag filters
             let mut filtered_illusts =
-                self.apply_tag_filters(&new_illusts, &subscription.filter_tags);
+                self.apply_tag_filters_ref(&new_illusts, &subscription.filter_tags);
 
             // Apply chat-level excluded tags
-            filtered_illusts = self.apply_chat_excluded_tags(filtered_illusts, &chat.excluded_tags);
+            filtered_illusts =
+                self.apply_chat_excluded_tags_ref(filtered_illusts, &chat.excluded_tags);
+
+            // Update subscription's latest_data with newest illust ID (before filtering)
+            // We track the newest illust regardless of filter, to avoid re-processing
+            if let Some(newest) = new_illusts.first() {
+                let updated_data = json!({
+                    "latest_illust_id": newest.id,
+                    "last_check": Local::now().to_rfc3339(),
+                });
+
+                if let Err(e) = self
+                    .repo
+                    .update_subscription_latest_data(subscription.id, Some(updated_data))
+                    .await
+                {
+                    error!(
+                        "Failed to update subscription {} latest_data: {}",
+                        subscription.id, e
+                    );
+                }
+            }
 
             if filtered_illusts.is_empty() {
                 continue;
@@ -288,6 +279,14 @@ impl SchedulerEngine {
             }
         }
 
+        // Update task's next poll time
+        let random_interval_sec =
+            rand::rng().random_range(self.min_task_interval_sec..=self.max_task_interval_sec);
+        let next_poll = Local::now() + chrono::Duration::seconds(random_interval_sec as i64);
+        self.repo
+            .update_task_after_poll(task.id, next_poll, task.created_by)
+            .await?;
+
         Ok(())
     }
 
@@ -305,82 +304,35 @@ impl SchedulerEngine {
 
         if illusts.is_empty() {
             info!("No ranking illusts found for mode {}", mode);
-            return Ok(());
-        }
-
-        info!("Found {} ranking illusts for mode {}", illusts.len(), mode);
-
-        // Get previously pushed illust IDs from latest_data
-        let pushed_ids: Vec<u64> = task
-            .latest_data
-            .as_ref()
-            .and_then(|data| data.get("pushed_ids"))
-            .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().filter_map(|v| v.as_u64()).collect())
-            .unwrap_or_default();
-
-        // Filter out illusts that have already been pushed
-        let new_illusts: Vec<&crate::pixiv_client::Illust> = illusts
-            .iter()
-            .filter(|illust| !pushed_ids.contains(&illust.id))
-            .collect();
-
-        if new_illusts.is_empty() {
-            info!(
-                "No new ranking illusts for mode {} (all {} already pushed)",
-                mode,
-                illusts.len()
-            );
-            // Still update the task poll time
+            // Update task poll time
             self.repo
                 .update_task_after_poll(
                     task.id,
                     Local::now() + chrono::Duration::seconds(86400),
-                    task.latest_data.clone(),
                     task.updated_by,
                 )
                 .await?;
             return Ok(());
         }
 
-        info!(
-            "Found {} new ranking illusts for mode {} ({} already pushed)",
-            new_illusts.len(),
-            mode,
-            pushed_ids.len()
-        );
-
-        // Collect new illust IDs
-        let new_ids: Vec<u64> = new_illusts.iter().map(|i| i.id).collect();
-
-        // Update latest_data with pushed IDs (keep existing + add new)
-        let mut all_pushed_ids = pushed_ids.clone();
-        all_pushed_ids.extend(new_ids);
-
-        // Keep only the last 100 IDs to prevent unbounded growth
-        if all_pushed_ids.len() > 100 {
-            let skip_count = all_pushed_ids.len() - 100;
-            all_pushed_ids = all_pushed_ids.into_iter().skip(skip_count).collect();
-        }
-
-        let updated_data = json!({
-            "pushed_ids": all_pushed_ids,
-            "last_check": Local::now().to_rfc3339(),
-        });
-
-        self.repo
-            .update_task_after_poll(
-                task.id,
-                Local::now() + chrono::Duration::seconds(86400),
-                Some(updated_data),
-                task.updated_by,
-            )
-            .await?;
+        info!("Found {} ranking illusts for mode {}", illusts.len(), mode);
 
         // Get all subscriptions
         let subscriptions = self.repo.list_subscriptions_by_task(task.id).await?;
 
-        // Notify each subscriber
+        if subscriptions.is_empty() {
+            info!("No subscriptions for ranking task {}", task.id);
+            self.repo
+                .update_task_after_poll(
+                    task.id,
+                    Local::now() + chrono::Duration::seconds(86400),
+                    task.updated_by,
+                )
+                .await?;
+            return Ok(());
+        }
+
+        // Process each subscription with its own push state
         for subscription in subscriptions {
             let chat_id = ChatId(subscription.chat_id);
 
@@ -401,7 +353,6 @@ impl SchedulerEngine {
             let should_notify = if chat.enabled {
                 true
             } else {
-                // Chat is disabled, check if it's admin/owner private chat
                 match self.repo.get_user(subscription.chat_id).await {
                     Ok(Some(user)) if user.role.is_admin() => {
                         info!(
@@ -419,6 +370,65 @@ impl SchedulerEngine {
 
             if !should_notify {
                 continue;
+            }
+
+            // Get this subscription's previously pushed illust IDs
+            let pushed_ids: Vec<u64> = subscription
+                .latest_data
+                .as_ref()
+                .and_then(|data| data.get("pushed_ids"))
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.iter().filter_map(|v| v.as_u64()).collect())
+                .unwrap_or_default();
+
+            // Filter out illusts that have already been pushed to this subscription
+            let new_illusts: Vec<&crate::pixiv_client::Illust> = illusts
+                .iter()
+                .filter(|illust| !pushed_ids.contains(&illust.id))
+                .collect();
+
+            if new_illusts.is_empty() {
+                info!(
+                    "No new ranking illusts for subscription {} (chat {})",
+                    subscription.id, chat_id
+                );
+                continue;
+            }
+
+            info!(
+                "Found {} new ranking illusts for subscription {} (chat {})",
+                new_illusts.len(),
+                subscription.id,
+                chat_id
+            );
+
+            // Collect new illust IDs
+            let new_ids: Vec<u64> = new_illusts.iter().map(|i| i.id).collect();
+
+            // Update subscription's latest_data with pushed IDs
+            let mut all_pushed_ids = pushed_ids.clone();
+            all_pushed_ids.extend(new_ids);
+
+            // Keep only the last 100 IDs to prevent unbounded growth
+            if all_pushed_ids.len() > 100 {
+                let skip_count = all_pushed_ids.len() - 100;
+                all_pushed_ids = all_pushed_ids.into_iter().skip(skip_count).collect();
+            }
+
+            let updated_data = json!({
+                "pushed_ids": all_pushed_ids,
+                "last_check": Local::now().to_rfc3339(),
+            });
+
+            if let Err(e) = self
+                .repo
+                .update_subscription_latest_data(subscription.id, Some(updated_data))
+                .await
+            {
+                error!(
+                    "Failed to update subscription {} latest_data: {}",
+                    subscription.id, e
+                );
             }
 
             // Apply chat-level excluded tags filter
@@ -492,10 +502,20 @@ impl SchedulerEngine {
             }
         }
 
+        // Update task's next poll time
+        self.repo
+            .update_task_after_poll(
+                task.id,
+                Local::now() + chrono::Duration::seconds(86400),
+                task.updated_by,
+            )
+            .await?;
+
         Ok(())
     }
 
-    /// Apply tag filters to illusts
+    /// Apply tag filters to illusts (for owned values)
+    #[allow(dead_code)]
     fn apply_tag_filters<'a>(
         &self,
         illusts: &'a [crate::pixiv_client::Illust],
@@ -558,6 +578,70 @@ impl SchedulerEngine {
             .collect()
     }
 
+    /// Apply tag filters to illusts (for reference values)
+    fn apply_tag_filters_ref<'a>(
+        &self,
+        illusts: &[&'a crate::pixiv_client::Illust],
+        filter_tags: &Option<serde_json::Value>,
+    ) -> Vec<&'a crate::pixiv_client::Illust> {
+        let Some(filters) = filter_tags else {
+            return illusts.to_vec();
+        };
+
+        let include_tags: Vec<String> = filters
+            .get("include")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_lowercase()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let exclude_tags: Vec<String> = filters
+            .get("exclude")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_lowercase()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        illusts
+            .iter()
+            .filter(|illust| {
+                let illust_tags: Vec<String> = illust
+                    .tags
+                    .iter()
+                    .map(|tag| tag.name.to_lowercase())
+                    .collect();
+
+                // Check exclude tags first (must not contain any - exact match)
+                if !exclude_tags.is_empty() {
+                    for exclude_tag in &exclude_tags {
+                        if illust_tags.iter().any(|t| t == exclude_tag) {
+                            return false;
+                        }
+                    }
+                }
+
+                // Check include tags (must contain at least one if specified - exact match)
+                if !include_tags.is_empty() {
+                    for include_tag in &include_tags {
+                        if illust_tags.iter().any(|t| t == include_tag) {
+                            return true;
+                        }
+                    }
+                    return false;
+                }
+
+                true
+            })
+            .copied()
+            .collect()
+    }
+
     /// Apply chat-level excluded tags filter (exact match, case-insensitive)
     fn apply_chat_excluded_tags<'a>(
         &self,
@@ -598,6 +682,16 @@ impl SchedulerEngine {
                 true
             })
             .collect()
+    }
+
+    /// Apply chat-level excluded tags filter for reference values
+    fn apply_chat_excluded_tags_ref<'a>(
+        &self,
+        illusts: Vec<&'a crate::pixiv_client::Illust>,
+        chat_excluded_tags: &Option<serde_json::Value>,
+    ) -> Vec<&'a crate::pixiv_client::Illust> {
+        // Same implementation as apply_chat_excluded_tags
+        self.apply_chat_excluded_tags(illusts, chat_excluded_tags)
     }
 
     /// Check if illust contains sensitive tags (exact match, case-insensitive)

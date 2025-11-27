@@ -9,6 +9,10 @@ pub struct Model {
     pub chat_id: i64,
     pub task_id: i32,
     pub filter_tags: Option<Json>,
+    /// Per-subscription push state:
+    /// - For author tasks: { "latest_illust_id": u64, "last_check": string }
+    /// - For ranking tasks: { "pushed_ids": [u64], "last_check": string }
+    pub latest_data: Option<Json>,
     pub created_at: DateTime,
 }
 

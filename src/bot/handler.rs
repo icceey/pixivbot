@@ -81,10 +81,6 @@ impl BotHandler {
             Command::SetAdmin(args) => {
                 // Only owner can use this command
                 if !user_role.is_owner() {
-                    info!(
-                        "User {} attempted to use SetAdmin without permission",
-                        user_id
-                    );
                     return Ok(()); // Silently ignore
                 }
                 self.handle_set_admin(bot, chat_id, args, true).await
@@ -92,10 +88,6 @@ impl BotHandler {
             Command::UnsetAdmin(args) => {
                 // Only owner can use this command
                 if !user_role.is_owner() {
-                    info!(
-                        "User {} attempted to use UnsetAdmin without permission",
-                        user_id
-                    );
                     return Ok(()); // Silently ignore
                 }
                 self.handle_set_admin(bot, chat_id, args, false).await
@@ -103,10 +95,6 @@ impl BotHandler {
             Command::EnableChat(args) => {
                 // Only admin or owner can use this command
                 if !user_role.is_admin() {
-                    info!(
-                        "User {} attempted to use EnableChat without permission",
-                        user_id
-                    );
                     return Ok(()); // Silently ignore
                 }
                 self.handle_enable_chat(bot, chat_id, args, true).await
@@ -114,10 +102,6 @@ impl BotHandler {
             Command::DisableChat(args) => {
                 // Only admin or owner can use this command
                 if !user_role.is_admin() {
-                    info!(
-                        "User {} attempted to use DisableChat without permission",
-                        user_id
-                    );
                     return Ok(()); // Silently ignore
                 }
                 self.handle_enable_chat(bot, chat_id, args, false).await
@@ -129,10 +113,6 @@ impl BotHandler {
             Command::Info => {
                 // Only admin/owner in private chat can use this command
                 if !user_role.is_admin() || !chat_id.is_user() {
-                    info!(
-                        "User {} attempted to use Info without permission (role: {:?}, is_private: {})",
-                        user_id, user_role, chat_id.is_user()
-                    );
                     return Ok(()); // Silently ignore
                 }
                 self.handle_info(bot, chat_id).await

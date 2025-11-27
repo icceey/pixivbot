@@ -60,8 +60,6 @@ async fn main() -> AppResult<()> {
         .init();
 
     info!("Starting PixivBot...");
-    info!("Configuration loaded from config.toml (or env)");
-    info!("Logging initialized at level: {}", log_level);
     info!("Logs are written to: {}", log_dir);
 
     // Connect to database
@@ -69,7 +67,6 @@ async fn main() -> AppResult<()> {
     info!("Database connection established");
 
     // Run migrations
-    info!("Running database migrations...");
     migration::Migrator::up(&db, None).await?;
     info!("✅ Database migrations completed");
 
@@ -81,7 +78,6 @@ async fn main() -> AppResult<()> {
     info!("✅ Database ping successful");
 
     // Initialize Pixiv Client
-    info!("Initializing Pixiv client...");
     let mut pixiv_client = pixiv::client::PixivClient::new(config.pixiv.clone())?;
     pixiv_client.login().await?;
     let pixiv_client = std::sync::Arc::new(tokio::sync::RwLock::new(pixiv_client));
@@ -89,7 +85,6 @@ async fn main() -> AppResult<()> {
 
     // Create cache directory
     std::fs::create_dir_all("data/cache")?;
-    info!("✅ Cache directory ready");
 
     // Initialize Downloader (use reqwest client)
     let http_client = reqwest::Client::builder()
@@ -142,6 +137,7 @@ async fn main() -> AppResult<()> {
     // Start Bot in a separate task (non-blocking)
     let bot_handle = tokio::spawn(async move {
         if let Err(e) = bot::run(
+            bot,
             config.telegram,
             repo.clone(),
             pixiv_client.clone(),
