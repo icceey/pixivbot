@@ -155,13 +155,7 @@ impl SchedulerEngine {
                 true
             } else {
                 match self.repo.get_user(subscription.chat_id).await {
-                    Ok(Some(user)) if user.role.is_admin() => {
-                        info!(
-                            "Chat {} is disabled but user is admin/owner, allowing notification",
-                            chat_id
-                        );
-                        true
-                    }
+                    Ok(Some(user)) if user.role.is_admin() => true,
                     _ => {
                         info!("Skipping notification to disabled chat {}", chat_id);
                         false
@@ -247,10 +241,11 @@ impl SchedulerEngine {
                 let tags = self.format_tags(illust);
 
                 let caption = format!(
-                    "🎨 {}{}\nby {}\n\n👀 {} \\| ❤️ {} \\| 🔗 [来源](https://pixiv\\.net/artworks/{}){}", 
+                    "🎨 {}{}\nby *{}* \\(ID: `{}`\\)\n\n👀 {} \\| ❤️ {} \\| 🔗 [来源](https://pixiv\\.net/artworks/{}){}", 
                     markdown::escape(&illust.title),
                     page_info,
                     markdown::escape(&illust.user.name),
+                    illust.user.id,
                     illust.total_view,
                     illust.total_bookmarks,
                     illust.id,
@@ -338,13 +333,7 @@ impl SchedulerEngine {
                 true
             } else {
                 match self.repo.get_user(subscription.chat_id).await {
-                    Ok(Some(user)) if user.role.is_admin() => {
-                        info!(
-                            "Chat {} is disabled but user is admin/owner, allowing notification",
-                            chat_id
-                        );
-                        true
-                    }
+                    Ok(Some(user)) if user.role.is_admin() => true,
                     _ => {
                         info!("Skipping notification to disabled chat {}", chat_id);
                         false
@@ -455,10 +444,11 @@ impl SchedulerEngine {
                 let tags = self.format_tags(illust);
 
                 let base_caption = format!(
-                    "{}\\.  {}\nby {}\n\n❤️ {} \\| 🔗 [来源](https://pixiv\\.net/artworks/{}){}",
+                    "{}\\.  {}\nby *{}* \\(ID: `{}`\\)\n\n❤️ {} \\| 🔗 [来源](https://pixiv\\.net/artworks/{}){}",
                     index + 1,
                     markdown::escape(&illust.title),
                     markdown::escape(&illust.user.name),
+                    illust.user.id,
                     illust.total_bookmarks,
                     illust.id,
                     tags
