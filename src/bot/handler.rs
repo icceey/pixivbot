@@ -71,11 +71,8 @@ impl BotHandler {
 
         match cmd {
             Command::Help => self.handle_help(bot, chat_id).await,
-            Command::Sub(args) => self.handle_sub_author(bot, chat_id, user_id, args).await,
-            Command::SubRank(args) => {
-                self.handle_sub_ranking_cmd(bot, chat_id, user_id, args)
-                    .await
-            }
+            Command::Sub(args) => self.handle_sub_author(bot, chat_id, args).await,
+            Command::SubRank(args) => self.handle_sub_ranking_cmd(bot, chat_id, args).await,
             Command::Unsub(args) => self.handle_unsub_author(bot, chat_id, args).await,
             Command::UnsubRank(args) => self.handle_unsub_ranking(bot, chat_id, args).await,
             Command::List => self.handle_list(bot, chat_id).await,
@@ -227,7 +224,6 @@ impl BotHandler {
         &self,
         bot: Bot,
         chat_id: ChatId,
-        user_id: i64,
         args: String,
     ) -> ResponseResult<()> {
         let parts: Vec<&str> = args.split_whitespace().collect();
@@ -308,7 +304,6 @@ impl BotHandler {
                 .get_or_create_task(
                     "author".to_string(),
                     author_id_str.to_string(),
-                    user_id,
                     Some(author_name.clone()),
                 )
                 .await
@@ -379,7 +374,6 @@ impl BotHandler {
         &self,
         bot: Bot,
         chat_id: ChatId,
-        user_id: i64,
         args: String,
     ) -> ResponseResult<()> {
         let mode_str = args.trim();
@@ -418,7 +412,6 @@ impl BotHandler {
             .get_or_create_task(
                 "ranking".to_string(),
                 mode_str_for_db.to_string(),
-                user_id,
                 None, // No author_name for ranking tasks
             )
             .await

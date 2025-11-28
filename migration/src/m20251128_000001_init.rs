@@ -72,7 +72,7 @@ impl MigrationTrait for Migration {
             )
             .await?;
 
-        // Create tasks table (without interval_sec)
+        // Create tasks table
         manager
             .create_table(
                 Table::create()
@@ -90,25 +90,6 @@ impl MigrationTrait for Migration {
                     .col(ColumnDef::new(Tasks::AuthorName).string())
                     .col(ColumnDef::new(Tasks::NextPollAt).timestamp().not_null())
                     .col(ColumnDef::new(Tasks::LastPolledAt).timestamp())
-                    .col(ColumnDef::new(Tasks::LatestData).json())
-                    .col(ColumnDef::new(Tasks::CreatedBy).big_integer().not_null())
-                    .col(ColumnDef::new(Tasks::UpdatedBy).big_integer().not_null())
-                    .foreign_key(
-                        ForeignKey::create()
-                            .name("fk_tasks_created_by")
-                            .from(Tasks::Table, Tasks::CreatedBy)
-                            .to(Users::Table, Users::Id)
-                            .on_delete(ForeignKeyAction::NoAction)
-                            .on_update(ForeignKeyAction::NoAction),
-                    )
-                    .foreign_key(
-                        ForeignKey::create()
-                            .name("fk_tasks_updated_by")
-                            .from(Tasks::Table, Tasks::UpdatedBy)
-                            .to(Users::Table, Users::Id)
-                            .on_delete(ForeignKeyAction::NoAction)
-                            .on_update(ForeignKeyAction::NoAction),
-                    )
                     .to_owned(),
             )
             .await?;
@@ -159,6 +140,7 @@ impl MigrationTrait for Migration {
                     )
                     .col(ColumnDef::new(Subscriptions::TaskId).integer().not_null())
                     .col(ColumnDef::new(Subscriptions::FilterTags).json())
+                    .col(ColumnDef::new(Subscriptions::LatestData).json())
                     .col(
                         ColumnDef::new(Subscriptions::CreatedAt)
                             .timestamp()
@@ -249,9 +231,6 @@ enum Tasks {
     AuthorName,
     NextPollAt,
     LastPolledAt,
-    LatestData,
-    CreatedBy,
-    UpdatedBy,
 }
 
 #[derive(DeriveIden)]
@@ -261,5 +240,6 @@ enum Subscriptions {
     ChatId,
     TaskId,
     FilterTags,
+    LatestData,
     CreatedAt,
 }
