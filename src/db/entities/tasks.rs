@@ -13,7 +13,6 @@ pub struct Model {
     pub next_poll_at: DateTime,
     pub last_polled_at: Option<DateTime>,
     pub created_by: i64,
-    pub updated_by: i64,
     pub author_name: Option<String>, // 作者名字（仅 type="author" 时有值）
 }
 
@@ -29,14 +28,6 @@ pub enum Relation {
         on_delete = "NoAction"
     )]
     UserCreated,
-    #[sea_orm(
-        belongs_to = "super::users::Entity",
-        from = "Column::UpdatedBy",
-        to = "super::users::Column::Id",
-        on_update = "NoAction",
-        on_delete = "NoAction"
-    )]
-    UserUpdated,
 }
 
 impl Related<super::subscriptions::Entity> for Entity {

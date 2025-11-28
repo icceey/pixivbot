@@ -176,7 +176,6 @@ impl Repo {
             next_poll_at: Set(next_poll_at.naive_local()),
             last_polled_at: Set(None),
             created_by: Set(created_by),
-            updated_by: Set(created_by),
             author_name: Set(author_name),
             ..Default::default()
         };
@@ -227,12 +226,10 @@ impl Repo {
     }
 
     /// Update task after polling
-    /// Note: updated_by should be a valid user_id (typically task.created_by)
     pub async fn update_task_after_poll(
         &self,
         task_id: i32,
         next_poll_at: DateTime<Local>,
-        updated_by: i64,
     ) -> Result<tasks::Model, DbErr> {
         let task = tasks::Entity::find_by_id(task_id)
             .one(&self.db)
@@ -243,7 +240,6 @@ impl Repo {
         let mut active: tasks::ActiveModel = task.into_active_model();
         active.next_poll_at = Set(next_poll_at.naive_local());
         active.last_polled_at = Set(Some(now));
-        active.updated_by = Set(updated_by);
 
         active.update(&self.db).await
     }
