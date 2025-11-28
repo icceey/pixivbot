@@ -107,20 +107,32 @@ impl Repo {
         }
     }
 
-    /// Enable or disable a chat
+    /// Enable or disable a chat (creates if not exists)
     pub async fn set_chat_enabled(
         &self,
         chat_id: i64,
         enabled: bool,
     ) -> Result<chats::Model, DbErr> {
-        let chat = chats::Entity::find_by_id(chat_id)
-            .one(&self.db)
-            .await?
-            .ok_or(DbErr::RecordNotFound(format!("Chat {} not found", chat_id)))?;
+        let now = Local::now().naive_local();
 
-        let mut active: chats::ActiveModel = chat.into_active_model();
-        active.enabled = Set(enabled);
-        active.update(&self.db).await
+        if let Some(existing) = chats::Entity::find_by_id(chat_id).one(&self.db).await? {
+            // Update existing chat
+            let mut active: chats::ActiveModel = existing.into_active_model();
+            active.enabled = Set(enabled);
+            active.update(&self.db).await
+        } else {
+            // Create new chat with specified enabled status
+            let new_chat = chats::ActiveModel {
+                id: Set(chat_id),
+                r#type: Set("unknown".to_string()), // Unknown type for manually added chats
+                title: Set(None),
+                enabled: Set(enabled),
+                blur_sensitive_tags: Set(true), // Default to enabled
+                excluded_tags: Set(None),
+                created_at: Set(now),
+            };
+            new_chat.insert(&self.db).await
+        }
     }
 
     /// Set blur_sensitive_tags for a chat
