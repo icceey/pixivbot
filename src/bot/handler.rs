@@ -656,9 +656,15 @@ impl BotHandler {
                     return Ok(());
                 }
 
+                // Separate authors and rankings
+                let (authors, rankings): (Vec<_>, Vec<_>) = subscriptions
+                    .into_iter()
+                    .partition(|(_, task)| task.r#type == "author");
+
                 let mut message = "📋 *您的订阅:*\n\n".to_string();
 
-                for (sub, task) in subscriptions {
+                // First show authors
+                for (sub, task) in authors.iter().chain(rankings.iter()) {
                     let type_emoji = match task.r#type.as_str() {
                         "author" => "🎨",
                         "ranking" => "📊",

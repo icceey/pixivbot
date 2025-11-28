@@ -20,6 +20,8 @@ tick_interval_sec = 30
 # Default: 60-120 minutes
 min_task_interval_sec = 3600
 max_task_interval_sec = 7200
+# Cache retention period in days (how long to keep downloaded images)
+cache_retention_days = 7
 
 [content]
 # Sensitive tags that can be blurred per chat setting

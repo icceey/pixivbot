@@ -94,9 +94,7 @@ impl SchedulerEngine {
                 rand::rng().random_range(self.min_task_interval_sec..=self.max_task_interval_sec);
             let next_poll = Local::now() + chrono::Duration::seconds(random_interval_sec as i64);
 
-            self.repo
-                .update_task_after_poll(task.id, next_poll, task.created_by)
-                .await?;
+            self.repo.update_task_after_poll(task.id, next_poll).await?;
         }
 
         Ok(())
@@ -119,9 +117,7 @@ impl SchedulerEngine {
             let random_interval_sec =
                 rand::rng().random_range(self.min_task_interval_sec..=self.max_task_interval_sec);
             let next_poll = Local::now() + chrono::Duration::seconds(random_interval_sec as i64);
-            self.repo
-                .update_task_after_poll(task.id, next_poll, task.created_by)
-                .await?;
+            self.repo.update_task_after_poll(task.id, next_poll).await?;
             return Ok(());
         }
 
@@ -133,9 +129,7 @@ impl SchedulerEngine {
             let random_interval_sec =
                 rand::rng().random_range(self.min_task_interval_sec..=self.max_task_interval_sec);
             let next_poll = Local::now() + chrono::Duration::seconds(random_interval_sec as i64);
-            self.repo
-                .update_task_after_poll(task.id, next_poll, task.created_by)
-                .await?;
+            self.repo.update_task_after_poll(task.id, next_poll).await?;
             return Ok(());
         }
 
@@ -283,9 +277,7 @@ impl SchedulerEngine {
         let random_interval_sec =
             rand::rng().random_range(self.min_task_interval_sec..=self.max_task_interval_sec);
         let next_poll = Local::now() + chrono::Duration::seconds(random_interval_sec as i64);
-        self.repo
-            .update_task_after_poll(task.id, next_poll, task.created_by)
-            .await?;
+        self.repo.update_task_after_poll(task.id, next_poll).await?;
 
         Ok(())
     }
@@ -306,11 +298,7 @@ impl SchedulerEngine {
             info!("No ranking illusts found for mode {}", mode);
             // Update task poll time
             self.repo
-                .update_task_after_poll(
-                    task.id,
-                    Local::now() + chrono::Duration::seconds(86400),
-                    task.updated_by,
-                )
+                .update_task_after_poll(task.id, Local::now() + chrono::Duration::seconds(86400))
                 .await?;
             return Ok(());
         }
@@ -323,11 +311,7 @@ impl SchedulerEngine {
         if subscriptions.is_empty() {
             info!("No subscriptions for ranking task {}", task.id);
             self.repo
-                .update_task_after_poll(
-                    task.id,
-                    Local::now() + chrono::Duration::seconds(86400),
-                    task.updated_by,
-                )
+                .update_task_after_poll(task.id, Local::now() + chrono::Duration::seconds(86400))
                 .await?;
             return Ok(());
         }
@@ -504,11 +488,7 @@ impl SchedulerEngine {
 
         // Update task's next poll time
         self.repo
-            .update_task_after_poll(
-                task.id,
-                Local::now() + chrono::Duration::seconds(86400),
-                task.updated_by,
-            )
+            .update_task_after_poll(task.id, Local::now() + chrono::Duration::seconds(86400))
             .await?;
 
         Ok(())
