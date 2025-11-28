@@ -1,0 +1,31 @@
+# Build artifacts
+target/
+debug/
+
+# Git
+.git/
+.gitignore
+.gitmodules
+
+# IDE/Editor
+.idea/
+.vscode/
+*.iml
+*.iws
+
+# Local config and data
+config.toml
+data/
+logs/
+
+# Documentation
+*.md
+LICENSE
+
+# Submodules
+pixivpy/
+
+# Misc
+*.log
+*.pdb
+**/*.rs.bk
