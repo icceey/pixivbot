@@ -25,8 +25,5 @@ WORKDIR /app
 # Copy the binary from builder
 COPY --from=builder /app/target/release/pixivbot /app/pixivbot
 
-# Set user to nonroot
-USER nonroot
-
 # Set entrypoint
 ENTRYPOINT ["/app/pixivbot"]
