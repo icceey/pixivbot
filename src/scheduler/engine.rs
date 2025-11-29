@@ -167,12 +167,32 @@ impl SchedulerEngine {
                 continue;
             }
 
-            // Get this subscription's last pushed illust ID
+            // Get this subscription's push state
             let last_illust_id = subscription
                 .latest_data
                 .as_ref()
                 .and_then(|data| data.get("latest_illust_id"))
                 .and_then(|v| v.as_u64());
+
+            // Check for pending illust (partially sent)
+            let pending_illust: Option<(u64, Vec<usize>, usize)> = subscription
+                .latest_data
+                .as_ref()
+                .and_then(|data| data.get("pending_illust"))
+                .and_then(|p| {
+                    let id = p.get("id")?.as_u64()?;
+                    let sent_pages: Vec<usize> = p
+                        .get("sent_pages")?
+                        .as_array()?
+                        .iter()
+                        .filter_map(|v| v.as_u64().map(|n| n as usize))
+                        .collect();
+                    let total_pages = p.get("total_pages")?.as_u64()? as usize;
+                    Some((id, sent_pages, total_pages))
+                });
+
+            // 保存 pending id 用于后续过滤
+            let pending_id_to_skip = pending_illust.as_ref().map(|(id, _, _)| *id);
 
             // Find new illusts for this subscription
             let new_illusts: Vec<_> = if let Some(last_id) = last_illust_id {
@@ -185,16 +205,20 @@ impl SchedulerEngine {
                 illusts.iter().take(1).collect()
             };
 
-            if new_illusts.is_empty() {
+            if new_illusts.is_empty() && pending_illust.is_none() {
                 continue;
             }
 
             info!(
-                "Found {} new illusts for subscription {} (chat {})",
+                "Found {} new illusts for subscription {} (chat {}), pending: {:?}",
                 new_illusts.len(),
                 subscription.id,
-                chat_id
+                chat_id,
+                pending_illust.as_ref().map(|(id, _, _)| id)
             );
+
+            // 记录最新的 illust id（用于在过滤后没有内容时也更新）
+            let newest_illust_id = new_illusts.first().map(|i| i.id);
 
             // Apply subscription tag filters
             let mut filtered_illusts =
@@ -204,30 +228,178 @@ impl SchedulerEngine {
             filtered_illusts =
                 self.apply_chat_excluded_tags_ref(filtered_illusts, &chat.excluded_tags);
 
-            // Update subscription's latest_data with newest illust ID (before filtering)
-            // We track the newest illust regardless of filter, to avoid re-processing
-            if let Some(newest) = new_illusts.first() {
-                let updated_data = json!({
-                    "latest_illust_id": newest.id,
-                    "last_check": Local::now().to_rfc3339(),
-                });
-
-                if let Err(e) = self
-                    .repo
-                    .update_subscription_latest_data(subscription.id, Some(updated_data))
-                    .await
-                {
-                    error!(
-                        "Failed to update subscription {} latest_data: {}",
-                        subscription.id, e
-                    );
+            // 如果过滤后没有内容且没有 pending，更新 latest_illust_id
+            if filtered_illusts.is_empty() && pending_illust.is_none() {
+                if let Some(newest_id) = newest_illust_id {
+                    let updated_data = json!({
+                        "latest_illust_id": newest_id,
+                        "last_check": Local::now().to_rfc3339(),
+                    });
+                    if let Err(e) = self
+                        .repo
+                        .update_subscription_latest_data(subscription.id, Some(updated_data))
+                        .await
+                    {
+                        error!(
+                            "Failed to update subscription {} latest_data: {}",
+                            subscription.id, e
+                        );
+                    }
                 }
-            }
-
-            if filtered_illusts.is_empty() {
                 continue;
             }
 
+            // 首先处理 pending illust（如果有）
+            if let Some((pending_id, sent_pages, total_pages)) = pending_illust {
+                // 找到对应的 illust
+                if let Some(illust) = illusts.iter().find(|i| i.id == pending_id) {
+                    info!(
+                        "Resuming pending illust {} ({}/{} pages sent)",
+                        pending_id,
+                        sent_pages.len(),
+                        total_pages
+                    );
+
+                    let has_spoiler = chat.blur_sensitive_tags && self.has_sensitive_tags(illust);
+
+                    // 获取所有图片 URL
+                    let all_urls = illust.get_all_image_urls();
+
+                    // 只发送尚未成功的页
+                    let pending_pages: Vec<usize> = (0..all_urls.len())
+                        .filter(|i| !sent_pages.contains(i))
+                        .collect();
+
+                    if pending_pages.is_empty() {
+                        // 所有页都已发送，标记为完成
+                        let updated_data = json!({
+                            "latest_illust_id": pending_id,
+                            "last_check": Local::now().to_rfc3339(),
+                        });
+                        if let Err(e) = self
+                            .repo
+                            .update_subscription_latest_data(subscription.id, Some(updated_data))
+                            .await
+                        {
+                            error!(
+                                "Failed to update subscription {} latest_data: {}",
+                                subscription.id, e
+                            );
+                        }
+                    } else {
+                        // 发送剩余页
+                        let pending_urls: Vec<String> = pending_pages
+                            .iter()
+                            .filter_map(|&i| all_urls.get(i).cloned())
+                            .collect();
+
+                        let caption = format!(
+                            "🎨 {} \\(continued, {}/{} remaining\\)\nby *{}*\n\n🔗 [来源](https://pixiv\\.net/artworks/{})",
+                            markdown::escape(&illust.title),
+                            pending_urls.len(),
+                            total_pages,
+                            markdown::escape(&illust.user.name),
+                            illust.id
+                        );
+
+                        let send_result = self
+                            .notifier
+                            .notify_with_images(chat_id, &pending_urls, Some(&caption), has_spoiler)
+                            .await;
+
+                        // 合并已发送的页索引
+                        let mut all_sent: Vec<usize> = sent_pages.clone();
+                        for &idx in &send_result.succeeded_indices {
+                            if let Some(&page_idx) = pending_pages.get(idx) {
+                                all_sent.push(page_idx);
+                            }
+                        }
+                        all_sent.sort();
+                        all_sent.dedup();
+
+                        if all_sent.len() == total_pages {
+                            // 全部完成
+                            let updated_data = json!({
+                                "latest_illust_id": pending_id,
+                                "last_check": Local::now().to_rfc3339(),
+                            });
+                            if let Err(e) = self
+                                .repo
+                                .update_subscription_latest_data(
+                                    subscription.id,
+                                    Some(updated_data),
+                                )
+                                .await
+                            {
+                                error!(
+                                    "Failed to update subscription {} latest_data: {}",
+                                    subscription.id, e
+                                );
+                            }
+                        } else {
+                            // 仍有失败，更新 pending 状态
+                            let updated_data = json!({
+                                "latest_illust_id": last_illust_id,
+                                "pending_illust": {
+                                    "id": pending_id,
+                                    "sent_pages": all_sent,
+                                    "total_pages": total_pages,
+                                },
+                                "last_check": Local::now().to_rfc3339(),
+                            });
+                            if let Err(e) = self
+                                .repo
+                                .update_subscription_latest_data(
+                                    subscription.id,
+                                    Some(updated_data),
+                                )
+                                .await
+                            {
+                                error!(
+                                    "Failed to update subscription {} latest_data: {}",
+                                    subscription.id, e
+                                );
+                            }
+                            // 有 pending 未完成，暂停处理新 illusts
+                            continue;
+                        }
+
+                        tokio::time::sleep(tokio::time::Duration::from_millis(2000)).await;
+                    }
+                } else {
+                    // pending illust 不在当前 API 返回中（可能太旧了）
+                    // 放弃这个 pending，清除状态，让程序继续处理新的 illusts
+                    warn!(
+                        "Pending illust {} not found in current API response, abandoning",
+                        pending_id
+                    );
+                    // 保留 last_illust_id，清除 pending
+                    if let Some(last_id) = last_illust_id {
+                        let updated_data = json!({
+                            "latest_illust_id": last_id,
+                            "last_check": Local::now().to_rfc3339(),
+                        });
+                        if let Err(e) = self
+                            .repo
+                            .update_subscription_latest_data(subscription.id, Some(updated_data))
+                            .await
+                        {
+                            error!(
+                                "Failed to update subscription {} latest_data: {}",
+                                subscription.id, e
+                            );
+                        }
+                    }
+                }
+            }
+
+            // 过滤掉已经处理过的 pending illust（如果有的话）
+            let filtered_illusts: Vec<_> = filtered_illusts
+                .into_iter()
+                .filter(|i| Some(i.id) != pending_id_to_skip)
+                .collect();
+
+            // 处理新的 illusts
             for illust in filtered_illusts {
                 let page_info = if illust.is_multi_page() {
                     format!(" \\({} photos\\)", illust.page_count)
@@ -254,17 +426,73 @@ impl SchedulerEngine {
 
                 // 获取所有图片URL (支持单图和多图)
                 let image_urls = illust.get_all_image_urls();
+                let total_pages = image_urls.len();
 
-                if let Err(e) = self
+                let send_result = self
                     .notifier
                     .notify_with_images(chat_id, &image_urls, Some(&caption), has_spoiler)
-                    .await
-                {
-                    error!("Failed to notify chat {}: {}", chat_id, e);
+                    .await;
+
+                if send_result.is_complete_success() {
+                    // 发送成功，更新 subscription 的 latest_data
+                    let updated_data = json!({
+                        "latest_illust_id": illust.id,
+                        "last_check": Local::now().to_rfc3339(),
+                    });
+
+                    if let Err(e) = self
+                        .repo
+                        .update_subscription_latest_data(subscription.id, Some(updated_data))
+                        .await
+                    {
+                        error!(
+                            "Failed to update subscription {} latest_data: {}",
+                            subscription.id, e
+                        );
+                    }
+                } else if send_result.is_complete_failure() {
+                    error!(
+                        "Failed to send illust {} to chat {}, will retry next poll",
+                        illust.id, chat_id
+                    );
+                    // 完全失败，不更新 latest_data，下次会重试
+                    break; // 停止处理这个 subscription 的后续 illusts
+                } else {
+                    // 部分成功，记录 pending 状态
+                    warn!(
+                        "Partially sent illust {} to chat {} ({}/{} pages)",
+                        illust.id,
+                        chat_id,
+                        send_result.succeeded_indices.len(),
+                        total_pages
+                    );
+
+                    let updated_data = json!({
+                        "latest_illust_id": last_illust_id,
+                        "pending_illust": {
+                            "id": illust.id,
+                            "sent_pages": send_result.succeeded_indices,
+                            "total_pages": total_pages,
+                        },
+                        "last_check": Local::now().to_rfc3339(),
+                    });
+
+                    if let Err(e) = self
+                        .repo
+                        .update_subscription_latest_data(subscription.id, Some(updated_data))
+                        .await
+                    {
+                        error!(
+                            "Failed to update subscription {} latest_data: {}",
+                            subscription.id, e
+                        );
+                    }
+                    // 有 pending，停止处理后续 illusts
+                    break;
                 }
 
                 // Small delay between messages
-                sleep(Duration::from_millis(2000)).await;
+                tokio::time::sleep(tokio::time::Duration::from_millis(2000)).await;
             }
         }
 
@@ -375,34 +603,8 @@ impl SchedulerEngine {
                 chat_id
             );
 
-            // Collect new illust IDs
+            // Collect new illust IDs (will be used to track what was successfully sent)
             let new_ids: Vec<u64> = new_illusts.iter().map(|i| i.id).collect();
-
-            // Update subscription's latest_data with pushed IDs
-            let mut all_pushed_ids = pushed_ids.clone();
-            all_pushed_ids.extend(new_ids);
-
-            // Keep only the last 100 IDs to prevent unbounded growth
-            if all_pushed_ids.len() > 100 {
-                let skip_count = all_pushed_ids.len() - 100;
-                all_pushed_ids = all_pushed_ids.into_iter().skip(skip_count).collect();
-            }
-
-            let updated_data = json!({
-                "pushed_ids": all_pushed_ids,
-                "last_check": Local::now().to_rfc3339(),
-            });
-
-            if let Err(e) = self
-                .repo
-                .update_subscription_latest_data(subscription.id, Some(updated_data))
-                .await
-            {
-                error!(
-                    "Failed to update subscription {} latest_data: {}",
-                    subscription.id, e
-                );
-            }
 
             // Apply chat-level excluded tags filter
             let filtered_illusts: Vec<&crate::pixiv_client::Illust> =
@@ -410,6 +612,27 @@ impl SchedulerEngine {
 
             if filtered_illusts.is_empty() {
                 info!("No illusts to send to chat {} after filtering", chat_id);
+                // 即使过滤后没有要发送的，也更新 pushed_ids（因为这些已被处理）
+                let mut all_pushed_ids = pushed_ids.clone();
+                all_pushed_ids.extend(new_ids);
+                if all_pushed_ids.len() > 100 {
+                    let skip_count = all_pushed_ids.len() - 100;
+                    all_pushed_ids = all_pushed_ids.into_iter().skip(skip_count).collect();
+                }
+                let updated_data = json!({
+                    "pushed_ids": all_pushed_ids,
+                    "last_check": Local::now().to_rfc3339(),
+                });
+                if let Err(e) = self
+                    .repo
+                    .update_subscription_latest_data(subscription.id, Some(updated_data))
+                    .await
+                {
+                    error!(
+                        "Failed to update subscription {} latest_data: {}",
+                        subscription.id, e
+                    );
+                }
                 continue;
             }
 
@@ -426,9 +649,10 @@ impl SchedulerEngine {
                     .iter()
                     .any(|illust| self.has_sensitive_tags(illust));
 
-            // Prepare image URLs and captions
+            // Prepare image URLs, captions, and corresponding illust IDs
             let mut image_urls: Vec<String> = Vec::new();
             let mut captions: Vec<String> = Vec::new();
+            let mut illust_ids: Vec<u64> = Vec::new();
 
             for (index, illust) in filtered_illusts.iter().enumerate() {
                 // Get image URL
@@ -439,6 +663,7 @@ impl SchedulerEngine {
                         illust.image_urls.large.clone()
                     };
                 image_urls.push(image_url);
+                illust_ids.push(illust.id);
 
                 // Build caption for this image
                 let tags = self.format_tags(illust);
@@ -464,14 +689,59 @@ impl SchedulerEngine {
             }
 
             // Send as media group with individual captions
-            if let Err(e) = self
+            let send_result = self
                 .notifier
                 .notify_with_individual_captions(chat_id, &image_urls, &captions, has_spoiler)
+                .await;
+
+            // 根据发送结果更新 pushed_ids
+            let successfully_sent_ids: Vec<u64> = send_result
+                .succeeded_indices
+                .iter()
+                .filter_map(|&idx| illust_ids.get(idx).copied())
+                .collect();
+
+            if send_result.is_complete_failure() {
+                error!(
+                    "Failed to send ranking to chat {}, will retry next poll",
+                    chat_id
+                );
+                // 完全失败，不更新 pushed_ids，下次会重试
+                continue;
+            }
+
+            // 更新 pushed_ids（只添加成功发送的）
+            let mut all_pushed_ids = pushed_ids.clone();
+            all_pushed_ids.extend(successfully_sent_ids);
+
+            // Keep only the last 100 IDs to prevent unbounded growth
+            if all_pushed_ids.len() > 100 {
+                let skip_count = all_pushed_ids.len() - 100;
+                all_pushed_ids = all_pushed_ids.into_iter().skip(skip_count).collect();
+            }
+
+            let updated_data = json!({
+                "pushed_ids": all_pushed_ids,
+                "last_check": Local::now().to_rfc3339(),
+            });
+
+            if let Err(e) = self
+                .repo
+                .update_subscription_latest_data(subscription.id, Some(updated_data))
                 .await
             {
                 error!(
-                    "Failed to send ranking media group to chat {}: {}",
-                    chat_id, e
+                    "Failed to update subscription {} latest_data: {}",
+                    subscription.id, e
+                );
+            }
+
+            if send_result.has_failures() {
+                warn!(
+                    "Partially sent ranking to chat {} ({}/{} images)",
+                    chat_id,
+                    send_result.succeeded_indices.len(),
+                    send_result.total
                 );
             }
         }

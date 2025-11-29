@@ -4,7 +4,48 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use teloxide::prelude::*;
 use teloxide::types::{InputFile, InputMedia, InputMediaPhoto, ParseMode};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
+
+/// 批量发送的结果，记录成功和失败的项目索引
+#[derive(Debug, Clone)]
+pub struct BatchSendResult {
+    /// 总共要发送的项目数
+    pub total: usize,
+    /// 成功发送的项目索引 (基于原始输入的索引)
+    pub succeeded_indices: Vec<usize>,
+    /// 失败的项目索引
+    pub failed_indices: Vec<usize>,
+}
+
+impl BatchSendResult {
+    pub fn all_succeeded(total: usize) -> Self {
+        Self {
+            total,
+            succeeded_indices: (0..total).collect(),
+            failed_indices: Vec::new(),
+        }
+    }
+
+    pub fn all_failed(total: usize) -> Self {
+        Self {
+            total,
+            succeeded_indices: Vec::new(),
+            failed_indices: (0..total).collect(),
+        }
+    }
+
+    pub fn is_complete_success(&self) -> bool {
+        self.failed_indices.is_empty()
+    }
+
+    pub fn is_complete_failure(&self) -> bool {
+        self.succeeded_indices.is_empty()
+    }
+
+    pub fn has_failures(&self) -> bool {
+        !self.failed_indices.is_empty()
+    }
+}
 
 pub struct Notifier {
     bot: Bot,
@@ -69,17 +110,18 @@ impl Notifier {
 
     /// 下载并发送多张图片 (媒体组)
     /// 超过10张时自动分批发送多条消息 (Telegram 单条限制10张)
+    /// 返回 BatchSendResult 表示哪些图片发送成功/失败
     pub async fn notify_with_images(
         &self,
         chat_id: ChatId,
         image_urls: &[String],
         caption: Option<&str>,
         has_spoiler: bool,
-    ) -> AppResult<()> {
+    ) -> BatchSendResult {
+        let total = image_urls.len();
+
         if image_urls.is_empty() {
-            return Err(crate::error::AppError::Unknown(
-                "No images to send".to_string(),
-            ));
+            return BatchSendResult::all_failed(0);
         }
 
         // 单图: 使用单图发送方式
@@ -88,7 +130,11 @@ impl Notifier {
                 .notify_with_image(chat_id, &image_urls[0], caption, has_spoiler)
                 .await;
             tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-            return result;
+            return if result.is_ok() {
+                BatchSendResult::all_succeeded(1)
+            } else {
+                BatchSendResult::all_failed(1)
+            };
         }
 
         info!(
@@ -107,7 +153,9 @@ impl Notifier {
                 } else {
                     format!("🔗 {} images", image_urls.len())
                 };
-                return self.notify_plain(chat_id, &fallback_message).await;
+                // 下载失败时尝试发送文本，但仍标记为全部失败
+                let _ = self.notify_plain(chat_id, &fallback_message).await;
+                return BatchSendResult::all_failed(total);
             }
         };
 
@@ -121,6 +169,10 @@ impl Notifier {
             "Sending {} images in {} batch(es)",
             total_images, total_batches
         );
+
+        let mut succeeded_indices: Vec<usize> = Vec::new();
+        let mut failed_indices: Vec<usize> = Vec::new();
+        let mut current_idx: usize = 0;
 
         for (batch_idx, chunk) in chunks.into_iter().enumerate() {
             // 第一批使用原始 caption,后续批次添加批次信息
@@ -138,6 +190,7 @@ impl Notifier {
 
             let batch_paths: Vec<PathBuf> = chunk.to_vec();
             let batch_size = batch_paths.len();
+            let batch_start_idx = current_idx;
 
             if let Err(e) = self
                 .send_media_group(chat_id, batch_paths, batch_caption.as_deref(), has_spoiler)
@@ -149,19 +202,43 @@ impl Notifier {
                     total_batches,
                     e
                 );
+                // 记录该批次所有图片为失败
+                for i in batch_start_idx..(batch_start_idx + batch_size) {
+                    failed_indices.push(i);
+                }
+                current_idx += batch_size;
                 // 继续发送剩余批次
                 continue;
             }
+
+            // 记录该批次所有图片为成功
+            for i in batch_start_idx..(batch_start_idx + batch_size) {
+                succeeded_indices.push(i);
+            }
+            current_idx += batch_size;
 
             let cooldown_secs = (batch_size * 2) as u64;
             tokio::time::sleep(tokio::time::Duration::from_secs(cooldown_secs)).await;
         }
 
-        info!(
-            "✅ All {} image(s) sent in {} batch(es)",
-            total_images, total_batches
-        );
-        Ok(())
+        if !failed_indices.is_empty() {
+            error!(
+                "❌ Failed to send {} of {} image(s)",
+                failed_indices.len(),
+                total_images
+            );
+        } else {
+            info!(
+                "✅ All {} image(s) sent in {} batch(es)",
+                total_images, total_batches
+            );
+        }
+
+        BatchSendResult {
+            total: total_images,
+            succeeded_indices,
+            failed_indices,
+        }
     }
 
     /// Send a photo from local file path
@@ -259,23 +336,23 @@ impl Notifier {
 
     /// Send media group with individual caption for each photo (for ranking push)
     /// Automatically splits into multiple messages when over 10 images (Telegram limit)
+    /// 返回 BatchSendResult 表示哪些图片发送成功/失败
     pub async fn notify_with_individual_captions(
         &self,
         chat_id: ChatId,
         image_urls: &[String],
         captions: &[String],
         has_spoiler: bool,
-    ) -> AppResult<()> {
+    ) -> BatchSendResult {
+        let total = image_urls.len();
+
         if image_urls.is_empty() {
-            return Err(crate::error::AppError::Unknown(
-                "No images to send".to_string(),
-            ));
+            return BatchSendResult::all_failed(0);
         }
 
         if image_urls.len() != captions.len() {
-            return Err(crate::error::AppError::Unknown(
-                "Image URLs and captions count mismatch".to_string(),
-            ));
+            warn!("Image URLs and captions count mismatch");
+            return BatchSendResult::all_failed(total);
         }
 
         // Single image: use single image method
@@ -284,7 +361,11 @@ impl Notifier {
                 .notify_with_image(chat_id, &image_urls[0], Some(&captions[0]), has_spoiler)
                 .await;
             tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-            return result;
+            return if result.is_ok() {
+                BatchSendResult::all_succeeded(1)
+            } else {
+                BatchSendResult::all_failed(1)
+            };
         }
 
         info!(
@@ -299,7 +380,8 @@ impl Notifier {
             Err(e) => {
                 warn!("Failed to download images: {}, falling back to text", e);
                 let fallback_message = format!("🔗 {} images (download failed)", image_urls.len());
-                return self.notify_plain(chat_id, &fallback_message).await;
+                let _ = self.notify_plain(chat_id, &fallback_message).await;
+                return BatchSendResult::all_failed(total);
             }
         };
 
@@ -318,8 +400,13 @@ impl Notifier {
             total_images, total_batches
         );
 
+        let mut succeeded_indices: Vec<usize> = Vec::new();
+        let mut failed_indices: Vec<usize> = Vec::new();
+        let mut current_idx: usize = 0;
+
         for (batch_idx, (path_chunk, caption_chunk)) in chunks.into_iter().enumerate() {
             let batch_size = path_chunk.len();
+            let batch_start_idx = current_idx;
 
             if let Err(e) = self
                 .send_media_group_with_individual_captions(
@@ -338,19 +425,43 @@ impl Notifier {
                     total_batches,
                     e
                 );
+                // 记录该批次所有图片为失败
+                for i in batch_start_idx..(batch_start_idx + batch_size) {
+                    failed_indices.push(i);
+                }
+                current_idx += batch_size;
                 // Continue with remaining batches
                 continue;
             }
+
+            // 记录该批次所有图片为成功
+            for i in batch_start_idx..(batch_start_idx + batch_size) {
+                succeeded_indices.push(i);
+            }
+            current_idx += batch_size;
 
             let cooldown_secs = (batch_size * 2) as u64;
             tokio::time::sleep(tokio::time::Duration::from_secs(cooldown_secs)).await;
         }
 
-        info!(
-            "✅ All {} image(s) sent in {} batch(es)",
-            total_images, total_batches
-        );
-        Ok(())
+        if !failed_indices.is_empty() {
+            error!(
+                "❌ Failed to send {} of {} image(s)",
+                failed_indices.len(),
+                total_images
+            );
+        } else {
+            info!(
+                "✅ All {} image(s) sent in {} batch(es)",
+                total_images, total_batches
+            );
+        }
+
+        BatchSendResult {
+            total: total_images,
+            succeeded_indices,
+            failed_indices,
+        }
     }
 
     /// Send media group with individual caption for each photo
