@@ -47,6 +47,7 @@ impl BatchSendResult {
     }
 }
 
+#[derive(Clone)]
 pub struct Notifier {
     bot: Bot,
     downloader: Arc<Downloader>,

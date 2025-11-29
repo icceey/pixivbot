@@ -1,5 +1,6 @@
 pub mod commands;
 mod handler;
+pub mod link_handler;
 pub mod notifier;
 
 use crate::config::TelegramConfig;
@@ -9,19 +10,25 @@ use crate::error::AppResult;
 use crate::pixiv::client::PixivClient;
 use crate::pixiv::downloader::Downloader;
 use std::sync::Arc;
+use teloxide::dispatching::{Dispatcher, UpdateFilterExt};
+use teloxide::dptree;
 use teloxide::prelude::*;
-use teloxide::types::BotCommandScope;
+use teloxide::types::{BotCommandScope, Me};
 use tracing::info;
 
 pub use commands::Command;
 pub use handler::BotHandler;
+
+/// Handler 返回类型
+type HandlerResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
 pub async fn run(
     bot: Bot,
     config: TelegramConfig,
     repo: Arc<Repo>,
     pixiv_client: Arc<tokio::sync::RwLock<PixivClient>>,
-    _downloader: Arc<Downloader>, // Not used in bot commands, only in scheduler
+    downloader: Arc<Downloader>,
+    sensitive_tags: Vec<String>,
 ) -> AppResult<()> {
     info!("Starting Telegram Bot...");
 
@@ -41,7 +48,9 @@ pub async fn run(
     let handler = BotHandler::new(
         bot.clone(),
         repo.clone(),
-        pixiv_client,
+        pixiv_client.clone(),
+        downloader,
+        sensitive_tags,
         config.owner_id,
         is_public_mode,
     );
@@ -51,12 +60,51 @@ pub async fn run(
     // 设置命令可见性
     setup_commands(&bot, &repo).await;
 
-    Command::repl(bot, move |bot: Bot, msg: Message, cmd: Command| {
-        let handler = handler.clone();
-        async move { handler.handle_command(bot, msg, cmd).await }
-    })
-    .await;
+    // 构建 handler 树
+    let handler_tree = build_handler_tree();
 
+    // 使用 Dispatcher
+    Dispatcher::builder(bot, handler_tree)
+        .dependencies(dptree::deps![handler])
+        .enable_ctrlc_handler()
+        .build()
+        .dispatch()
+        .await;
+
+    Ok(())
+}
+
+/// 构建消息处理树
+fn build_handler_tree(
+) -> teloxide::dispatching::UpdateHandler<Box<dyn std::error::Error + Send + Sync + 'static>> {
+    use teloxide::dispatching::HandlerExt;
+
+    // 使用 filter_mention_command: 在群组中需要 @bot 才能触发命令
+    let command_handler = Update::filter_message()
+        .filter_command::<Command>()
+        .endpoint(handle_command);
+
+    let message_handler = Update::filter_message().endpoint(handle_message);
+
+    dptree::entry()
+        .branch(command_handler)
+        .branch(message_handler)
+}
+
+/// 处理命令
+async fn handle_command(
+    bot: Bot,
+    msg: Message,
+    cmd: Command,
+    handler: BotHandler,
+) -> HandlerResult {
+    handler.handle_command(bot, msg, cmd).await?;
+    Ok(())
+}
+
+/// 处理普通消息（检查 Pixiv 链接）
+async fn handle_message(bot: Bot, msg: Message, me: Me, handler: BotHandler) -> HandlerResult {
+    handler.handle_message(bot, msg, me).await?;
     Ok(())
 }
 

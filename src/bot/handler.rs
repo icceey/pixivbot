@@ -1,13 +1,16 @@
+use crate::bot::link_handler::{is_bot_mentioned, parse_pixiv_links, PixivLink};
+use crate::bot::notifier::Notifier;
 use crate::bot::Command;
 use crate::db::entities::role::UserRole;
 use crate::db::repo::Repo;
 use crate::pixiv::client::PixivClient;
+use crate::pixiv::downloader::Downloader;
 use crate::pixiv::model::RankingMode;
 use crate::utils::markdown;
 use serde_json::json;
 use std::sync::Arc;
 use teloxide::prelude::*;
-use teloxide::types::ParseMode;
+use teloxide::types::{Me, ParseMode};
 use tracing::{error, info};
 
 #[derive(Clone)]
@@ -16,6 +19,8 @@ pub struct BotHandler {
     bot: Bot,
     repo: Arc<Repo>,
     pixiv_client: Arc<tokio::sync::RwLock<PixivClient>>,
+    notifier: Notifier,
+    sensitive_tags: Vec<String>,
     owner_id: Option<i64>,
     is_public_mode: bool,
 }
@@ -25,13 +30,18 @@ impl BotHandler {
         bot: Bot,
         repo: Arc<Repo>,
         pixiv_client: Arc<tokio::sync::RwLock<PixivClient>>,
+        downloader: Arc<Downloader>,
+        sensitive_tags: Vec<String>,
         owner_id: Option<i64>,
         is_public_mode: bool,
     ) -> Self {
+        let notifier = Notifier::new(bot.clone(), downloader);
         Self {
             bot,
             repo,
             pixiv_client,
+            notifier,
+            sensitive_tags,
             owner_id,
             is_public_mode,
         }
@@ -1067,5 +1077,245 @@ impl BotHandler {
             .await?;
 
         Ok(())
+    }
+
+    /// 处理普通消息（检查 Pixiv 链接）
+    ///
+    /// - 作品链接 (https://www.pixiv.net/artworks/xxx): 一次性推送作品
+    /// - 作者链接 (https://www.pixiv.net/users/xxx): 订阅作者
+    ///
+    /// 群组中只在被 @ 时响应
+    pub async fn handle_message(&self, bot: Bot, msg: Message, me: Me) -> ResponseResult<()> {
+        // 获取消息文本
+        let text = match msg.text() {
+            Some(t) => t,
+            None => return Ok(()), // 没有文本，忽略
+        };
+
+        // 检查是否包含 Pixiv 链接
+        let links = parse_pixiv_links(text);
+        if links.is_empty() {
+            return Ok(()); // 没有链接，忽略
+        }
+
+        let chat_id = msg.chat.id;
+        let user_id = msg.from.as_ref().map(|u| u.id.0 as i64).unwrap_or(0);
+        let is_group = msg.chat.is_group() || msg.chat.is_supergroup();
+
+        // 群组中需要检查是否被 @
+        if is_group {
+            let bot_username = me.username();
+            let entities = msg.entities().unwrap_or(&[]);
+
+            if !is_bot_mentioned(text, entities, bot_username) {
+                return Ok(()); // 群组中没被 @，忽略
+            }
+        }
+
+        info!(
+            "Processing Pixiv links from user {} in chat {}: {:?}",
+            user_id, chat_id, links
+        );
+
+        // 确保用户和聊天存在于数据库中
+        let (user_role, chat_enabled) = match self.ensure_user_and_chat(&msg).await {
+            Ok(data) => data,
+            Err(e) => {
+                error!("Failed to ensure user/chat: {}", e);
+                return Ok(());
+            }
+        };
+
+        // 检查聊天是否启用
+        let is_private_chat_with_admin = chat_id.is_user() && user_role.is_admin();
+        if !chat_enabled && !is_private_chat_with_admin {
+            info!(
+                "Ignoring message from disabled chat {} (user: {}, role: {:?})",
+                chat_id, user_id, user_role
+            );
+            return Ok(());
+        }
+
+        // 获取聊天设置（用于模糊敏感内容）
+        let chat_settings = self.repo.get_chat(chat_id.0).await.ok().flatten();
+        let blur_sensitive = chat_settings
+            .as_ref()
+            .map(|c| c.blur_sensitive_tags)
+            .unwrap_or(false);
+
+        // 处理每个链接
+        for link in links {
+            match link {
+                PixivLink::Illust(illust_id) => {
+                    self.handle_illust_link(bot.clone(), chat_id, illust_id, blur_sensitive)
+                        .await?;
+                }
+                PixivLink::User(user_id) => {
+                    self.handle_user_link(bot.clone(), chat_id, user_id).await?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// 处理作品链接 - 推送作品图片
+    async fn handle_illust_link(
+        &self,
+        bot: Bot,
+        chat_id: ChatId,
+        illust_id: u64,
+        blur_sensitive: bool,
+    ) -> ResponseResult<()> {
+        info!("Fetching illust {} for chat {}", illust_id, chat_id);
+
+        // 获取作品详情
+        let pixiv = self.pixiv_client.read().await;
+        let illust = match pixiv.get_illust_detail(illust_id).await {
+            Ok(illust) => illust,
+            Err(e) => {
+                error!("Failed to get illust {}: {}", illust_id, e);
+                bot.send_message(chat_id, format!("❌ 获取作品 {} 失败: {}", illust_id, e))
+                    .await?;
+                return Ok(());
+            }
+        };
+        drop(pixiv);
+
+        // 构建消息
+        let page_info = if illust.is_multi_page() {
+            format!(" \\({} photos\\)", illust.page_count)
+        } else {
+            String::new()
+        };
+
+        let tags = self.format_tags(&illust);
+
+        let caption = format!(
+            "🎨 {}{}\nby *{}* \\(ID: `{}`\\)\n\n👀 {} \\| ❤️ {} \\| 🔗 [来源](https://pixiv\\.net/artworks/{}){}", 
+            markdown::escape(&illust.title),
+            page_info,
+            markdown::escape(&illust.user.name),
+            illust.user.id,
+            illust.total_view,
+            illust.total_bookmarks,
+            illust.id,
+            tags
+        );
+
+        // 检查是否有敏感标签
+        let has_spoiler = blur_sensitive && self.has_sensitive_tags(&illust);
+
+        // 获取所有图片 URL
+        let image_urls = illust.get_all_image_urls();
+
+        // 发送图片
+        let _ = self
+            .notifier
+            .notify_with_images(chat_id, &image_urls, Some(&caption), has_spoiler)
+            .await;
+
+        Ok(())
+    }
+
+    /// 处理用户链接 - 订阅作者
+    async fn handle_user_link(
+        &self,
+        bot: Bot,
+        chat_id: ChatId,
+        user_id: u64,
+    ) -> ResponseResult<()> {
+        info!("Subscribing to user {} for chat {}", user_id, chat_id);
+
+        // 获取用户详情
+        let pixiv = self.pixiv_client.read().await;
+        let author = match pixiv.get_user_detail(user_id).await {
+            Ok(user) => user,
+            Err(e) => {
+                error!("Failed to get user {}: {}", user_id, e);
+                bot.send_message(chat_id, format!("❌ 获取用户 {} 失败: {}", user_id, e))
+                    .await?;
+                return Ok(());
+            }
+        };
+        drop(pixiv);
+
+        // 创建或获取任务
+        match self
+            .repo
+            .get_or_create_task(
+                "author".to_string(),
+                user_id.to_string(),
+                Some(author.name.clone()),
+            )
+            .await
+        {
+            Ok(task) => {
+                // 创建订阅
+                match self
+                    .repo
+                    .upsert_subscription(chat_id.0, task.id, None)
+                    .await
+                {
+                    Ok(_) => {
+                        let message = format!(
+                            "✅ 成功订阅作者 *{}* \\(ID: `{}`\\)",
+                            markdown::escape(&author.name),
+                            user_id
+                        );
+                        bot.send_message(chat_id, message)
+                            .parse_mode(ParseMode::MarkdownV2)
+                            .await?;
+                    }
+                    Err(e) => {
+                        error!("Failed to create subscription for {}: {}", user_id, e);
+                        bot.send_message(chat_id, "❌ 创建订阅失败").await?;
+                    }
+                }
+            }
+            Err(e) => {
+                error!("Failed to create task for {}: {}", user_id, e);
+                bot.send_message(chat_id, "❌ 创建任务失败").await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// 检查作品是否包含敏感标签
+    fn has_sensitive_tags(&self, illust: &crate::pixiv_client::Illust) -> bool {
+        let illust_tags: Vec<String> = illust
+            .tags
+            .iter()
+            .map(|tag| tag.name.to_lowercase())
+            .collect();
+
+        for sensitive_tag in &self.sensitive_tags {
+            let sensitive_lower = sensitive_tag.to_lowercase();
+            if illust_tags.iter().any(|t| t == &sensitive_lower) {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    /// 格式化标签用于显示
+    fn format_tags(&self, illust: &crate::pixiv_client::Illust) -> String {
+        use crate::utils::html;
+
+        let tag_names: Vec<&str> = illust.tags.iter().map(|t| t.name.as_str()).collect();
+        let formatted = html::format_tags(&tag_names);
+
+        if formatted.is_empty() {
+            return String::new();
+        }
+
+        let escaped: Vec<String> = formatted
+            .iter()
+            .map(|t| format!("\\#{}", markdown::escape(t)))
+            .collect();
+
+        format!("\n\n{}", escaped.join("  "))
     }
 }

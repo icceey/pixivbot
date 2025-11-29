@@ -136,6 +136,7 @@ async fn main() -> AppResult<()> {
     });
 
     // Start Bot in a separate task (non-blocking)
+    let sensitive_tags_for_bot = config.content.sensitive_tags.clone();
     let bot_handle = tokio::spawn(async move {
         if let Err(e) = bot::run(
             bot,
@@ -143,6 +144,7 @@ async fn main() -> AppResult<()> {
             repo.clone(),
             pixiv_client.clone(),
             downloader.clone(),
+            sensitive_tags_for_bot,
         )
         .await
         {
