@@ -2,9 +2,9 @@
 
 ## Project Overview
 
-A Rust-based Telegram bot for subscribing to Pixiv artists and rankings. When artists publish new works, the bot automatically downloads and pushes images to subscribers.
+A Rust-based Telegram bot for subscribing to Pixiv artists and rankings. When artists publish new works, the bot automatically downloads and pushes images to subscribers. Also supports detecting Pixiv links in messages and responding accordingly.
 
-**Tech Stack**: Rust 2021, teloxide (Telegram), SeaORM (SQLite), reqwest, tokio
+**Tech Stack**: Rust 2021, teloxide (Telegram), SeaORM (SQLite), reqwest, tokio, regex
 
 ## Architecture
 
@@ -15,20 +15,25 @@ src/
 ├── error.rs             # Unified error handling with AppError/AppResult
 ├── pixiv_client/        # Low-level Pixiv API (independent, no project deps)
 │   ├── auth.rs          # OAuth refresh_token → access_token
-│   ├── client.rs        # API calls: user_illusts, illust_ranking
+│   ├── client.rs        # API calls: user_illusts, illust_ranking, user_detail, illust_detail
 │   └── models.rs        # Raw API response types
 ├── pixiv/               # Business layer (wraps pixiv_client)
 │   ├── client.rs        # PixivClient with login/auth management
 │   ├── downloader.rs    # Image download with hash-based caching
-│   └── model.rs         # Domain models (Illust, User)
+│   └── model.rs         # Domain models (Illust, User, RankingMode)
 ├── bot/                 # Telegram bot layer
-│   ├── handler.rs       # Command dispatcher
-│   ├── commands.rs      # /sub, /list, /unsub implementations
+│   ├── mod.rs           # Dispatcher setup, handler tree building
+│   ├── handler.rs       # BotHandler: commands + message handling
+│   ├── commands.rs      # Command enum definitions
+│   ├── link_handler.rs  # Pixiv URL parsing, @mention detection
 │   └── notifier.rs      # Send text/images to Telegram
 ├── scheduler/           # Background task engine
 │   └── engine.rs        # Polls DB, executes tasks serially with rate limiting
+├── utils/               # Utility functions
+│   ├── markdown.rs      # MarkdownV2 escaping
+│   └── html.rs          # HTML formatting, tag processing
 └── db/                  # Database layer
-    ├── entities/        # SeaORM entities (users, chats, tasks, subscriptions)
+    ├── entities/        # SeaORM entities (users, chats, tasks, subscriptions, role)
     └── repo.rs          # CRUD operations
 ```
 
@@ -62,6 +67,49 @@ Downloaded images cached at `data/cache/{hash_prefix}/{filename}`. Downloader ch
 ### Telegram Media Groups
 Max 10 images per media group. `Notifier::notify_with_images` auto-splits larger sets.
 
+### Teloxide Dispatcher Pattern
+The bot uses teloxide's `Dispatcher` with a handler tree:
+```rust
+// In bot/mod.rs
+fn build_handler_tree() {
+    let command_handler = Update::filter_message()
+        .filter_command::<Command>()
+        .endpoint(handle_command);
+
+    let message_handler = Update::filter_message()
+        .endpoint(handle_message);
+
+    dptree::entry()
+        .branch(command_handler)
+        .branch(message_handler)
+}
+```
+
+### Pixiv Link Detection
+The bot detects Pixiv links in messages via `link_handler.rs`:
+- **Artwork links** (`https://pixiv.net/artworks/xxx`): Push images immediately
+- **User links** (`https://pixiv.net/users/xxx`): Subscribe to the author
+- In groups, the bot only responds when **@mentioned**
+- Uses `LazyLock<Regex>` for efficient pattern matching
+
+```rust
+// Parse links from message text
+let links = parse_pixiv_links(text);  // Returns Vec<PixivLink>
+
+// Check if bot is @mentioned (for groups)
+let mentioned = is_bot_mentioned(text, entities, bot_username);
+```
+
+### Sensitive Tags Configuration
+Sensitive tags are loaded from `config.content.sensitive_tags` and passed through the component chain:
+```rust
+// main.rs → bot::run → BotHandler
+let sensitive_tags = config.content.sensitive_tags.clone();
+bot::run(..., sensitive_tags).await;
+```
+
+Use `self.sensitive_tags` in BotHandler, NOT hardcoded constants.
+
 ## Development Commands
 
 ```bash
@@ -81,6 +129,7 @@ CI uses `RUSTFLAGS=-Dwarnings` - all warnings are errors. Run `make ci` before c
 ```bash
 cargo add serde --features derive
 cargo add tokio --features full
+cargo add regex  # Already added for link parsing
 ```
 
 ## Code Conventions
@@ -90,6 +139,28 @@ cargo add tokio --features full
 - Prefer `MarkdownV2` for Telegram message formatting
 - Use `chrono` for datetime handling (with `serde` feature)
 - Async functions should return `AppResult<T>` for consistency
+- Use `LazyLock<Regex>` for compile-once regex patterns
+- Derive `Clone` for types that need to be shared across async contexts
+
+## Bot Command Filtering
+
+Commands use `filter_command::<Command>()` in the Dispatcher. For group @mention requirement on commands, use `filter_mention_command::<Command>()`:
+```rust
+// Commands work in any chat
+Update::filter_message().filter_command::<Command>()
+
+// Commands require @mention in groups
+Update::filter_message().filter_mention_command::<Command>()
+```
+
+## User Roles
+
+Three roles defined in `db/entities/role.rs`:
+- `Owner`: Full access, set via `config.telegram.owner_id`
+- `Admin`: Can enable/disable chats, set by owner via `/setadmin`
+- `User`: Standard user, basic commands only
+
+Role checks: `user_role.is_owner()`, `user_role.is_admin()`
 
 ## Testing
 
@@ -98,7 +169,7 @@ make test        # Run all tests
 cargo test -p pixivbot -- --nocapture  # Run with output
 ```
 
-Tests located alongside code in `#[cfg(test)]` modules.
+Tests located alongside code in `#[cfg(test)]` modules. See `link_handler.rs` for regex test examples.
 
 ## Before Committing
 
@@ -112,10 +183,49 @@ This matches the exact checks in `.github/workflows/ci.yml`. Fix any issues befo
 ## Configuration
 
 Copy `config.toml.example` → `config.toml`. Key sections:
-- `[telegram]` - bot_token, owner_id
+- `[telegram]` - bot_token, owner_id, bot_mode (public/private)
 - `[pixiv]` - refresh_token
 - `[database]` - SQLite URL
-- `[scheduler]` - polling intervals
-- `[content]` - sensitive_tags list
+- `[scheduler]` - tick_interval_sec, min/max_task_interval_sec, cache_retention_days
+- `[content]` - sensitive_tags list (e.g., ["R-18", "R-18G", "NSFW"])
 
-Environment variables override config: `APP_TELEGRAM__BOT_TOKEN`, `APP_PIXIV__REFRESH_TOKEN`
+Environment variables override config with prefix `PIX`: `PIX__TELEGRAM__BOT_TOKEN`, `PIX__PIXIV__REFRESH_TOKEN`
+
+## Bot Modes
+
+- `private`: New chats disabled by default, must be enabled by admin
+- `public`: New chats enabled by default
+
+## Feature Implementation Checklist
+
+When adding new features:
+1. **Understand before coding** - Read and fully understand existing logic before making changes
+2. Design a reasonable solution, then implement
+3. Read config from `config.rs` if needed
+4. Pass config values through component chain (don't use globals)
+5. Respect chat enabled/disabled status
+6. In groups, check for @mention when appropriate
+7. Use `MarkdownV2` for formatted messages (escape with `utils::markdown::escape`)
+8. Add tests in `#[cfg(test)]` modules
+9. **Review your changes** - Carefully review all modifications before committing
+10. Run `make ci` before committing
+
+## Crate Usage Guidelines
+
+**When unsure about crate APIs, ALWAYS verify first:**
+
+```bash
+# Generate and open local documentation
+cargo doc --open
+
+# Generate docs for a specific crate
+cargo doc -p teloxide --open
+```
+
+Or check [docs.rs](https://docs.rs) for published crate documentation.
+
+**Never guess API usage** - incorrect assumptions about crate behavior can lead to subtle bugs. Common crates to verify:
+- `teloxide` - Telegram bot framework, check dispatcher patterns and filter methods
+- `sea-orm` - Database ORM, verify entity relationships and query builders
+- `tokio` - Async runtime, understand spawn/select/channel patterns
+- `regex` - Pattern matching, test patterns before using

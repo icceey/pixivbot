@@ -24,6 +24,7 @@ pub fn format_tags<T: AsRef<str>>(tags: &[T]) -> Vec<String> {
             result = result.replace(')', "_");
             result = result.replace('・', "_");
             result = result.replace('/', "_");
+            result = result.replace(':', "_");
             result
         })
         .collect()
