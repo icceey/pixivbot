@@ -154,7 +154,6 @@ impl Downloader {
     }
 
     /// Clean up old cache files (older than days_threshold)
-    #[allow(dead_code)]
     pub async fn cleanup_cache(&self, days_threshold: u64) -> AppResult<usize> {
         use std::time::{SystemTime, UNIX_EPOCH};
 

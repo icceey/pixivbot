@@ -112,6 +112,7 @@ async fn main() -> AppResult<()> {
         scheduler_config.tick_interval_sec,
         scheduler_config.min_task_interval_sec,
         scheduler_config.max_task_interval_sec,
+        scheduler_config.cache_retention_days,
         sensitive_tags,
     );
 

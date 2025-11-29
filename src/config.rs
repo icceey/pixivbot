@@ -61,7 +61,6 @@ pub struct SchedulerConfig {
     pub max_task_interval_sec: u64,
     /// Cache retention period in days (default: 7 days)
     #[serde(default = "default_cache_retention_days")]
-    #[allow(dead_code)]
     pub cache_retention_days: u64,
 }
 
@@ -70,11 +69,11 @@ fn default_tick_interval_sec() -> u64 {
 }
 
 fn default_min_task_interval_sec() -> u64 {
-    30 * 60 // 30 minutes
+    60 * 60 // 60 minutes
 }
 
 fn default_max_task_interval_sec() -> u64 {
-    40 * 60 // 40 minutes
+    2 * 60 * 60 // 120 minutes
 }
 
 fn default_cache_retention_days() -> u64 {
