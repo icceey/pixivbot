@@ -192,8 +192,17 @@ impl Notifier {
             let batch_size = batch_paths.len();
             let batch_start_idx = current_idx;
 
+            // 第一批带提醒，后续批次静默发送
+            let disable_notification = batch_idx > 0;
+
             if let Err(e) = self
-                .send_media_group(chat_id, batch_paths, batch_caption.as_deref(), has_spoiler)
+                .send_media_group(
+                    chat_id,
+                    batch_paths,
+                    batch_caption.as_deref(),
+                    has_spoiler,
+                    disable_notification,
+                )
                 .await
             {
                 warn!(
@@ -284,12 +293,14 @@ impl Notifier {
         file_paths: Vec<PathBuf>,
         caption: Option<&str>,
         has_spoiler: bool,
+        disable_notification: bool,
     ) -> AppResult<()> {
         info!(
-            "Sending media group with {} photos to chat {} (spoiler: {})",
+            "Sending media group with {} photos to chat {} (spoiler: {}, silent: {})",
             file_paths.len(),
             chat_id,
-            has_spoiler
+            has_spoiler,
+            disable_notification
         );
 
         if file_paths.is_empty() {
@@ -322,7 +333,12 @@ impl Notifier {
             })
             .collect();
 
-        match self.bot.send_media_group(chat_id, media).await {
+        let mut request = self.bot.send_media_group(chat_id, media);
+        if disable_notification {
+            request = request.disable_notification(true);
+        }
+
+        match request.await {
             Ok(_) => {
                 info!("✅ Media group sent successfully");
                 Ok(())
@@ -408,6 +424,9 @@ impl Notifier {
             let batch_size = path_chunk.len();
             let batch_start_idx = current_idx;
 
+            // 第一批带提醒，后续批次静默发送
+            let disable_notification = batch_idx > 0;
+
             if let Err(e) = self
                 .send_media_group_with_individual_captions(
                     chat_id,
@@ -416,6 +435,7 @@ impl Notifier {
                     has_spoiler,
                     batch_idx,
                     total_batches,
+                    disable_notification,
                 )
                 .await
             {
@@ -465,6 +485,7 @@ impl Notifier {
     }
 
     /// Send media group with individual caption for each photo
+    #[allow(clippy::too_many_arguments)]
     async fn send_media_group_with_individual_captions(
         &self,
         chat_id: ChatId,
@@ -473,14 +494,16 @@ impl Notifier {
         has_spoiler: bool,
         batch_idx: usize,
         total_batches: usize,
+        disable_notification: bool,
     ) -> AppResult<()> {
         info!(
-            "Sending media group with {} photos (batch {}/{}) to chat {} (spoiler: {})",
+            "Sending media group with {} photos (batch {}/{}) to chat {} (spoiler: {}, silent: {})",
             file_paths.len(),
             batch_idx + 1,
             total_batches,
             chat_id,
-            has_spoiler
+            has_spoiler,
+            disable_notification
         );
 
         if file_paths.is_empty() {
@@ -524,7 +547,12 @@ impl Notifier {
             })
             .collect();
 
-        match self.bot.send_media_group(chat_id, media).await {
+        let mut request = self.bot.send_media_group(chat_id, media);
+        if disable_notification {
+            request = request.disable_notification(true);
+        }
+
+        match request.await {
             Ok(_) => {
                 info!("✅ Media group sent successfully");
                 Ok(())
