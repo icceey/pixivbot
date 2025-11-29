@@ -1,7 +1,8 @@
 use chrono::{DateTime, Local};
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseConnection, DbErr, EntityTrait, IntoActiveModel,
-    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set,
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, DbErr, EntityTrait,
+    FromQueryResult, IntoActiveModel, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set,
+    Statement,
 };
 use serde_json::Value as JsonValue;
 
@@ -395,12 +396,32 @@ impl Repo {
             .await
     }
 
-    /// Count enabled chats
+    /// Count enabled chats (including admin chats which are always considered enabled)
     pub async fn count_enabled_chats(&self) -> Result<u64, DbErr> {
-        chats::Entity::find()
-            .filter(chats::Column::Enabled.eq(true))
-            .count(&self.db)
-            .await
+        #[derive(FromQueryResult)]
+        struct CountResult {
+            count: i64,
+        }
+
+        // Count chats that are either:
+        // 1. Explicitly enabled (enabled = true)
+        // 2. Belong to an admin/owner user (who are always enabled)
+        // Using DISTINCT to avoid double counting admins with enabled=true
+        let result: Option<CountResult> =
+            CountResult::find_by_statement(Statement::from_sql_and_values(
+                self.db.get_database_backend(),
+                r#"
+                SELECT COUNT(DISTINCT c.id) as count 
+                FROM chats c
+                LEFT JOIN users u ON c.id = u.id
+                WHERE c.enabled = true OR u.role IN ('admin', 'owner')
+            "#,
+                [],
+            ))
+            .one(&self.db)
+            .await?;
+
+        Ok(result.map(|r| r.count as u64).unwrap_or(0))
     }
 
     /// Count all subscriptions
