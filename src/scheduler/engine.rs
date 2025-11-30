@@ -3,7 +3,7 @@ use crate::db::repo::Repo;
 use crate::pixiv::client::PixivClient;
 use crate::pixiv::downloader::Downloader;
 use crate::utils::{html, markdown};
-use chrono::{Datelike, Local, Timelike};
+use chrono::Local;
 use rand::Rng;
 use serde_json::json;
 use std::sync::Arc;
@@ -16,13 +16,12 @@ pub struct SchedulerEngine {
     repo: Arc<Repo>,
     pixiv_client: Arc<tokio::sync::RwLock<PixivClient>>,
     notifier: Notifier,
+    #[allow(dead_code)]
     downloader: Arc<Downloader>,
     tick_interval_sec: u64,
     min_task_interval_sec: u64,
     max_task_interval_sec: u64,
-    cache_retention_days: u64,
     sensitive_tags: Vec<String>,
-    last_cache_cleanup_day: std::sync::atomic::AtomicU32,
 }
 
 impl SchedulerEngine {
@@ -35,7 +34,6 @@ impl SchedulerEngine {
         tick_interval_sec: u64,
         min_task_interval_sec: u64,
         max_task_interval_sec: u64,
-        cache_retention_days: u64,
         sensitive_tags: Vec<String>,
     ) -> Self {
         Self {
@@ -46,81 +44,20 @@ impl SchedulerEngine {
             tick_interval_sec,
             min_task_interval_sec,
             max_task_interval_sec,
-            cache_retention_days,
             sensitive_tags,
-            last_cache_cleanup_day: std::sync::atomic::AtomicU32::new(0),
         }
     }
 
     /// Main scheduler loop - runs indefinitely
     pub async fn run(&self) {
         info!("🚀 Scheduler engine started");
-        info!(
-            "📁 Cache cleanup enabled: files older than {} days will be removed daily at 4:00 AM",
-            self.cache_retention_days
-        );
 
         loop {
             // Wait for tick interval before checking for tasks
             sleep(Duration::from_secs(self.tick_interval_sec)).await;
 
-            // Try cache cleanup (daily at 4:00 AM local time)
-            self.try_cache_cleanup().await;
-
             if let Err(e) = self.tick().await {
                 error!("Scheduler tick error: {}", e);
-            }
-        }
-    }
-
-    /// Try to run cache cleanup if it's 4:00 AM and hasn't run today
-    async fn try_cache_cleanup(&self) {
-        let now = Local::now();
-        let current_day = now.ordinal(); // Day of year (1-366)
-        let current_hour = now.hour();
-
-        // Only run at 4:00 AM
-        if current_hour != 4 {
-            return;
-        }
-
-        // Check if we already ran today
-        let last_day = self
-            .last_cache_cleanup_day
-            .load(std::sync::atomic::Ordering::Relaxed);
-        if last_day == current_day {
-            return;
-        }
-
-        // Try to claim this cleanup (atomic compare-and-swap)
-        if self
-            .last_cache_cleanup_day
-            .compare_exchange(
-                last_day,
-                current_day,
-                std::sync::atomic::Ordering::SeqCst,
-                std::sync::atomic::Ordering::Relaxed,
-            )
-            .is_err()
-        {
-            return; // Another tick already claimed it
-        }
-
-        info!("🧹 Starting daily cache cleanup...");
-        match self
-            .downloader
-            .cleanup_cache(self.cache_retention_days)
-            .await
-        {
-            Ok(count) => {
-                if count > 0 {
-                    info!("✅ Cache cleanup complete: {} files deleted", count);
-                } else {
-                    info!("✅ Cache cleanup complete: no old files found");
-                }
-            }
-            Err(e) => {
-                error!("❌ Cache cleanup failed: {}", e);
             }
         }
     }

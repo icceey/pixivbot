@@ -1,4 +1,5 @@
 mod bot;
+mod cache;
 mod config;
 mod db;
 mod pixiv;
@@ -82,16 +83,23 @@ async fn main() -> Result<()> {
     let pixiv_client = std::sync::Arc::new(tokio::sync::RwLock::new(pixiv_client));
     info!("✅ Pixiv client initialized");
 
-    // Create cache directory
+    // Initialize cache manager (starts background cleanup task)
     let cache_dir = &config.scheduler.cache_dir;
-    std::fs::create_dir_all(cache_dir)?;
+    let cache_retention_days = config.scheduler.cache_retention_days;
+    let cache_manager = cache::FileCacheManager::new(cache_dir, cache_retention_days);
+    info!(
+        "✅ Cache manager initialized (retention: {} days)",
+        cache_retention_days
+    );
 
     // Initialize Downloader (use reqwest client)
     let http_client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()?;
-    let downloader =
-        std::sync::Arc::new(pixiv::downloader::Downloader::new(http_client, cache_dir));
+    let downloader = std::sync::Arc::new(pixiv::downloader::Downloader::new(
+        http_client,
+        cache_manager,
+    ));
     info!("✅ Downloader initialized");
 
     info!("PixivBot initialization complete");
@@ -110,7 +118,6 @@ async fn main() -> Result<()> {
         scheduler_config.tick_interval_sec,
         scheduler_config.min_task_interval_sec,
         scheduler_config.max_task_interval_sec,
-        scheduler_config.cache_retention_days,
         sensitive_tags,
     );
 
