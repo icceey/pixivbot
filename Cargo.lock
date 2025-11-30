@@ -2126,7 +2126,6 @@ dependencies = [
  "serde",
  "serde_json",
  "teloxide",
- "thiserror 2.0.17",
  "tokio",
  "tokio-cron-scheduler",
  "tracing",

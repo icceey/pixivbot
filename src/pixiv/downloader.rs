@@ -1,4 +1,4 @@
-use crate::error::AppResult;
+use anyhow::{anyhow, Context, Result};
 use reqwest::Client;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -21,7 +21,7 @@ impl Downloader {
 
     /// Download image and cache locally
     /// Returns the path to the downloaded file
-    pub async fn download(&self, url: &str) -> AppResult<PathBuf> {
+    pub async fn download(&self, url: &str) -> Result<PathBuf> {
         // Generate cache key from URL
         let cache_key = self.generate_cache_key(url);
         let ext = self.extract_extension(url).unwrap_or("jpg");
@@ -48,18 +48,19 @@ impl Downloader {
             .header("Referer", "https://app-api.pixiv.net/")
             .send()
             .await
-            .map_err(|e| crate::error::AppError::Unknown(format!("Download failed: {}", e)))?;
+            .context("Failed to send download request")?;
 
         if !response.status().is_success() {
-            return Err(crate::error::AppError::Unknown(format!(
+            return Err(anyhow!(
                 "Download failed with status: {}",
                 response.status()
-            )));
+            ));
         }
 
-        let bytes = response.bytes().await.map_err(|e| {
-            crate::error::AppError::Unknown(format!("Failed to read response: {}", e))
-        })?;
+        let bytes = response
+            .bytes()
+            .await
+            .context("Failed to read response bytes")?;
 
         let mut file = tokio::fs::File::create(&filepath).await?;
         file.write_all(&bytes).await?;
@@ -70,7 +71,7 @@ impl Downloader {
 
     /// 批量下载多张图片 (用于多图作品)
     /// 返回所有下载成功的文件路径
-    pub async fn download_all(&self, urls: &[String]) -> AppResult<Vec<PathBuf>> {
+    pub async fn download_all(&self, urls: &[String]) -> Result<Vec<PathBuf>> {
         info!("Batch downloading {} images", urls.len());
 
         let mut paths = Vec::with_capacity(urls.len());
@@ -95,9 +96,7 @@ impl Downloader {
         }
 
         if paths.is_empty() {
-            return Err(crate::error::AppError::Unknown(
-                "All images failed to download".to_string(),
-            ));
+            return Err(anyhow!("All images failed to download"));
         }
 
         info!(
@@ -154,7 +153,7 @@ impl Downloader {
     }
 
     /// Clean up old cache files (older than days_threshold)
-    pub async fn cleanup_cache(&self, days_threshold: u64) -> AppResult<usize> {
+    pub async fn cleanup_cache(&self, days_threshold: u64) -> Result<usize> {
         use std::time::{SystemTime, UNIX_EPOCH};
 
         info!(

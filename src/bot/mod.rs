@@ -6,9 +6,9 @@ pub mod notifier;
 use crate::config::TelegramConfig;
 use crate::db::entities::role::UserRole;
 use crate::db::repo::Repo;
-use crate::error::AppResult;
 use crate::pixiv::client::PixivClient;
 use crate::pixiv::downloader::Downloader;
+use anyhow::Result;
 use std::sync::Arc;
 use teloxide::dispatching::{Dispatcher, UpdateFilterExt};
 use teloxide::dptree;
@@ -29,7 +29,7 @@ pub async fn run(
     pixiv_client: Arc<tokio::sync::RwLock<PixivClient>>,
     downloader: Arc<Downloader>,
     sensitive_tags: Vec<String>,
-) -> AppResult<()> {
+) -> Result<()> {
     info!("Starting Telegram Bot...");
 
     // Parse bot mode from config

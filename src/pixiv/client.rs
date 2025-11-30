@@ -1,6 +1,6 @@
 use crate::config::PixivConfig;
-use crate::error::AppResult;
 use crate::pixiv_client::{self, Illust};
+use anyhow::Result;
 use tracing::info;
 
 pub struct PixivClient {
@@ -8,14 +8,14 @@ pub struct PixivClient {
 }
 
 impl PixivClient {
-    pub fn new(config: PixivConfig) -> AppResult<Self> {
+    pub fn new(config: PixivConfig) -> Result<Self> {
         let client = pixiv_client::PixivClient::new(config.refresh_token)?;
 
         Ok(Self { client })
     }
 
     /// Login using refresh token
-    pub async fn login(&mut self) -> AppResult<()> {
+    pub async fn login(&mut self) -> Result<()> {
         info!("Authenticating with Pixiv using refresh token...");
 
         self.client.login().await?;
@@ -25,7 +25,7 @@ impl PixivClient {
     }
 
     /// Get latest illusts from an author
-    pub async fn get_user_illusts(&self, user_id: u64, limit: usize) -> AppResult<Vec<Illust>> {
+    pub async fn get_user_illusts(&self, user_id: u64, limit: usize) -> Result<Vec<Illust>> {
         info!("Fetching illusts for author {}", user_id);
 
         let response = self
@@ -49,7 +49,7 @@ impl PixivClient {
         mode: &str,
         date: Option<&str>,
         limit: usize,
-    ) -> AppResult<Vec<Illust>> {
+    ) -> Result<Vec<Illust>> {
         info!("Fetching {} ranking", mode);
 
         let response = self.client.illust_ranking(mode, date, None).await?;
@@ -62,7 +62,7 @@ impl PixivClient {
 
     /// Get illust detail by ID
     #[allow(dead_code)]
-    pub async fn get_illust_detail(&self, illust_id: u64) -> AppResult<Illust> {
+    pub async fn get_illust_detail(&self, illust_id: u64) -> Result<Illust> {
         info!("Fetching illust detail for {}", illust_id);
 
         let response = self.client.illust_detail(illust_id).await?;
@@ -83,7 +83,7 @@ impl PixivClient {
     }
 
     /// 获取用户详情
-    pub async fn get_user_detail(&self, user_id: u64) -> AppResult<pixiv_client::User> {
+    pub async fn get_user_detail(&self, user_id: u64) -> Result<pixiv_client::User> {
         info!("Fetching user detail for {}", user_id);
 
         let response = self.client.user_detail(user_id).await?;

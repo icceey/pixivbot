@@ -80,7 +80,6 @@ impl PixivClient {
         };
 
         if needs_refresh {
-            tracing::info!("Token expired or not available, refreshing...");
             self.login().await?;
         }
 

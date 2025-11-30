@@ -1,5 +1,5 @@
-use crate::error::AppResult;
 use crate::pixiv::downloader::Downloader;
+use anyhow::{anyhow, Context, Result};
 use std::path::PathBuf;
 use std::sync::Arc;
 use teloxide::prelude::*;
@@ -59,19 +59,15 @@ impl Notifier {
     }
 
     /// Send plain text notification without formatting
-    pub async fn notify_plain(&self, chat_id: ChatId, message: &str) -> AppResult<()> {
+    pub async fn notify_plain(&self, chat_id: ChatId, message: &str) -> Result<()> {
         info!("Sending plain notification to chat {}", chat_id);
 
-        match self.bot.send_message(chat_id, message).await {
-            Ok(_) => {
-                info!("✅ Notification sent successfully");
-                Ok(())
-            }
-            Err(e) => {
-                warn!("Failed to send notification to {}: {}", chat_id, e);
-                Err(crate::error::AppError::Telegram(e.to_string()))
-            }
-        }
+        self.bot
+            .send_message(chat_id, message)
+            .await
+            .context("Failed to send Telegram message")?;
+        info!("✅ Notification sent successfully");
+        Ok(())
     }
 
     /// Download image and send as photo with caption
@@ -81,7 +77,7 @@ impl Notifier {
         image_url: &str,
         caption: Option<&str>,
         has_spoiler: bool,
-    ) -> AppResult<()> {
+    ) -> Result<()> {
         info!(
             "Downloading and sending image to chat {}: {} (spoiler: {})",
             chat_id, image_url, has_spoiler
@@ -258,7 +254,7 @@ impl Notifier {
         file_path: PathBuf,
         caption: Option<&str>,
         has_spoiler: bool,
-    ) -> AppResult<()> {
+    ) -> Result<()> {
         info!(
             "Sending photo from {:?} to chat {} (spoiler: {})",
             file_path, chat_id, has_spoiler
@@ -275,16 +271,9 @@ impl Notifier {
             request = request.has_spoiler(true);
         }
 
-        match request.await {
-            Ok(_) => {
-                info!("✅ Photo sent successfully");
-                Ok(())
-            }
-            Err(e) => {
-                warn!("Failed to send photo to {}: {}", chat_id, e);
-                Err(crate::error::AppError::Telegram(e.to_string()))
-            }
-        }
+        request.await.context("Failed to send photo")?;
+        info!("✅ Photo sent successfully");
+        Ok(())
     }
 
     /// 发送媒体组 (多张图片)
@@ -295,7 +284,7 @@ impl Notifier {
         caption: Option<&str>,
         has_spoiler: bool,
         disable_notification: bool,
-    ) -> AppResult<()> {
+    ) -> Result<()> {
         info!(
             "Sending media group with {} photos to chat {} (spoiler: {}, silent: {})",
             file_paths.len(),
@@ -305,9 +294,7 @@ impl Notifier {
         );
 
         if file_paths.is_empty() {
-            return Err(crate::error::AppError::Unknown(
-                "No files to send".to_string(),
-            ));
+            return Err(anyhow!("No files to send"));
         }
 
         // 构建媒体组
@@ -339,16 +326,9 @@ impl Notifier {
             request = request.disable_notification(true);
         }
 
-        match request.await {
-            Ok(_) => {
-                info!("✅ Media group sent successfully");
-                Ok(())
-            }
-            Err(e) => {
-                warn!("Failed to send media group to {}: {}", chat_id, e);
-                Err(crate::error::AppError::Telegram(e.to_string()))
-            }
-        }
+        request.await.context("Failed to send media group")?;
+        info!("✅ Media group sent successfully");
+        Ok(())
     }
 
     /// Send media group with individual caption for each photo (for ranking push)
@@ -496,7 +476,7 @@ impl Notifier {
         batch_idx: usize,
         total_batches: usize,
         disable_notification: bool,
-    ) -> AppResult<()> {
+    ) -> Result<()> {
         info!(
             "Sending media group with {} photos (batch {}/{}) to chat {} (spoiler: {}, silent: {})",
             file_paths.len(),
@@ -508,9 +488,7 @@ impl Notifier {
         );
 
         if file_paths.is_empty() {
-            return Err(crate::error::AppError::Unknown(
-                "No files to send".to_string(),
-            ));
+            return Err(anyhow!("No files to send"));
         }
 
         // Build media group with individual caption for each photo
@@ -553,15 +531,8 @@ impl Notifier {
             request = request.disable_notification(true);
         }
 
-        match request.await {
-            Ok(_) => {
-                info!("✅ Media group sent successfully");
-                Ok(())
-            }
-            Err(e) => {
-                warn!("Failed to send media group to {}: {}", chat_id, e);
-                Err(crate::error::AppError::Telegram(e.to_string()))
-            }
-        }
+        request.await.context("Failed to send media group")?;
+        info!("✅ Media group sent successfully");
+        Ok(())
     }
 }

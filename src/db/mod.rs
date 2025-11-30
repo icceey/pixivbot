@@ -2,12 +2,12 @@
 pub mod entities;
 pub mod repo;
 
-use crate::error::AppResult;
+use anyhow::Result;
 use sea_orm::{ConnectOptions, Database, DatabaseConnection};
 use std::time::Duration;
 use tracing::info;
 
-pub async fn establish_connection(database_url: &str) -> AppResult<DatabaseConnection> {
+pub async fn establish_connection(database_url: &str) -> Result<DatabaseConnection> {
     let mut opt = ConnectOptions::new(database_url);
     opt.max_connections(100)
         .min_connections(5)

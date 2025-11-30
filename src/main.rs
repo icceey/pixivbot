@@ -1,21 +1,20 @@
 mod bot;
 mod config;
 mod db;
-mod error;
 mod pixiv;
 mod pixiv_client;
 mod scheduler;
 mod utils;
 
 use crate::config::Config;
-use crate::error::AppResult;
+use anyhow::Result;
 use sea_orm_migration::MigratorTrait;
 use tracing::{error, info};
 use tracing_subscriber::fmt::time::ChronoLocal;
 use tracing_subscriber::{prelude::*, EnvFilter};
 
 #[tokio::main]
-async fn main() -> AppResult<()> {
+async fn main() -> Result<()> {
     // Load configuration
     let config = Config::load()?;
 
