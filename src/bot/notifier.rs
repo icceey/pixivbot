@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use teloxide::prelude::*;
 use teloxide::types::{InputFile, InputMedia, InputMediaPhoto, ParseMode};
+use tokio::time::{sleep, Duration};
 use tracing::{error, info, warn};
 
 /// 批量发送的结果，记录成功和失败的项目索引
@@ -126,7 +127,7 @@ impl Notifier {
             let result = self
                 .notify_with_image(chat_id, &image_urls[0], caption, has_spoiler)
                 .await;
-            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+            sleep(Duration::from_secs(2)).await;
             return if result.is_ok() {
                 BatchSendResult::all_succeeded(1)
             } else {
@@ -224,7 +225,7 @@ impl Notifier {
             current_idx += batch_size;
 
             let cooldown_secs = (batch_size * 2) as u64;
-            tokio::time::sleep(tokio::time::Duration::from_secs(cooldown_secs)).await;
+            sleep(Duration::from_secs(cooldown_secs)).await;
         }
 
         if !failed_indices.is_empty() {
@@ -357,7 +358,7 @@ impl Notifier {
             let result = self
                 .notify_with_image(chat_id, &image_urls[0], Some(&captions[0]), has_spoiler)
                 .await;
-            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+            sleep(Duration::from_secs(2)).await;
             return if result.is_ok() {
                 BatchSendResult::all_succeeded(1)
             } else {
@@ -442,7 +443,7 @@ impl Notifier {
             current_idx += batch_size;
 
             let cooldown_secs = (batch_size * 2) as u64;
-            tokio::time::sleep(tokio::time::Duration::from_secs(cooldown_secs)).await;
+            sleep(Duration::from_secs(cooldown_secs)).await;
         }
 
         if !failed_indices.is_empty() {

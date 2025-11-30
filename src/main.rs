@@ -83,16 +83,15 @@ async fn main() -> Result<()> {
     info!("✅ Pixiv client initialized");
 
     // Create cache directory
-    std::fs::create_dir_all("data/cache")?;
+    let cache_dir = &config.scheduler.cache_dir;
+    std::fs::create_dir_all(cache_dir)?;
 
     // Initialize Downloader (use reqwest client)
     let http_client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()?;
-    let downloader = std::sync::Arc::new(pixiv::downloader::Downloader::new(
-        http_client,
-        "data/cache",
-    ));
+    let downloader =
+        std::sync::Arc::new(pixiv::downloader::Downloader::new(http_client, cache_dir));
     info!("✅ Downloader initialized");
 
     info!("PixivBot initialization complete");

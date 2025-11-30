@@ -62,6 +62,9 @@ pub struct SchedulerConfig {
     /// Cache retention period in days (default: 7 days)
     #[serde(default = "default_cache_retention_days")]
     pub cache_retention_days: u64,
+    /// Cache directory path (default: "data/cache")
+    #[serde(default = "default_cache_dir")]
+    pub cache_dir: String,
 }
 
 fn default_tick_interval_sec() -> u64 {
@@ -78,6 +81,10 @@ fn default_max_task_interval_sec() -> u64 {
 
 fn default_cache_retention_days() -> u64 {
     7 // 7 days
+}
+
+fn default_cache_dir() -> String {
+    "data/cache".to_string()
 }
 
 #[derive(Debug, Deserialize, Clone)]

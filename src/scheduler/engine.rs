@@ -430,7 +430,7 @@ impl SchedulerEngine {
                             continue;
                         }
 
-                        tokio::time::sleep(tokio::time::Duration::from_millis(2000)).await;
+                        sleep(Duration::from_millis(2000)).await;
                     }
                 } else {
                     // pending illust 不在当前 API 返回中（可能太旧了）
@@ -558,7 +558,7 @@ impl SchedulerEngine {
                 }
 
                 // Small delay between messages
-                tokio::time::sleep(tokio::time::Duration::from_millis(2000)).await;
+                sleep(Duration::from_millis(2000)).await;
             }
         }
 
