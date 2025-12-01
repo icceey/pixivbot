@@ -609,9 +609,13 @@ impl SchedulerEngine {
             // Collect new illust IDs (will be used to track what was successfully sent)
             let new_ids: Vec<u64> = new_illusts.iter().map(|i| i.id).collect();
 
+            // Apply subscription-level tag filters (include/exclude from filter_tags)
+            let filtered_illusts: Vec<&crate::pixiv_client::Illust> =
+                self.apply_tag_filters_ref(&new_illusts, &subscription.filter_tags);
+
             // Apply chat-level excluded tags filter
             let filtered_illusts: Vec<&crate::pixiv_client::Illust> =
-                self.apply_chat_excluded_tags(new_illusts.clone(), &chat.excluded_tags);
+                self.apply_chat_excluded_tags(filtered_illusts, &chat.excluded_tags);
 
             if filtered_illusts.is_empty() {
                 info!("No illusts to send to chat {} after filtering", chat_id);
@@ -773,7 +777,7 @@ impl SchedulerEngine {
             .and_then(|v| v.as_array())
             .map(|arr| {
                 arr.iter()
-                    .filter_map(|v| v.as_str().map(|s| s.to_lowercase()))
+                    .filter_map(|v| v.as_str().map(html::normalize_tag))
                     .collect()
             })
             .unwrap_or_default();
@@ -783,7 +787,7 @@ impl SchedulerEngine {
             .and_then(|v| v.as_array())
             .map(|arr| {
                 arr.iter()
-                    .filter_map(|v| v.as_str().map(|s| s.to_lowercase()))
+                    .filter_map(|v| v.as_str().map(html::normalize_tag))
                     .collect()
             })
             .unwrap_or_default();
@@ -794,10 +798,10 @@ impl SchedulerEngine {
                 let illust_tags: Vec<String> = illust
                     .tags
                     .iter()
-                    .map(|tag| tag.name.to_lowercase())
+                    .map(|tag| html::normalize_tag(&tag.name))
                     .collect();
 
-                // Check exclude tags first (must not contain any - exact match)
+                // Check exclude tags first (must not contain any - normalized match)
                 if !exclude_tags.is_empty() {
                     for exclude_tag in &exclude_tags {
                         if illust_tags.iter().any(|t| t == exclude_tag) {
@@ -806,7 +810,7 @@ impl SchedulerEngine {
                     }
                 }
 
-                // Check include tags (must contain at least one if specified - exact match)
+                // Check include tags (must contain at least one if specified - normalized match)
                 if !include_tags.is_empty() {
                     for include_tag in &include_tags {
                         if illust_tags.iter().any(|t| t == include_tag) {
@@ -836,7 +840,7 @@ impl SchedulerEngine {
             .and_then(|v| v.as_array())
             .map(|arr| {
                 arr.iter()
-                    .filter_map(|v| v.as_str().map(|s| s.to_lowercase()))
+                    .filter_map(|v| v.as_str().map(html::normalize_tag))
                     .collect()
             })
             .unwrap_or_default();
@@ -846,7 +850,7 @@ impl SchedulerEngine {
             .and_then(|v| v.as_array())
             .map(|arr| {
                 arr.iter()
-                    .filter_map(|v| v.as_str().map(|s| s.to_lowercase()))
+                    .filter_map(|v| v.as_str().map(html::normalize_tag))
                     .collect()
             })
             .unwrap_or_default();
@@ -857,10 +861,10 @@ impl SchedulerEngine {
                 let illust_tags: Vec<String> = illust
                     .tags
                     .iter()
-                    .map(|tag| tag.name.to_lowercase())
+                    .map(|tag| html::normalize_tag(&tag.name))
                     .collect();
 
-                // Check exclude tags first (must not contain any - exact match)
+                // Check exclude tags first (must not contain any - normalized match)
                 if !exclude_tags.is_empty() {
                     for exclude_tag in &exclude_tags {
                         if illust_tags.iter().any(|t| t == exclude_tag) {
@@ -869,7 +873,7 @@ impl SchedulerEngine {
                     }
                 }
 
-                // Check include tags (must contain at least one if specified - exact match)
+                // Check include tags (must contain at least one if specified - normalized match)
                 if !include_tags.is_empty() {
                     for include_tag in &include_tags {
                         if illust_tags.iter().any(|t| t == include_tag) {
@@ -885,7 +889,7 @@ impl SchedulerEngine {
             .collect()
     }
 
-    /// Apply chat-level excluded tags filter (exact match, case-insensitive)
+    /// Apply chat-level excluded tags filter (normalized match, case-insensitive)
     fn apply_chat_excluded_tags<'a>(
         &self,
         illusts: Vec<&'a crate::pixiv_client::Illust>,
@@ -897,7 +901,7 @@ impl SchedulerEngine {
 
         let excluded: Vec<String> =
             if let Ok(tag_array) = serde_json::from_value::<Vec<String>>(tags.clone()) {
-                tag_array.iter().map(|s| s.to_lowercase()).collect()
+                tag_array.iter().map(|s| html::normalize_tag(s)).collect()
             } else {
                 return illusts;
             };
@@ -912,10 +916,10 @@ impl SchedulerEngine {
                 let illust_tags: Vec<String> = illust
                     .tags
                     .iter()
-                    .map(|tag| tag.name.to_lowercase())
+                    .map(|tag| html::normalize_tag(&tag.name))
                     .collect();
 
-                // Must not contain any excluded tag (exact match)
+                // Must not contain any excluded tag (normalized match)
                 for exclude_tag in &excluded {
                     if illust_tags.iter().any(|t| t == exclude_tag) {
                         return false;
@@ -937,17 +941,17 @@ impl SchedulerEngine {
         self.apply_chat_excluded_tags(illusts, chat_excluded_tags)
     }
 
-    /// Check if illust contains sensitive tags (exact match, case-insensitive)
+    /// Check if illust contains sensitive tags (normalized match, case-insensitive)
     fn has_sensitive_tags(&self, illust: &crate::pixiv_client::Illust) -> bool {
         let illust_tags: Vec<String> = illust
             .tags
             .iter()
-            .map(|tag| tag.name.to_lowercase())
+            .map(|tag| html::normalize_tag(&tag.name))
             .collect();
 
         for sensitive_tag in &self.sensitive_tags {
-            let sensitive_lower = sensitive_tag.to_lowercase();
-            if illust_tags.iter().any(|t| t == &sensitive_lower) {
+            let sensitive_normalized = html::normalize_tag(sensitive_tag);
+            if illust_tags.iter().any(|t| t == &sensitive_normalized) {
                 return true;
             }
         }
