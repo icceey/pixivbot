@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use reqwest::Client;
 use std::path::PathBuf;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::cache::FileCacheManager;
 
@@ -25,29 +25,21 @@ impl Downloader {
         }
 
         // Cache miss - download
-        let response = self
+        let bytes = self
             .http_client
             .get(url)
             .header("Referer", "https://app-api.pixiv.net/")
             .send()
             .await
-            .context("Failed to send download request")?;
-
-        if !response.status().is_success() {
-            return Err(anyhow!(
-                "Download failed with status: {}",
-                response.status()
-            ));
-        }
-
-        let bytes = response
+            .context("Failed to send download request")?
+            .error_for_status()
+            .context("Download returned error status")?
             .bytes()
             .await
             .context("Failed to read response bytes")?;
 
         // Save to cache
         let path = self.cache.save(url, &bytes).await?;
-
         info!("Downloaded to: {:?}", path);
         Ok(path)
     }
@@ -67,13 +59,7 @@ impl Downloader {
                 }
                 Err(e) => {
                     // 继续下载其他图片,不因一张失败而中断
-                    tracing::warn!(
-                        "Failed to download image {}/{} ({}): {}",
-                        idx + 1,
-                        urls.len(),
-                        url,
-                        e
-                    );
+                    warn!("Failed to download image[{}] ({}): {}", idx + 1, url, e);
                 }
             }
         }

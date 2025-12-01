@@ -53,10 +53,10 @@ pub struct SchedulerConfig {
     /// Tick interval in seconds (how often to check for pending tasks)
     #[serde(default = "default_tick_interval_sec")]
     pub tick_interval_sec: u64,
-    /// Minimum random interval in seconds between task executions (default: 30 min)
+    /// Minimum random interval in seconds between task executions (default: 2 hours)
     #[serde(default = "default_min_task_interval_sec")]
     pub min_task_interval_sec: u64,
-    /// Maximum random interval in seconds between task executions (default: 40 min)
+    /// Maximum random interval in seconds between task executions (default: 3 hours)
     #[serde(default = "default_max_task_interval_sec")]
     pub max_task_interval_sec: u64,
     /// Cache retention period in days (default: 7 days)
@@ -72,11 +72,11 @@ fn default_tick_interval_sec() -> u64 {
 }
 
 fn default_min_task_interval_sec() -> u64 {
-    60 * 60 // 60 minutes
+    2 * 60 * 60 // 120 minutes
 }
 
 fn default_max_task_interval_sec() -> u64 {
-    2 * 60 * 60 // 120 minutes
+    3 * 60 * 60 // 180 minutes
 }
 
 fn default_cache_retention_days() -> u64 {

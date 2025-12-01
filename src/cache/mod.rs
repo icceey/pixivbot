@@ -45,11 +45,7 @@ impl FileCacheManager {
     /// * `None` - Cache miss
     pub async fn get(&self, url: &str) -> Option<PathBuf> {
         let path = self.resolve_path(url);
-        if tokio::fs::metadata(&path).await.is_ok() {
-            Some(path)
-        } else {
-            None
-        }
+        tokio::fs::metadata(&path).await.ok().map(|_| path)
     }
 
     /// Save data to cache.
@@ -87,23 +83,24 @@ impl FileCacheManager {
     /// Start background cleanup task.
     fn start_background_cleanup(root_dir: PathBuf, retention_days: u64) {
         tokio::spawn(async move {
-            // Initial delay to avoid startup contention
-            tokio::time::sleep(Duration::from_secs(60)).await;
+            const STARTUP_DELAY: Duration = Duration::from_secs(60);
+            const CLEANUP_PERIOD: Duration = Duration::from_secs(24 * 3600);
 
-            let mut interval = tokio::time::interval(Duration::from_secs(24 * 3600));
+            // Initial delay to avoid startup contention
+            tokio::time::sleep(STARTUP_DELAY).await;
+
+            let mut interval = tokio::time::interval(CLEANUP_PERIOD);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
             loop {
                 interval.tick().await;
 
                 match Self::cleanup_dir(&root_dir, retention_days).await {
-                    Ok(count) => {
-                        if count > 0 {
-                            info!("✅ Cache cleanup complete: {} files deleted", count);
-                        }
+                    Ok(count) if count > 0 => {
+                        info!("✅ Cache cleanup complete: {} files deleted", count)
                     }
-                    Err(e) => {
-                        error!("❌ Cache cleanup failed: {}", e);
-                    }
+                    Ok(_) => (),
+                    Err(e) => error!("❌ Cache cleanup failed: {}", e),
                 }
             }
         });

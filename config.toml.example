@@ -17,9 +17,9 @@ dir = "./data/logs"
 # Tick interval in seconds (how often to check for pending tasks)
 tick_interval_sec = 30
 # Random interval range for task execution (in seconds)
-# Default: 60-120 minutes
-min_task_interval_sec = 3600
-max_task_interval_sec = 7200
+# Default: 2-3 hours
+min_task_interval_sec = 7200
+max_task_interval_sec = 10800
 # Cache retention period in days (how long to keep downloaded images)
 cache_retention_days = 7
 # Cache directory path for downloaded images
