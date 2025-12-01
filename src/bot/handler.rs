@@ -7,11 +7,48 @@ use crate::pixiv::client::PixivClient;
 use crate::pixiv::downloader::Downloader;
 use crate::pixiv::model::RankingMode;
 use crate::utils::markdown;
-use serde_json::json;
+use serde_json::{json, Value};
 use std::sync::Arc;
 use teloxide::prelude::*;
 use teloxide::types::{Me, ParseMode};
 use tracing::{error, info};
+
+/// 从 filter_tags JSON 中提取并格式化过滤器信息（用于 MarkdownV2）
+fn format_filter_tags(tags: &Value) -> String {
+    let include: Vec<&str> = tags
+        .get("include")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+    let exclude: Vec<&str> = tags
+        .get("exclude")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+
+    let mut parts = Vec::new();
+    if !include.is_empty() {
+        parts.push(format!(
+            "\\+{}",
+            include
+                .iter()
+                .map(|s| markdown::escape(s))
+                .collect::<Vec<_>>()
+                .join(" \\+")
+        ));
+    }
+    if !exclude.is_empty() {
+        parts.push(format!(
+            "\\-{}",
+            exclude
+                .iter()
+                .map(|s| markdown::escape(s))
+                .collect::<Vec<_>>()
+                .join(" \\-")
+        ));
+    }
+    parts.join(" ")
+}
 
 #[derive(Clone)]
 pub struct BotHandler {
@@ -357,11 +394,10 @@ impl BotHandler {
             }
 
             if let Some(ref tags) = filter_tags {
-                response.push_str(&format!(
-                    "\n🏷 过滤器: 包含: {:?}, 排除: {:?}",
-                    tags.get("include"),
-                    tags.get("exclude")
-                ));
+                let filter_str = format_filter_tags(tags);
+                if !filter_str.is_empty() {
+                    response.push_str(&format!("\n🏷 {}", filter_str));
+                }
             }
         }
 
@@ -466,11 +502,10 @@ impl BotHandler {
                     Ok(_) => {
                         let mut message = format!("✅ 成功订阅 {}", mode.display_name());
                         if let Some(ref tags) = filter_tags {
-                            message.push_str(&format!(
-                                "\n\n🏷 过滤器: 包含: {:?}, 排除: {:?}",
-                                tags.get("include"),
-                                tags.get("exclude")
-                            ));
+                            let filter_str = format_filter_tags(tags);
+                            if !filter_str.is_empty() {
+                                message.push_str(&format!("\n\n🏷 {}", filter_str));
+                            }
                         }
                         bot.send_message(chat_id, message)
                             .parse_mode(ParseMode::MarkdownV2)
@@ -745,46 +780,9 @@ impl BotHandler {
 
                     // Show filter tags for all subscription types (author and ranking)
                     let filter_info = if let Some(tags) = &sub.filter_tags {
-                        if let Ok(filter) =
-                            serde_json::from_value::<serde_json::Value>(tags.clone())
-                        {
-                            let include = filter
-                                .get("include")
-                                .and_then(|v| v.as_array())
-                                .map(|arr| {
-                                    arr.iter()
-                                        .filter_map(|v| v.as_str())
-                                        .map(|s| format!("\\+{}", s.replace('-', "\\-")))
-                                        .collect::<Vec<_>>()
-                                        .join(" ")
-                                })
-                                .unwrap_or_default();
-
-                            let exclude = filter
-                                .get("exclude")
-                                .and_then(|v| v.as_array())
-                                .map(|arr| {
-                                    arr.iter()
-                                        .filter_map(|v| v.as_str())
-                                        .map(|s| format!("\\-{}", s.replace('-', "\\-")))
-                                        .collect::<Vec<_>>()
-                                        .join(" ")
-                                })
-                                .unwrap_or_default();
-
-                            let mut filters = Vec::new();
-                            if !include.is_empty() {
-                                filters.push(include);
-                            }
-                            if !exclude.is_empty() {
-                                filters.push(exclude);
-                            }
-
-                            if !filters.is_empty() {
-                                format!("\n  🏷 Tags: {}", filters.join(" "))
-                            } else {
-                                String::new()
-                            }
+                        let filter_str = format_filter_tags(tags);
+                        if !filter_str.is_empty() {
+                            format!("\n  🏷 {}", filter_str)
                         } else {
                             String::new()
                         }
