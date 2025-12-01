@@ -1,3 +1,28 @@
+/// Normalize a tag string for comparison purposes
+///
+/// Converts the tag to lowercase and replaces special characters with underscores
+/// so that tags like "R-18", "R_18", "r-18" all match.
+///
+/// # Example
+/// ```
+/// use pixivbot::utils::html::normalize_tag;
+///
+/// assert_eq!(normalize_tag("R-18"), "r_18");
+/// assert_eq!(normalize_tag("R_18"), "r_18");
+/// assert_eq!(normalize_tag("Genshin Impact"), "genshin_impact");
+/// ```
+pub fn normalize_tag(tag: &str) -> String {
+    let result = tag.to_lowercase();
+    // Replace special characters that might vary between user input and API response
+    let result = result.replace(' ', "_");
+    let result = result.replace('-', "_");
+    let result = result.replace('(', "_");
+    let result = result.replace(')', "_");
+    let result = result.replace('・', "_");
+    let result = result.replace('/', "_");
+    result.replace(':', "_")
+}
+
 /// Extract tag names from tags and format for display
 ///
 /// Converts tag names by replacing spaces with underscores and special characters
@@ -73,5 +98,35 @@ mod tests {
         let tags = vec!["Genshin Impact", "R-18", "tag(test)"];
         let result = format_tags(&tags);
         assert_eq!(result, vec!["Genshin_Impact", "R_18", "tag_test_"]);
+    }
+
+    #[test]
+    fn test_normalize_tag_lowercase() {
+        assert_eq!(normalize_tag("R-18"), "r_18");
+        assert_eq!(normalize_tag("NSFW"), "nsfw");
+    }
+
+    #[test]
+    fn test_normalize_tag_special_chars() {
+        assert_eq!(normalize_tag("R-18"), "r_18");
+        assert_eq!(normalize_tag("R_18"), "r_18");
+        assert_eq!(normalize_tag("r-18"), "r_18");
+        assert_eq!(normalize_tag("r_18"), "r_18");
+    }
+
+    #[test]
+    fn test_normalize_tag_spaces() {
+        assert_eq!(normalize_tag("Genshin Impact"), "genshin_impact");
+        assert_eq!(normalize_tag("Genshin_Impact"), "genshin_impact");
+    }
+
+    #[test]
+    fn test_normalize_tag_match() {
+        // Test that different variations normalize to the same value
+        let filter = normalize_tag("R-18");
+        assert_eq!(normalize_tag("R-18"), filter);
+        assert_eq!(normalize_tag("R_18"), filter);
+        assert_eq!(normalize_tag("r-18"), filter);
+        assert_eq!(normalize_tag("r_18"), filter);
     }
 }

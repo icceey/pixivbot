@@ -197,11 +197,13 @@ impl BotHandler {
    \- `\-tag`: 排除带有此标签的作品
    \- 示例: `/sub 123456,789012 \+原神 \-R\-18`
 
-📊 `/subrank <mode>`
+📊 `/subrank <mode> [+tag1 \-tag2]`
    订阅 Pixiv 排行榜
    \- 模式: `day`, `week`, `month`, `day_male`, `day_female`, `week_original`, `week_rookie`, `day_manga`
    \- R18 模式: `day_r18`, `week_r18`, `week_r18g`, `day_male_r18`, `day_female_r18`
-   \- 示例: `/subrank day`
+   \- `\+tag`: 仅包含带有此标签的作品
+   \- `\-tag`: 排除带有此标签的作品
+   \- 示例: `/subrank day \+原神`
 
 🗑 `/unsub <author_id,...>`
    取消订阅作者
@@ -386,18 +388,23 @@ impl BotHandler {
         chat_id: ChatId,
         args: String,
     ) -> ResponseResult<()> {
-        let mode_str = args.trim();
+        let parts: Vec<&str> = args.split_whitespace().collect();
 
-        if mode_str.is_empty() {
+        if parts.is_empty() {
             let available_modes = RankingMode::all_modes().join(", ");
             bot.send_message(
                 chat_id,
-                format!("❌ 用法: `/subrank <mode>`\n可用模式: {}", available_modes),
+                format!(
+                    "❌ 用法: `/subrank <mode> [+tag1 -tag2]`\n可用模式: {}",
+                    available_modes
+                ),
             )
             .parse_mode(ParseMode::MarkdownV2)
             .await?;
             return Ok(());
         }
+
+        let mode_str = parts[0];
 
         // 解析排行榜模式
         let mode = match RankingMode::from_str(mode_str) {
@@ -411,6 +418,29 @@ impl BotHandler {
                 .await?;
                 return Ok(());
             }
+        };
+
+        // Parse filter tags (optional)
+        let mut include_tags = Vec::new();
+        let mut exclude_tags = Vec::new();
+
+        for tag in &parts[1..] {
+            if let Some(stripped) = tag.strip_prefix('+') {
+                include_tags.push(stripped.to_string());
+            } else if let Some(stripped) = tag.strip_prefix('-') {
+                exclude_tags.push(stripped.to_string());
+            } else {
+                include_tags.push(tag.to_string());
+            }
+        }
+
+        let filter_tags = if !include_tags.is_empty() || !exclude_tags.is_empty() {
+            Some(json!({
+                "include": include_tags,
+                "exclude": exclude_tags,
+            }))
+        } else {
+            None
         };
 
         // 使用模式字符串创建任务
@@ -427,14 +457,22 @@ impl BotHandler {
             .await
         {
             Ok(task) => {
-                // Create subscription
+                // Create subscription with filter tags
                 match self
                     .repo
-                    .upsert_subscription(chat_id.0, task.id, None)
+                    .upsert_subscription(chat_id.0, task.id, filter_tags.clone())
                     .await
                 {
                     Ok(_) => {
-                        bot.send_message(chat_id, format!("✅ 成功订阅 {}", mode.display_name()))
+                        let mut message = format!("✅ 成功订阅 {}", mode.display_name());
+                        if let Some(ref tags) = filter_tags {
+                            message.push_str(&format!(
+                                "\n\n🏷 过滤器: 包含: {:?}, 排除: {:?}",
+                                tags.get("include"),
+                                tags.get("exclude")
+                            ));
+                        }
+                        bot.send_message(chat_id, message)
                             .parse_mode(ParseMode::MarkdownV2)
                             .await?;
                     }
@@ -705,49 +743,45 @@ impl BotHandler {
                         task.value.replace('_', "\\_")
                     };
 
-                    let filter_info = if task.r#type == "author" {
-                        // Show filter tags for author subscriptions
-                        if let Some(tags) = &sub.filter_tags {
-                            if let Ok(filter) =
-                                serde_json::from_value::<serde_json::Value>(tags.clone())
-                            {
-                                let include = filter
-                                    .get("include")
-                                    .and_then(|v| v.as_array())
-                                    .map(|arr| {
-                                        arr.iter()
-                                            .filter_map(|v| v.as_str())
-                                            .map(|s| format!("\\+{}", s.replace('-', "\\-")))
-                                            .collect::<Vec<_>>()
-                                            .join(" ")
-                                    })
-                                    .unwrap_or_default();
+                    // Show filter tags for all subscription types (author and ranking)
+                    let filter_info = if let Some(tags) = &sub.filter_tags {
+                        if let Ok(filter) =
+                            serde_json::from_value::<serde_json::Value>(tags.clone())
+                        {
+                            let include = filter
+                                .get("include")
+                                .and_then(|v| v.as_array())
+                                .map(|arr| {
+                                    arr.iter()
+                                        .filter_map(|v| v.as_str())
+                                        .map(|s| format!("\\+{}", s.replace('-', "\\-")))
+                                        .collect::<Vec<_>>()
+                                        .join(" ")
+                                })
+                                .unwrap_or_default();
 
-                                let exclude = filter
-                                    .get("exclude")
-                                    .and_then(|v| v.as_array())
-                                    .map(|arr| {
-                                        arr.iter()
-                                            .filter_map(|v| v.as_str())
-                                            .map(|s| format!("\\-{}", s.replace('-', "\\-")))
-                                            .collect::<Vec<_>>()
-                                            .join(" ")
-                                    })
-                                    .unwrap_or_default();
+                            let exclude = filter
+                                .get("exclude")
+                                .and_then(|v| v.as_array())
+                                .map(|arr| {
+                                    arr.iter()
+                                        .filter_map(|v| v.as_str())
+                                        .map(|s| format!("\\-{}", s.replace('-', "\\-")))
+                                        .collect::<Vec<_>>()
+                                        .join(" ")
+                                })
+                                .unwrap_or_default();
 
-                                let mut filters = Vec::new();
-                                if !include.is_empty() {
-                                    filters.push(include);
-                                }
-                                if !exclude.is_empty() {
-                                    filters.push(exclude);
-                                }
+                            let mut filters = Vec::new();
+                            if !include.is_empty() {
+                                filters.push(include);
+                            }
+                            if !exclude.is_empty() {
+                                filters.push(exclude);
+                            }
 
-                                if !filters.is_empty() {
-                                    format!("\n  🏷 Tags: {}", filters.join(" "))
-                                } else {
-                                    String::new()
-                                }
+                            if !filters.is_empty() {
+                                format!("\n  🏷 Tags: {}", filters.join(" "))
                             } else {
                                 String::new()
                             }
@@ -1282,17 +1316,19 @@ impl BotHandler {
         Ok(())
     }
 
-    /// 检查作品是否包含敏感标签
+    /// 检查作品是否包含敏感标签（使用标准化匹配）
     fn has_sensitive_tags(&self, illust: &crate::pixiv_client::Illust) -> bool {
+        use crate::utils::html;
+
         let illust_tags: Vec<String> = illust
             .tags
             .iter()
-            .map(|tag| tag.name.to_lowercase())
+            .map(|tag| html::normalize_tag(&tag.name))
             .collect();
 
         for sensitive_tag in &self.sensitive_tags {
-            let sensitive_lower = sensitive_tag.to_lowercase();
-            if illust_tags.iter().any(|t| t == &sensitive_lower) {
+            let sensitive_normalized = html::normalize_tag(sensitive_tag);
+            if illust_tags.iter().any(|t| t == &sensitive_normalized) {
                 return true;
             }
         }
