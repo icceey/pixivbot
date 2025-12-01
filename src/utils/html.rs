@@ -12,15 +12,15 @@
 /// assert_eq!(normalize_tag("Genshin Impact"), "genshin_impact");
 /// ```
 pub fn normalize_tag(tag: &str) -> String {
-    let result = tag.to_lowercase();
-    // Replace special characters that might vary between user input and API response
-    let result = result.replace(' ', "_");
-    let result = result.replace('-', "_");
-    let result = result.replace('(', "_");
-    let result = result.replace(')', "_");
-    let result = result.replace('・', "_");
-    let result = result.replace('/', "_");
-    result.replace(':', "_")
+    tag.chars()
+        .map(|c| {
+            let c_lower = c.to_lowercase().next().unwrap_or(c);
+            match c_lower {
+                ' ' | '-' | '(' | ')' | '・' | '/' | ':' => '_',
+                _ => c_lower,
+            }
+        })
+        .collect()
 }
 
 /// Extract tag names from tags and format for display
