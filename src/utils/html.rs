@@ -1,32 +1,33 @@
+/// Special characters that should be removed from tags.
+/// These characters are not compatible with Telegram hashtags or cause matching issues.
+const SPECIAL_CHARS: &[char] = &[' ', '-', '(', ')', '・', '/', ':', '…', '「', '」', '_'];
+
+/// Remove special characters from a tag string.
+/// Used by both normalize_tag and format_tags.
+fn remove_special_chars(tag: &str) -> String {
+    tag.chars().filter(|c| !SPECIAL_CHARS.contains(c)).collect()
+}
+
 /// Normalize a tag string for comparison purposes
 ///
-/// Converts the tag to lowercase and replaces special characters with underscores
-/// so that tags like "R-18", "R_18", "r-18" all match.
+/// Converts the tag to lowercase and removes special characters
+/// so that tags like "R-18", "R18", "r-18" all match.
 ///
 /// # Example
 /// ```
 /// use pixivbot::utils::html::normalize_tag;
 ///
-/// assert_eq!(normalize_tag("R-18"), "r_18");
-/// assert_eq!(normalize_tag("R_18"), "r_18");
-/// assert_eq!(normalize_tag("Genshin Impact"), "genshin_impact");
+/// assert_eq!(normalize_tag("R-18"), "r18");
+/// assert_eq!(normalize_tag("R_18"), "r18");
+/// assert_eq!(normalize_tag("Genshin Impact"), "genshinimpact");
 /// ```
 pub fn normalize_tag(tag: &str) -> String {
-    tag.chars()
-        .map(|c| {
-            let c_lower = c.to_lowercase().next().unwrap_or(c);
-            match c_lower {
-                ' ' | '-' | '(' | ')' | '・' | '/' | ':' => '_',
-                _ => c_lower,
-            }
-        })
-        .collect()
+    remove_special_chars(tag).to_lowercase()
 }
 
 /// Extract tag names from tags and format for display
 ///
-/// Converts tag names by replacing spaces with underscores and removing special characters
-/// that Telegram doesn't recognize in hashtags (e.g., `-`, `(`, `)`).
+/// Removes special characters that Telegram doesn't recognize in hashtags.
 /// Does NOT add hashtags or markdown escaping - that should be done by the caller.
 ///
 /// # Example
@@ -35,23 +36,11 @@ pub fn normalize_tag(tag: &str) -> String {
 ///
 /// let tags = vec!["原神", "Genshin Impact", "R-18", "test-tag(test)"];
 /// let formatted = format_tags(&tags);
-/// // Returns: vec!["原神", "Genshin_Impact", "R18", "testtagtest"]
+/// // Returns: vec!["原神", "GenshinImpact", "R18", "testtagtest"]
 /// ```
 pub fn format_tags<T: AsRef<str>>(tags: &[T]) -> Vec<String> {
     tags.iter()
-        .map(|tag| {
-            let tag_str = tag.as_ref();
-            // Replace spaces with underscores
-            let mut result = tag_str.replace(' ', "_");
-            // Remove special characters that Telegram doesn't recognize in hashtags
-            result = result.replace('-', "");
-            result = result.replace('(', "");
-            result = result.replace(')', "");
-            result = result.replace('・', "");
-            result = result.replace('/', "");
-            result = result.replace(':', "");
-            result
-        })
+        .map(|tag| remove_special_chars(tag.as_ref()))
         .collect()
 }
 
@@ -76,7 +65,7 @@ mod tests {
     fn test_format_tags_with_spaces() {
         let tags = vec!["Genshin Impact", "Game Art"];
         let result = format_tags(&tags);
-        assert_eq!(result, vec!["Genshin_Impact", "Game_Art"]);
+        assert_eq!(result, vec!["GenshinImpact", "GameArt"]);
     }
 
     #[test]
@@ -97,27 +86,37 @@ mod tests {
     fn test_format_tags_mixed() {
         let tags = vec!["Genshin Impact", "R-18", "tag(test)"];
         let result = format_tags(&tags);
-        assert_eq!(result, vec!["Genshin_Impact", "R18", "tagtest"]);
+        assert_eq!(result, vec!["GenshinImpact", "R18", "tagtest"]);
+    }
+
+    #[test]
+    fn test_format_tags_japanese_chars() {
+        let tags = vec!["「テスト」", "テスト…", "ヴァイオレット・エヴァーガーデン"];
+        let result = format_tags(&tags);
+        assert_eq!(
+            result,
+            vec!["テスト", "テスト", "ヴァイオレットエヴァーガーデン"]
+        );
     }
 
     #[test]
     fn test_normalize_tag_lowercase() {
-        assert_eq!(normalize_tag("R-18"), "r_18");
+        assert_eq!(normalize_tag("R-18"), "r18");
         assert_eq!(normalize_tag("NSFW"), "nsfw");
     }
 
     #[test]
     fn test_normalize_tag_special_chars() {
-        assert_eq!(normalize_tag("R-18"), "r_18");
-        assert_eq!(normalize_tag("R_18"), "r_18");
-        assert_eq!(normalize_tag("r-18"), "r_18");
-        assert_eq!(normalize_tag("r_18"), "r_18");
+        assert_eq!(normalize_tag("R-18"), "r18");
+        assert_eq!(normalize_tag("R_18"), "r18");
+        assert_eq!(normalize_tag("r-18"), "r18");
+        assert_eq!(normalize_tag("r_18"), "r18");
     }
 
     #[test]
     fn test_normalize_tag_spaces() {
-        assert_eq!(normalize_tag("Genshin Impact"), "genshin_impact");
-        assert_eq!(normalize_tag("Genshin_Impact"), "genshin_impact");
+        assert_eq!(normalize_tag("Genshin Impact"), "genshinimpact");
+        assert_eq!(normalize_tag("Genshin_Impact"), "genshinimpact");
     }
 
     #[test]
@@ -128,5 +127,11 @@ mod tests {
         assert_eq!(normalize_tag("R_18"), filter);
         assert_eq!(normalize_tag("r-18"), filter);
         assert_eq!(normalize_tag("r_18"), filter);
+    }
+
+    #[test]
+    fn test_normalize_tag_japanese_chars() {
+        assert_eq!(normalize_tag("「テスト」"), "テスト");
+        assert_eq!(normalize_tag("テスト…"), "テスト");
     }
 }
