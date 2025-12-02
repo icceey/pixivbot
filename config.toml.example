@@ -26,5 +26,6 @@ cache_retention_days = 7
 cache_dir = "data/cache"
 
 [content]
-# Sensitive tags that can be blurred per chat setting
+# Default sensitive tags for new chats. Each chat can customize their own sensitive tags.
+# When blur_sensitive is enabled for a chat, images containing these tags will be spoiler-blurred.
 sensitive_tags = ["R-18", "R-18G", "NSFW"]

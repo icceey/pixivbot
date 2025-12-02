@@ -84,6 +84,7 @@ impl Repo {
         chat_type: String,
         title: Option<String>,
         default_enabled: bool,
+        default_sensitive_tags: Option<JsonValue>,
     ) -> Result<chats::Model, DbErr> {
         let now = Local::now().naive_local();
 
@@ -102,6 +103,7 @@ impl Repo {
                 enabled: Set(default_enabled),
                 blur_sensitive_tags: Set(true), // Default to enabled
                 excluded_tags: Set(None),
+                sensitive_tags: Set(default_sensitive_tags),
                 created_at: Set(now),
             };
             new_chat.insert(&self.db).await
@@ -130,6 +132,7 @@ impl Repo {
                 enabled: Set(enabled),
                 blur_sensitive_tags: Set(true), // Default to enabled
                 excluded_tags: Set(None),
+                sensitive_tags: Set(None),
                 created_at: Set(now),
             };
             new_chat.insert(&self.db).await
@@ -165,6 +168,22 @@ impl Repo {
 
         let mut active: chats::ActiveModel = chat.into_active_model();
         active.excluded_tags = Set(tags);
+        active.update(&self.db).await
+    }
+
+    /// Set sensitive tags for a chat
+    pub async fn set_sensitive_tags(
+        &self,
+        chat_id: i64,
+        tags: Option<JsonValue>,
+    ) -> Result<chats::Model, DbErr> {
+        let chat = chats::Entity::find_by_id(chat_id)
+            .one(&self.db)
+            .await?
+            .ok_or(DbErr::RecordNotFound(format!("Chat {} not found", chat_id)))?;
+
+        let mut active: chats::ActiveModel = chat.into_active_model();
+        active.sensitive_tags = Set(tags);
         active.update(&self.db).await
     }
 

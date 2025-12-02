@@ -11,6 +11,7 @@ pub struct Model {
     pub enabled: bool,
     pub blur_sensitive_tags: bool,
     pub excluded_tags: Option<Json>,
+    pub sensitive_tags: Option<Json>,
     pub created_at: DateTime,
 }
 

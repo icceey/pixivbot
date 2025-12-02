@@ -2,7 +2,7 @@ use crate::bot::notifier::Notifier;
 use crate::db::repo::Repo;
 use crate::pixiv::client::PixivClient;
 use crate::pixiv::downloader::Downloader;
-use crate::utils::{html, markdown};
+use crate::utils::{html, markdown, sensitive};
 use chrono::Local;
 use rand::Rng;
 use serde_json::json;
@@ -21,7 +21,6 @@ pub struct SchedulerEngine {
     tick_interval_sec: u64,
     min_task_interval_sec: u64,
     max_task_interval_sec: u64,
-    sensitive_tags: Vec<String>,
 }
 
 impl SchedulerEngine {
@@ -34,7 +33,6 @@ impl SchedulerEngine {
         tick_interval_sec: u64,
         min_task_interval_sec: u64,
         max_task_interval_sec: u64,
-        sensitive_tags: Vec<String>,
     ) -> Self {
         Self {
             repo,
@@ -44,7 +42,6 @@ impl SchedulerEngine {
             tick_interval_sec,
             min_task_interval_sec,
             max_task_interval_sec,
-            sensitive_tags,
         }
     }
 
@@ -263,7 +260,9 @@ impl SchedulerEngine {
                         total_pages
                     );
 
-                    let has_spoiler = chat.blur_sensitive_tags && self.has_sensitive_tags(illust);
+                    let sensitive_tags = sensitive::get_chat_sensitive_tags(&chat);
+                    let has_spoiler = chat.blur_sensitive_tags
+                        && sensitive::contains_sensitive_tags(illust, &sensitive_tags);
 
                     // 获取所有图片 URL
                     let all_urls = illust.get_all_image_urls();
@@ -411,7 +410,9 @@ impl SchedulerEngine {
                 };
 
                 // Check if this illust has sensitive tags for spoiler
-                let has_spoiler = chat.blur_sensitive_tags && self.has_sensitive_tags(illust);
+                let sensitive_tags = sensitive::get_chat_sensitive_tags(&chat);
+                let has_spoiler = chat.blur_sensitive_tags
+                    && sensitive::contains_sensitive_tags(illust, &sensitive_tags);
 
                 let tags = self.format_tags(illust);
 
@@ -651,10 +652,11 @@ impl SchedulerEngine {
             );
 
             // Check if any illust has sensitive tags for spoiler
+            let sensitive_tags = sensitive::get_chat_sensitive_tags(&chat);
             let has_spoiler = chat.blur_sensitive_tags
                 && filtered_illusts
                     .iter()
-                    .any(|illust| self.has_sensitive_tags(illust));
+                    .any(|illust| sensitive::contains_sensitive_tags(illust, &sensitive_tags));
 
             // Prepare image URLs, captions, and corresponding illust IDs
             let mut image_urls: Vec<String> = Vec::new();
@@ -939,24 +941,6 @@ impl SchedulerEngine {
     ) -> Vec<&'a crate::pixiv_client::Illust> {
         // Same implementation as apply_chat_excluded_tags
         self.apply_chat_excluded_tags(illusts, chat_excluded_tags)
-    }
-
-    /// Check if illust contains sensitive tags (normalized match, case-insensitive)
-    fn has_sensitive_tags(&self, illust: &crate::pixiv_client::Illust) -> bool {
-        let illust_tags: Vec<String> = illust
-            .tags
-            .iter()
-            .map(|tag| html::normalize_tag(&tag.name))
-            .collect();
-
-        for sensitive_tag in &self.sensitive_tags {
-            let sensitive_normalized = html::normalize_tag(sensitive_tag);
-            if illust_tags.iter().any(|t| t == &sensitive_normalized) {
-                return true;
-            }
-        }
-
-        false
     }
 
     /// Format tags for display (no blur on tags, blur is on images)

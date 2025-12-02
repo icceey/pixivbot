@@ -173,7 +173,7 @@ pub struct BotHandler {
     repo: Arc<Repo>,
     pixiv_client: Arc<tokio::sync::RwLock<PixivClient>>,
     notifier: Notifier,
-    sensitive_tags: Vec<String>,
+    default_sensitive_tags: Vec<String>,
     owner_id: Option<i64>,
     is_public_mode: bool,
 }
@@ -188,7 +188,7 @@ impl BotHandler {
         repo: Arc<Repo>,
         pixiv_client: Arc<tokio::sync::RwLock<PixivClient>>,
         downloader: Arc<Downloader>,
-        sensitive_tags: Vec<String>,
+        default_sensitive_tags: Vec<String>,
         owner_id: Option<i64>,
         is_public_mode: bool,
     ) -> Self {
@@ -198,7 +198,7 @@ impl BotHandler {
             repo,
             pixiv_client,
             notifier,
-            sensitive_tags,
+            default_sensitive_tags,
             owner_id,
             is_public_mode,
         }
@@ -271,6 +271,8 @@ impl BotHandler {
             Command::UnsubRank(args) => self.handle_unsub_ranking(bot, chat_id, args).await,
             Command::List => self.handle_list(bot, chat_id).await,
             Command::BlurSensitive(args) => self.handle_blur_sensitive(bot, chat_id, args).await,
+            Command::SensitiveTags(args) => self.handle_sensitive_tags(bot, chat_id, args).await,
+            Command::ClearSensitiveTags => self.handle_clear_sensitive_tags(bot, chat_id).await,
             Command::ExcludeTags(args) => self.handle_exclude_tags(bot, chat_id, args).await,
             Command::ClearExcludedTags => self.handle_clear_excluded_tags(bot, chat_id).await,
             Command::Settings => self.handle_settings(bot, chat_id).await,
@@ -311,6 +313,13 @@ impl BotHandler {
         };
         let chat_title = msg.chat.title().map(|s| s.to_string());
 
+        // Convert default sensitive tags to JSON for new chats
+        let default_sensitive_tags_json = if self.default_sensitive_tags.is_empty() {
+            None
+        } else {
+            Some(json!(self.default_sensitive_tags))
+        };
+
         // Upsert chat - new chats get enabled status based on bot mode
         let chat = self
             .repo
@@ -319,6 +328,7 @@ impl BotHandler {
                 chat_type.to_string(),
                 chat_title,
                 self.is_public_mode,
+                default_sensitive_tags_json,
             )
             .await
             .map_err(|e| e.to_string())?;
@@ -396,6 +406,13 @@ impl BotHandler {
 🔒 `/blursensitive <on|off>`
    启用或禁用敏感内容模糊
    \- 示例: `/blursensitive on`
+
+🏷 `/sensitivetags <tag1,tag2,...>`
+   设置此聊天的敏感标签
+   \- 示例: `/sensitivetags R\-18,R\-18G`
+
+🗑 `/clearsensitivetags`
+   清除所有敏感标签
 
 🚫 `/excludetags <tag1,tag2,...>`
    设置此聊天的全局排除标签
@@ -951,6 +968,78 @@ impl BotHandler {
         Ok(())
     }
 
+    async fn handle_sensitive_tags(
+        &self,
+        bot: Bot,
+        chat_id: ChatId,
+        args: String,
+    ) -> ResponseResult<()> {
+        let arg = args.trim();
+
+        if arg.is_empty() {
+            bot.send_message(chat_id, "❌ 用法: `/sensitivetags <tag1,tag2,...>`")
+                .parse_mode(ParseMode::MarkdownV2)
+                .await?;
+            return Ok(());
+        }
+
+        let tags: Vec<String> = arg
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        if tags.is_empty() {
+            bot.send_message(chat_id, "❌ 未提供有效的标签").await?;
+            return Ok(());
+        }
+
+        let sensitive_tags = Some(json!(tags));
+
+        match self
+            .repo
+            .set_sensitive_tags(chat_id.0, sensitive_tags.clone())
+            .await
+        {
+            Ok(_) => {
+                let tag_list: Vec<String> = tags
+                    .iter()
+                    .map(|s| format!("`{}`", markdown::escape(s)))
+                    .collect();
+
+                let message = format!("✅ 敏感标签已更新: {}", tag_list.join(", "));
+
+                bot.send_message(chat_id, message)
+                    .parse_mode(ParseMode::MarkdownV2)
+                    .await?;
+
+                info!("Chat {} set sensitive_tags", chat_id);
+            }
+            Err(e) => {
+                error!("Failed to set sensitive_tags: {}", e);
+                bot.send_message(chat_id, "❌ 更新设置失败").await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn handle_clear_sensitive_tags(&self, bot: Bot, chat_id: ChatId) -> ResponseResult<()> {
+        match self.repo.set_sensitive_tags(chat_id.0, None).await {
+            Ok(_) => {
+                bot.send_message(chat_id, "✅ 敏感标签已清除").await?;
+
+                info!("Chat {} cleared sensitive_tags", chat_id);
+            }
+            Err(e) => {
+                error!("Failed to clear sensitive_tags: {}", e);
+                bot.send_message(chat_id, "❌ 更新设置失败").await?;
+            }
+        }
+
+        Ok(())
+    }
+
     async fn handle_exclude_tags(
         &self,
         bot: Bot,
@@ -1032,6 +1121,24 @@ impl BotHandler {
                     "**已禁用**"
                 };
 
+                let sensitive_tags = if let Some(tags) = &chat.sensitive_tags {
+                    if let Ok(tag_array) = serde_json::from_value::<Vec<String>>(tags.clone()) {
+                        if tag_array.is_empty() {
+                            "无".to_string()
+                        } else {
+                            tag_array
+                                .iter()
+                                .map(|s| format!("`{}`", markdown::escape(s)))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        }
+                    } else {
+                        "无".to_string()
+                    }
+                } else {
+                    "无".to_string()
+                };
+
                 let excluded_tags = if let Some(tags) = chat.excluded_tags {
                     if let Ok(tag_array) = serde_json::from_value::<Vec<String>>(tags) {
                         if tag_array.is_empty() {
@@ -1051,8 +1158,8 @@ impl BotHandler {
                 };
 
                 let message = format!(
-                    "⚙️ *聊天设置*\n\n🔒 敏感内容模糊: {}\n🚫 排除标签: {}",
-                    blur_status, excluded_tags
+                    "⚙️ *聊天设置*\n\n🔒 敏感内容模糊: {}\n🏷 敏感标签: {}\n🚫 排除标签: {}",
+                    blur_status, sensitive_tags, excluded_tags
                 );
 
                 bot.send_message(chat_id, message)
@@ -1161,17 +1268,18 @@ impl BotHandler {
 
         // 获取聊天设置（用于模糊敏感内容）
         let chat_settings = self.repo.get_chat(chat_id.0).await.ok().flatten();
-        let blur_sensitive = chat_settings
-            .as_ref()
-            .map(|c| c.blur_sensitive_tags)
-            .unwrap_or(false);
 
         // 处理每个链接
         for link in links {
             match link {
                 PixivLink::Illust(illust_id) => {
-                    self.handle_illust_link(bot.clone(), chat_id, illust_id, blur_sensitive)
-                        .await?;
+                    self.handle_illust_link(
+                        bot.clone(),
+                        chat_id,
+                        illust_id,
+                        chat_settings.as_ref(),
+                    )
+                    .await?;
                 }
                 PixivLink::User(user_id) => {
                     self.handle_user_link(bot.clone(), chat_id, user_id).await?;
@@ -1188,7 +1296,7 @@ impl BotHandler {
         bot: Bot,
         chat_id: ChatId,
         illust_id: u64,
-        blur_sensitive: bool,
+        chat_settings: Option<&crate::db::entities::chats::Model>,
     ) -> ResponseResult<()> {
         info!("Fetching illust {} for chat {}", illust_id, chat_id);
 
@@ -1226,8 +1334,16 @@ impl BotHandler {
             tags
         );
 
-        // 检查是否有敏感标签
-        let has_spoiler = blur_sensitive && self.has_sensitive_tags(&illust);
+        // 检查是否有敏感标签 (使用 chat-level 设置)
+        use crate::utils::sensitive;
+        let blur_sensitive = chat_settings
+            .map(|c| c.blur_sensitive_tags)
+            .unwrap_or(false);
+        let sensitive_tags = chat_settings
+            .map(sensitive::get_chat_sensitive_tags)
+            .unwrap_or_default();
+        let has_spoiler =
+            blur_sensitive && sensitive::contains_sensitive_tags(&illust, &sensitive_tags);
 
         // 获取所有图片 URL
         let image_urls = illust.get_all_image_urls();
@@ -1303,26 +1419,6 @@ impl BotHandler {
         }
 
         Ok(())
-    }
-
-    /// 检查作品是否包含敏感标签（使用标准化匹配）
-    fn has_sensitive_tags(&self, illust: &crate::pixiv_client::Illust) -> bool {
-        use crate::utils::html;
-
-        let illust_tags: Vec<String> = illust
-            .tags
-            .iter()
-            .map(|tag| html::normalize_tag(&tag.name))
-            .collect();
-
-        for sensitive_tag in &self.sensitive_tags {
-            let sensitive_normalized = html::normalize_tag(sensitive_tag);
-            if illust_tags.iter().any(|t| t == &sensitive_normalized) {
-                return true;
-            }
-        }
-
-        false
     }
 
     /// 格式化标签用于显示

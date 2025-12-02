@@ -28,6 +28,10 @@ pub enum Command {
     DisableChat(String),
     #[command(description = "启用或禁用敏感内容模糊\n  用法: /blursensitive <on|off>")]
     BlurSensitive(String),
+    #[command(description = "设置敏感标签\n  用法: /sensitivetags <tag1,tag2,...>")]
+    SensitiveTags(String),
+    #[command(description = "清除所有敏感标签")]
+    ClearSensitiveTags,
     #[command(description = "设置排除的标签\n  用法: /excludetags <tag1,tag2,...>")]
     ExcludeTags(String),
     #[command(description = "清除所有排除的标签")]
@@ -49,6 +53,11 @@ impl Command {
                 "blursensitive",
                 "启用或禁用敏感内容模糊 - /blursensitive <on|off>",
             ),
+            BotCommand::new(
+                "sensitivetags",
+                "设置敏感标签 - /sensitivetags <tag1,tag2,...>",
+            ),
+            BotCommand::new("clearsensitivetags", "清除所有敏感标签"),
             BotCommand::new(
                 "excludetags",
                 "设置排除的标签 - /excludetags <tag1,tag2,...>",
