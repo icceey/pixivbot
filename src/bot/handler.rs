@@ -1335,14 +1335,15 @@ impl BotHandler {
         );
 
         // 检查是否有敏感标签 (使用 chat-level 设置)
+        use crate::utils::sensitive;
         let blur_sensitive = chat_settings
             .map(|c| c.blur_sensitive_tags)
             .unwrap_or(false);
         let sensitive_tags = chat_settings
-            .map(Self::get_chat_sensitive_tags)
+            .map(sensitive::get_chat_sensitive_tags)
             .unwrap_or_default();
         let has_spoiler =
-            blur_sensitive && Self::has_sensitive_tags_with_list(&illust, &sensitive_tags);
+            blur_sensitive && sensitive::contains_sensitive_tags(&illust, &sensitive_tags);
 
         // 获取所有图片 URL
         let image_urls = illust.get_all_image_urls();
@@ -1418,37 +1419,6 @@ impl BotHandler {
         }
 
         Ok(())
-    }
-
-    /// 检查作品是否包含敏感标签（使用标准化匹配）
-    fn has_sensitive_tags_with_list(
-        illust: &crate::pixiv_client::Illust,
-        sensitive_tags: &[String],
-    ) -> bool {
-        use crate::utils::html;
-
-        let illust_tags: Vec<String> = illust
-            .tags
-            .iter()
-            .map(|tag| html::normalize_tag(&tag.name))
-            .collect();
-
-        for sensitive_tag in sensitive_tags {
-            let sensitive_normalized = html::normalize_tag(sensitive_tag);
-            if illust_tags.iter().any(|t| t == &sensitive_normalized) {
-                return true;
-            }
-        }
-
-        false
-    }
-
-    /// 从 chat 设置中获取敏感标签列表
-    fn get_chat_sensitive_tags(chat: &crate::db::entities::chats::Model) -> Vec<String> {
-        chat.sensitive_tags
-            .as_ref()
-            .and_then(|tags| serde_json::from_value::<Vec<String>>(tags.clone()).ok())
-            .unwrap_or_default()
     }
 
     /// 格式化标签用于显示
