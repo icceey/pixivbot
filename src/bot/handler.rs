@@ -13,6 +13,55 @@ use teloxide::prelude::*;
 use teloxide::types::{Me, ParseMode};
 use tracing::{error, info};
 
+// ============================================================================
+// Helper Types and Functions
+// ============================================================================
+
+/// 解析后的过滤标签
+#[derive(Debug, Clone, Default)]
+struct FilterTags {
+    include: Vec<String>,
+    exclude: Vec<String>,
+}
+
+impl FilterTags {
+    /// 从命令参数中解析过滤标签
+    /// 格式: +tag1 -tag2 tag3 (无前缀视为 include)
+    fn parse_from_args(args: &[&str]) -> Self {
+        let mut include = Vec::new();
+        let mut exclude = Vec::new();
+
+        for tag in args {
+            if let Some(stripped) = tag.strip_prefix('+') {
+                include.push(stripped.to_string());
+            } else if let Some(stripped) = tag.strip_prefix('-') {
+                exclude.push(stripped.to_string());
+            } else {
+                include.push((*tag).to_string());
+            }
+        }
+
+        Self { include, exclude }
+    }
+
+    /// 检查是否为空（没有任何过滤条件）
+    fn is_empty(&self) -> bool {
+        self.include.is_empty() && self.exclude.is_empty()
+    }
+
+    /// 转换为 JSON Value (用于数据库存储)
+    fn to_json(&self) -> Option<Value> {
+        if self.is_empty() {
+            None
+        } else {
+            Some(json!({
+                "include": self.include,
+                "exclude": self.exclude,
+            }))
+        }
+    }
+}
+
 /// 从 filter_tags JSON 中提取并格式化过滤器信息（用于 MarkdownV2）
 fn format_filter_tags(tags: &Value) -> String {
     let include: Vec<&str> = tags
@@ -50,6 +99,59 @@ fn format_filter_tags(tags: &Value) -> String {
     parts.join(" ")
 }
 
+/// 批量操作结果收集器
+struct BatchResult {
+    success: Vec<String>,
+    failed: Vec<String>,
+}
+
+impl BatchResult {
+    fn new() -> Self {
+        Self {
+            success: Vec::new(),
+            failed: Vec::new(),
+        }
+    }
+
+    fn add_success(&mut self, item: String) {
+        self.success.push(item);
+    }
+
+    fn add_failure(&mut self, item: String) {
+        self.failed.push(item);
+    }
+
+    /// 构建成功/失败列表的响应消息
+    fn build_response(&self, success_prefix: &str, failure_prefix: &str) -> String {
+        let mut response = String::new();
+
+        if !self.success.is_empty() {
+            response.push_str(success_prefix);
+            response.push('\n');
+            for item in &self.success {
+                response.push_str(&format!("  • {}\n", item));
+            }
+        }
+
+        if !self.failed.is_empty() {
+            if !response.is_empty() {
+                response.push('\n');
+            }
+            response.push_str(failure_prefix);
+            response.push('\n');
+            for item in &self.failed {
+                response.push_str(&format!("  • {}\n", item));
+            }
+        }
+
+        response
+    }
+}
+
+// ============================================================================
+// BotHandler - Core Handler Structure
+// ============================================================================
+
 #[derive(Clone)]
 pub struct BotHandler {
     #[allow(dead_code)]
@@ -63,6 +165,10 @@ pub struct BotHandler {
 }
 
 impl BotHandler {
+    // ------------------------------------------------------------------------
+    // Constructor
+    // ------------------------------------------------------------------------
+
     pub fn new(
         bot: Bot,
         repo: Arc<Repo>,
@@ -84,6 +190,10 @@ impl BotHandler {
         }
     }
 
+    // ------------------------------------------------------------------------
+    // Command Entry Point
+    // ------------------------------------------------------------------------
+
     pub async fn handle_command(&self, bot: Bot, msg: Message, cmd: Command) -> ResponseResult<()> {
         let chat_id = msg.chat.id;
         let user_id = msg.from.as_ref().map(|u| u.id.0 as i64).unwrap_or(0);
@@ -97,18 +207,14 @@ impl BotHandler {
         let (user_role, chat_enabled) = match self.ensure_user_and_chat(&msg).await {
             Ok(data) => data,
             Err(e) => {
-                let error_msg = format!("Failed to ensure user/chat: {}", e);
-                error!("{}", error_msg);
+                error!("Failed to ensure user/chat: {}", e);
                 bot.send_message(chat_id, "⚠️ 数据库错误").await?;
                 return Ok(());
             }
         };
 
-        // Check if chat is enabled
-        // Special case: private chat with admin/owner, consider it enabled ()
-        let is_private_chat_with_admin = chat_id.is_user() && user_role.is_admin();
-
-        if !chat_enabled && !is_private_chat_with_admin {
+        // Check if chat is enabled (private chat with admin/owner is always considered enabled)
+        if !self.is_chat_accessible(chat_id, chat_enabled, &user_role) {
             info!(
                 "Ignoring command from disabled chat {} (user: {}, role: {:?})",
                 chat_id, user_id, user_role
@@ -116,60 +222,79 @@ impl BotHandler {
             return Ok(());
         }
 
+        // Route command to appropriate handler
+        self.dispatch_command(bot, chat_id, cmd, &user_role).await
+    }
+
+    /// Check if the chat is accessible for command processing
+    fn is_chat_accessible(
+        &self,
+        chat_id: ChatId,
+        chat_enabled: bool,
+        user_role: &UserRole,
+    ) -> bool {
+        if chat_enabled {
+            return true;
+        }
+        // Special case: private chat with admin/owner is always accessible
+        chat_id.is_user() && user_role.is_admin()
+    }
+
+    /// Dispatch command to the appropriate handler
+    async fn dispatch_command(
+        &self,
+        bot: Bot,
+        chat_id: ChatId,
+        cmd: Command,
+        user_role: &UserRole,
+    ) -> ResponseResult<()> {
         match cmd {
+            // User commands (available to all users)
             Command::Help => self.handle_help(bot, chat_id).await,
             Command::Sub(args) => self.handle_sub_author(bot, chat_id, args).await,
-            Command::SubRank(args) => self.handle_sub_ranking_cmd(bot, chat_id, args).await,
+            Command::SubRank(args) => self.handle_sub_ranking(bot, chat_id, args).await,
             Command::Unsub(args) => self.handle_unsub_author(bot, chat_id, args).await,
             Command::UnsubRank(args) => self.handle_unsub_ranking(bot, chat_id, args).await,
             Command::List => self.handle_list(bot, chat_id).await,
-            Command::SetAdmin(args) => {
-                // Only owner can use this command
-                if !user_role.is_owner() {
-                    return Ok(()); // Silently ignore
-                }
-                self.handle_set_admin(bot, chat_id, args, true).await
-            }
-            Command::UnsetAdmin(args) => {
-                // Only owner can use this command
-                if !user_role.is_owner() {
-                    return Ok(()); // Silently ignore
-                }
-                self.handle_set_admin(bot, chat_id, args, false).await
-            }
-            Command::EnableChat(args) => {
-                // Only admin or owner can use this command
-                if !user_role.is_admin() {
-                    return Ok(()); // Silently ignore
-                }
-                self.handle_enable_chat(bot, chat_id, args, true).await
-            }
-            Command::DisableChat(args) => {
-                // Only admin or owner can use this command
-                if !user_role.is_admin() {
-                    return Ok(()); // Silently ignore
-                }
-                self.handle_enable_chat(bot, chat_id, args, false).await
-            }
             Command::BlurSensitive(args) => self.handle_blur_sensitive(bot, chat_id, args).await,
             Command::ExcludeTags(args) => self.handle_exclude_tags(bot, chat_id, args).await,
             Command::ClearExcludedTags => self.handle_clear_excluded_tags(bot, chat_id).await,
             Command::Settings => self.handle_settings(bot, chat_id).await,
-            Command::Info => {
-                // Only admin/owner in private chat can use this command
-                if !user_role.is_admin() || !chat_id.is_user() {
-                    return Ok(()); // Silently ignore
-                }
+
+            // Admin commands (require admin or owner role)
+            Command::EnableChat(args) if user_role.is_admin() => {
+                self.handle_enable_chat(bot, chat_id, args, true).await
+            }
+            Command::DisableChat(args) if user_role.is_admin() => {
+                self.handle_enable_chat(bot, chat_id, args, false).await
+            }
+            Command::Info if user_role.is_admin() && chat_id.is_user() => {
                 self.handle_info(bot, chat_id).await
             }
+
+            // Owner commands (require owner role)
+            Command::SetAdmin(args) if user_role.is_owner() => {
+                self.handle_set_admin(bot, chat_id, args, true).await
+            }
+            Command::UnsetAdmin(args) if user_role.is_owner() => {
+                self.handle_set_admin(bot, chat_id, args, false).await
+            }
+
+            // Silently ignore unauthorized commands
+            _ => Ok(()),
         }
     }
 
+    // ------------------------------------------------------------------------
+    // User/Chat Management
+    // ------------------------------------------------------------------------
+
     async fn ensure_user_and_chat(&self, msg: &Message) -> Result<(UserRole, bool), String> {
         let chat_id = msg.chat.id.0;
-        let chat_type = match msg.chat.is_group() || msg.chat.is_supergroup() {
-            true => "group",
-            false => "private",
+        let chat_type = if msg.chat.is_group() || msg.chat.is_supergroup() {
+            "group"
+        } else {
+            "private"
         };
         let chat_title = msg.chat.title().map(|s| s.to_string());
 
@@ -221,6 +346,10 @@ impl BotHandler {
         Ok((UserRole::User, chat.enabled))
     }
 
+    // ------------------------------------------------------------------------
+    // Help Command
+    // ------------------------------------------------------------------------
+
     async fn handle_help(&self, bot: Bot, chat_id: ChatId) -> ResponseResult<()> {
         let help_text = r#"
 📚 *PixivBot 帮助*
@@ -269,6 +398,10 @@ impl BotHandler {
         Ok(())
     }
 
+    // ------------------------------------------------------------------------
+    // Subscription Commands
+    // ------------------------------------------------------------------------
+
     async fn handle_sub_author(
         &self,
         bot: Bot,
@@ -284,9 +417,8 @@ impl BotHandler {
             return Ok(());
         }
 
-        // First part is comma-separated IDs
-        let ids_str = parts[0];
-        let author_ids: Vec<&str> = ids_str
+        // Parse comma-separated IDs
+        let author_ids: Vec<&str> = parts[0]
             .split(',')
             .map(|s| s.trim())
             .filter(|s| !s.is_empty())
@@ -298,38 +430,18 @@ impl BotHandler {
             return Ok(());
         }
 
-        // Parse filter tags (shared by all authors in this batch)
-        let mut include_tags = Vec::new();
-        let mut exclude_tags = Vec::new();
+        // Parse filter tags using helper
+        let filter_tags = FilterTags::parse_from_args(&parts[1..]);
+        let filter_tags_json = filter_tags.to_json();
 
-        for tag in &parts[1..] {
-            if let Some(stripped) = tag.strip_prefix('+') {
-                include_tags.push(stripped.to_string());
-            } else if let Some(stripped) = tag.strip_prefix('-') {
-                exclude_tags.push(stripped.to_string());
-            } else {
-                include_tags.push(tag.to_string());
-            }
-        }
-
-        let filter_tags = if !include_tags.is_empty() || !exclude_tags.is_empty() {
-            Some(json!({
-                "include": include_tags,
-                "exclude": exclude_tags,
-            }))
-        } else {
-            None
-        };
-
-        let mut success_list: Vec<String> = Vec::new();
-        let mut failed_list: Vec<String> = Vec::new();
+        let mut result = BatchResult::new();
 
         for author_id_str in author_ids {
-            // Validate it's a number
+            // Validate ID format
             let author_id = match author_id_str.parse::<u64>() {
                 Ok(id) => id,
                 Err(_) => {
-                    failed_list.push(format!("`{}` \\(无效 ID\\)", author_id_str));
+                    result.add_failure(format!("`{}` \\(无效 ID\\)", author_id_str));
                     continue;
                 }
             };
@@ -341,73 +453,49 @@ impl BotHandler {
                     Ok(user) => user.name,
                     Err(e) => {
                         error!("Failed to get user detail for {}: {}", author_id, e);
-                        failed_list.push(format!("`{}` \\(未找到\\)", author_id));
+                        result.add_failure(format!("`{}` \\(未找到\\)", author_id));
                         continue;
                     }
                 }
             };
 
-            // Create or get task
+            // Create or get task and subscription
             match self
-                .repo
-                .get_or_create_task(
-                    "author".to_string(),
-                    author_id_str.to_string(),
-                    Some(author_name.clone()),
+                .create_subscription(
+                    chat_id.0,
+                    "author",
+                    author_id_str,
+                    Some(&author_name),
+                    filter_tags_json.clone(),
                 )
                 .await
             {
-                Ok(task) => {
-                    // Create subscription
-                    match self
-                        .repo
-                        .upsert_subscription(chat_id.0, task.id, filter_tags.clone())
-                        .await
-                    {
-                        Ok(_) => {
-                            success_list.push(format!(
-                                "*{}* \\(ID: `{}`\\)",
-                                markdown::escape(&author_name),
-                                author_id
-                            ));
-                        }
-                        Err(e) => {
-                            error!("Failed to create subscription for {}: {}", author_id, e);
-                            failed_list.push(format!("`{}` \\(订阅失败\\)", author_id));
-                        }
-                    }
+                Ok(_) => {
+                    result.add_success(format!(
+                        "*{}* \\(ID: `{}`\\)",
+                        markdown::escape(&author_name),
+                        author_id
+                    ));
                 }
                 Err(e) => {
-                    error!("Failed to create task for {}: {}", author_id, e);
-                    failed_list.push(format!("`{}` \\(任务创建失败\\)", author_id));
+                    error!("Failed to subscribe to author {}: {}", author_id, e);
+                    result.add_failure(format!("`{}` \\(订阅失败\\)", author_id));
                 }
             }
         }
 
         // Build response message
-        let mut response = String::new();
+        let mut response = result.build_response("✅ 成功订阅:", "❌ 订阅失败:");
 
-        if !success_list.is_empty() {
-            response.push_str("✅ 成功订阅:\n");
-            for author in &success_list {
-                response.push_str(&format!("  • {}\n", author));
-            }
-
-            if let Some(ref tags) = filter_tags {
+        // Append filter tags info if any
+        if !result.success.is_empty() {
+            if let Some(ref tags) = filter_tags_json {
                 let filter_str = format_filter_tags(tags);
                 if !filter_str.is_empty() {
-                    response.push_str(&format!("\n🏷 {}", filter_str));
+                    // Insert filter info after success list
+                    let insert_pos = response.find("\n\n❌").unwrap_or(response.len());
+                    response.insert_str(insert_pos, &format!("\n🏷 {}", filter_str));
                 }
-            }
-        }
-
-        if !failed_list.is_empty() {
-            if !response.is_empty() {
-                response.push_str("\n\n");
-            }
-            response.push_str("❌ 订阅失败:\n");
-            for author in &failed_list {
-                response.push_str(&format!("  • {}\n", author));
             }
         }
 
@@ -418,7 +506,7 @@ impl BotHandler {
         Ok(())
     }
 
-    async fn handle_sub_ranking_cmd(
+    async fn handle_sub_ranking(
         &self,
         bot: Bot,
         chat_id: ChatId,
@@ -440,10 +528,8 @@ impl BotHandler {
             return Ok(());
         }
 
-        let mode_str = parts[0];
-
-        // 解析排行榜模式
-        let mode = match RankingMode::from_str(mode_str) {
+        // Parse ranking mode
+        let mode = match RankingMode::from_str(parts[0]) {
             Some(mode) => mode,
             None => {
                 let available_modes = RankingMode::all_modes().join(", ");
@@ -456,75 +542,45 @@ impl BotHandler {
             }
         };
 
-        // Parse filter tags (optional)
-        let mut include_tags = Vec::new();
-        let mut exclude_tags = Vec::new();
+        // Parse filter tags using helper
+        let filter_tags = FilterTags::parse_from_args(&parts[1..]);
+        let filter_tags_json = filter_tags.to_json();
 
-        for tag in &parts[1..] {
-            if let Some(stripped) = tag.strip_prefix('+') {
-                include_tags.push(stripped.to_string());
-            } else if let Some(stripped) = tag.strip_prefix('-') {
-                exclude_tags.push(stripped.to_string());
-            } else {
-                include_tags.push(tag.to_string());
-            }
-        }
-
-        let filter_tags = if !include_tags.is_empty() || !exclude_tags.is_empty() {
-            Some(json!({
-                "include": include_tags,
-                "exclude": exclude_tags,
-            }))
-        } else {
-            None
-        };
-
-        // 使用模式字符串创建任务
-        let mode_str_for_db = mode.as_str();
-
-        // Create or get task
+        // Create subscription
         match self
-            .repo
-            .get_or_create_task(
-                "ranking".to_string(),
-                mode_str_for_db.to_string(),
-                None, // No author_name for ranking tasks
+            .create_subscription(
+                chat_id.0,
+                "ranking",
+                mode.as_str(),
+                None,
+                filter_tags_json.clone(),
             )
             .await
         {
-            Ok(task) => {
-                // Create subscription with filter tags
-                match self
-                    .repo
-                    .upsert_subscription(chat_id.0, task.id, filter_tags.clone())
-                    .await
-                {
-                    Ok(_) => {
-                        let mut message = format!("✅ 成功订阅 {}", mode.display_name());
-                        if let Some(ref tags) = filter_tags {
-                            let filter_str = format_filter_tags(tags);
-                            if !filter_str.is_empty() {
-                                message.push_str(&format!("\n\n🏷 {}", filter_str));
-                            }
-                        }
-                        bot.send_message(chat_id, message)
-                            .parse_mode(ParseMode::MarkdownV2)
-                            .await?;
-                    }
-                    Err(e) => {
-                        error!("Failed to create subscription: {}", e);
-                        bot.send_message(chat_id, "❌ 创建订阅失败").await?;
+            Ok(_) => {
+                let mut message = format!("✅ 成功订阅 {}", mode.display_name());
+                if let Some(ref tags) = filter_tags_json {
+                    let filter_str = format_filter_tags(tags);
+                    if !filter_str.is_empty() {
+                        message.push_str(&format!("\n\n🏷 {}", filter_str));
                     }
                 }
+                bot.send_message(chat_id, message)
+                    .parse_mode(ParseMode::MarkdownV2)
+                    .await?;
             }
             Err(e) => {
-                error!("Failed to create task: {}", e);
-                bot.send_message(chat_id, "❌ 创建订阅任务失败").await?;
+                error!("Failed to subscribe to ranking {}: {}", mode.as_str(), e);
+                bot.send_message(chat_id, "❌ 创建订阅失败").await?;
             }
         }
 
         Ok(())
     }
+
+    // ------------------------------------------------------------------------
+    // Unsubscribe Commands
+    // ------------------------------------------------------------------------
 
     async fn handle_unsub_author(
         &self,
@@ -547,77 +603,22 @@ impl BotHandler {
             .filter(|s| !s.is_empty())
             .collect();
 
-        let mut success_list: Vec<String> = Vec::new();
-        let mut failed_list: Vec<String> = Vec::new();
+        let mut result = BatchResult::new();
 
         for author_id in author_ids {
-            // Find task by author ID
-            match self.repo.get_task_by_type_value("author", author_id).await {
-                Ok(Some(task)) => {
-                    // Delete subscription for this chat and task
-                    match self
-                        .repo
-                        .delete_subscription_by_chat_task(chat_id.0, task.id)
-                        .await
-                    {
-                        Ok(_) => {
-                            // Check if task still has other subscriptions
-                            match self.repo.count_subscriptions_for_task(task.id).await {
-                                Ok(count) => {
-                                    if count == 0 {
-                                        // No more subscriptions, delete the task
-                                        if let Err(e) = self.repo.delete_task(task.id).await {
-                                            error!("Failed to delete task {}: {}", task.id, e);
-                                        } else {
-                                            info!("Deleted task {} (author {}) - no more subscriptions", task.id, author_id);
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    error!(
-                                        "Failed to count subscriptions for task {}: {}",
-                                        task.id, e
-                                    );
-                                }
-                            }
-                            success_list.push(format!("`{}`", author_id));
-                        }
-                        Err(e) => {
-                            error!("Failed to delete subscription for {}: {}", author_id, e);
-                            failed_list.push(format!("`{}` (未订阅)", author_id));
-                        }
-                    }
-                }
-                Ok(None) => {
-                    failed_list.push(format!("`{}` (未找到)", author_id));
-                }
+            match self
+                .delete_subscription(chat_id.0, "author", author_id)
+                .await
+            {
+                Ok(_) => result.add_success(format!("`{}`", author_id)),
                 Err(e) => {
-                    error!("Failed to get task for {}: {}", author_id, e);
-                    failed_list.push(format!("`{}` (错误)", author_id));
+                    error!("Failed to unsubscribe from author {}: {}", author_id, e);
+                    result.add_failure(format!("`{}` \\({}\\)", author_id, e));
                 }
             }
         }
 
-        // Build response message
-        let mut response = String::new();
-
-        if !success_list.is_empty() {
-            response.push_str("✅ 成功取消订阅:\n");
-            for author in &success_list {
-                response.push_str(&format!("  • {}\n", author));
-            }
-        }
-
-        if !failed_list.is_empty() {
-            if !response.is_empty() {
-                response.push('\n');
-            }
-            response.push_str("❌ 取消订阅失败:\n");
-            for author in &failed_list {
-                response.push_str(&format!("  • {}\n", author));
-            }
-        }
-
+        let response = result.build_response("✅ 成功取消订阅:", "❌ 取消订阅失败:");
         bot.send_message(chat_id, response)
             .parse_mode(ParseMode::MarkdownV2)
             .await?;
@@ -640,7 +641,7 @@ impl BotHandler {
             return Ok(());
         }
 
-        // 解析排行榜模式
+        // Parse ranking mode
         let mode = match RankingMode::from_str(mode_str) {
             Some(mode) => mode,
             None => {
@@ -654,73 +655,32 @@ impl BotHandler {
             }
         };
 
-        let mode_str_for_db = mode.as_str();
-
-        // Find task by ranking mode
         match self
-            .repo
-            .get_task_by_type_value("ranking", mode_str_for_db)
+            .delete_subscription(chat_id.0, "ranking", mode.as_str())
             .await
         {
-            Ok(Some(task)) => {
-                // Delete subscription for this chat and task
-                match self
-                    .repo
-                    .delete_subscription_by_chat_task(chat_id.0, task.id)
-                    .await
-                {
-                    Ok(_) => {
-                        // Check if task still has other subscriptions
-                        match self.repo.count_subscriptions_for_task(task.id).await {
-                            Ok(count) => {
-                                if count == 0 {
-                                    // No more subscriptions, delete the task
-                                    if let Err(e) = self.repo.delete_task(task.id).await {
-                                        error!("Failed to delete task {}: {}", task.id, e);
-                                    } else {
-                                        info!(
-                                            "Deleted task {} (ranking {}) - no more subscriptions",
-                                            task.id, mode_str_for_db
-                                        );
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                error!("Failed to count subscriptions for task {}: {}", task.id, e);
-                            }
-                        }
-
-                        bot.send_message(
-                            chat_id,
-                            format!("✅ 成功取消订阅 {}", mode.display_name()),
-                        )
-                        .parse_mode(ParseMode::MarkdownV2)
-                        .await?;
-                    }
-                    Err(e) => {
-                        error!("Failed to delete subscription: {}", e);
-                        bot.send_message(chat_id, "❌ 取消订阅失败。您可能未订阅此排行榜。")
-                            .parse_mode(ParseMode::MarkdownV2)
-                            .await?;
-                    }
-                }
-            }
-            Ok(None) => {
-                bot.send_message(
-                    chat_id,
-                    format!("❌ 未在您的订阅中找到 {}", mode.display_name()),
-                )
-                .parse_mode(ParseMode::MarkdownV2)
-                .await?;
+            Ok(_) => {
+                bot.send_message(chat_id, format!("✅ 成功取消订阅 {}", mode.display_name()))
+                    .parse_mode(ParseMode::MarkdownV2)
+                    .await?;
             }
             Err(e) => {
-                error!("Failed to get task: {}", e);
-                bot.send_message(chat_id, "❌ 数据库错误").await?;
+                error!(
+                    "Failed to unsubscribe from ranking {}: {}",
+                    mode.as_str(),
+                    e
+                );
+                bot.send_message(chat_id, format!("❌ 取消订阅失败: {}", e))
+                    .await?;
             }
         }
 
         Ok(())
     }
+
+    // ------------------------------------------------------------------------
+    // List Subscriptions
+    // ------------------------------------------------------------------------
 
     async fn handle_list(&self, bot: Bot, chat_id: ChatId) -> ResponseResult<()> {
         match self.repo.list_subscriptions_by_chat(chat_id.0).await {
@@ -807,6 +767,10 @@ impl BotHandler {
 
         Ok(())
     }
+
+    // ------------------------------------------------------------------------
+    // Admin Commands
+    // ------------------------------------------------------------------------
 
     async fn handle_set_admin(
         &self,
@@ -924,6 +888,10 @@ impl BotHandler {
 
         Ok(())
     }
+
+    // ------------------------------------------------------------------------
+    // Chat Settings Commands
+    // ------------------------------------------------------------------------
 
     async fn handle_blur_sensitive(
         &self,
@@ -1088,6 +1056,10 @@ impl BotHandler {
         Ok(())
     }
 
+    // ------------------------------------------------------------------------
+    // Bot Info (Admin only)
+    // ------------------------------------------------------------------------
+
     async fn handle_info(&self, bot: Bot, chat_id: ChatId) -> ResponseResult<()> {
         // Gather statistics
         let admin_count = self.repo.count_admin_users().await.unwrap_or(0);
@@ -1110,6 +1082,10 @@ impl BotHandler {
 
         Ok(())
     }
+
+    // ------------------------------------------------------------------------
+    // Message Handler (for Pixiv links)
+    // ------------------------------------------------------------------------
 
     /// 处理普通消息（检查 Pixiv 链接）
     ///
@@ -1351,5 +1327,86 @@ impl BotHandler {
             .collect();
 
         format!("\n\n{}", escaped.join("  "))
+    }
+
+    // ------------------------------------------------------------------------
+    // Subscription Helper Methods
+    // ------------------------------------------------------------------------
+
+    /// Create or update a subscription for a chat
+    async fn create_subscription(
+        &self,
+        chat_id: i64,
+        task_type: &str,
+        task_value: &str,
+        author_name: Option<&str>,
+        filter_tags: Option<Value>,
+    ) -> Result<(), String> {
+        // Get or create the task
+        let task = self
+            .repo
+            .get_or_create_task(
+                task_type.to_string(),
+                task_value.to_string(),
+                author_name.map(|s| s.to_string()),
+            )
+            .await
+            .map_err(|e| format!("任务创建失败: {}", e))?;
+
+        // Create subscription
+        self.repo
+            .upsert_subscription(chat_id, task.id, filter_tags)
+            .await
+            .map_err(|e| format!("订阅失败: {}", e))?;
+
+        Ok(())
+    }
+
+    /// Delete a subscription and cleanup orphaned tasks
+    async fn delete_subscription(
+        &self,
+        chat_id: i64,
+        task_type: &str,
+        task_value: &str,
+    ) -> Result<(), String> {
+        // Find the task
+        let task = self
+            .repo
+            .get_task_by_type_value(task_type, task_value)
+            .await
+            .map_err(|e| format!("数据库错误: {}", e))?
+            .ok_or_else(|| "未找到".to_string())?;
+
+        // Delete subscription
+        self.repo
+            .delete_subscription_by_chat_task(chat_id, task.id)
+            .await
+            .map_err(|_| "未订阅".to_string())?;
+
+        // Cleanup orphaned task if no more subscriptions
+        self.cleanup_orphaned_task(task.id, task_type, task_value)
+            .await;
+
+        Ok(())
+    }
+
+    /// Cleanup task if it has no more subscriptions
+    async fn cleanup_orphaned_task(&self, task_id: i32, task_type: &str, task_value: &str) {
+        match self.repo.count_subscriptions_for_task(task_id).await {
+            Ok(0) => {
+                if let Err(e) = self.repo.delete_task(task_id).await {
+                    error!("Failed to delete task {}: {}", task_id, e);
+                } else {
+                    info!(
+                        "Deleted task {} ({} {}) - no more subscriptions",
+                        task_id, task_type, task_value
+                    );
+                }
+            }
+            Err(e) => {
+                error!("Failed to count subscriptions for task {}: {}", task_id, e);
+            }
+            _ => {}
+        }
     }
 }
