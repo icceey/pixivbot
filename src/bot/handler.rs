@@ -37,7 +37,7 @@ impl FilterTags {
             } else if let Some(stripped) = tag.strip_prefix('-') {
                 exclude.push(stripped.to_string());
             } else {
-                include.push((*tag).to_string());
+                include.push(tag.to_string());
             }
         }
 
@@ -123,6 +123,16 @@ impl BatchResult {
 
     /// 构建成功/失败列表的响应消息
     fn build_response(&self, success_prefix: &str, failure_prefix: &str) -> String {
+        self.build_response_with_suffix(success_prefix, failure_prefix, None)
+    }
+
+    /// 构建成功/失败列表的响应消息，在成功列表后添加可选后缀
+    fn build_response_with_suffix(
+        &self,
+        success_prefix: &str,
+        failure_prefix: &str,
+        success_suffix: Option<&str>,
+    ) -> String {
         let mut response = String::new();
 
         if !self.success.is_empty() {
@@ -130,6 +140,10 @@ impl BatchResult {
             response.push('\n');
             for item in &self.success {
                 response.push_str(&format!("  • {}\n", item));
+            }
+            // Add suffix after success list if provided
+            if let Some(suffix) = success_suffix {
+                response.push_str(suffix);
             }
         }
 
@@ -291,10 +305,9 @@ impl BotHandler {
 
     async fn ensure_user_and_chat(&self, msg: &Message) -> Result<(UserRole, bool), String> {
         let chat_id = msg.chat.id.0;
-        let chat_type = if msg.chat.is_group() || msg.chat.is_supergroup() {
-            "group"
-        } else {
-            "private"
+        let chat_type = match msg.chat.is_group() || msg.chat.is_supergroup() {
+            true => "group",
+            false => "private",
         };
         let chat_title = msg.chat.title().map(|s| s.to_string());
 
@@ -484,20 +497,22 @@ impl BotHandler {
             }
         }
 
-        // Build response message
-        let mut response = result.build_response("✅ 成功订阅:", "❌ 订阅失败:");
-
-        // Append filter tags info if any
-        if !result.success.is_empty() {
-            if let Some(ref tags) = filter_tags_json {
-                let filter_str = format_filter_tags(tags);
-                if !filter_str.is_empty() {
-                    // Insert filter info after success list
-                    let insert_pos = response.find("\n\n❌").unwrap_or(response.len());
-                    response.insert_str(insert_pos, &format!("\n🏷 {}", filter_str));
-                }
+        // Build filter tags suffix if any
+        let filter_suffix = filter_tags_json.as_ref().and_then(|tags| {
+            let filter_str = format_filter_tags(tags);
+            if filter_str.is_empty() {
+                None
+            } else {
+                Some(format!("\n🏷 {}", filter_str))
             }
-        }
+        });
+
+        // Build response message with filter suffix
+        let response = result.build_response_with_suffix(
+            "✅ 成功订阅:",
+            "❌ 订阅失败:",
+            filter_suffix.as_deref(),
+        );
 
         bot.send_message(chat_id, response)
             .parse_mode(ParseMode::MarkdownV2)
