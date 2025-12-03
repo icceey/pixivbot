@@ -44,6 +44,42 @@ pub fn format_tags<T: AsRef<str>>(tags: &[T]) -> Vec<String> {
         .collect()
 }
 
+/// Format tags for display
+///
+/// Adds hashtags and escapes for Telegram MarkdownV2.
+/// Returns a string like `\n\n\#tag1  \#tag2`
+/// # Example
+/// ```
+/// use pixivbot::utils::tag::format_tags_escaped;
+/// use crate::pixiv_client::Illust;
+/// let illust = Illust {
+///     tags: vec![
+///         pixivbot::pixiv::model::Tag { name: "原神".to_string() },
+///         pixivbot::pixiv::model::Tag { name: "Genshin Impact".to_string() },
+///     ],
+///     ..Default::default()
+/// };
+/// let formatted = format_tags_escaped(&illust);
+/// // Returns: "\n\n\#原神  \#GenshinImpact"
+/// ```
+pub fn format_tags_escaped(illust: &crate::pixiv_client::Illust) -> String {
+    use teloxide::utils::markdown;
+
+    let tag_names: Vec<&str> = illust.tags.iter().map(|t| t.name.as_str()).collect();
+    let formatted = format_tags(&tag_names);
+
+    if formatted.is_empty() {
+        return String::new();
+    }
+
+    let escaped: Vec<String> = formatted
+        .iter()
+        .map(|t| markdown::escape(format!("#{}", t).as_str()))
+        .collect();
+
+    format!("\n\n{}", escaped.join("  "))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

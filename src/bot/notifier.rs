@@ -59,19 +59,6 @@ impl Notifier {
         Self { bot, downloader }
     }
 
-    /// Send plain text notification without formatting
-    #[allow(dead_code)]
-    pub async fn notify_plain(&self, chat_id: ChatId, message: &str) -> Result<()> {
-        info!("Sending plain notification to chat {}", chat_id);
-
-        self.bot
-            .send_message(chat_id, message)
-            .await
-            .context("Failed to send Telegram message")?;
-        info!("✅ Notification sent successfully");
-        Ok(())
-    }
-
     /// Download image and send as photo with caption
     pub async fn notify_with_image(
         &self,

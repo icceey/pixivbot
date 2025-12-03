@@ -59,7 +59,7 @@ impl Downloader {
                 }
                 Err(e) => {
                     // 继续下载其他图片,不因一张失败而中断
-                    warn!("Failed to download image[{}] ({}): {}", idx + 1, url, e);
+                    warn!("Failed to download image[{}] ({}): {:#}", idx + 1, url, e);
                 }
             }
         }

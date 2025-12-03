@@ -4,100 +4,19 @@ use crate::bot::Command;
 use crate::db::entities::role::UserRole;
 use crate::db::repo::Repo;
 use crate::pixiv::client::PixivClient;
-use crate::pixiv::downloader::Downloader;
 use crate::pixiv::model::RankingMode;
-use crate::utils::markdown;
+use crate::utils::filter::TagFilter;
+use crate::utils::tag;
 use serde_json::{json, Value};
 use std::sync::Arc;
 use teloxide::prelude::*;
 use teloxide::types::{Me, ParseMode};
+use teloxide::utils::markdown;
 use tracing::{error, info};
 
 // ============================================================================
 // Helper Types and Functions
 // ============================================================================
-
-/// 解析后的过滤标签
-#[derive(Debug, Clone, Default)]
-struct FilterTags {
-    include: Vec<String>,
-    exclude: Vec<String>,
-}
-
-impl FilterTags {
-    /// 从命令参数中解析过滤标签
-    /// 格式: +tag1 -tag2 tag3 (无前缀视为 include)
-    fn parse_from_args(args: &[&str]) -> Self {
-        let mut include = Vec::new();
-        let mut exclude = Vec::new();
-
-        for tag in args {
-            if let Some(stripped) = tag.strip_prefix('+') {
-                include.push(stripped.to_string());
-            } else if let Some(stripped) = tag.strip_prefix('-') {
-                exclude.push(stripped.to_string());
-            } else {
-                include.push(tag.to_string());
-            }
-        }
-
-        Self { include, exclude }
-    }
-
-    /// 检查是否为空（没有任何过滤条件）
-    fn is_empty(&self) -> bool {
-        self.include.is_empty() && self.exclude.is_empty()
-    }
-
-    /// 转换为 JSON Value (用于数据库存储)
-    fn to_json(&self) -> Option<Value> {
-        if self.is_empty() {
-            None
-        } else {
-            Some(json!({
-                "include": self.include,
-                "exclude": self.exclude,
-            }))
-        }
-    }
-}
-
-/// 从 filter_tags JSON 中提取并格式化过滤器信息（用于 MarkdownV2）
-fn format_filter_tags(tags: &Value) -> String {
-    let include: Vec<&str> = tags
-        .get("include")
-        .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
-        .unwrap_or_default();
-    let exclude: Vec<&str> = tags
-        .get("exclude")
-        .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
-        .unwrap_or_default();
-
-    let mut parts = Vec::new();
-    if !include.is_empty() {
-        parts.push(format!(
-            "\\+{}",
-            include
-                .iter()
-                .map(|s| markdown::escape(s))
-                .collect::<Vec<_>>()
-                .join(" \\+")
-        ));
-    }
-    if !exclude.is_empty() {
-        parts.push(format!(
-            "\\-{}",
-            exclude
-                .iter()
-                .map(|s| markdown::escape(s))
-                .collect::<Vec<_>>()
-                .join(" \\-")
-        ));
-    }
-    parts.join(" ")
-}
 
 /// 批量操作结果收集器
 struct BatchResult {
@@ -168,8 +87,6 @@ impl BatchResult {
 
 #[derive(Clone)]
 pub struct BotHandler {
-    #[allow(dead_code)]
-    bot: Bot,
     repo: Arc<Repo>,
     pixiv_client: Arc<tokio::sync::RwLock<PixivClient>>,
     notifier: Notifier,
@@ -184,17 +101,14 @@ impl BotHandler {
     // ------------------------------------------------------------------------
 
     pub fn new(
-        bot: Bot,
         repo: Arc<Repo>,
         pixiv_client: Arc<tokio::sync::RwLock<PixivClient>>,
-        downloader: Arc<Downloader>,
+        notifier: Notifier,
         default_sensitive_tags: Vec<String>,
         owner_id: Option<i64>,
         is_public_mode: bool,
     ) -> Self {
-        let notifier = Notifier::new(bot.clone(), downloader);
         Self {
-            bot,
             repo,
             pixiv_client,
             notifier,
@@ -461,7 +375,7 @@ impl BotHandler {
         }
 
         // Parse filter tags using helper
-        let filter_tags = FilterTags::parse_from_args(&parts[1..]);
+        let filter_tags = TagFilter::parse_from_args(&parts[1..]);
         let filter_tags_json = filter_tags.to_json();
 
         let mut result = BatchResult::new();
@@ -515,14 +429,11 @@ impl BotHandler {
         }
 
         // Build filter tags suffix if any
-        let filter_suffix = filter_tags_json.as_ref().and_then(|tags| {
-            let filter_str = format_filter_tags(tags);
-            if filter_str.is_empty() {
-                None
-            } else {
-                Some(format!("\n🏷 {}", filter_str))
-            }
-        });
+        let filter_suffix = if filter_tags.is_empty() {
+            None
+        } else {
+            Some(format!("\n🏷 {}", filter_tags.format_for_display()))
+        };
 
         // Build response message with filter suffix
         let response = result.build_response_with_suffix(
@@ -575,7 +486,7 @@ impl BotHandler {
         };
 
         // Parse filter tags using helper
-        let filter_tags = FilterTags::parse_from_args(&parts[1..]);
+        let filter_tags = TagFilter::parse_from_args(&parts[1..]);
         let filter_tags_json = filter_tags.to_json();
 
         // Create subscription
@@ -591,11 +502,8 @@ impl BotHandler {
         {
             Ok(_) => {
                 let mut message = format!("✅ 成功订阅 {}", mode.display_name());
-                if let Some(ref tags) = filter_tags_json {
-                    let filter_str = format_filter_tags(tags);
-                    if !filter_str.is_empty() {
-                        message.push_str(&format!("\n\n🏷 {}", filter_str));
-                    }
+                if !filter_tags.is_empty() {
+                    message.push_str(&format!("\n\n🏷 {}", filter_tags.format_for_display()));
                 }
                 bot.send_message(chat_id, message)
                     .parse_mode(ParseMode::MarkdownV2)
@@ -779,15 +687,13 @@ impl BotHandler {
                     };
 
                     // Show filter tags for all subscription types (author and ranking)
-                    let filter_info = if let Some(tags) = &sub.filter_tags {
-                        let filter_str = format_filter_tags(tags);
-                        if !filter_str.is_empty() {
-                            format!("\n  🏷 {}", filter_str)
+                    let filter_info = {
+                        let filter = TagFilter::from_filter_json(&sub.filter_tags);
+                        if !filter.is_empty() {
+                            format!("\n  🏷 {}", filter.format_for_display())
                         } else {
                             String::new()
                         }
-                    } else {
-                        String::new()
                     };
 
                     message.push_str(&format!("{} {}{}\n", type_emoji, display_info, filter_info));
@@ -1328,7 +1234,7 @@ impl BotHandler {
             String::new()
         };
 
-        let tags = self.format_tags(&illust);
+        let tags = tag::format_tags_escaped(&illust);
 
         let caption = format!(
             "🎨 {}{}\nby *{}* \\(ID: `{}`\\)\n\n👀 {} \\| ❤️ {} \\| 🔗 [来源](https://pixiv\\.net/artworks/{}){}", 
@@ -1380,7 +1286,7 @@ impl BotHandler {
             Ok(user) => user,
             Err(e) => {
                 error!("Failed to get user {}: {}", user_id, e);
-                bot.send_message(chat_id, format!("❌ 获取用户 {} 失败: {}", user_id, e))
+                bot.send_message(chat_id, format!("❌ 获取用户 {} 失败: {:#}", user_id, e))
                     .await?;
                 return Ok(());
             }
@@ -1415,7 +1321,7 @@ impl BotHandler {
                             .await?;
                     }
                     Err(e) => {
-                        error!("Failed to create subscription for {}: {}", user_id, e);
+                        error!("Failed to create subscription for {}: {:#}", user_id, e);
                         bot.send_message(chat_id, "❌ 创建订阅失败").await?;
                     }
                 }
@@ -1427,25 +1333,6 @@ impl BotHandler {
         }
 
         Ok(())
-    }
-
-    /// 格式化标签用于显示
-    fn format_tags(&self, illust: &crate::pixiv_client::Illust) -> String {
-        use crate::utils::html;
-
-        let tag_names: Vec<&str> = illust.tags.iter().map(|t| t.name.as_str()).collect();
-        let formatted = html::format_tags(&tag_names);
-
-        if formatted.is_empty() {
-            return String::new();
-        }
-
-        let escaped: Vec<String> = formatted
-            .iter()
-            .map(|t| format!("\\#{}", markdown::escape(t)))
-            .collect();
-
-        format!("\n\n{}", escaped.join("  "))
     }
 
     // ------------------------------------------------------------------------

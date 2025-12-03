@@ -7,7 +7,6 @@ use crate::config::TelegramConfig;
 use crate::db::entities::role::UserRole;
 use crate::db::repo::Repo;
 use crate::pixiv::client::PixivClient;
-use crate::pixiv::downloader::Downloader;
 use anyhow::Result;
 use std::sync::Arc;
 use teloxide::dispatching::{Dispatcher, UpdateFilterExt};
@@ -27,7 +26,7 @@ pub async fn run(
     config: TelegramConfig,
     repo: Arc<Repo>,
     pixiv_client: Arc<tokio::sync::RwLock<PixivClient>>,
-    downloader: Arc<Downloader>,
+    notifier: notifier::Notifier,
     sensitive_tags: Vec<String>,
 ) -> Result<()> {
     info!("Starting Telegram Bot...");
@@ -46,10 +45,9 @@ pub async fn run(
     );
 
     let handler = BotHandler::new(
-        bot.clone(),
         repo.clone(),
         pixiv_client.clone(),
-        downloader,
+        notifier,
         sensitive_tags,
         config.owner_id,
         is_public_mode,

@@ -1,4 +1,4 @@
-use super::html::normalize_tag;
+use super::tag::normalize_tag;
 use crate::db::entities::chats;
 use crate::pixiv_client::Illust;
 

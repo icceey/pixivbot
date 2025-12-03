@@ -1,3 +1,3 @@
-pub mod html;
-pub mod markdown;
+pub mod filter;
 pub mod sensitive;
+pub mod tag;

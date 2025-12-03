@@ -1,14 +1,16 @@
 use crate::bot::notifier::Notifier;
 use crate::db::repo::Repo;
 use crate::pixiv::client::PixivClient;
-use crate::pixiv::downloader::Downloader;
-use crate::utils::{html, markdown, sensitive};
+use crate::pixiv_client::Illust;
+use crate::utils::filter::TagFilter;
+use crate::utils::{sensitive, tag};
+use anyhow::Result;
 use chrono::Local;
 use rand::Rng;
 use serde_json::json;
 use std::sync::Arc;
 use teloxide::prelude::*;
-use teloxide::Bot;
+use teloxide::utils::markdown;
 use tokio::time::{sleep, Duration};
 use tracing::{error, info, warn};
 
@@ -16,8 +18,6 @@ pub struct SchedulerEngine {
     repo: Arc<Repo>,
     pixiv_client: Arc<tokio::sync::RwLock<PixivClient>>,
     notifier: Notifier,
-    #[allow(dead_code)]
-    downloader: Arc<Downloader>,
     tick_interval_sec: u64,
     min_task_interval_sec: u64,
     max_task_interval_sec: u64,
@@ -28,8 +28,7 @@ impl SchedulerEngine {
     pub fn new(
         repo: Arc<Repo>,
         pixiv_client: Arc<tokio::sync::RwLock<PixivClient>>,
-        bot: Bot,
-        downloader: Arc<Downloader>,
+        notifier: Notifier,
         tick_interval_sec: u64,
         min_task_interval_sec: u64,
         max_task_interval_sec: u64,
@@ -37,8 +36,7 @@ impl SchedulerEngine {
         Self {
             repo,
             pixiv_client,
-            notifier: Notifier::new(bot, downloader.clone()),
-            downloader,
+            notifier,
             tick_interval_sec,
             min_task_interval_sec,
             max_task_interval_sec,
@@ -49,9 +47,12 @@ impl SchedulerEngine {
     pub async fn run(&self) {
         info!("🚀 Scheduler engine started");
 
+        let mut interval = tokio::time::interval(Duration::from_secs(self.tick_interval_sec));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
         loop {
             // Wait for tick interval before checking for tasks
-            sleep(Duration::from_secs(self.tick_interval_sec)).await;
+            interval.tick().await;
 
             if let Err(e) = self.tick().await {
                 error!("Scheduler tick error: {}", e);
@@ -60,15 +61,15 @@ impl SchedulerEngine {
     }
 
     /// Single tick - fetch and execute one pending task
-    async fn tick(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn tick(&self) -> Result<()> {
         // Get one pending task
         let tasks = self.repo.get_pending_tasks(1).await?;
 
-        if tasks.is_empty() {
-            return Ok(());
-        }
+        let task = match tasks.first() {
+            Some(t) => t,
+            None => return Ok(()),
+        };
 
-        let task = &tasks[0];
         info!(
             "⚙️  Executing task [{}] {} {}",
             task.id, task.r#type, task.value
@@ -87,7 +88,7 @@ impl SchedulerEngine {
         // Note: task's next_poll_at is updated inside execute_*_task methods
         // We only log errors here, no need to update task again
         if let Err(e) = result {
-            error!("Task execution failed: {}", e);
+            error!("Task execution failed: {:#}", e);
 
             // On error, still update the poll time to avoid immediate retry
             let random_interval_sec =
@@ -101,10 +102,7 @@ impl SchedulerEngine {
     }
 
     /// Execute author subscription task
-    async fn execute_author_task(
-        &self,
-        task: &crate::db::entities::tasks::Model,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn execute_author_task(&self, task: &crate::db::entities::tasks::Model) -> Result<()> {
         let author_id: u64 = task.value.parse()?;
 
         // Get latest illusts
@@ -221,13 +219,14 @@ impl SchedulerEngine {
             // 记录最新的 illust id（用于在过滤后没有内容时也更新）
             let newest_illust_id = new_illusts.first().map(|i| i.id);
 
-            // Apply subscription tag filters
-            let mut filtered_illusts =
-                self.apply_tag_filters_ref(&new_illusts, &subscription.filter_tags);
+            // Pre-parse tag filters once for this subscription
+            let subscription_filter = TagFilter::from_filter_json(&subscription.filter_tags);
+            let chat_filter = TagFilter::from_excluded_json(&chat.excluded_tags);
 
-            // Apply chat-level excluded tags
-            filtered_illusts =
-                self.apply_chat_excluded_tags_ref(filtered_illusts, &chat.excluded_tags);
+            // Apply subscription tag filters, then chat-level excluded tags
+            let combined_filter = subscription_filter.merged(&chat_filter);
+            let filtered_illusts: Vec<&Illust> =
+                combined_filter.filter(new_illusts.iter().copied());
 
             // 如果过滤后没有内容且没有 pending，更新 latest_illust_id
             if filtered_illusts.is_empty() && pending_illust.is_none() {
@@ -415,7 +414,7 @@ impl SchedulerEngine {
                 let has_spoiler = chat.blur_sensitive_tags
                     && sensitive::contains_sensitive_tags(illust, &sensitive_tags);
 
-                let tags = self.format_tags(illust);
+                let tags = tag::format_tags_escaped(illust);
 
                 let caption = format!(
                     "🎨 {}{}\nby *{}* \\(ID: `{}`\\)\n\n👀 {} \\| ❤️ {} \\| 🔗 [来源](https://pixiv\\.net/artworks/{}){}", 
@@ -512,10 +511,7 @@ impl SchedulerEngine {
     }
 
     /// Execute ranking subscription task
-    async fn execute_ranking_task(
-        &self,
-        task: &crate::db::entities::tasks::Model,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn execute_ranking_task(&self, task: &crate::db::entities::tasks::Model) -> Result<()> {
         let mode = &task.value;
 
         // Get ranking
@@ -613,13 +609,14 @@ impl SchedulerEngine {
             // Collect new illust IDs (will be used to track what was successfully sent)
             let new_ids: Vec<u64> = new_illusts.iter().map(|i| i.id).collect();
 
-            // Apply subscription-level tag filters (include/exclude from filter_tags)
-            let filtered_illusts: Vec<&crate::pixiv_client::Illust> =
-                self.apply_tag_filters_ref(&new_illusts, &subscription.filter_tags);
+            // Pre-parse tag filters once for this subscription
+            let subscription_filter = TagFilter::from_filter_json(&subscription.filter_tags);
+            let chat_filter = TagFilter::from_excluded_json(&chat.excluded_tags);
 
-            // Apply chat-level excluded tags filter
-            let filtered_illusts: Vec<&crate::pixiv_client::Illust> =
-                self.apply_chat_excluded_tags(filtered_illusts, &chat.excluded_tags);
+            // Apply subscription-level tag filters and chat-level excluded tags
+            let combined_filter = subscription_filter.merged(&chat_filter);
+            let filtered_illusts: Vec<&Illust> =
+                combined_filter.filter(new_illusts.iter().copied());
 
             if filtered_illusts.is_empty() {
                 info!("No illusts to send to chat {} after filtering", chat_id);
@@ -678,7 +675,7 @@ impl SchedulerEngine {
                 illust_ids.push(illust.id);
 
                 // Build caption for this image
-                let tags = self.format_tags(illust);
+                let tags = tag::format_tags_escaped(illust);
 
                 let base_caption = format!(
                     "{}\\.  {}\nby *{}* \\(ID: `{}`\\)\n\n❤️ {} \\| 🔗 [来源](https://pixiv\\.net/artworks/{}){}",
@@ -764,202 +761,5 @@ impl SchedulerEngine {
             .await?;
 
         Ok(())
-    }
-
-    /// Apply tag filters to illusts (for owned values)
-    #[allow(dead_code)]
-    fn apply_tag_filters<'a>(
-        &self,
-        illusts: &'a [crate::pixiv_client::Illust],
-        filter_tags: &Option<serde_json::Value>,
-    ) -> Vec<&'a crate::pixiv_client::Illust> {
-        let Some(filters) = filter_tags else {
-            return illusts.iter().collect();
-        };
-
-        let include_tags: Vec<String> = filters
-            .get("include")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(html::normalize_tag))
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        let exclude_tags: Vec<String> = filters
-            .get("exclude")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(html::normalize_tag))
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        illusts
-            .iter()
-            .filter(|illust| {
-                let illust_tags: Vec<String> = illust
-                    .tags
-                    .iter()
-                    .map(|tag| html::normalize_tag(&tag.name))
-                    .collect();
-
-                // Check exclude tags first (must not contain any - normalized match)
-                if !exclude_tags.is_empty() {
-                    for exclude_tag in &exclude_tags {
-                        if illust_tags.iter().any(|t| t == exclude_tag) {
-                            return false;
-                        }
-                    }
-                }
-
-                // Check include tags (must contain at least one if specified - normalized match)
-                if !include_tags.is_empty() {
-                    for include_tag in &include_tags {
-                        if illust_tags.iter().any(|t| t == include_tag) {
-                            return true;
-                        }
-                    }
-                    return false;
-                }
-
-                true
-            })
-            .collect()
-    }
-
-    /// Apply tag filters to illusts (for reference values)
-    fn apply_tag_filters_ref<'a>(
-        &self,
-        illusts: &[&'a crate::pixiv_client::Illust],
-        filter_tags: &Option<serde_json::Value>,
-    ) -> Vec<&'a crate::pixiv_client::Illust> {
-        let Some(filters) = filter_tags else {
-            return illusts.to_vec();
-        };
-
-        let include_tags: Vec<String> = filters
-            .get("include")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(html::normalize_tag))
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        let exclude_tags: Vec<String> = filters
-            .get("exclude")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(html::normalize_tag))
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        illusts
-            .iter()
-            .filter(|illust| {
-                let illust_tags: Vec<String> = illust
-                    .tags
-                    .iter()
-                    .map(|tag| html::normalize_tag(&tag.name))
-                    .collect();
-
-                // Check exclude tags first (must not contain any - normalized match)
-                if !exclude_tags.is_empty() {
-                    for exclude_tag in &exclude_tags {
-                        if illust_tags.iter().any(|t| t == exclude_tag) {
-                            return false;
-                        }
-                    }
-                }
-
-                // Check include tags (must contain at least one if specified - normalized match)
-                if !include_tags.is_empty() {
-                    for include_tag in &include_tags {
-                        if illust_tags.iter().any(|t| t == include_tag) {
-                            return true;
-                        }
-                    }
-                    return false;
-                }
-
-                true
-            })
-            .copied()
-            .collect()
-    }
-
-    /// Apply chat-level excluded tags filter (normalized match, case-insensitive)
-    fn apply_chat_excluded_tags<'a>(
-        &self,
-        illusts: Vec<&'a crate::pixiv_client::Illust>,
-        chat_excluded_tags: &Option<serde_json::Value>,
-    ) -> Vec<&'a crate::pixiv_client::Illust> {
-        let Some(tags) = chat_excluded_tags else {
-            return illusts;
-        };
-
-        let excluded: Vec<String> =
-            if let Ok(tag_array) = serde_json::from_value::<Vec<String>>(tags.clone()) {
-                tag_array.iter().map(|s| html::normalize_tag(s)).collect()
-            } else {
-                return illusts;
-            };
-
-        if excluded.is_empty() {
-            return illusts;
-        }
-
-        illusts
-            .into_iter()
-            .filter(|illust| {
-                let illust_tags: Vec<String> = illust
-                    .tags
-                    .iter()
-                    .map(|tag| html::normalize_tag(&tag.name))
-                    .collect();
-
-                // Must not contain any excluded tag (normalized match)
-                for exclude_tag in &excluded {
-                    if illust_tags.iter().any(|t| t == exclude_tag) {
-                        return false;
-                    }
-                }
-
-                true
-            })
-            .collect()
-    }
-
-    /// Apply chat-level excluded tags filter for reference values
-    fn apply_chat_excluded_tags_ref<'a>(
-        &self,
-        illusts: Vec<&'a crate::pixiv_client::Illust>,
-        chat_excluded_tags: &Option<serde_json::Value>,
-    ) -> Vec<&'a crate::pixiv_client::Illust> {
-        // Same implementation as apply_chat_excluded_tags
-        self.apply_chat_excluded_tags(illusts, chat_excluded_tags)
-    }
-
-    /// Format tags for display (no blur on tags, blur is on images)
-    fn format_tags(&self, illust: &crate::pixiv_client::Illust) -> String {
-        let tag_names: Vec<&str> = illust.tags.iter().map(|t| t.name.as_str()).collect();
-        let formatted = html::format_tags(&tag_names);
-
-        if formatted.is_empty() {
-            return String::new();
-        }
-
-        let escaped: Vec<String> = formatted
-            .iter()
-            .map(|t| format!("\\#{}", markdown::escape(t)))
-            .collect();
-
-        format!("\n\n{}", escaped.join("  "))
     }
 }

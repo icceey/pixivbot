@@ -107,13 +107,15 @@ async fn main() -> Result<()> {
     // Initialize Telegram Bot
     let bot = teloxide::Bot::new(config.telegram.bot_token.clone());
 
+    // Initialize Notifier
+    let notifier = bot::notifier::Notifier::new(bot.clone(), downloader.clone());
+
     // Initialize scheduler
     let scheduler_config = config.scheduler.clone();
     let scheduler = scheduler::SchedulerEngine::new(
         repo.clone(),
         pixiv_client.clone(),
-        bot.clone(),
-        downloader.clone(),
+        notifier.clone(),
         scheduler_config.tick_interval_sec,
         scheduler_config.min_task_interval_sec,
         scheduler_config.max_task_interval_sec,
@@ -146,7 +148,7 @@ async fn main() -> Result<()> {
             config.telegram,
             repo.clone(),
             pixiv_client.clone(),
-            downloader.clone(),
+            notifier.clone(),
             sensitive_tags_for_bot,
         )
         .await

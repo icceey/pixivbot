@@ -1,21 +1,6 @@
 // Pixiv domain models
 use serde::{Deserialize, Serialize};
 
-#[allow(dead_code)]
-#[derive(Debug, Serialize, Deserialize)]
-pub struct Illustrator {
-    pub id: u64,
-    pub name: String,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Serialize, Deserialize)]
-pub struct Illustration {
-    pub id: u64,
-    pub title: String,
-    pub urls: Vec<String>,
-}
-
 /// 排行榜模式枚举
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RankingMode {
