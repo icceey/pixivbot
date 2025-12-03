@@ -440,10 +440,7 @@ impl SchedulerEngine {
 
                 if send_result.is_complete_success() {
                     // 发送成功，更新 subscription 的 latest_data
-                    info!(
-                        "Successfully sent illust {} to chat {}",
-                        illust.id, chat_id
-                    );
+                    info!("Successfully sent illust {} to chat {}", illust.id, chat_id);
                     let updated_data = json!({
                         "latest_illust_id": illust.id,
                         "last_check": Local::now().to_rfc3339(),

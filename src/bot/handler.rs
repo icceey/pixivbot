@@ -645,11 +645,7 @@ impl BotHandler {
                 Ok(author_name) => {
                     // Display author name if available, otherwise just show ID
                     let display = if let Some(name) = author_name {
-                        format!(
-                            "*{}* \\(ID: `{}`\\)",
-                            markdown::escape(&name),
-                            author_id
-                        )
+                        format!("*{}* \\(ID: `{}`\\)", markdown::escape(&name), author_id)
                     } else {
                         format!("`{}`", author_id)
                     };
