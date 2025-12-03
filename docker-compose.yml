@@ -1,0 +1,12 @@
+services:
+  pixivbot:
+    build: .
+    container_name: pixivbot
+    restart: unless-stopped
+    volumes:
+      # Configuration file
+      - ./config.toml:/app/config.toml:ro
+      # Data directory (database, logs, cache)
+      - ./data:/app/data
+    environment:
+      - TZ=Asia/Shanghai

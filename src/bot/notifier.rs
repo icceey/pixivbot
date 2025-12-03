@@ -60,6 +60,7 @@ impl Notifier {
     }
 
     /// Send plain text notification without formatting
+    #[allow(dead_code)]
     pub async fn notify_plain(&self, chat_id: ChatId, message: &str) -> Result<()> {
         info!("Sending plain notification to chat {}", chat_id);
 
@@ -85,25 +86,9 @@ impl Notifier {
         );
 
         // Download the image first
-        match self.downloader.download(image_url).await {
-            Ok(local_path) => {
-                self.send_photo_file(chat_id, local_path, caption, has_spoiler)
-                    .await
-            }
-            Err(e) => {
-                warn!(
-                    "Failed to download image {}: {}, falling back to text",
-                    image_url, e
-                );
-                // Fallback: send text message with URL
-                let fallback_message = if let Some(cap) = caption {
-                    format!("{}\n🔗 {}", cap, image_url)
-                } else {
-                    format!("🔗 {}", image_url)
-                };
-                self.notify_plain(chat_id, &fallback_message).await
-            }
-        }
+        let local_path = self.downloader.download(image_url).await?;
+        self.send_photo_file(chat_id, local_path, caption, has_spoiler)
+            .await
     }
 
     /// 下载并发送多张图片 (媒体组)
@@ -145,14 +130,7 @@ impl Notifier {
         let local_paths = match self.downloader.download_all(image_urls).await {
             Ok(paths) => paths,
             Err(e) => {
-                warn!("Failed to download images: {}, falling back to text", e);
-                let fallback_message = if let Some(cap) = caption {
-                    format!("{}\n🔗 {} images", cap, image_urls.len())
-                } else {
-                    format!("🔗 {} images", image_urls.len())
-                };
-                // 下载失败时尝试发送文本，但仍标记为全部失败
-                let _ = self.notify_plain(chat_id, &fallback_message).await;
+                error!("Failed to download images: {}", e);
                 return BatchSendResult::all_failed(total);
             }
         };
@@ -376,9 +354,7 @@ impl Notifier {
         let local_paths = match self.downloader.download_all(image_urls).await {
             Ok(paths) => paths,
             Err(e) => {
-                warn!("Failed to download images: {}, falling back to text", e);
-                let fallback_message = format!("🔗 {} images (download failed)", image_urls.len());
-                let _ = self.notify_plain(chat_id, &fallback_message).await;
+                error!("Failed to download images: {}", e);
                 return BatchSendResult::all_failed(total);
             }
         };

@@ -642,7 +642,15 @@ impl BotHandler {
                 .delete_subscription(chat_id.0, "author", author_id)
                 .await
             {
-                Ok(_) => result.add_success(format!("`{}`", author_id)),
+                Ok(author_name) => {
+                    // Display author name if available, otherwise just show ID
+                    let display = if let Some(name) = author_name {
+                        format!("*{}* \\(ID: `{}`\\)", markdown::escape(&name), author_id)
+                    } else {
+                        format!("`{}`", author_id)
+                    };
+                    result.add_success(display);
+                }
                 Err(e) => {
                     error!("Failed to unsubscribe from author {}: {}", author_id, e);
                     result.add_failure(format!("`{}` \\({}\\)", author_id, e));
@@ -1474,12 +1482,13 @@ impl BotHandler {
     }
 
     /// Delete a subscription and cleanup orphaned tasks
+    /// Returns the author_name if available (for display purposes)
     async fn delete_subscription(
         &self,
         chat_id: i64,
         task_type: &str,
         task_value: &str,
-    ) -> Result<(), String> {
+    ) -> Result<Option<String>, String> {
         // Find the task
         let task = self
             .repo
@@ -1487,6 +1496,9 @@ impl BotHandler {
             .await
             .map_err(|e| format!("数据库错误: {}", e))?
             .ok_or_else(|| "未找到".to_string())?;
+
+        // Store author_name before cleanup
+        let author_name = task.author_name.clone();
 
         // Delete subscription
         self.repo
@@ -1498,7 +1510,7 @@ impl BotHandler {
         self.cleanup_orphaned_task(task.id, task_type, task_value)
             .await;
 
-        Ok(())
+        Ok(author_name)
     }
 
     /// Cleanup task if it has no more subscriptions

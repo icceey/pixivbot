@@ -210,10 +210,11 @@ impl SchedulerEngine {
             }
 
             info!(
-                "Found {} new illusts for subscription {} (chat {}), pending: {:?}",
+                "Found {} new illusts for subscription {} (chat {}): {:?}, pending: {:?}",
                 new_illusts.len(),
                 subscription.id,
                 chat_id,
+                new_illusts.iter().map(|i| i.id).collect::<Vec<_>>(),
                 pending_illust.as_ref().map(|(id, _, _)| id)
             );
 
@@ -439,6 +440,7 @@ impl SchedulerEngine {
 
                 if send_result.is_complete_success() {
                     // 发送成功，更新 subscription 的 latest_data
+                    info!("Successfully sent illust {} to chat {}", illust.id, chat_id);
                     let updated_data = json!({
                         "latest_illust_id": illust.id,
                         "last_check": Local::now().to_rfc3339(),
@@ -601,10 +603,11 @@ impl SchedulerEngine {
             }
 
             info!(
-                "Found {} new ranking illusts for subscription {} (chat {})",
+                "Found {} new ranking illusts for subscription {} (chat {}): {:?}",
                 new_illusts.len(),
                 subscription.id,
-                chat_id
+                chat_id,
+                new_illusts.iter().map(|i| i.id).collect::<Vec<_>>()
             );
 
             // Collect new illust IDs (will be used to track what was successfully sent)
