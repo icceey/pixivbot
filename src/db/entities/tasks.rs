@@ -1,12 +1,14 @@
 use sea_orm::entity::prelude::*;
 use serde::{Deserialize, Serialize};
 
+use crate::db::entities::types::TaskType;
+
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Deserialize, Serialize)]
 #[sea_orm(table_name = "tasks")]
 pub struct Model {
     #[sea_orm(primary_key)]
     pub id: i32,
-    pub r#type: String, // author, ranking
+    pub r#type: TaskType,
     #[sea_orm(unique)]
     pub value: String, // author_id, ranking_mode
     #[sea_orm(indexed)]

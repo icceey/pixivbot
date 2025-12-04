@@ -6,6 +6,8 @@ use sea_orm::{
 };
 use serde_json::Value as JsonValue;
 
+use crate::db::entities::types::TaskType;
+
 use super::entities::role::UserRole;
 use super::entities::{chats, subscriptions, tasks, users};
 
@@ -196,7 +198,7 @@ impl Repo {
     /// Create a new task
     pub async fn create_task(
         &self,
-        task_type: String,
+        task_type: TaskType,
         value: String,
         next_poll_at: DateTime<Local>,
         author_name: Option<String>,
@@ -216,7 +218,7 @@ impl Repo {
     /// Find task by type and value
     pub async fn get_task_by_type_value(
         &self,
-        task_type: &str,
+        task_type: TaskType,
         value: &str,
     ) -> Result<Option<tasks::Model>, DbErr> {
         tasks::Entity::find()
@@ -229,11 +231,11 @@ impl Repo {
     /// Get or create a task (for subscription flow)
     pub async fn get_or_create_task(
         &self,
-        task_type: String,
+        task_type: TaskType,
         value: String,
         author_name: Option<String>,
     ) -> Result<tasks::Model, DbErr> {
-        if let Some(existing) = self.get_task_by_type_value(&task_type, &value).await? {
+        if let Some(existing) = self.get_task_by_type_value(task_type, &value).await? {
             Ok(existing)
         } else {
             let next_poll = Local::now() + chrono::Duration::seconds(60); // Poll in 1 minute

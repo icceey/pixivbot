@@ -9,16 +9,19 @@
 
 use crate::pixiv_client::Illust;
 use crate::utils::tag;
-use serde_json::{json, Value};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use teloxide::utils::markdown;
 
 /// A unified tag filter for include/exclude filtering.
 ///
 /// Tags are stored in their original form for display purposes.
 /// Normalization is done on-the-fly during matching for case-insensitive comparison.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TagFilter {
+    #[serde(default)]
     include: Vec<String>,
+    #[serde(default)]
     exclude: Vec<String>,
 }
 
@@ -57,31 +60,10 @@ impl TagFilter {
     ///
     /// Expected JSON format: `{"include": ["tag1", "tag2"], "exclude": ["tag3"]}`
     pub fn from_filter_json(filter_tags: &Option<Value>) -> Self {
-        let Some(filters) = filter_tags else {
-            return Self::default();
-        };
-
-        let include = filters
-            .get("include")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        let exclude = filters
-            .get("exclude")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        Self { include, exclude }
+        match filter_tags {
+            Some(v) => serde_json::from_value(v.clone()).unwrap_or_default(),
+            None => Self::default(),
+        }
     }
 
     /// Create a TagFilter from chat excluded_tags JSON (exclude only).
@@ -92,7 +74,7 @@ impl TagFilter {
             return Self::default();
         };
 
-        let exclude = serde_json::from_value::<Vec<String>>(tags.clone()).unwrap_or_default();
+        let exclude: Vec<String> = serde_json::from_value(tags.clone()).unwrap_or_default();
 
         Self {
             include: Vec::new(),
@@ -112,10 +94,7 @@ impl TagFilter {
         if self.is_empty() {
             None
         } else {
-            Some(json!({
-                "include": self.include,
-                "exclude": self.exclude,
-            }))
+            serde_json::to_value(self).ok()
         }
     }
 
@@ -265,7 +244,7 @@ mod tests {
 
     #[test]
     fn test_from_excluded_json() {
-        let json = Some(json!(["R-18", "gore"]));
+        let json = Some(serde_json::json!(["R-18", "gore"]));
         let filter = TagFilter::from_excluded_json(&json);
         assert!(filter.include.is_empty());
         assert_eq!(filter.exclude, vec!["R-18", "gore"]);

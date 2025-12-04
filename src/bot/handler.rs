@@ -2,6 +2,7 @@ use crate::bot::link_handler::{is_bot_mentioned, parse_pixiv_links, PixivLink};
 use crate::bot::notifier::Notifier;
 use crate::bot::Command;
 use crate::db::entities::role::UserRole;
+use crate::db::entities::types::TaskType;
 use crate::db::repo::Repo;
 use crate::pixiv::client::PixivClient;
 use crate::pixiv::model::RankingMode;
@@ -407,7 +408,7 @@ impl BotHandler {
             match self
                 .create_subscription(
                     chat_id.0,
-                    "author",
+                    TaskType::Author,
                     author_id_str,
                     Some(&author_name),
                     filter_tags_json.clone(),
@@ -493,7 +494,7 @@ impl BotHandler {
         match self
             .create_subscription(
                 chat_id.0,
-                "ranking",
+                TaskType::Ranking,
                 mode.as_str(),
                 None,
                 filter_tags_json.clone(),
@@ -547,7 +548,7 @@ impl BotHandler {
 
         for author_id in author_ids {
             match self
-                .delete_subscription(chat_id.0, "author", author_id)
+                .delete_subscription(chat_id.0, TaskType::Author, author_id)
                 .await
             {
                 Ok(author_name) => {
@@ -604,7 +605,7 @@ impl BotHandler {
         };
 
         match self
-            .delete_subscription(chat_id.0, "ranking", mode.as_str())
+            .delete_subscription(chat_id.0, TaskType::Ranking, mode.as_str())
             .await
         {
             Ok(_) => {
@@ -643,27 +644,26 @@ impl BotHandler {
                 // Separate authors and rankings
                 let (authors, rankings): (Vec<_>, Vec<_>) = subscriptions
                     .into_iter()
-                    .partition(|(_, task)| task.r#type == "author");
+                    .partition(|(_, task)| task.r#type == TaskType::Author);
 
                 let mut message = "📋 *您的订阅:*\n\n".to_string();
 
                 // First show authors
                 for (sub, task) in authors.iter().chain(rankings.iter()) {
-                    let type_emoji = match task.r#type.as_str() {
-                        "author" => "🎨",
-                        "ranking" => "📊",
-                        _ => "❓",
+                    let type_emoji = match task.r#type {
+                        TaskType::Author => "🎨",
+                        TaskType::Ranking => "📊",
                     };
 
                     // 构建显示名称：对于 author 类型显示作者名字，对于 ranking 类型显示排行榜类型和模式
                     // 使用代码块格式使得ID可以复制
-                    let display_info = if task.r#type == "author" {
+                    let display_info = if task.r#type == TaskType::Author {
                         if let Some(ref name) = task.author_name {
                             format!("{} \\| ID: `{}`", markdown::escape(name), task.value)
                         } else {
                             format!("ID: `{}`", task.value)
                         }
-                    } else if task.r#type == "ranking" {
+                    } else if task.r#type == TaskType::Ranking {
                         // 对于排行榜，显示友好的排行榜名称和模式
                         match RankingMode::from_str(&task.value) {
                             Some(mode) => {
@@ -1297,7 +1297,7 @@ impl BotHandler {
         match self
             .repo
             .get_or_create_task(
-                "author".to_string(),
+                TaskType::Author,
                 user_id.to_string(),
                 Some(author.name.clone()),
             )
@@ -1343,7 +1343,7 @@ impl BotHandler {
     async fn create_subscription(
         &self,
         chat_id: i64,
-        task_type: &str,
+        task_type: TaskType,
         task_value: &str,
         author_name: Option<&str>,
         filter_tags: Option<Value>,
@@ -1352,7 +1352,7 @@ impl BotHandler {
         let task = self
             .repo
             .get_or_create_task(
-                task_type.to_string(),
+                task_type,
                 task_value.to_string(),
                 author_name.map(|s| s.to_string()),
             )
@@ -1373,7 +1373,7 @@ impl BotHandler {
     async fn delete_subscription(
         &self,
         chat_id: i64,
-        task_type: &str,
+        task_type: TaskType,
         task_value: &str,
     ) -> Result<Option<String>, String> {
         // Find the task
@@ -1401,7 +1401,7 @@ impl BotHandler {
     }
 
     /// Cleanup task if it has no more subscriptions
-    async fn cleanup_orphaned_task(&self, task_id: i32, task_type: &str, task_value: &str) {
+    async fn cleanup_orphaned_task(&self, task_id: i32, task_type: TaskType, task_value: &str) {
         match self.repo.count_subscriptions_for_task(task_id).await {
             Ok(0) => {
                 if let Err(e) = self.repo.delete_task(task_id).await {

@@ -1,4 +1,5 @@
 use crate::bot::notifier::Notifier;
+use crate::db::entities::types::TaskType;
 use crate::db::repo::Repo;
 use crate::pixiv::client::PixivClient;
 use crate::pixiv_client::Illust;
@@ -76,13 +77,9 @@ impl SchedulerEngine {
         );
 
         // Execute based on task type
-        let result = match task.r#type.as_str() {
-            "author" => self.execute_author_task(task).await,
-            "ranking" => self.execute_ranking_task(task).await,
-            _ => {
-                warn!("Unknown task type: {}", task.r#type);
-                Ok(())
-            }
+        let result = match task.r#type {
+            TaskType::Author => self.execute_author_task(task).await,
+            TaskType::Ranking => self.execute_ranking_task(task).await,
         };
 
         // Note: task's next_poll_at is updated inside execute_*_task methods
