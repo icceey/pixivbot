@@ -1,4 +1,4 @@
-use super::role::UserRole;
+use crate::db::types::UserRole;
 use sea_orm::entity::prelude::*;
 use serde::{Deserialize, Serialize};
 

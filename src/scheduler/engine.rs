@@ -1,9 +1,8 @@
 use crate::bot::notifier::Notifier;
-use crate::db::entities::types::TaskType;
 use crate::db::repo::Repo;
+use crate::db::types::{TagFilter, TaskType};
 use crate::pixiv::client::PixivClient;
 use crate::pixiv_client::Illust;
-use crate::utils::filter::TagFilter;
 use crate::utils::{sensitive, tag};
 use anyhow::Result;
 use chrono::Local;
@@ -217,11 +216,10 @@ impl SchedulerEngine {
             let newest_illust_id = new_illusts.first().map(|i| i.id);
 
             // Pre-parse tag filters once for this subscription
-            let subscription_filter = TagFilter::from_filter_json(&subscription.filter_tags);
-            let chat_filter = TagFilter::from_excluded_json(&chat.excluded_tags);
+            let chat_filter = TagFilter::from_excluded_tags(&chat.excluded_tags);
 
             // Apply subscription tag filters, then chat-level excluded tags
-            let combined_filter = subscription_filter.merged(&chat_filter);
+            let combined_filter = subscription.filter_tags.merged(&chat_filter);
             let filtered_illusts: Vec<&Illust> =
                 combined_filter.filter(new_illusts.iter().copied());
 
@@ -259,7 +257,7 @@ impl SchedulerEngine {
 
                     let sensitive_tags = sensitive::get_chat_sensitive_tags(&chat);
                     let has_spoiler = chat.blur_sensitive_tags
-                        && sensitive::contains_sensitive_tags(illust, &sensitive_tags);
+                        && sensitive::contains_sensitive_tags(illust, sensitive_tags);
 
                     // 获取所有图片 URL
                     let all_urls = illust.get_all_image_urls();
@@ -409,7 +407,7 @@ impl SchedulerEngine {
                 // Check if this illust has sensitive tags for spoiler
                 let sensitive_tags = sensitive::get_chat_sensitive_tags(&chat);
                 let has_spoiler = chat.blur_sensitive_tags
-                    && sensitive::contains_sensitive_tags(illust, &sensitive_tags);
+                    && sensitive::contains_sensitive_tags(illust, sensitive_tags);
 
                 let tags = tag::format_tags_escaped(illust);
 
@@ -607,11 +605,10 @@ impl SchedulerEngine {
             let new_ids: Vec<u64> = new_illusts.iter().map(|i| i.id).collect();
 
             // Pre-parse tag filters once for this subscription
-            let subscription_filter = TagFilter::from_filter_json(&subscription.filter_tags);
-            let chat_filter = TagFilter::from_excluded_json(&chat.excluded_tags);
+            let chat_filter = TagFilter::from_excluded_tags(&chat.excluded_tags);
 
             // Apply subscription-level tag filters and chat-level excluded tags
-            let combined_filter = subscription_filter.merged(&chat_filter);
+            let combined_filter = subscription.filter_tags.merged(&chat_filter);
             let filtered_illusts: Vec<&Illust> =
                 combined_filter.filter(new_illusts.iter().copied());
 
@@ -653,7 +650,7 @@ impl SchedulerEngine {
             let has_spoiler = chat.blur_sensitive_tags
                 && filtered_illusts
                     .iter()
-                    .any(|illust| sensitive::contains_sensitive_tags(illust, &sensitive_tags));
+                    .any(|illust| sensitive::contains_sensitive_tags(illust, sensitive_tags));
 
             // Prepare image URLs, captions, and corresponding illust IDs
             let mut image_urls: Vec<String> = Vec::new();

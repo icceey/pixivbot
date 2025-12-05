@@ -1,6 +1,8 @@
 use sea_orm::entity::prelude::*;
 use serde::{Deserialize, Serialize};
 
+use crate::db::types::Tags;
+
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Deserialize, Serialize)]
 #[sea_orm(table_name = "chats")]
 pub struct Model {
@@ -10,8 +12,8 @@ pub struct Model {
     pub title: Option<String>,
     pub enabled: bool,
     pub blur_sensitive_tags: bool,
-    pub excluded_tags: Option<Json>,
-    pub sensitive_tags: Option<Json>,
+    pub excluded_tags: Tags,
+    pub sensitive_tags: Tags,
     pub created_at: DateTime,
 }
 

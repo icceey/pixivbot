@@ -4,8 +4,8 @@ pub mod link_handler;
 pub mod notifier;
 
 use crate::config::TelegramConfig;
-use crate::db::entities::role::UserRole;
 use crate::db::repo::Repo;
+use crate::db::types::UserRole;
 use crate::pixiv::client::PixivClient;
 use anyhow::Result;
 use std::sync::Arc;

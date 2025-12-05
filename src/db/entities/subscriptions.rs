@@ -1,6 +1,8 @@
 use sea_orm::entity::prelude::*;
 use serde::{Deserialize, Serialize};
 
+use crate::db::types::TagFilter;
+
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Deserialize, Serialize)]
 #[sea_orm(table_name = "subscriptions")]
 pub struct Model {
@@ -8,7 +10,8 @@ pub struct Model {
     pub id: i32,
     pub chat_id: i64,
     pub task_id: i32,
-    pub filter_tags: Option<Json>,
+    #[serde(default)]
+    pub filter_tags: TagFilter,
     /// Per-subscription push state:
     /// - For author tasks: { "latest_illust_id": u64, "last_check": string }
     /// - For ranking tasks: { "pushed_ids": [u64], "last_check": string }

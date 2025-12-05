@@ -6,10 +6,8 @@ use sea_orm::{
 };
 use serde_json::Value as JsonValue;
 
-use crate::db::entities::types::TaskType;
-
-use super::entities::role::UserRole;
 use super::entities::{chats, subscriptions, tasks, users};
+use crate::db::types::{TagFilter, Tags, TaskType, UserRole};
 
 pub struct Repo {
     db: DatabaseConnection,
@@ -86,7 +84,7 @@ impl Repo {
         chat_type: String,
         title: Option<String>,
         default_enabled: bool,
-        default_sensitive_tags: Option<JsonValue>,
+        default_sensitive_tags: Tags,
     ) -> Result<chats::Model, DbErr> {
         let now = Local::now().naive_local();
 
@@ -104,7 +102,7 @@ impl Repo {
                 title: Set(title),
                 enabled: Set(default_enabled),
                 blur_sensitive_tags: Set(true), // Default to enabled
-                excluded_tags: Set(None),
+                excluded_tags: Set(Tags::default()),
                 sensitive_tags: Set(default_sensitive_tags),
                 created_at: Set(now),
             };
@@ -133,8 +131,8 @@ impl Repo {
                 title: Set(None),
                 enabled: Set(enabled),
                 blur_sensitive_tags: Set(true), // Default to enabled
-                excluded_tags: Set(None),
-                sensitive_tags: Set(None),
+                excluded_tags: Set(Tags::default()),
+                sensitive_tags: Set(Tags::default()),
                 created_at: Set(now),
             };
             new_chat.insert(&self.db).await
@@ -158,11 +156,7 @@ impl Repo {
     }
 
     /// Set excluded tags for a chat
-    pub async fn set_excluded_tags(
-        &self,
-        chat_id: i64,
-        tags: Option<JsonValue>,
-    ) -> Result<chats::Model, DbErr> {
+    pub async fn set_excluded_tags(&self, chat_id: i64, tags: Tags) -> Result<chats::Model, DbErr> {
         let chat = chats::Entity::find_by_id(chat_id)
             .one(&self.db)
             .await?
@@ -177,7 +171,7 @@ impl Repo {
     pub async fn set_sensitive_tags(
         &self,
         chat_id: i64,
-        tags: Option<JsonValue>,
+        tags: Tags,
     ) -> Result<chats::Model, DbErr> {
         let chat = chats::Entity::find_by_id(chat_id)
             .one(&self.db)
@@ -288,7 +282,7 @@ impl Repo {
         &self,
         chat_id: i64,
         task_id: i32,
-        filter_tags: Option<JsonValue>,
+        filter_tags: TagFilter,
     ) -> Result<subscriptions::Model, DbErr> {
         let now = Local::now().naive_local();
 
@@ -308,7 +302,7 @@ impl Repo {
         &self,
         chat_id: i64,
         task_id: i32,
-        filter_tags: Option<JsonValue>,
+        filter_tags: TagFilter,
     ) -> Result<subscriptions::Model, DbErr> {
         // Check if subscription exists
         if let Some(existing) = subscriptions::Entity::find()

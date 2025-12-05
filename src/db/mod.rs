@@ -1,6 +1,7 @@
 //! Database module
 pub mod entities;
 pub mod repo;
+pub mod types;
 
 use anyhow::Result;
 use sea_orm::{ConnectOptions, Database, DatabaseConnection};

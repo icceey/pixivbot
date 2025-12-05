@@ -3,11 +3,8 @@ use crate::db::entities::chats;
 use crate::pixiv_client::Illust;
 
 /// Get sensitive tags list from chat settings
-pub fn get_chat_sensitive_tags(chat: &chats::Model) -> Vec<String> {
-    chat.sensitive_tags
-        .as_ref()
-        .and_then(|tags| serde_json::from_value::<Vec<String>>(tags.clone()).ok())
-        .unwrap_or_default()
+pub fn get_chat_sensitive_tags(chat: &chats::Model) -> &[String] {
+    &chat.sensitive_tags
 }
 
 /// Check if illust contains any sensitive tags (normalized match, case-insensitive)

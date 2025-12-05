@@ -9,15 +9,40 @@
 
 use crate::pixiv_client::Illust;
 use crate::utils::tag;
+use sea_orm::FromJsonQueryResult;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::ops::{Deref, DerefMut};
 use teloxide::utils::markdown;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, FromJsonQueryResult)]
+#[serde(transparent)]
+pub struct Tags(pub Vec<String>);
+
+impl Deref for Tags {
+    type Target = Vec<String>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for Tags {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl From<Vec<String>> for Tags {
+    fn from(tags: Vec<String>) -> Self {
+        Tags(tags)
+    }
+}
 
 /// A unified tag filter for include/exclude filtering.
 ///
 /// Tags are stored in their original form for display purposes.
 /// Normalization is done on-the-fly during matching for case-insensitive comparison.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, FromJsonQueryResult)]
 pub struct TagFilter {
     #[serde(default)]
     include: Vec<String>,
@@ -56,19 +81,22 @@ impl TagFilter {
         Self { include, exclude }
     }
 
-    /// Create a TagFilter from subscription filter_tags JSON.
-    ///
-    /// Expected JSON format: `{"include": ["tag1", "tag2"], "exclude": ["tag3"]}`
-    pub fn from_filter_json(filter_tags: &Option<Value>) -> Self {
-        match filter_tags {
-            Some(v) => serde_json::from_value(v.clone()).unwrap_or_default(),
-            None => Self::default(),
+    /// Create a TagFilter from chat excluded_tags (exclude only).
+    pub fn from_excluded_tags(excluded_tags: &Tags) -> Self {
+        if excluded_tags.is_empty() {
+            return Self::default();
+        }
+
+        Self {
+            include: Vec::new(),
+            exclude: excluded_tags.0.clone(),
         }
     }
 
     /// Create a TagFilter from chat excluded_tags JSON (exclude only).
     ///
     /// Expected JSON format: `["tag1", "tag2", "tag3"]`
+    #[allow(dead_code)]
     pub fn from_excluded_json(excluded_tags: &Option<Value>) -> Self {
         let Some(tags) = excluded_tags else {
             return Self::default();
@@ -237,7 +265,7 @@ mod tests {
         let json = original.to_json();
         assert!(json.is_some());
 
-        let restored = TagFilter::from_filter_json(&json);
+        let restored: TagFilter = serde_json::from_value(json.unwrap()).unwrap();
         assert_eq!(restored.include, original.include);
         assert_eq!(restored.exclude, original.exclude);
     }

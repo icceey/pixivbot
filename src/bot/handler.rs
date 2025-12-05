@@ -1,14 +1,11 @@
 use crate::bot::link_handler::{is_bot_mentioned, parse_pixiv_links, PixivLink};
 use crate::bot::notifier::Notifier;
 use crate::bot::Command;
-use crate::db::entities::role::UserRole;
-use crate::db::entities::types::TaskType;
 use crate::db::repo::Repo;
+use crate::db::types::{TagFilter, Tags, TaskType, UserRole};
 use crate::pixiv::client::PixivClient;
 use crate::pixiv::model::RankingMode;
-use crate::utils::filter::TagFilter;
 use crate::utils::tag;
-use serde_json::{json, Value};
 use std::sync::Arc;
 use teloxide::prelude::*;
 use teloxide::types::{Me, ParseMode};
@@ -228,12 +225,8 @@ impl BotHandler {
         };
         let chat_title = msg.chat.title().map(|s| s.to_string());
 
-        // Convert default sensitive tags to JSON for new chats
-        let default_sensitive_tags_json = if self.default_sensitive_tags.is_empty() {
-            None
-        } else {
-            Some(json!(self.default_sensitive_tags))
-        };
+        // Convert default sensitive tags to Tags for new chats
+        let default_sensitive_tags = Tags::from(self.default_sensitive_tags.clone());
 
         // Upsert chat - new chats get enabled status based on bot mode
         let chat = self
@@ -243,7 +236,7 @@ impl BotHandler {
                 chat_type.to_string(),
                 chat_title,
                 self.is_public_mode,
-                default_sensitive_tags_json,
+                default_sensitive_tags,
             )
             .await
             .map_err(|e| e.to_string())?;
@@ -377,7 +370,6 @@ impl BotHandler {
 
         // Parse filter tags using helper
         let filter_tags = TagFilter::parse_from_args(&parts[1..]);
-        let filter_tags_json = filter_tags.to_json();
 
         let mut result = BatchResult::new();
 
@@ -411,7 +403,7 @@ impl BotHandler {
                     TaskType::Author,
                     author_id_str,
                     Some(&author_name),
-                    filter_tags_json.clone(),
+                    filter_tags.clone(),
                 )
                 .await
             {
@@ -488,7 +480,6 @@ impl BotHandler {
 
         // Parse filter tags using helper
         let filter_tags = TagFilter::parse_from_args(&parts[1..]);
-        let filter_tags_json = filter_tags.to_json();
 
         // Create subscription
         match self
@@ -497,7 +488,7 @@ impl BotHandler {
                 TaskType::Ranking,
                 mode.as_str(),
                 None,
-                filter_tags_json.clone(),
+                filter_tags.clone(),
             )
             .await
         {
@@ -687,13 +678,10 @@ impl BotHandler {
                     };
 
                     // Show filter tags for all subscription types (author and ranking)
-                    let filter_info = {
-                        let filter = TagFilter::from_filter_json(&sub.filter_tags);
-                        if !filter.is_empty() {
-                            format!("\n  🏷 {}", filter.format_for_display())
-                        } else {
-                            String::new()
-                        }
+                    let filter_info = if !sub.filter_tags.is_empty() {
+                        format!("\n  🏷 {}", sub.filter_tags.format_for_display())
+                    } else {
+                        String::new()
                     };
 
                     message.push_str(&format!("{} {}{}\n", type_emoji, display_info, filter_info));
@@ -908,11 +896,11 @@ impl BotHandler {
             return Ok(());
         }
 
-        let sensitive_tags = Some(json!(tags));
+        let sensitive_tags = Tags::from(tags.clone());
 
         match self
             .repo
-            .set_sensitive_tags(chat_id.0, sensitive_tags.clone())
+            .set_sensitive_tags(chat_id.0, sensitive_tags)
             .await
         {
             Ok(_) => {
@@ -939,7 +927,11 @@ impl BotHandler {
     }
 
     async fn handle_clear_sensitive_tags(&self, bot: Bot, chat_id: ChatId) -> ResponseResult<()> {
-        match self.repo.set_sensitive_tags(chat_id.0, None).await {
+        match self
+            .repo
+            .set_sensitive_tags(chat_id.0, Tags::default())
+            .await
+        {
             Ok(_) => {
                 bot.send_message(chat_id, "✅ 敏感标签已清除").await?;
 
@@ -980,13 +972,9 @@ impl BotHandler {
             return Ok(());
         }
 
-        let excluded_tags = Some(json!(tags));
+        let excluded_tags = Tags::from(tags.clone());
 
-        match self
-            .repo
-            .set_excluded_tags(chat_id.0, excluded_tags.clone())
-            .await
-        {
+        match self.repo.set_excluded_tags(chat_id.0, excluded_tags).await {
             Ok(_) => {
                 let tag_list: Vec<String> = tags
                     .iter()
@@ -1011,7 +999,11 @@ impl BotHandler {
     }
 
     async fn handle_clear_excluded_tags(&self, bot: Bot, chat_id: ChatId) -> ResponseResult<()> {
-        match self.repo.set_excluded_tags(chat_id.0, None).await {
+        match self
+            .repo
+            .set_excluded_tags(chat_id.0, Tags::default())
+            .await
+        {
             Ok(_) => {
                 bot.send_message(chat_id, "✅ 排除标签已清除").await?;
 
@@ -1035,40 +1027,24 @@ impl BotHandler {
                     "**已禁用**"
                 };
 
-                let sensitive_tags = if let Some(tags) = &chat.sensitive_tags {
-                    if let Ok(tag_array) = serde_json::from_value::<Vec<String>>(tags.clone()) {
-                        if tag_array.is_empty() {
-                            "无".to_string()
-                        } else {
-                            tag_array
-                                .iter()
-                                .map(|s| format!("`{}`", markdown::escape(s)))
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        }
-                    } else {
-                        "无".to_string()
-                    }
-                } else {
+                let sensitive_tags = if chat.sensitive_tags.is_empty() {
                     "无".to_string()
+                } else {
+                    chat.sensitive_tags
+                        .iter()
+                        .map(|s| format!("`{}`", markdown::escape(s)))
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 };
 
-                let excluded_tags = if let Some(tags) = chat.excluded_tags {
-                    if let Ok(tag_array) = serde_json::from_value::<Vec<String>>(tags) {
-                        if tag_array.is_empty() {
-                            "无".to_string()
-                        } else {
-                            tag_array
-                                .iter()
-                                .map(|s| format!("`{}`", markdown::escape(s)))
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        }
-                    } else {
-                        "无".to_string()
-                    }
-                } else {
+                let excluded_tags = if chat.excluded_tags.is_empty() {
                     "无".to_string()
+                } else {
+                    chat.excluded_tags
+                        .iter()
+                        .map(|s| format!("`{}`", markdown::escape(s)))
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 };
 
                 let message = format!(
@@ -1257,7 +1233,7 @@ impl BotHandler {
             .map(sensitive::get_chat_sensitive_tags)
             .unwrap_or_default();
         let has_spoiler =
-            blur_sensitive && sensitive::contains_sensitive_tags(&illust, &sensitive_tags);
+            blur_sensitive && sensitive::contains_sensitive_tags(&illust, sensitive_tags);
 
         // 获取所有图片 URL
         let image_urls = illust.get_all_image_urls();
@@ -1307,7 +1283,7 @@ impl BotHandler {
                 // 创建订阅
                 match self
                     .repo
-                    .upsert_subscription(chat_id.0, task.id, None)
+                    .upsert_subscription(chat_id.0, task.id, TagFilter::default())
                     .await
                 {
                     Ok(_) => {
@@ -1346,7 +1322,7 @@ impl BotHandler {
         task_type: TaskType,
         task_value: &str,
         author_name: Option<&str>,
-        filter_tags: Option<Value>,
+        filter_tags: TagFilter,
     ) -> Result<(), String> {
         // Get or create the task
         let task = self
