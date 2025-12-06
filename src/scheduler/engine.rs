@@ -1,13 +1,14 @@
 use crate::bot::notifier::Notifier;
 use crate::db::repo::Repo;
-use crate::db::types::{TagFilter, TaskType};
+use crate::db::types::{
+    AuthorState, PendingIllust, RankingState, SubscriptionState, TagFilter, TaskType,
+};
 use crate::pixiv::client::PixivClient;
 use crate::pixiv_client::Illust;
 use crate::utils::{sensitive, tag};
 use anyhow::Result;
 use chrono::Local;
 use rand::Rng;
-use serde_json::json;
 use std::sync::Arc;
 use teloxide::prelude::*;
 use teloxide::utils::markdown;
@@ -161,32 +162,20 @@ impl SchedulerEngine {
                 continue;
             }
 
+            let subscription_state = match &subscription.latest_data {
+                Some(SubscriptionState::Author(state)) => Some(state),
+                _ => None,
+            };
+
             // Get this subscription's push state
-            let last_illust_id = subscription
-                .latest_data
-                .as_ref()
-                .and_then(|data| data.get("latest_illust_id"))
-                .and_then(|v| v.as_u64());
+            // TODO 有其他写法吗
+            let last_illust_id = subscription_state.map(|state| state.latest_illust_id);
 
             // Check for pending illust (partially sent)
-            let pending_illust: Option<(u64, Vec<usize>, usize)> = subscription
-                .latest_data
-                .as_ref()
-                .and_then(|data| data.get("pending_illust"))
-                .and_then(|p| {
-                    let id = p.get("id")?.as_u64()?;
-                    let sent_pages: Vec<usize> = p
-                        .get("sent_pages")?
-                        .as_array()?
-                        .iter()
-                        .filter_map(|v| v.as_u64().map(|n| n as usize))
-                        .collect();
-                    let total_pages = p.get("total_pages")?.as_u64()? as usize;
-                    Some((id, sent_pages, total_pages))
-                });
+            let pending_illust = subscription_state.and_then(|data| data.pending_illust.as_ref());
 
             // 保存 pending id 用于后续过滤
-            let pending_id_to_skip = pending_illust.as_ref().map(|(id, _, _)| *id);
+            let pending_id_to_skip = pending_illust.map(|p| p.illust_id);
 
             // Find new illusts for this subscription
             let new_illusts: Vec<_> = if let Some(last_id) = last_illust_id {
@@ -209,7 +198,7 @@ impl SchedulerEngine {
                 subscription.id,
                 chat_id,
                 new_illusts.iter().map(|i| i.id).collect::<Vec<_>>(),
-                pending_illust.as_ref().map(|(id, _, _)| id)
+                pending_id_to_skip
             );
 
             // 记录最新的 illust id（用于在过滤后没有内容时也更新）
@@ -226,13 +215,14 @@ impl SchedulerEngine {
             // 如果过滤后没有内容且没有 pending，更新 latest_illust_id
             if filtered_illusts.is_empty() && pending_illust.is_none() {
                 if let Some(newest_id) = newest_illust_id {
-                    let updated_data = json!({
-                        "latest_illust_id": newest_id,
-                        "last_check": Local::now().to_rfc3339(),
+                    let state = SubscriptionState::Author(AuthorState {
+                        latest_illust_id: newest_id,
+                        last_checked_at: Some(Local::now().timestamp()),
+                        pending_illust: None,
                     });
                     if let Err(e) = self
                         .repo
-                        .update_subscription_latest_data(subscription.id, Some(updated_data))
+                        .update_subscription_latest_data(subscription.id, Some(state))
                         .await
                     {
                         error!(
@@ -245,12 +235,18 @@ impl SchedulerEngine {
             }
 
             // 首先处理 pending illust（如果有）
-            if let Some((pending_id, sent_pages, total_pages)) = pending_illust {
+            if let Some(&PendingIllust {
+                illust_id,
+                ref sent_pages,
+                total_pages,
+                ..
+            }) = pending_illust
+            {
                 // 找到对应的 illust
-                if let Some(illust) = illusts.iter().find(|i| i.id == pending_id) {
+                if let Some(illust) = illusts.iter().find(|i| i.id == illust_id) {
                     info!(
                         "Resuming pending illust {} ({}/{} pages sent)",
-                        pending_id,
+                        illust_id,
                         sent_pages.len(),
                         total_pages
                     );
@@ -269,9 +265,10 @@ impl SchedulerEngine {
 
                     if pending_pages.is_empty() {
                         // 所有页都已发送，标记为完成
-                        let updated_data = json!({
-                            "latest_illust_id": pending_id,
-                            "last_check": Local::now().to_rfc3339(),
+                        let updated_data = SubscriptionState::Author(AuthorState {
+                            latest_illust_id: illust_id,
+                            last_checked_at: Some(Local::now().timestamp()),
+                            pending_illust: None,
                         });
                         if let Err(e) = self
                             .repo
@@ -316,9 +313,10 @@ impl SchedulerEngine {
 
                         if all_sent.len() == total_pages {
                             // 全部完成
-                            let updated_data = json!({
-                                "latest_illust_id": pending_id,
-                                "last_check": Local::now().to_rfc3339(),
+                            let updated_data = SubscriptionState::Author(AuthorState {
+                                latest_illust_id: illust_id,
+                                last_checked_at: Some(Local::now().timestamp()),
+                                pending_illust: None,
                             });
                             if let Err(e) = self
                                 .repo
@@ -335,14 +333,15 @@ impl SchedulerEngine {
                             }
                         } else {
                             // 仍有失败，更新 pending 状态
-                            let updated_data = json!({
-                                "latest_illust_id": last_illust_id,
-                                "pending_illust": {
-                                    "id": pending_id,
-                                    "sent_pages": all_sent,
-                                    "total_pages": total_pages,
-                                },
-                                "last_check": Local::now().to_rfc3339(),
+                            let updated_data = SubscriptionState::Author(AuthorState {
+                                latest_illust_id: last_illust_id.unwrap_or(illust_id),
+                                pending_illust: Some(PendingIllust {
+                                    illust_id,
+                                    sent_pages: all_sent,
+                                    total_pages,
+                                    retry_count: 0,
+                                }),
+                                last_checked_at: Some(Local::now().timestamp()),
                             });
                             if let Err(e) = self
                                 .repo
@@ -368,13 +367,14 @@ impl SchedulerEngine {
                     // 放弃这个 pending，清除状态，让程序继续处理新的 illusts
                     warn!(
                         "Pending illust {} not found in current API response, abandoning",
-                        pending_id
+                        illust_id
                     );
                     // 保留 last_illust_id，清除 pending
                     if let Some(last_id) = last_illust_id {
-                        let updated_data = json!({
-                            "latest_illust_id": last_id,
-                            "last_check": Local::now().to_rfc3339(),
+                        let updated_data = SubscriptionState::Author(AuthorState {
+                            latest_illust_id: last_id,
+                            last_checked_at: Some(Local::now().timestamp()),
+                            pending_illust: None,
                         });
                         if let Err(e) = self
                             .repo
@@ -435,9 +435,10 @@ impl SchedulerEngine {
                 if send_result.is_complete_success() {
                     // 发送成功，更新 subscription 的 latest_data
                     info!("Successfully sent illust {} to chat {}", illust.id, chat_id);
-                    let updated_data = json!({
-                        "latest_illust_id": illust.id,
-                        "last_check": Local::now().to_rfc3339(),
+                    let updated_data = SubscriptionState::Author(AuthorState {
+                        latest_illust_id: illust.id,
+                        last_checked_at: Some(Local::now().timestamp()),
+                        pending_illust: None,
                     });
 
                     if let Err(e) = self
@@ -467,14 +468,15 @@ impl SchedulerEngine {
                         total_pages
                     );
 
-                    let updated_data = json!({
-                        "latest_illust_id": last_illust_id,
-                        "pending_illust": {
-                            "id": illust.id,
-                            "sent_pages": send_result.succeeded_indices,
-                            "total_pages": total_pages,
-                        },
-                        "last_check": Local::now().to_rfc3339(),
+                    let updated_data = SubscriptionState::Author(AuthorState {
+                        latest_illust_id: last_illust_id.unwrap_or(0), // TODO
+                        pending_illust: Some(PendingIllust {
+                            illust_id: illust.id,
+                            sent_pages: send_result.succeeded_indices,
+                            total_pages,
+                            retry_count: 0,
+                        }),
+                        last_checked_at: Some(Local::now().timestamp()),
                     });
 
                     if let Err(e) = self
@@ -570,13 +572,14 @@ impl SchedulerEngine {
                 continue;
             }
 
+            let subscription_state = match &subscription.latest_data {
+                Some(SubscriptionState::Ranking(state)) => Some(state),
+                _ => None,
+            };
+
             // Get this subscription's previously pushed illust IDs
-            let pushed_ids: Vec<u64> = subscription
-                .latest_data
-                .as_ref()
-                .and_then(|data| data.get("pushed_ids"))
-                .and_then(|v| v.as_array())
-                .map(|arr| arr.iter().filter_map(|v| v.as_u64()).collect())
+            let pushed_ids = subscription_state
+                .map(|data| data.pushed_ids.clone())
                 .unwrap_or_default();
 
             // Filter out illusts that have already been pushed to this subscription
@@ -621,9 +624,10 @@ impl SchedulerEngine {
                     let skip_count = all_pushed_ids.len() - 100;
                     all_pushed_ids = all_pushed_ids.into_iter().skip(skip_count).collect();
                 }
-                let updated_data = json!({
-                    "pushed_ids": all_pushed_ids,
-                    "last_check": Local::now().to_rfc3339(),
+                let updated_data = SubscriptionState::Ranking(RankingState {
+                    pushed_ids: all_pushed_ids,
+                    last_checked_at: Some(Local::now().timestamp()),
+                    pending_illust: None,
                 });
                 if let Err(e) = self
                     .repo
@@ -723,9 +727,10 @@ impl SchedulerEngine {
                 all_pushed_ids = all_pushed_ids.into_iter().skip(skip_count).collect();
             }
 
-            let updated_data = json!({
-                "pushed_ids": all_pushed_ids,
-                "last_check": Local::now().to_rfc3339(),
+            let updated_data = SubscriptionState::Ranking(RankingState {
+                pushed_ids: all_pushed_ids,
+                last_checked_at: Some(Local::now().timestamp()),
+                pending_illust: None,
             });
 
             if let Err(e) = self

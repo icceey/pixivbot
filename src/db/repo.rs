@@ -5,10 +5,9 @@ use sea_orm::{
     FromQueryResult, IntoActiveModel, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set,
     Statement,
 };
-use serde_json::Value as JsonValue;
 
 use super::entities::{chats, subscriptions, tasks, users};
-use crate::db::types::{TagFilter, Tags, TaskType, UserRole};
+use crate::db::types::{SubscriptionState, TagFilter, Tags, TaskType, UserRole};
 
 pub struct Repo {
     db: DatabaseConnection,
@@ -448,7 +447,7 @@ impl Repo {
     pub async fn update_subscription_latest_data(
         &self,
         subscription_id: i32,
-        latest_data: Option<JsonValue>,
+        latest_data: Option<SubscriptionState>,
     ) -> Result<subscriptions::Model> {
         let subscription = subscriptions::Entity::find_by_id(subscription_id)
             .one(&self.db)
