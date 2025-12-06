@@ -117,7 +117,7 @@ async fn setup_commands(bot: &Bot, repo: &Repo) {
         .scope(BotCommandScope::Default)
         .await
     {
-        tracing::warn!("Failed to set default commands: {}", e);
+        tracing::warn!("Failed to set default commands: {:#}", e);
     } else {
         info!("✅ Set default commands for all users");
     }
@@ -151,7 +151,7 @@ async fn setup_commands(bot: &Bot, repo: &Repo) {
             }
         }
         Err(e) => {
-            tracing::warn!("Failed to get admin users from database: {}", e);
+            tracing::warn!("Failed to get admin users from database: {:#}", e);
         }
     }
 }

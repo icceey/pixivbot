@@ -153,7 +153,7 @@ async fn main() -> Result<()> {
         )
         .await
         {
-            error!("Bot error: {:?}", e);
+            error!("Bot error: {:#}", e);
         }
     });
 

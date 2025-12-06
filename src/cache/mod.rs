@@ -100,7 +100,7 @@ impl FileCacheManager {
                         info!("✅ Cache cleanup complete: {} files deleted", count)
                     }
                     Ok(_) => (),
-                    Err(e) => error!("❌ Cache cleanup failed: {}", e),
+                    Err(e) => error!("❌ Cache cleanup failed: {:#}", e),
                 }
             }
         });

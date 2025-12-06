@@ -12,11 +12,11 @@ A Rust-based Telegram bot for subscribing to Pixiv artists and rankings. When ar
 src/
 ├── main.rs              # Entry point, initializes all components
 ├── config.rs            # Configuration loading (config.toml + env vars)
-├── error.rs             # Unified error handling with AppError/AppResult
 ├── pixiv_client/        # Low-level Pixiv API (independent, no project deps)
 │   ├── auth.rs          # OAuth refresh_token → access_token
 │   ├── client.rs        # API calls: user_illusts, illust_ranking, user_detail, illust_detail
-│   └── models.rs        # Raw API response types
+│   ├── models.rs        # Raw API response types
+│   └── error.rs         # Custom Error type for API errors
 ├── pixiv/               # Business layer (wraps pixiv_client)
 │   ├── client.rs        # PixivClient with login/auth management
 │   ├── downloader.rs    # Image download with hash-based caching
@@ -28,28 +28,38 @@ src/
 │   ├── link_handler.rs  # Pixiv URL parsing, @mention detection
 │   └── notifier.rs      # Send text/images to Telegram
 ├── scheduler/           # Background task engine
-│   └── engine.rs        # Polls DB, executes tasks serially with rate limiting
+│   └── engine.rs        # Polls DB, executes tasks serially with randomized intervals
+├── cache/               # File-based cache system
+│   └── mod.rs           # FileCacheManager with hash-bucketing and auto-cleanup
 ├── utils/               # Utility functions
 │   ├── markdown.rs      # MarkdownV2 escaping
 │   └── html.rs          # HTML formatting, tag processing
 └── db/                  # Database layer
-    ├── entities/        # SeaORM entities (users, chats, tasks, subscriptions, role)
-    └── repo.rs          # CRUD operations
+    ├── entities/        # SeaORM entities (users, chats, tasks, subscriptions)
+    ├── types/           # Custom DB types (TaskType, UserRole, TagFilter, Tags)
+    ├── repo.rs          # CRUD operations
+    └── mod.rs           # Connection management
 ```
 
 ## Key Patterns
 
 ### Error Handling
-Use `AppResult<T>` and `AppError` from `src/error.rs`. Convert external errors with `From` implementations:
+Use `anyhow::Result<T>` for all fallible functions. Use `.context()` to add context to errors:
 ```rust
-use crate::error::{AppError, AppResult};
+use anyhow::{Context, Result};
 
-fn example() -> AppResult<()> {
-    // Errors auto-convert via From traits
-    let db_result = repo.get_chat(id).await?;
+async fn example() -> Result<()> {
+    let chat = repo.get_chat(id).await.context("Failed to get chat")?;
     Ok(())
 }
 ```
+
+When logging errors, use `{:#}` format specifier to show the full error chain:
+```rust
+error!("Failed to process: {:#}", e);
+```
+
+The `pixiv_client/` module has its own `Error` type for API-specific errors, but these are automatically converted to anyhow errors when propagated up.
 
 ### Shared State
 Components use `Arc<T>` for sharing, `Arc<RwLock<T>>` when mutable access needed:
@@ -61,11 +71,32 @@ let repo = Arc::new(Repo::new(db));
 ### Database Migrations
 Located in `migration/src/`. Run automatically on startup via `migration::Migrator::up(&db, None).await?`.
 
-### Image Caching
-Downloaded images cached at `data/cache/{hash_prefix}/{filename}`. Downloader checks cache before downloading. Use `downloader.download(url)` for single, `downloader.download_all(&urls)` for batch.
+### Image Caching & Background Cleanup
+The `FileCacheManager` (`cache/mod.rs`) provides:
+- **Hash-bucketed storage**: Files stored at `data/cache/{hash_prefix}/{filename}` (256 buckets: `00`-`ff`)
+- **Cache-before-download**: Always call `cache.get(url)` before downloading
+- **Automatic cleanup**: Background task runs every 24 hours, deleting files older than `cache_retention_days`
+- **Lifecycle**: Cleanup task spawned in `FileCacheManager::new()`, runs for lifetime of cache manager
+
+```rust
+// In downloader.rs
+pub async fn download(&self, url: &str) -> Result<PathBuf> {
+    // Check cache first
+    if let Some(path) = self.cache.get(url).await {
+        return Ok(path);
+    }
+    // Download and save to cache
+    let bytes = self.http_client.get(url)
+        .header("Referer", "https://app-api.pixiv.net/")
+        .send().await?...;
+    self.cache.save(url, &bytes).await
+}
+```
+
+Use `downloader.download(url)` for single, `downloader.download_all(&urls)` for batch with partial failure tolerance.
 
 ### Telegram Media Groups
-Max 10 images per media group. `Notifier::notify_with_images` auto-splits larger sets.
+Max 10 images per media group. `Notifier::notify_with_images` auto-splits larger sets into multiple groups.
 
 ### Teloxide Dispatcher Pattern
 The bot uses teloxide's `Dispatcher` with a handler tree:
@@ -138,7 +169,9 @@ cargo add regex  # Already added for link parsing
 - Mark unused but intentional public APIs with `#[allow(dead_code)]`
 - Prefer `MarkdownV2` for Telegram message formatting
 - Use `chrono` for datetime handling (with `serde` feature)
-- Async functions should return `AppResult<T>` for consistency
+- Async functions should return `anyhow::Result<T>` for consistency
+- Use `.context()` to add meaningful error context
+- Use `{:#}` format specifier when logging errors to show full error chain
 - Use `LazyLock<Regex>` for compile-once regex patterns
 - Derive `Clone` for types that need to be shared across async contexts
 
@@ -185,11 +218,12 @@ This matches the exact checks in `.github/workflows/ci.yml`. Fix any issues befo
 Copy `config.toml.example` → `config.toml`. Key sections:
 - `[telegram]` - bot_token, owner_id, bot_mode (public/private)
 - `[pixiv]` - refresh_token
-- `[database]` - SQLite URL
-- `[scheduler]` - tick_interval_sec, min/max_task_interval_sec, cache_retention_days
+- `[database]` - SQLite URL (default: `sqlite:data/pixivbot.db?mode=rwc`)
+- `[logging]` - level (info/debug/warn), dir (default: `data/logs`)
+- `[scheduler]` - tick_interval_sec (default: 30), min/max_task_interval_sec (2-3 hours), cache_retention_days (default: 7), cache_dir (default: `data/cache`)
 - `[content]` - sensitive_tags list (e.g., ["R-18", "R-18G", "NSFW"])
 
-Environment variables override config with prefix `PIX`: `PIX__TELEGRAM__BOT_TOKEN`, `PIX__PIXIV__REFRESH_TOKEN`
+Environment variables override config with prefix `PIX` and double underscores: `PIX__TELEGRAM__BOT_TOKEN`, `PIX__PIXIV__REFRESH_TOKEN`
 
 ## Bot Modes
 

@@ -1,3 +1,4 @@
+use anyhow::{Context, Result};
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize, Clone)]
@@ -102,12 +103,16 @@ impl Default for ContentConfig {
 }
 
 impl Config {
-    pub fn load() -> Result<Self, config::ConfigError> {
+    pub fn load() -> Result<Self> {
         let builder = config::Config::builder()
             .add_source(config::File::with_name("config.toml").required(false))
             .add_source(config::Environment::with_prefix("PIX").separator("__"));
 
-        builder.build()?.try_deserialize()
+        builder
+            .build()
+            .context("Failed to build configuration")?
+            .try_deserialize()
+            .context("Failed to deserialize configuration")
     }
 
     pub fn log_level(&self) -> tracing::Level {

@@ -55,7 +55,7 @@ impl SchedulerEngine {
             interval.tick().await;
 
             if let Err(e) = self.tick().await {
-                error!("Scheduler tick error: {}", e);
+                error!("Scheduler tick error: {:#}", e);
             }
         }
     }
@@ -139,7 +139,7 @@ impl SchedulerEngine {
                     continue;
                 }
                 Err(e) => {
-                    error!("Failed to get chat {}: {}", chat_id, e);
+                    error!("Failed to get chat {}: {:#}", chat_id, e);
                     continue;
                 }
             };
@@ -548,7 +548,7 @@ impl SchedulerEngine {
                     continue;
                 }
                 Err(e) => {
-                    error!("Failed to get chat {}: {}", chat_id, e);
+                    error!("Failed to get chat {}: {:#}", chat_id, e);
                     continue;
                 }
             };

@@ -93,23 +93,6 @@ impl TagFilter {
         }
     }
 
-    /// Create a TagFilter from chat excluded_tags JSON (exclude only).
-    ///
-    /// Expected JSON format: `["tag1", "tag2", "tag3"]`
-    #[allow(dead_code)]
-    pub fn from_excluded_json(excluded_tags: &Option<Value>) -> Self {
-        let Some(tags) = excluded_tags else {
-            return Self::default();
-        };
-
-        let exclude: Vec<String> = serde_json::from_value(tags.clone()).unwrap_or_default();
-
-        Self {
-            include: Vec::new(),
-            exclude,
-        }
-    }
-
     /// Check if this filter has any restrictions.
     pub fn is_empty(&self) -> bool {
         self.include.is_empty() && self.exclude.is_empty()
@@ -268,14 +251,6 @@ mod tests {
         let restored: TagFilter = serde_json::from_value(json.unwrap()).unwrap();
         assert_eq!(restored.include, original.include);
         assert_eq!(restored.exclude, original.exclude);
-    }
-
-    #[test]
-    fn test_from_excluded_json() {
-        let json = Some(serde_json::json!(["R-18", "gore"]));
-        let filter = TagFilter::from_excluded_json(&json);
-        assert!(filter.include.is_empty());
-        assert_eq!(filter.exclude, vec!["R-18", "gore"]);
     }
 
     #[test]

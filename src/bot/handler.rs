@@ -6,6 +6,7 @@ use crate::db::types::{TagFilter, Tags, TaskType, UserRole};
 use crate::pixiv::client::PixivClient;
 use crate::pixiv::model::RankingMode;
 use crate::utils::tag;
+use anyhow::{Context, Result};
 use std::sync::Arc;
 use teloxide::prelude::*;
 use teloxide::types::{Me, ParseMode};
@@ -133,7 +134,7 @@ impl BotHandler {
         let (user_role, chat_enabled) = match self.ensure_user_and_chat(&msg).await {
             Ok(data) => data,
             Err(e) => {
-                error!("Failed to ensure user/chat: {}", e);
+                error!("Failed to ensure user/chat: {:#}", e);
                 bot.send_message(chat_id, "⚠️ 数据库错误").await?;
                 return Ok(());
             }
@@ -217,7 +218,7 @@ impl BotHandler {
     // User/Chat Management
     // ------------------------------------------------------------------------
 
-    async fn ensure_user_and_chat(&self, msg: &Message) -> Result<(UserRole, bool), String> {
+    async fn ensure_user_and_chat(&self, msg: &Message) -> Result<(UserRole, bool)> {
         let chat_id = msg.chat.id.0;
         let chat_type = match msg.chat.is_group() || msg.chat.is_supergroup() {
             true => "group",
@@ -239,7 +240,7 @@ impl BotHandler {
                 default_sensitive_tags,
             )
             .await
-            .map_err(|e| e.to_string())?;
+            .context("Failed to upsert chat")?;
 
         if let Some(user) = msg.from.as_ref() {
             let user_id = user.id.0 as i64;
@@ -250,7 +251,7 @@ impl BotHandler {
                 .repo
                 .get_user(user_id)
                 .await
-                .map_err(|e| e.to_string())?
+                .context("Failed to get user")?
             {
                 Some(existing_user) => existing_user,
                 None => {
@@ -266,7 +267,7 @@ impl BotHandler {
                     self.repo
                         .upsert_user(user_id, username, role)
                         .await
-                        .map_err(|e| e.to_string())?
+                        .context("Failed to upsert user")?
                 }
             };
 
@@ -389,7 +390,7 @@ impl BotHandler {
                 match pixiv.get_user_detail(author_id).await {
                     Ok(user) => user.name,
                     Err(e) => {
-                        error!("Failed to get user detail for {}: {}", author_id, e);
+                        error!("Failed to get user detail for {}: {:#}", author_id, e);
                         result.add_failure(format!("`{}` \\(未找到\\)", author_id));
                         continue;
                     }
@@ -415,7 +416,7 @@ impl BotHandler {
                     ));
                 }
                 Err(e) => {
-                    error!("Failed to subscribe to author {}: {}", author_id, e);
+                    error!("Failed to subscribe to author {}: {:#}", author_id, e);
                     result.add_failure(format!("`{}` \\(订阅失败\\)", author_id));
                 }
             }
@@ -502,7 +503,7 @@ impl BotHandler {
                     .await?;
             }
             Err(e) => {
-                error!("Failed to subscribe to ranking {}: {}", mode.as_str(), e);
+                error!("Failed to subscribe to ranking {}: {:#}", mode.as_str(), e);
                 bot.send_message(chat_id, "❌ 创建订阅失败").await?;
             }
         }
@@ -552,8 +553,12 @@ impl BotHandler {
                     result.add_success(display);
                 }
                 Err(e) => {
-                    error!("Failed to unsubscribe from author {}: {}", author_id, e);
-                    result.add_failure(format!("`{}` \\({}\\)", author_id, e));
+                    error!("Failed to unsubscribe from author {}: {:#}", author_id, e);
+                    result.add_failure(format!(
+                        "`{}` \\({}\\)",
+                        author_id,
+                        markdown::escape(&e.to_string())
+                    ));
                 }
             }
         }
@@ -606,7 +611,7 @@ impl BotHandler {
             }
             Err(e) => {
                 error!(
-                    "Failed to unsubscribe from ranking {}: {}",
+                    "Failed to unsubscribe from ranking {}: {:#}",
                     mode.as_str(),
                     e
                 );
@@ -694,7 +699,7 @@ impl BotHandler {
                     .await?;
             }
             Err(e) => {
-                error!("Failed to list subscriptions: {}", e);
+                error!("Failed to list subscriptions: {:#}", e);
                 bot.send_message(chat_id, "❌ 获取订阅列表失败").await?;
             }
         }
@@ -748,7 +753,7 @@ impl BotHandler {
                 info!("Owner set user {} role to {:?}", target_user_id, role);
             }
             Err(e) => {
-                error!("Failed to set user role: {}", e);
+                error!("Failed to set user role: {:#}", e);
                 bot.send_message(chat_id, "❌ 设置用户角色失败。用户可能不存在。")
                     .await?;
             }
@@ -814,7 +819,7 @@ impl BotHandler {
                 );
             }
             Err(e) => {
-                error!("Failed to set chat enabled status: {}", e);
+                error!("Failed to set chat enabled status: {:#}", e);
                 bot.send_message(current_chat_id, "❌ 更新聊天状态失败")
                     .await?;
             }
@@ -862,7 +867,7 @@ impl BotHandler {
                 info!("Chat {} set blur_sensitive_tags to {}", chat_id, blur);
             }
             Err(e) => {
-                error!("Failed to set blur_sensitive_tags: {}", e);
+                error!("Failed to set blur_sensitive_tags: {:#}", e);
                 bot.send_message(chat_id, "❌ 更新设置失败").await?;
             }
         }
@@ -918,7 +923,7 @@ impl BotHandler {
                 info!("Chat {} set sensitive_tags", chat_id);
             }
             Err(e) => {
-                error!("Failed to set sensitive_tags: {}", e);
+                error!("Failed to set sensitive_tags: {:#}", e);
                 bot.send_message(chat_id, "❌ 更新设置失败").await?;
             }
         }
@@ -938,7 +943,7 @@ impl BotHandler {
                 info!("Chat {} cleared sensitive_tags", chat_id);
             }
             Err(e) => {
-                error!("Failed to clear sensitive_tags: {}", e);
+                error!("Failed to clear sensitive_tags: {:#}", e);
                 bot.send_message(chat_id, "❌ 更新设置失败").await?;
             }
         }
@@ -990,7 +995,7 @@ impl BotHandler {
                 info!("Chat {} set excluded_tags", chat_id);
             }
             Err(e) => {
-                error!("Failed to set excluded_tags: {}", e);
+                error!("Failed to set excluded_tags: {:#}", e);
                 bot.send_message(chat_id, "❌ 更新设置失败").await?;
             }
         }
@@ -1010,7 +1015,7 @@ impl BotHandler {
                 info!("Chat {} cleared excluded_tags", chat_id);
             }
             Err(e) => {
-                error!("Failed to clear excluded_tags: {}", e);
+                error!("Failed to clear excluded_tags: {:#}", e);
                 bot.send_message(chat_id, "❌ 更新设置失败").await?;
             }
         }
@@ -1060,7 +1065,7 @@ impl BotHandler {
                 bot.send_message(chat_id, "❌ 未找到聊天").await?;
             }
             Err(e) => {
-                error!("Failed to get chat settings: {}", e);
+                error!("Failed to get chat settings: {:#}", e);
                 bot.send_message(chat_id, "❌ 获取设置失败").await?;
             }
         }
@@ -1141,7 +1146,7 @@ impl BotHandler {
         let (user_role, chat_enabled) = match self.ensure_user_and_chat(&msg).await {
             Ok(data) => data,
             Err(e) => {
-                error!("Failed to ensure user/chat: {}", e);
+                error!("Failed to ensure user/chat: {:#}", e);
                 return Ok(());
             }
         };
@@ -1195,8 +1200,8 @@ impl BotHandler {
         let illust = match pixiv.get_illust_detail(illust_id).await {
             Ok(illust) => illust,
             Err(e) => {
-                error!("Failed to get illust {}: {}", illust_id, e);
-                bot.send_message(chat_id, format!("❌ 获取作品 {} 失败: {}", illust_id, e))
+                error!("Failed to get illust {}: {:#}", illust_id, e);
+                bot.send_message(chat_id, format!("❌ 获取作品 {} 失败: {:#}", illust_id, e))
                     .await?;
                 return Ok(());
             }
@@ -1261,7 +1266,7 @@ impl BotHandler {
         let author = match pixiv.get_user_detail(user_id).await {
             Ok(user) => user,
             Err(e) => {
-                error!("Failed to get user {}: {}", user_id, e);
+                error!("Failed to get user {}: {:#}", user_id, e);
                 bot.send_message(chat_id, format!("❌ 获取用户 {} 失败: {:#}", user_id, e))
                     .await?;
                 return Ok(());
@@ -1303,7 +1308,7 @@ impl BotHandler {
                 }
             }
             Err(e) => {
-                error!("Failed to create task for {}: {}", user_id, e);
+                error!("Failed to create task for {}: {:#}", user_id, e);
                 bot.send_message(chat_id, "❌ 创建任务失败").await?;
             }
         }
@@ -1323,7 +1328,7 @@ impl BotHandler {
         task_value: &str,
         author_name: Option<&str>,
         filter_tags: TagFilter,
-    ) -> Result<(), String> {
+    ) -> Result<()> {
         // Get or create the task
         let task = self
             .repo
@@ -1333,13 +1338,13 @@ impl BotHandler {
                 author_name.map(|s| s.to_string()),
             )
             .await
-            .map_err(|e| format!("任务创建失败: {}", e))?;
+            .context("Failed to create task")?;
 
         // Create subscription
         self.repo
             .upsert_subscription(chat_id, task.id, filter_tags)
             .await
-            .map_err(|e| format!("订阅失败: {}", e))?;
+            .context("Failed to upsert subscription")?;
 
         Ok(())
     }
@@ -1351,14 +1356,14 @@ impl BotHandler {
         chat_id: i64,
         task_type: TaskType,
         task_value: &str,
-    ) -> Result<Option<String>, String> {
+    ) -> Result<Option<String>> {
         // Find the task
         let task = self
             .repo
             .get_task_by_type_value(task_type, task_value)
             .await
-            .map_err(|e| format!("数据库错误: {}", e))?
-            .ok_or_else(|| "未找到".to_string())?;
+            .context("Failed to query task")?
+            .ok_or_else(|| anyhow::anyhow!("未找到"))?;
 
         // Store author_name before cleanup
         let author_name = task.author_name.clone();
@@ -1367,7 +1372,7 @@ impl BotHandler {
         self.repo
             .delete_subscription_by_chat_task(chat_id, task.id)
             .await
-            .map_err(|_| "未订阅".to_string())?;
+            .context("未订阅")?;
 
         // Cleanup orphaned task if no more subscriptions
         self.cleanup_orphaned_task(task.id, task_type, task_value)
@@ -1381,7 +1386,7 @@ impl BotHandler {
         match self.repo.count_subscriptions_for_task(task_id).await {
             Ok(0) => {
                 if let Err(e) = self.repo.delete_task(task_id).await {
-                    error!("Failed to delete task {}: {}", task_id, e);
+                    error!("Failed to delete task {}: {:#}", task_id, e);
                 } else {
                     info!(
                         "Deleted task {} ({} {}) - no more subscriptions",
@@ -1390,7 +1395,10 @@ impl BotHandler {
                 }
             }
             Err(e) => {
-                error!("Failed to count subscriptions for task {}: {}", task_id, e);
+                error!(
+                    "Failed to count subscriptions for task {}: {:#}",
+                    task_id, e
+                );
             }
             _ => {}
         }

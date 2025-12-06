@@ -117,7 +117,7 @@ impl Notifier {
         let local_paths = match self.downloader.download_all(image_urls).await {
             Ok(paths) => paths,
             Err(e) => {
-                error!("Failed to download images: {}", e);
+                error!("Failed to download images: {:#}", e);
                 return BatchSendResult::all_failed(total);
             }
         };
@@ -341,7 +341,7 @@ impl Notifier {
         let local_paths = match self.downloader.download_all(image_urls).await {
             Ok(paths) => paths,
             Err(e) => {
-                error!("Failed to download images: {}", e);
+                error!("Failed to download images: {:#}", e);
                 return BatchSendResult::all_failed(total);
             }
         };
