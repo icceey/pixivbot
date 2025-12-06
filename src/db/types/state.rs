@@ -2,6 +2,7 @@ use sea_orm::FromJsonQueryResult;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, FromJsonQueryResult)]
+#[serde(tag = "type", content = "state")]
 pub enum SubscriptionState {
     Author(AuthorState),
     Ranking(RankingState),
@@ -10,14 +11,14 @@ pub enum SubscriptionState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthorState {
     pub latest_illust_id: u64,
-    pub last_checked_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_illust: Option<PendingIllust>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RankingState {
     pub pushed_ids: Vec<u64>,
-    pub last_checked_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_illust: Option<PendingIllust>,
 }
 

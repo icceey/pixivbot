@@ -30,12 +30,6 @@ impl PixivClient {
             .await?;
 
         let illusts: Vec<_> = response.illusts.into_iter().take(limit).collect();
-
-        info!(
-            "Successfully fetched {} illusts for author {}",
-            illusts.len(),
-            user_id
-        );
         Ok(illusts)
     }
 

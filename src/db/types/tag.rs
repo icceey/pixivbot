@@ -44,9 +44,9 @@ impl From<Vec<String>> for Tags {
 /// Normalization is done on-the-fly during matching for case-insensitive comparison.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, FromJsonQueryResult)]
 pub struct TagFilter {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     include: Vec<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     exclude: Vec<String>,
 }
 

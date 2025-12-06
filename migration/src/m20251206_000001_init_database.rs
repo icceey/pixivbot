@@ -61,7 +61,18 @@ impl MigrationTrait for Migration {
                             .not_null()
                             .default(true),
                     )
-                    .col(ColumnDef::new(Chats::ExcludedTags).json())
+                    .col(
+                        ColumnDef::new(Chats::ExcludedTags)
+                            .json()
+                            .not_null()
+                            .default("[]"),
+                    )
+                    .col(
+                        ColumnDef::new(Chats::SensitiveTags)
+                            .json()
+                            .not_null()
+                            .default("[]"),
+                    )
                     .col(
                         ColumnDef::new(Chats::CreatedAt)
                             .timestamp()
@@ -139,7 +150,12 @@ impl MigrationTrait for Migration {
                             .not_null(),
                     )
                     .col(ColumnDef::new(Subscriptions::TaskId).integer().not_null())
-                    .col(ColumnDef::new(Subscriptions::FilterTags).json())
+                    .col(
+                        ColumnDef::new(Subscriptions::FilterTags)
+                            .json()
+                            .not_null()
+                            .default(r#"{"include":[],"exclude":[]}"#),
+                    )
                     .col(ColumnDef::new(Subscriptions::LatestData).json())
                     .col(
                         ColumnDef::new(Subscriptions::CreatedAt)
@@ -219,6 +235,7 @@ enum Chats {
     Enabled,
     BlurSensitiveTags,
     ExcludedTags,
+    SensitiveTags,
     CreatedAt,
 }
 

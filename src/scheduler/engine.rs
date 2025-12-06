@@ -1,4 +1,4 @@
-use crate::bot::notifier::Notifier;
+use crate::bot::notifier::{BatchSendResult, Notifier};
 use crate::db::repo::Repo;
 use crate::db::types::{
     AuthorState, PendingIllust, RankingState, SubscriptionState, TagFilter, TaskType,
@@ -6,7 +6,7 @@ use crate::db::types::{
 use crate::pixiv::client::PixivClient;
 use crate::pixiv_client::Illust;
 use crate::utils::{sensitive, tag};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::Local;
 use rand::Rng;
 use std::sync::Arc;
@@ -14,6 +14,35 @@ use teloxide::prelude::*;
 use teloxide::utils::markdown;
 use tokio::time::{sleep, Duration};
 use tracing::{error, info, warn};
+
+/// Result of processing a single illust push
+#[derive(Debug)]
+enum PushResult {
+    /// All pages sent successfully
+    Success { illust_id: u64 },
+    /// Some pages failed, need to retry
+    Partial {
+        illust_id: u64,
+        sent_pages: Vec<usize>,
+        total_pages: usize,
+    },
+    /// Complete failure, retry later
+    Failure { illust_id: u64 },
+}
+
+/// Context for processing a single author subscription
+struct AuthorContext<'a> {
+    subscription: &'a crate::db::entities::subscriptions::Model,
+    chat: crate::db::entities::chats::Model,
+    subscription_state: Option<AuthorState>,
+}
+
+/// Context for processing a single ranking subscription
+struct RankingContext<'a> {
+    subscription: &'a crate::db::entities::subscriptions::Model,
+    chat: crate::db::entities::chats::Model,
+    subscription_state: Option<RankingState>,
+}
 
 pub struct SchedulerEngine {
     repo: Arc<Repo>,
@@ -98,21 +127,18 @@ impl SchedulerEngine {
         Ok(())
     }
 
-    /// Execute author subscription task
+    /// Execute author subscription task (Orchestrator)
+    /// Fetches data once, iterates subscriptions, delegates to dispatcher
     async fn execute_author_task(&self, task: &crate::db::entities::tasks::Model) -> Result<()> {
         let author_id: u64 = task.value.parse()?;
 
-        // Get latest illusts
+        // Get latest illusts from Pixiv API
         let pixiv = self.pixiv_client.read().await;
         let illusts = pixiv.get_user_illusts(author_id, 10).await?;
         drop(pixiv);
 
         if illusts.is_empty() {
-            info!("No illusts found for author {}", author_id);
-            let random_interval_sec =
-                rand::rng().random_range(self.min_task_interval_sec..=self.max_task_interval_sec);
-            let next_poll = Local::now() + chrono::Duration::seconds(random_interval_sec as i64);
-            self.repo.update_task_after_poll(task.id, next_poll).await?;
+            self.schedule_next_poll(task.id).await?;
             return Ok(());
         }
 
@@ -121,644 +147,749 @@ impl SchedulerEngine {
 
         if subscriptions.is_empty() {
             info!("No subscriptions for author task {}", task.id);
-            let random_interval_sec =
-                rand::rng().random_range(self.min_task_interval_sec..=self.max_task_interval_sec);
-            let next_poll = Local::now() + chrono::Duration::seconds(random_interval_sec as i64);
-            self.repo.update_task_after_poll(task.id, next_poll).await?;
+            self.schedule_next_poll(task.id).await?;
             return Ok(());
         }
 
-        // Process each subscription with its own push state
+        // Process each subscription independently (one push per subscription per tick)
         for subscription in subscriptions {
-            let chat_id = ChatId(subscription.chat_id);
-
-            // Get chat settings
-            let chat = match self.repo.get_chat(subscription.chat_id).await {
+            // Prepare context
+            let chat = match self.get_chat_if_should_notify(subscription.chat_id).await {
                 Ok(Some(chat)) => chat,
-                Ok(None) => {
-                    info!("Chat {} not found, skipping", chat_id);
-                    continue;
-                }
+                Ok(None) => continue,
                 Err(e) => {
-                    error!("Failed to get chat {}: {:#}", chat_id, e);
+                    error!("Failed to process chat {}: {:#}", subscription.chat_id, e);
                     continue;
                 }
             };
-
-            // Check if chat is enabled or if it's an admin/owner private chat
-            let should_notify = if chat.enabled {
-                true
-            } else {
-                match self.repo.get_user(subscription.chat_id).await {
-                    Ok(Some(user)) if user.role.is_admin() => true,
-                    _ => {
-                        info!("Skipping notification to disabled chat {}", chat_id);
-                        false
-                    }
-                }
-            };
-
-            if !should_notify {
-                continue;
-            }
 
             let subscription_state = match &subscription.latest_data {
-                Some(SubscriptionState::Author(state)) => Some(state),
+                Some(SubscriptionState::Author(state)) => Some(state.clone()),
                 _ => None,
             };
 
-            // Get this subscription's push state
-            // TODO 有其他写法吗
-            let last_illust_id = subscription_state.map(|state| state.latest_illust_id);
-
-            // Check for pending illust (partially sent)
-            let pending_illust = subscription_state.and_then(|data| data.pending_illust.as_ref());
-
-            // 保存 pending id 用于后续过滤
-            let pending_id_to_skip = pending_illust.map(|p| p.illust_id);
-
-            // Find new illusts for this subscription
-            let new_illusts: Vec<_> = if let Some(last_id) = last_illust_id {
-                illusts
-                    .iter()
-                    .take_while(|illust| illust.id != last_id)
-                    .collect()
-            } else {
-                // First run for this subscription - only send the latest one
-                illusts.iter().take(1).collect()
+            let ctx = AuthorContext {
+                subscription: &subscription,
+                chat,
+                subscription_state,
             };
 
-            if new_illusts.is_empty() && pending_illust.is_none() {
-                continue;
-            }
-
-            info!(
-                "Found {} new illusts for subscription {} (chat {}): {:?}, pending: {:?}",
-                new_illusts.len(),
-                subscription.id,
-                chat_id,
-                new_illusts.iter().map(|i| i.id).collect::<Vec<_>>(),
-                pending_id_to_skip
-            );
-
-            // 记录最新的 illust id（用于在过滤后没有内容时也更新）
-            let newest_illust_id = new_illusts.first().map(|i| i.id);
-
-            // Pre-parse tag filters once for this subscription
-            let chat_filter = TagFilter::from_excluded_tags(&chat.excluded_tags);
-
-            // Apply subscription tag filters, then chat-level excluded tags
-            let combined_filter = subscription.filter_tags.merged(&chat_filter);
-            let filtered_illusts: Vec<&Illust> =
-                combined_filter.filter(new_illusts.iter().copied());
-
-            // 如果过滤后没有内容且没有 pending，更新 latest_illust_id
-            if filtered_illusts.is_empty() && pending_illust.is_none() {
-                if let Some(newest_id) = newest_illust_id {
-                    let state = SubscriptionState::Author(AuthorState {
-                        latest_illust_id: newest_id,
-                        last_checked_at: Some(Local::now().timestamp()),
-                        pending_illust: None,
-                    });
+            // Delegate to dispatcher, get new state if any
+            match self
+                .process_single_author_sub(&ctx, &illusts)
+                .await
+                .context(format!(
+                    "Failed to process subscription {}",
+                    subscription.id
+                )) {
+                Ok(Some(new_state)) => {
+                    // Worker returned new state, persist it
                     if let Err(e) = self
-                        .repo
-                        .update_subscription_latest_data(subscription.id, Some(state))
+                        .update_subscription_state(subscription.id, new_state)
                         .await
                     {
                         error!(
-                            "Failed to update subscription {} latest_data: {}",
+                            "Failed to update subscription {} state: {:#}",
                             subscription.id, e
                         );
                     }
                 }
-                continue;
-            }
-
-            // 首先处理 pending illust（如果有）
-            if let Some(&PendingIllust {
-                illust_id,
-                ref sent_pages,
-                total_pages,
-                ..
-            }) = pending_illust
-            {
-                // 找到对应的 illust
-                if let Some(illust) = illusts.iter().find(|i| i.id == illust_id) {
-                    info!(
-                        "Resuming pending illust {} ({}/{} pages sent)",
-                        illust_id,
-                        sent_pages.len(),
-                        total_pages
-                    );
-
-                    let sensitive_tags = sensitive::get_chat_sensitive_tags(&chat);
-                    let has_spoiler = chat.blur_sensitive_tags
-                        && sensitive::contains_sensitive_tags(illust, sensitive_tags);
-
-                    // 获取所有图片 URL
-                    let all_urls = illust.get_all_image_urls();
-
-                    // 只发送尚未成功的页
-                    let pending_pages: Vec<usize> = (0..all_urls.len())
-                        .filter(|i| !sent_pages.contains(i))
-                        .collect();
-
-                    if pending_pages.is_empty() {
-                        // 所有页都已发送，标记为完成
-                        let updated_data = SubscriptionState::Author(AuthorState {
-                            latest_illust_id: illust_id,
-                            last_checked_at: Some(Local::now().timestamp()),
-                            pending_illust: None,
-                        });
-                        if let Err(e) = self
-                            .repo
-                            .update_subscription_latest_data(subscription.id, Some(updated_data))
-                            .await
-                        {
-                            error!(
-                                "Failed to update subscription {} latest_data: {}",
-                                subscription.id, e
-                            );
-                        }
-                    } else {
-                        // 发送剩余页
-                        let pending_urls: Vec<String> = pending_pages
-                            .iter()
-                            .filter_map(|&i| all_urls.get(i).cloned())
-                            .collect();
-
-                        let caption = format!(
-                            "🎨 {} \\(continued, {}/{} remaining\\)\nby *{}*\n\n🔗 [来源](https://pixiv\\.net/artworks/{})",
-                            markdown::escape(&illust.title),
-                            pending_urls.len(),
-                            total_pages,
-                            markdown::escape(&illust.user.name),
-                            illust.id
-                        );
-
-                        let send_result = self
-                            .notifier
-                            .notify_with_images(chat_id, &pending_urls, Some(&caption), has_spoiler)
-                            .await;
-
-                        // 合并已发送的页索引
-                        let mut all_sent: Vec<usize> = sent_pages.clone();
-                        for &idx in &send_result.succeeded_indices {
-                            if let Some(&page_idx) = pending_pages.get(idx) {
-                                all_sent.push(page_idx);
-                            }
-                        }
-                        all_sent.sort();
-                        all_sent.dedup();
-
-                        if all_sent.len() == total_pages {
-                            // 全部完成
-                            let updated_data = SubscriptionState::Author(AuthorState {
-                                latest_illust_id: illust_id,
-                                last_checked_at: Some(Local::now().timestamp()),
-                                pending_illust: None,
-                            });
-                            if let Err(e) = self
-                                .repo
-                                .update_subscription_latest_data(
-                                    subscription.id,
-                                    Some(updated_data),
-                                )
-                                .await
-                            {
-                                error!(
-                                    "Failed to update subscription {} latest_data: {}",
-                                    subscription.id, e
-                                );
-                            }
-                        } else {
-                            // 仍有失败，更新 pending 状态
-                            let updated_data = SubscriptionState::Author(AuthorState {
-                                latest_illust_id: last_illust_id.unwrap_or(illust_id),
-                                pending_illust: Some(PendingIllust {
-                                    illust_id,
-                                    sent_pages: all_sent,
-                                    total_pages,
-                                    retry_count: 0,
-                                }),
-                                last_checked_at: Some(Local::now().timestamp()),
-                            });
-                            if let Err(e) = self
-                                .repo
-                                .update_subscription_latest_data(
-                                    subscription.id,
-                                    Some(updated_data),
-                                )
-                                .await
-                            {
-                                error!(
-                                    "Failed to update subscription {} latest_data: {}",
-                                    subscription.id, e
-                                );
-                            }
-                            // 有 pending 未完成，暂停处理新 illusts
-                            continue;
-                        }
-
-                        sleep(Duration::from_millis(2000)).await;
-                    }
-                } else {
-                    // pending illust 不在当前 API 返回中（可能太旧了）
-                    // 放弃这个 pending，清除状态，让程序继续处理新的 illusts
-                    warn!(
-                        "Pending illust {} not found in current API response, abandoning",
-                        illust_id
-                    );
-                    // 保留 last_illust_id，清除 pending
-                    if let Some(last_id) = last_illust_id {
-                        let updated_data = SubscriptionState::Author(AuthorState {
-                            latest_illust_id: last_id,
-                            last_checked_at: Some(Local::now().timestamp()),
-                            pending_illust: None,
-                        });
-                        if let Err(e) = self
-                            .repo
-                            .update_subscription_latest_data(subscription.id, Some(updated_data))
-                            .await
-                        {
-                            error!(
-                                "Failed to update subscription {} latest_data: {}",
-                                subscription.id, e
-                            );
-                        }
-                    }
+                Ok(None) => {
+                    // No state change
+                }
+                Err(e) => {
+                    error!("{:#}", e);
                 }
             }
 
-            // 过滤掉已经处理过的 pending illust（如果有的话）
-            let filtered_illusts: Vec<_> = filtered_illusts
-                .into_iter()
-                .filter(|i| Some(i.id) != pending_id_to_skip)
-                .collect();
-
-            // 处理新的 illusts
-            for illust in filtered_illusts {
-                let page_info = if illust.is_multi_page() {
-                    format!(" \\({} photos\\)", illust.page_count)
-                } else {
-                    String::new()
-                };
-
-                // Check if this illust has sensitive tags for spoiler
-                let sensitive_tags = sensitive::get_chat_sensitive_tags(&chat);
-                let has_spoiler = chat.blur_sensitive_tags
-                    && sensitive::contains_sensitive_tags(illust, sensitive_tags);
-
-                let tags = tag::format_tags_escaped(illust);
-
-                let caption = format!(
-                    "🎨 {}{}\nby *{}* \\(ID: `{}`\\)\n\n👀 {} \\| ❤️ {} \\| 🔗 [来源](https://pixiv\\.net/artworks/{}){}", 
-                    markdown::escape(&illust.title),
-                    page_info,
-                    markdown::escape(&illust.user.name),
-                    illust.user.id,
-                    illust.total_view,
-                    illust.total_bookmarks,
-                    illust.id,
-                    tags
-                );
-
-                // 获取所有图片URL (支持单图和多图)
-                let image_urls = illust.get_all_image_urls();
-                let total_pages = image_urls.len();
-
-                let send_result = self
-                    .notifier
-                    .notify_with_images(chat_id, &image_urls, Some(&caption), has_spoiler)
-                    .await;
-
-                if send_result.is_complete_success() {
-                    // 发送成功，更新 subscription 的 latest_data
-                    info!("Successfully sent illust {} to chat {}", illust.id, chat_id);
-                    let updated_data = SubscriptionState::Author(AuthorState {
-                        latest_illust_id: illust.id,
-                        last_checked_at: Some(Local::now().timestamp()),
-                        pending_illust: None,
-                    });
-
-                    if let Err(e) = self
-                        .repo
-                        .update_subscription_latest_data(subscription.id, Some(updated_data))
-                        .await
-                    {
-                        error!(
-                            "Failed to update subscription {} latest_data: {}",
-                            subscription.id, e
-                        );
-                    }
-                } else if send_result.is_complete_failure() {
-                    error!(
-                        "Failed to send illust {} to chat {}, will retry next poll",
-                        illust.id, chat_id
-                    );
-                    // 完全失败，不更新 latest_data，下次会重试
-                    break; // 停止处理这个 subscription 的后续 illusts
-                } else {
-                    // 部分成功，记录 pending 状态
-                    warn!(
-                        "Partially sent illust {} to chat {} ({}/{} pages)",
-                        illust.id,
-                        chat_id,
-                        send_result.succeeded_indices.len(),
-                        total_pages
-                    );
-
-                    let updated_data = SubscriptionState::Author(AuthorState {
-                        latest_illust_id: last_illust_id.unwrap_or(0), // TODO
-                        pending_illust: Some(PendingIllust {
-                            illust_id: illust.id,
-                            sent_pages: send_result.succeeded_indices,
-                            total_pages,
-                            retry_count: 0,
-                        }),
-                        last_checked_at: Some(Local::now().timestamp()),
-                    });
-
-                    if let Err(e) = self
-                        .repo
-                        .update_subscription_latest_data(subscription.id, Some(updated_data))
-                        .await
-                    {
-                        error!(
-                            "Failed to update subscription {} latest_data: {}",
-                            subscription.id, e
-                        );
-                    }
-                    // 有 pending，停止处理后续 illusts
-                    break;
-                }
-
-                // Small delay between messages
-                sleep(Duration::from_millis(2000)).await;
-            }
+            // Small delay between subscriptions
+            sleep(Duration::from_millis(2000)).await;
         }
 
-        // Update task's next poll time
-        let random_interval_sec =
-            rand::rng().random_range(self.min_task_interval_sec..=self.max_task_interval_sec);
-        let next_poll = Local::now() + chrono::Duration::seconds(random_interval_sec as i64);
-        self.repo.update_task_after_poll(task.id, next_poll).await?;
+        // Schedule next poll
+        self.schedule_next_poll(task.id).await?;
 
         Ok(())
     }
 
-    /// Execute ranking subscription task
+    /// Execute ranking subscription task (Orchestrator)
     async fn execute_ranking_task(&self, task: &crate::db::entities::tasks::Model) -> Result<()> {
         let mode = &task.value;
 
-        // Get ranking
+        // Get ranking illusts from Pixiv API
         let pixiv = self.pixiv_client.read().await;
         let illusts = pixiv.get_ranking(mode, None, 10).await?;
         drop(pixiv);
 
         if illusts.is_empty() {
             info!("No ranking illusts found for mode {}", mode);
-            // Update task poll time
-            self.repo
-                .update_task_after_poll(task.id, Local::now() + chrono::Duration::seconds(86400))
-                .await?;
+            self.schedule_ranking_next_poll(task.id).await?;
             return Ok(());
         }
 
         info!("Found {} ranking illusts for mode {}", illusts.len(), mode);
 
-        // Get all subscriptions
+        // Get all subscriptions for this task
         let subscriptions = self.repo.list_subscriptions_by_task(task.id).await?;
 
         if subscriptions.is_empty() {
             info!("No subscriptions for ranking task {}", task.id);
-            self.repo
-                .update_task_after_poll(task.id, Local::now() + chrono::Duration::seconds(86400))
+            self.schedule_ranking_next_poll(task.id).await?;
+            return Ok(());
+        }
+
+        // Process each subscription independently (one push per subscription per tick)
+        for subscription in subscriptions {
+            // Prepare context
+            let chat = match self.get_chat_if_should_notify(subscription.chat_id).await {
+                Ok(Some(chat)) => chat,
+                Ok(None) => continue,
+                Err(e) => {
+                    error!("Failed to process chat {}: {:#}", subscription.chat_id, e);
+                    continue;
+                }
+            };
+
+            let subscription_state = match &subscription.latest_data {
+                Some(SubscriptionState::Ranking(state)) => Some(state.clone()),
+                _ => None,
+            };
+
+            let ctx = RankingContext {
+                subscription: &subscription,
+                chat,
+                subscription_state,
+            };
+
+            // Delegate to dispatcher
+            if let Err(e) = self
+                .process_single_ranking_sub(&ctx, &illusts, mode)
+                .await
+                .context(format!(
+                    "Failed to process subscription {}",
+                    subscription.id
+                ))
+            {
+                error!("{:#}", e);
+            }
+
+            // Small delay between subscriptions
+            sleep(Duration::from_millis(2000)).await;
+        }
+
+        // Schedule next poll (24 hours for ranking)
+        self.schedule_ranking_next_poll(task.id).await?;
+
+        Ok(())
+    }
+
+    // ==================== Helper Methods ====================
+
+    /// Schedule next poll with randomized interval
+    async fn schedule_next_poll(&self, task_id: i32) -> Result<()> {
+        let random_interval_sec =
+            rand::rng().random_range(self.min_task_interval_sec..=self.max_task_interval_sec);
+        let next_poll = Local::now() + chrono::Duration::seconds(random_interval_sec as i64);
+        self.repo.update_task_after_poll(task_id, next_poll).await?;
+        Ok(())
+    }
+
+    /// Get chat and check if should notify (enabled or admin)
+    async fn get_chat_if_should_notify(
+        &self,
+        chat_id: i64,
+    ) -> Result<Option<crate::db::entities::chats::Model>> {
+        let chat = self
+            .repo
+            .get_chat(chat_id)
+            .await
+            .context("Failed to get chat")?;
+
+        let Some(chat) = chat else {
+            info!("Chat {} not found, skipping", chat_id);
+            return Ok(None);
+        };
+
+        if chat.enabled {
+            return Ok(Some(chat));
+        }
+
+        // Check if admin/owner
+        match self.repo.get_user(chat_id).await {
+            Ok(Some(user)) if user.role.is_admin() => Ok(Some(chat)),
+            _ => {
+                info!("Skipping notification to disabled chat {}", chat_id);
+                Ok(None)
+            }
+        }
+    }
+
+    /// Update subscription state in database
+    async fn update_subscription_state(
+        &self,
+        subscription_id: i32,
+        state: AuthorState,
+    ) -> Result<()> {
+        self.repo
+            .update_subscription_latest_data(
+                subscription_id,
+                Some(SubscriptionState::Author(state)),
+            )
+            .await?;
+        Ok(())
+    }
+
+    // ==================== Dispatcher ====================
+
+    /// Dispatcher: Decide between pending retry or new illust processing
+    /// Returns Some(new_state) if state changed, None if no change
+    async fn process_single_author_sub(
+        &self,
+        ctx: &AuthorContext<'_>,
+        illusts: &[Illust],
+    ) -> Result<Option<AuthorState>> {
+        // Check if there's a pending illust to resume
+        if let Some(ref state) = ctx.subscription_state {
+            if let Some(ref pending) = state.pending_illust {
+                // Handle pending first (retry incomplete push)
+                return self.handle_existing_pending(ctx, illusts, pending).await;
+            }
+        }
+
+        // No pending, process new illusts
+        self.handle_new_illusts(ctx, illusts).await
+    }
+
+    // ==================== Workers ====================
+
+    /// Worker: Handle retry of existing pending illust
+    /// Returns Some(new_state) if state changed, None if no change
+    async fn handle_existing_pending(
+        &self,
+        ctx: &AuthorContext<'_>,
+        illusts: &[Illust],
+        pending: &PendingIllust,
+    ) -> Result<Option<AuthorState>> {
+        let chat_id = ChatId(ctx.subscription.chat_id);
+        let state = ctx.subscription_state.as_ref().unwrap();
+
+        // Find the illust in API response
+        let Some(illust) = illusts.iter().find(|i| i.id == pending.illust_id) else {
+            // Pending illust not found (deleted or too old), abandon it
+            warn!(
+                "Pending illust {} not found in API response, abandoning",
+                pending.illust_id
+            );
+            return Ok(Some(AuthorState {
+                latest_illust_id: state.latest_illust_id,
+                pending_illust: None,
+            }));
+        };
+
+        info!(
+            "Resuming pending illust {} ({}/{} pages sent)",
+            pending.illust_id,
+            pending.sent_pages.len(),
+            pending.total_pages
+        );
+
+        // Calculate remaining pages
+        let all_urls = illust.get_all_image_urls();
+        let remaining_pages: Vec<usize> = (0..all_urls.len())
+            .filter(|i| !pending.sent_pages.contains(i))
+            .collect();
+
+        if remaining_pages.is_empty() {
+            // All pages already sent, mark as complete
+            return Ok(Some(AuthorState {
+                latest_illust_id: pending.illust_id,
+                pending_illust: None,
+            }));
+        }
+
+        // Send remaining pages
+        let push_result = self
+            .process_illust_push(ctx, illust, &pending.sent_pages)
+            .await?;
+
+        // Calculate new state based on result
+        let new_state = match push_result {
+            PushResult::Success { illust_id } => {
+                info!(
+                    "✅ Completed pending illust {} for chat {}",
+                    illust_id, chat_id
+                );
+                AuthorState {
+                    latest_illust_id: illust_id,
+                    pending_illust: None,
+                }
+            }
+            PushResult::Partial {
+                illust_id,
+                sent_pages,
+                total_pages,
+            } => {
+                warn!(
+                    "⚠️  Partially sent illust {} ({}/{} pages)",
+                    illust_id,
+                    sent_pages.len(),
+                    total_pages
+                );
+                AuthorState {
+                    latest_illust_id: state.latest_illust_id,
+                    pending_illust: Some(PendingIllust {
+                        illust_id,
+                        sent_pages,
+                        total_pages,
+                        retry_count: pending.retry_count + 1,
+                    }),
+                }
+            }
+            PushResult::Failure { illust_id } => {
+                error!(
+                    "❌ Failed to send pending illust {} to chat {}",
+                    illust_id, chat_id
+                );
+                // Keep pending state for retry, no state change
+                return Ok(None);
+            }
+        };
+
+        Ok(Some(new_state))
+    }
+
+    /// Worker: Select and push the oldest new illust
+    /// Returns Some(new_state) if state changed, None if no change
+    async fn handle_new_illusts(
+        &self,
+        ctx: &AuthorContext<'_>,
+        illusts: &[Illust],
+    ) -> Result<Option<AuthorState>> {
+        let chat_id = ChatId(ctx.subscription.chat_id);
+        let last_illust_id = ctx.subscription_state.as_ref().map(|s| s.latest_illust_id);
+
+        // Find new illusts for this subscription
+        let new_illusts: Vec<_> = if let Some(last_id) = last_illust_id {
+            illusts.iter().take_while(|i| i.id > last_id).collect()
+        } else {
+            // First run: only send the latest one
+            illusts.iter().take(1).collect()
+        };
+
+        if new_illusts.is_empty() {
+            return Ok(None);
+        }
+
+        info!(
+            "Found {} new illusts for subscription {} (chat {}): {:?}",
+            new_illusts.len(),
+            ctx.subscription.id,
+            chat_id,
+            new_illusts.iter().map(|i| i.id).collect::<Vec<_>>()
+        );
+
+        let newest_illust_id = new_illusts.first().map(|i| i.id);
+
+        // Apply tag filters
+        let chat_filter = TagFilter::from_excluded_tags(&ctx.chat.excluded_tags);
+        let combined_filter = ctx.subscription.filter_tags.merged(&chat_filter);
+        let filtered_illusts: Vec<&Illust> = combined_filter.filter(new_illusts.iter().copied());
+
+        // If all filtered out, update cursor and return
+        if filtered_illusts.is_empty() {
+            return Ok(newest_illust_id.map(|newest_id| AuthorState {
+                latest_illust_id: newest_id,
+                pending_illust: None,
+            }));
+        }
+
+        // *** KEY CHANGE: Only process the OLDEST new illust (last in the filtered list) ***
+        let illust = filtered_illusts
+            .last()
+            .expect("filtered_illusts is not empty");
+
+        // Push this single illust
+        let push_result = self.process_illust_push(ctx, illust, &[]).await?;
+
+        // Calculate new state based on result
+        let new_state = match push_result {
+            PushResult::Success { illust_id } => {
+                info!(
+                    "✅ Successfully sent illust {} to chat {}",
+                    illust_id, chat_id
+                );
+                AuthorState {
+                    latest_illust_id: illust_id,
+                    pending_illust: None,
+                }
+            }
+            PushResult::Partial {
+                illust_id,
+                sent_pages,
+                total_pages,
+            } => {
+                warn!(
+                    "⚠️  Partially sent illust {} ({}/{} pages)",
+                    illust_id,
+                    sent_pages.len(),
+                    total_pages
+                );
+                AuthorState {
+                    latest_illust_id: last_illust_id.unwrap_or(0),
+                    pending_illust: Some(PendingIllust {
+                        illust_id,
+                        sent_pages,
+                        total_pages,
+                        retry_count: 0,
+                    }),
+                }
+            }
+            PushResult::Failure { illust_id } => {
+                error!(
+                    "❌ Failed to send illust {} to chat {}, will retry next poll",
+                    illust_id, chat_id
+                );
+                // Don't update state, retry next tick
+                return Ok(None);
+            }
+        };
+
+        Ok(Some(new_state))
+    }
+
+    /// Generic push executor: Send specific illust pages (excluding already sent pages)
+    async fn process_illust_push(
+        &self,
+        ctx: &AuthorContext<'_>,
+        illust: &Illust,
+        already_sent_pages: &[usize],
+    ) -> Result<PushResult> {
+        let chat_id = ChatId(ctx.subscription.chat_id);
+        let all_urls = illust.get_all_image_urls();
+        let total_pages = all_urls.len();
+
+        // Calculate pages to send
+        let pages_to_send: Vec<usize> = (0..total_pages)
+            .filter(|i| !already_sent_pages.contains(i))
+            .collect();
+
+        if pages_to_send.is_empty() {
+            return Ok(PushResult::Success {
+                illust_id: illust.id,
+            });
+        }
+
+        let urls_to_send: Vec<String> = pages_to_send
+            .iter()
+            .filter_map(|&i| all_urls.get(i).cloned())
+            .collect();
+
+        // Prepare caption
+        let caption = if already_sent_pages.is_empty() {
+            // First time sending this illust
+            let page_info = if illust.is_multi_page() {
+                format!(" \\({} photos\\)", illust.page_count)
+            } else {
+                String::new()
+            };
+            let tags = tag::format_tags_escaped(illust);
+            format!(
+                "🎨 {}{}\nby *{}* \\(ID: `{}`\\)\n\n👀 {} \\| ❤️ {} \\| 🔗 [来源](https://pixiv\\.net/artworks/{}){}", 
+                markdown::escape(&illust.title),
+                page_info,
+                markdown::escape(&illust.user.name),
+                illust.user.id,
+                illust.total_view,
+                illust.total_bookmarks,
+                illust.id,
+                tags
+            )
+        } else {
+            // Continuing from previous attempt
+            format!(
+                "🎨 {} \\(continued, {}/{} remaining\\)\nby *{}*\n\n🔗 [来源](https://pixiv\\.net/artworks/{})",
+                markdown::escape(&illust.title),
+                urls_to_send.len(),
+                total_pages,
+                markdown::escape(&illust.user.name),
+                illust.id
+            )
+        };
+
+        // Check spoiler setting
+        let sensitive_tags = sensitive::get_chat_sensitive_tags(&ctx.chat);
+        let has_spoiler = ctx.chat.blur_sensitive_tags
+            && sensitive::contains_sensitive_tags(illust, sensitive_tags);
+
+        // Send images
+        let send_result = self
+            .notifier
+            .notify_with_images(chat_id, &urls_to_send, Some(&caption), has_spoiler)
+            .await;
+
+        // Map send result to PushResult
+        let result = self.map_send_result_to_push_result(
+            illust.id,
+            send_result,
+            already_sent_pages,
+            &pages_to_send,
+            total_pages,
+        );
+
+        Ok(result)
+    }
+
+    /// Map BatchSendResult to PushResult
+    fn map_send_result_to_push_result(
+        &self,
+        illust_id: u64,
+        send_result: BatchSendResult,
+        already_sent: &[usize],
+        attempted_pages: &[usize],
+        total_pages: usize,
+    ) -> PushResult {
+        if send_result.is_complete_success() {
+            // All attempted pages succeeded
+            let mut all_sent = already_sent.to_vec();
+            all_sent.extend(attempted_pages);
+            all_sent.sort();
+            all_sent.dedup();
+
+            if all_sent.len() == total_pages {
+                PushResult::Success { illust_id }
+            } else {
+                // Should not happen, but handle gracefully
+                PushResult::Partial {
+                    illust_id,
+                    sent_pages: all_sent,
+                    total_pages,
+                }
+            }
+        } else if send_result.is_complete_failure() {
+            PushResult::Failure { illust_id }
+        } else {
+            // Partial success
+            let mut all_sent = already_sent.to_vec();
+            for &idx in &send_result.succeeded_indices {
+                if let Some(&page_idx) = attempted_pages.get(idx) {
+                    all_sent.push(page_idx);
+                }
+            }
+            all_sent.sort();
+            all_sent.dedup();
+
+            PushResult::Partial {
+                illust_id,
+                sent_pages: all_sent,
+                total_pages,
+            }
+        }
+    }
+
+    // ==================== Ranking-Specific Methods ====================
+
+    /// Schedule next poll for ranking task (24 hours)
+    async fn schedule_ranking_next_poll(&self, task_id: i32) -> Result<()> {
+        self.repo
+            .update_task_after_poll(task_id, Local::now() + chrono::Duration::seconds(86400))
+            .await?;
+        Ok(())
+    }
+
+    /// Update ranking subscription state in database
+    async fn update_ranking_state(&self, subscription_id: i32, state: RankingState) -> Result<()> {
+        self.repo
+            .update_subscription_latest_data(
+                subscription_id,
+                Some(SubscriptionState::Ranking(state)),
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Dispatcher: Process single ranking subscription
+    async fn process_single_ranking_sub(
+        &self,
+        ctx: &RankingContext<'_>,
+        illusts: &[Illust],
+        mode: &str,
+    ) -> Result<()> {
+        let chat_id = ChatId(ctx.subscription.chat_id);
+
+        // Get previously pushed IDs
+        let pushed_ids = ctx
+            .subscription_state
+            .as_ref()
+            .map(|s| s.pushed_ids.clone())
+            .unwrap_or_default();
+
+        // Find new illusts (not already pushed)
+        let new_illusts: Vec<_> = illusts
+            .iter()
+            .filter(|i| !pushed_ids.contains(&i.id))
+            .collect();
+
+        if new_illusts.is_empty() {
+            return Ok(());
+        }
+
+        info!(
+            "Found {} new ranking illusts for subscription {} (chat {}): {:?}",
+            new_illusts.len(),
+            ctx.subscription.id,
+            chat_id,
+            new_illusts.iter().map(|i| i.id).collect::<Vec<_>>()
+        );
+
+        // Apply tag filters
+        let chat_filter = TagFilter::from_excluded_tags(&ctx.chat.excluded_tags);
+        let combined_filter = ctx.subscription.filter_tags.merged(&chat_filter);
+        let filtered_illusts: Vec<&Illust> = combined_filter.filter(new_illusts.iter().copied());
+
+        // Collect all new IDs for tracking
+        let all_new_ids: Vec<u64> = new_illusts.iter().map(|i| i.id).collect();
+
+        // If all filtered out, mark as processed and return
+        if filtered_illusts.is_empty() {
+            info!("No illusts to send to chat {} after filtering", chat_id);
+            self.mark_ranking_illusts_as_pushed(ctx, pushed_ids, all_new_ids)
                 .await?;
             return Ok(());
         }
 
-        // Process each subscription with its own push state
-        for subscription in subscriptions {
-            let chat_id = ChatId(subscription.chat_id);
+        // *** Process ALL filtered ranking illusts in batch ***
+        info!(
+            "Sending {} ranking illusts to chat {}",
+            filtered_illusts.len(),
+            chat_id
+        );
 
-            // Get chat settings
-            let chat = match self.repo.get_chat(subscription.chat_id).await {
-                Ok(Some(chat)) => chat,
-                Ok(None) => {
-                    info!("Chat {} not found, skipping", chat_id);
-                    continue;
-                }
-                Err(e) => {
-                    error!("Failed to get chat {}: {:#}", chat_id, e);
-                    continue;
-                }
-            };
+        // Build title for the batch
+        let title = format!(
+            "📊 *{} Ranking* \\- {} new\\!\n\n",
+            markdown::escape(&mode.replace('_', " ").to_uppercase()),
+            filtered_illusts.len()
+        );
 
-            // Check if chat is enabled or if it's an admin/owner private chat
-            let should_notify = if chat.enabled {
-                true
+        // Collect all illusts data for batch sending
+        let mut image_urls = Vec::new();
+        let mut captions = Vec::new();
+        let mut illust_ids = Vec::new();
+
+        for (index, illust) in filtered_illusts.iter().enumerate() {
+            // Get image URL (single image per ranking item)
+            let image_url = if let Some(url) = &illust.meta_single_page.original_image_url {
+                url.clone()
             } else {
-                match self.repo.get_user(subscription.chat_id).await {
-                    Ok(Some(user)) if user.role.is_admin() => true,
-                    _ => {
-                        info!("Skipping notification to disabled chat {}", chat_id);
-                        false
-                    }
-                }
+                illust.image_urls.large.clone()
             };
+            image_urls.push(image_url);
+            illust_ids.push(illust.id);
 
-            if !should_notify {
-                continue;
-            }
-
-            let subscription_state = match &subscription.latest_data {
-                Some(SubscriptionState::Ranking(state)) => Some(state),
-                _ => None,
-            };
-
-            // Get this subscription's previously pushed illust IDs
-            let pushed_ids = subscription_state
-                .map(|data| data.pushed_ids.clone())
-                .unwrap_or_default();
-
-            // Filter out illusts that have already been pushed to this subscription
-            let new_illusts: Vec<&crate::pixiv_client::Illust> = illusts
-                .iter()
-                .filter(|illust| !pushed_ids.contains(&illust.id))
-                .collect();
-
-            if new_illusts.is_empty() {
-                info!(
-                    "No new ranking illusts for subscription {} (chat {})",
-                    subscription.id, chat_id
-                );
-                continue;
-            }
-
-            info!(
-                "Found {} new ranking illusts for subscription {} (chat {}): {:?}",
-                new_illusts.len(),
-                subscription.id,
-                chat_id,
-                new_illusts.iter().map(|i| i.id).collect::<Vec<_>>()
+            // Build caption
+            let tags = tag::format_tags_escaped(illust);
+            let base_caption = format!(
+                "{}\\.  {}\nby *{}* \\(ID: `{}`\\)\n\n❤️ {} \\| 🔗 [来源](https://pixiv\\.net/artworks/{}){}", 
+                index + 1,
+                markdown::escape(&illust.title),
+                markdown::escape(&illust.user.name),
+                illust.user.id,
+                illust.total_bookmarks,
+                illust.id,
+                tags
             );
 
-            // Collect new illust IDs (will be used to track what was successfully sent)
-            let new_ids: Vec<u64> = new_illusts.iter().map(|i| i.id).collect();
-
-            // Pre-parse tag filters once for this subscription
-            let chat_filter = TagFilter::from_excluded_tags(&chat.excluded_tags);
-
-            // Apply subscription-level tag filters and chat-level excluded tags
-            let combined_filter = subscription.filter_tags.merged(&chat_filter);
-            let filtered_illusts: Vec<&Illust> =
-                combined_filter.filter(new_illusts.iter().copied());
-
-            if filtered_illusts.is_empty() {
-                info!("No illusts to send to chat {} after filtering", chat_id);
-                // 即使过滤后没有要发送的，也更新 pushed_ids（因为这些已被处理）
-                let mut all_pushed_ids = pushed_ids.clone();
-                all_pushed_ids.extend(new_ids);
-                if all_pushed_ids.len() > 100 {
-                    let skip_count = all_pushed_ids.len() - 100;
-                    all_pushed_ids = all_pushed_ids.into_iter().skip(skip_count).collect();
-                }
-                let updated_data = SubscriptionState::Ranking(RankingState {
-                    pushed_ids: all_pushed_ids,
-                    last_checked_at: Some(Local::now().timestamp()),
-                    pending_illust: None,
-                });
-                if let Err(e) = self
-                    .repo
-                    .update_subscription_latest_data(subscription.id, Some(updated_data))
-                    .await
-                {
-                    error!(
-                        "Failed to update subscription {} latest_data: {}",
-                        subscription.id, e
-                    );
-                }
-                continue;
-            }
-
-            // Build title to prepend to first image caption
-            let title = format!(
-                "📊 *{} Ranking* \\- {} new\\!\n\n",
-                markdown::escape(&mode.replace('_', " ").to_uppercase()),
-                filtered_illusts.len()
-            );
-
-            // Check if any illust has sensitive tags for spoiler
-            let sensitive_tags = sensitive::get_chat_sensitive_tags(&chat);
-            let has_spoiler = chat.blur_sensitive_tags
-                && filtered_illusts
-                    .iter()
-                    .any(|illust| sensitive::contains_sensitive_tags(illust, sensitive_tags));
-
-            // Prepare image URLs, captions, and corresponding illust IDs
-            let mut image_urls: Vec<String> = Vec::new();
-            let mut captions: Vec<String> = Vec::new();
-            let mut illust_ids: Vec<u64> = Vec::new();
-
-            for (index, illust) in filtered_illusts.iter().enumerate() {
-                // Get image URL
-                let image_url =
-                    if let Some(original_url) = &illust.meta_single_page.original_image_url {
-                        original_url.clone()
-                    } else {
-                        illust.image_urls.large.clone()
-                    };
-                image_urls.push(image_url);
-                illust_ids.push(illust.id);
-
-                // Build caption for this image
-                let tags = tag::format_tags_escaped(illust);
-
-                let base_caption = format!(
-                    "{}\\.  {}\nby *{}* \\(ID: `{}`\\)\n\n❤️ {} \\| 🔗 [来源](https://pixiv\\.net/artworks/{}){}",
-                    index + 1,
-                    markdown::escape(&illust.title),
-                    markdown::escape(&illust.user.name),
-                    illust.user.id,
-                    illust.total_bookmarks,
-                    illust.id,
-                    tags
-                );
-
-                // Prepend title to first image caption
-                let caption = if index == 0 {
-                    format!("{}{}", title, base_caption)
-                } else {
-                    base_caption
-                };
-                captions.push(caption);
-            }
-
-            // Send as media group with individual captions
-            let send_result = self
-                .notifier
-                .notify_with_individual_captions(chat_id, &image_urls, &captions, has_spoiler)
-                .await;
-
-            // 根据发送结果更新 pushed_ids
-            let successfully_sent_ids: Vec<u64> = send_result
-                .succeeded_indices
-                .iter()
-                .filter_map(|&idx| illust_ids.get(idx).copied())
-                .collect();
-
-            if send_result.is_complete_failure() {
-                error!(
-                    "Failed to send ranking to chat {}, will retry next poll",
-                    chat_id
-                );
-                // 完全失败，不更新 pushed_ids，下次会重试
-                continue;
-            }
-
-            // 更新 pushed_ids（只添加成功发送的）
-            let mut all_pushed_ids = pushed_ids.clone();
-            all_pushed_ids.extend(successfully_sent_ids);
-
-            // Keep only the last 100 IDs to prevent unbounded growth
-            if all_pushed_ids.len() > 100 {
-                let skip_count = all_pushed_ids.len() - 100;
-                all_pushed_ids = all_pushed_ids.into_iter().skip(skip_count).collect();
-            }
-
-            let updated_data = SubscriptionState::Ranking(RankingState {
-                pushed_ids: all_pushed_ids,
-                last_checked_at: Some(Local::now().timestamp()),
-                pending_illust: None,
-            });
-
-            if let Err(e) = self
-                .repo
-                .update_subscription_latest_data(subscription.id, Some(updated_data))
-                .await
-            {
-                error!(
-                    "Failed to update subscription {} latest_data: {}",
-                    subscription.id, e
-                );
-            }
-
-            if send_result.has_failures() {
-                warn!(
-                    "Partially sent ranking to chat {} ({}/{} images)",
-                    chat_id,
-                    send_result.succeeded_indices.len(),
-                    send_result.total
-                );
-            }
+            // Prepend title to first caption
+            let caption = if index == 0 {
+                format!("{}{}", title, base_caption)
+            } else {
+                base_caption
+            };
+            captions.push(caption);
         }
 
-        // Update task's next poll time
-        self.repo
-            .update_task_after_poll(task.id, Local::now() + chrono::Duration::seconds(86400))
+        // Check spoiler setting
+        let sensitive_tags = sensitive::get_chat_sensitive_tags(&ctx.chat);
+        let has_spoiler = ctx.chat.blur_sensitive_tags
+            && filtered_illusts
+                .iter()
+                .any(|illust| sensitive::contains_sensitive_tags(illust, sensitive_tags));
+
+        // Send as media group with individual captions
+        let send_result = self
+            .notifier
+            .notify_with_individual_captions(chat_id, &image_urls, &captions, has_spoiler)
+            .await;
+
+        // Collect successfully sent illust IDs
+        let successfully_sent_ids: Vec<u64> = send_result
+            .succeeded_indices
+            .iter()
+            .filter_map(|&idx| illust_ids.get(idx).copied())
+            .collect();
+
+        if send_result.is_complete_failure() {
+            error!(
+                "❌ Failed to send ranking to chat {}, will retry next poll",
+                chat_id
+            );
+            // Don't update pushed_ids, retry next tick
+            return Ok(());
+        }
+
+        // Update pushed_ids with successfully sent illusts
+        let mut new_pushed_ids = pushed_ids.clone();
+        new_pushed_ids.extend(successfully_sent_ids);
+        self.trim_and_update_pushed_ids(ctx.subscription.id, new_pushed_ids)
             .await?;
 
+        if send_result.is_complete_success() {
+            info!(
+                "✅ Successfully sent {} ranking illusts to chat {}",
+                filtered_illusts.len(),
+                chat_id
+            );
+        } else {
+            warn!(
+                "⚠️  Partially sent ranking to chat {} ({}/{} illusts)",
+                chat_id,
+                send_result.succeeded_indices.len(),
+                filtered_illusts.len()
+            );
+        }
+
         Ok(())
+    }
+
+    /// Helper: Mark illusts as pushed (when filtered out but should be marked as processed)
+    async fn mark_ranking_illusts_as_pushed(
+        &self,
+        ctx: &RankingContext<'_>,
+        mut pushed_ids: Vec<u64>,
+        new_ids: Vec<u64>,
+    ) -> Result<()> {
+        pushed_ids.extend(new_ids);
+        self.trim_and_update_pushed_ids(ctx.subscription.id, pushed_ids)
+            .await
+    }
+
+    /// Helper: Trim pushed_ids to last 100 and update state
+    async fn trim_and_update_pushed_ids(
+        &self,
+        subscription_id: i32,
+        mut pushed_ids: Vec<u64>,
+    ) -> Result<()> {
+        // Keep only the last 100 IDs to prevent unbounded growth
+        if pushed_ids.len() > 100 {
+            let skip_count = pushed_ids.len() - 100;
+            pushed_ids = pushed_ids.into_iter().skip(skip_count).collect();
+        }
+
+        let new_state = RankingState {
+            pushed_ids,
+            pending_illust: None,
+        };
+
+        self.update_ranking_state(subscription_id, new_state).await
     }
 }

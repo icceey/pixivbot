@@ -10,8 +10,6 @@ use tracing::{error, info, warn};
 /// 批量发送的结果，记录成功和失败的项目索引
 #[derive(Debug, Clone)]
 pub struct BatchSendResult {
-    /// 总共要发送的项目数
-    pub total: usize,
     /// 成功发送的项目索引 (基于原始输入的索引)
     pub succeeded_indices: Vec<usize>,
     /// 失败的项目索引
@@ -21,7 +19,6 @@ pub struct BatchSendResult {
 impl BatchSendResult {
     pub fn all_succeeded(total: usize) -> Self {
         Self {
-            total,
             succeeded_indices: (0..total).collect(),
             failed_indices: Vec::new(),
         }
@@ -29,7 +26,6 @@ impl BatchSendResult {
 
     pub fn all_failed(total: usize) -> Self {
         Self {
-            total,
             succeeded_indices: Vec::new(),
             failed_indices: (0..total).collect(),
         }
@@ -41,10 +37,6 @@ impl BatchSendResult {
 
     pub fn is_complete_failure(&self) -> bool {
         self.succeeded_indices.is_empty()
-    }
-
-    pub fn has_failures(&self) -> bool {
-        !self.failed_indices.is_empty()
     }
 }
 
@@ -207,7 +199,6 @@ impl Notifier {
         }
 
         BatchSendResult {
-            total: total_images,
             succeeded_indices,
             failed_indices,
         }
@@ -423,7 +414,6 @@ impl Notifier {
         }
 
         BatchSendResult {
-            total: total_images,
             succeeded_indices,
             failed_indices,
         }
