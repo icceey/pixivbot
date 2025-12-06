@@ -1,5 +1,6 @@
 pub mod commands;
 mod handler;
+mod handlers;
 pub mod link_handler;
 pub mod notifier;
 

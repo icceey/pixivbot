@@ -789,8 +789,7 @@ impl SchedulerEngine {
             // Build caption
             let tags = tag::format_tags_escaped(illust);
             let base_caption = format!(
-                "{}\\.  {}\nby *{}* \\(ID: `{}`\\)\n\n❤️ {} \\| 🔗 [来源](https://pixiv\\.net/artworks/{}){}", 
-                index + 1,
+                "{}\nby *{}* \\(ID: `{}`\\)\n\n❤️ {} \\| 🔗 [来源](https://pixiv\\.net/artworks/{}){}", 
                 markdown::escape(&illust.title),
                 markdown::escape(&illust.user.name),
                 illust.user.id,
