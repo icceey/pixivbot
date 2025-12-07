@@ -7,8 +7,8 @@
 //! - Formatting for display in Telegram messages
 //! - Filtering Illust objects
 
-use crate::pixiv_client::Illust;
 use crate::utils::tag;
+use pixiv_client::Illust;
 use sea_orm::FromJsonQueryResult;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

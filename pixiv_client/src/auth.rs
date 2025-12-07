@@ -2,7 +2,7 @@
 //!
 //! 参考 [pixivpy](https://github.com/upbit/pixivpy) 的 pixivpy3/api.py auth() 方法实现
 
-use crate::pixiv_client::error::{Error, Result};
+use crate::error::{Error, Result};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 

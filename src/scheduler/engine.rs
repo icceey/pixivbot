@@ -4,10 +4,10 @@ use crate::db::types::{
     AuthorState, PendingIllust, RankingState, SubscriptionState, TagFilter, TaskType,
 };
 use crate::pixiv::client::PixivClient;
-use crate::pixiv_client::Illust;
 use crate::utils::{sensitive, tag};
 use anyhow::{Context, Result};
 use chrono::Local;
+use pixiv_client::Illust;
 use rand::Rng;
 use std::sync::Arc;
 use teloxide::prelude::*;

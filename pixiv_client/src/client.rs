@@ -1,8 +1,8 @@
 //! Pixiv API 客户端实现
 
-use crate::pixiv_client::auth;
-use crate::pixiv_client::error::{Error, Result};
-use crate::pixiv_client::models::*;
+use crate::auth;
+use crate::error::{Error, Result};
+use crate::models::*;
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, USER_AGENT};
 use std::sync::Arc;
 use std::time::{Duration, Instant};

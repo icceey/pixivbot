@@ -1,6 +1,6 @@
 use super::tag::normalize_tag;
 use crate::db::entities::chats;
-use crate::pixiv_client::Illust;
+use pixiv_client::Illust;
 
 /// Get sensitive tags list from chat settings
 pub fn get_chat_sensitive_tags(chat: &chats::Model) -> &[String] {

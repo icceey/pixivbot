@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "migration"]
+members = [".", "migration", "pixiv_client"]
 
 [package]
 name = "pixivbot"
@@ -13,6 +13,7 @@ config = { version = "0.15.19", features = ["toml"], default-features = false }
 governor = "0.10.2"
 md5 = "0.8.0"
 migration = { path = "migration" }
+pixiv_client = { path = "pixiv_client" }
 rand = "0.9.2"
 regex = "1.12.2"
 reqwest = { version = "0.12.24", features = ["json", "rustls-tls"] }

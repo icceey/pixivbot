@@ -3,7 +3,6 @@ mod cache;
 mod config;
 mod db;
 mod pixiv;
-mod pixiv_client;
 mod scheduler;
 mod utils;
 

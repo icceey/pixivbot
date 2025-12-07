@@ -1,6 +1,6 @@
 use crate::config::PixivConfig;
-use crate::pixiv_client::{self, Illust};
 use anyhow::Result;
+use pixiv_client::{self, Illust};
 use tracing::info;
 
 pub struct PixivClient {

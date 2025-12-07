@@ -53,7 +53,7 @@ pub fn format_tags<T: AsRef<str>>(tags: &[T]) -> Vec<String> {
 /// # Example
 /// ```
 /// use pixivbot::utils::tag::format_tags_escaped;
-/// use crate::pixiv_client::Illust;
+/// use pixiv_client::Illust;
 /// let illust = Illust {
 ///     tags: vec![
 ///         pixivbot::pixiv::model::Tag { name: "原神".to_string() },
@@ -64,7 +64,7 @@ pub fn format_tags<T: AsRef<str>>(tags: &[T]) -> Vec<String> {
 /// let formatted = format_tags_escaped(&illust);
 /// // Returns: "\n\n\#原神  \#GenshinImpact"
 /// ```
-pub fn format_tags_escaped(illust: &crate::pixiv_client::Illust) -> String {
+pub fn format_tags_escaped(illust: &pixiv_client::Illust) -> String {
     use teloxide::utils::markdown;
 
     let tag_names: Vec<&str> = illust.tags.iter().map(|t| t.name.as_str()).collect();
