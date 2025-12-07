@@ -34,10 +34,10 @@ pub async fn run(
     info!("Starting Telegram Bot...");
 
     // Parse bot mode from config
-    let is_public_mode = config.bot_mode.to_lowercase() == "public";
+    let is_public_mode = config.bot_mode.is_public();
 
     info!(
-        "Bot mode: {} (new chats will be {} by default)",
+        "Bot mode: {:?} (new chats will be {} by default)",
         config.bot_mode,
         if is_public_mode {
             "enabled"

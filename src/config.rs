@@ -1,6 +1,20 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum BotMode {
+    #[default]
+    Private,
+    Public,
+}
+
+impl BotMode {
+    pub fn is_public(&self) -> bool {
+        matches!(self, Self::Public)
+    }
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {
     pub telegram: TelegramConfig,
@@ -16,12 +30,8 @@ pub struct Config {
 pub struct TelegramConfig {
     pub bot_token: String,
     pub owner_id: Option<i64>,
-    #[serde(default = "default_bot_mode")]
-    pub bot_mode: String,
-}
-
-fn default_bot_mode() -> String {
-    "private".to_string()
+    #[serde(default)]
+    pub bot_mode: BotMode,
 }
 
 #[derive(Debug, Deserialize, Clone)]
