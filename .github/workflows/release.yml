@@ -110,7 +110,7 @@ jobs:
           echo "archive=$ARCHIVE_NAME.${{ matrix.archive }}" >> $env:GITHUB_OUTPUT
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: ${{ env.BINARY_NAME }}-${{ matrix.target }}
           path: ${{ steps.archive-unix.outputs.archive || steps.archive-windows.outputs.archive }}
