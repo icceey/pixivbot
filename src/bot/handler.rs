@@ -1,4 +1,4 @@
-use crate::bot::link_handler::{is_bot_mentioned, parse_pixiv_links, PixivLink};
+use crate::bot::link_handler::{parse_pixiv_links, PixivLink};
 use crate::bot::notifier::Notifier;
 use crate::bot::Command;
 use crate::db::repo::Repo;
@@ -8,7 +8,7 @@ use crate::utils::tag;
 use anyhow::{Context, Result};
 use std::sync::Arc;
 use teloxide::prelude::*;
-use teloxide::types::{Me, ParseMode};
+use teloxide::types::ParseMode;
 use teloxide::utils::markdown;
 use tracing::{error, info};
 
@@ -224,13 +224,7 @@ impl BotHandler {
     /// - 作者链接 (https://www.pixiv.net/users/xxx): 订阅作者
     ///
     /// 群组中只在被 @ 时响应
-    pub async fn handle_message(&self, bot: Bot, msg: Message, me: Me) -> ResponseResult<()> {
-        // 获取消息文本
-        let text = match msg.text() {
-            Some(t) => t,
-            None => return Ok(()), // 没有文本，忽略
-        };
-
+    pub async fn handle_message(&self, bot: Bot, msg: Message, text: &str) -> ResponseResult<()> {
         // 检查是否包含 Pixiv 链接
         let links = parse_pixiv_links(text);
         if links.is_empty() {
@@ -239,17 +233,6 @@ impl BotHandler {
 
         let chat_id = msg.chat.id;
         let user_id = msg.from.as_ref().map(|u| u.id.0 as i64).unwrap_or(0);
-        let is_group = msg.chat.is_group() || msg.chat.is_supergroup();
-
-        // 群组中需要检查是否被 @
-        if is_group {
-            let bot_username = me.username();
-            let entities = msg.entities().unwrap_or(&[]);
-
-            if !is_bot_mentioned(text, entities, bot_username) {
-                return Ok(()); // 群组中没被 @，忽略
-            }
-        }
 
         info!(
             "Processing Pixiv links from user {} in chat {}: {:?}",

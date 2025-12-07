@@ -51,48 +51,6 @@ pub fn parse_pixiv_links(text: &str) -> Vec<PixivLink> {
     links
 }
 
-/// 检查消息是否 @ 了机器人
-///
-/// 在群组中，需要检查消息中是否有 mention 实体指向机器人
-pub fn is_bot_mentioned(
-    text: &str,
-    entities: &[teloxide::types::MessageEntity],
-    bot_username: &str,
-) -> bool {
-    use teloxide::types::MessageEntityKind;
-
-    for entity in entities {
-        if let MessageEntityKind::Mention = entity.kind {
-            // 提取 mention 的用户名（去掉 @）
-            let start = entity.offset;
-            let end = entity.offset + entity.length;
-
-            // 注意: text 是 UTF-8 编码，但 offset/length 是 UTF-16 单元
-            // 我们需要正确处理这种情况
-            if let Some(mention) = extract_utf16_substring(text, start, end) {
-                // mention 格式是 @username，去掉 @
-                let mentioned_username = mention.trim_start_matches('@');
-                if mentioned_username.eq_ignore_ascii_case(bot_username) {
-                    return true;
-                }
-            }
-        }
-    }
-
-    false
-}
-
-/// 根据 UTF-16 偏移量从 UTF-8 字符串中提取子串
-fn extract_utf16_substring(text: &str, offset: usize, end: usize) -> Option<String> {
-    let utf16_units: Vec<u16> = text.encode_utf16().collect();
-    if end > utf16_units.len() {
-        return None;
-    }
-
-    let substring_utf16 = &utf16_units[offset..end];
-    String::from_utf16(substring_utf16).ok()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

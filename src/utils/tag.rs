@@ -1,6 +1,8 @@
 /// Special characters that should be removed from tags.
 /// These characters are not compatible with Telegram hashtags or cause matching issues.
-const SPECIAL_CHARS: &[char] = &[' ', '-', '(', ')', '・', '/', ':', '…', '「', '」', '_'];
+const SPECIAL_CHARS: &[char] = &[
+    ' ', '-', '(', ')', '・', '/', ':', '…', '「', '」', '_', '!', '♡',
+];
 
 /// Remove special characters from a tag string.
 /// Used by both normalize_tag and format_tags.
