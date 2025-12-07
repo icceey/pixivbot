@@ -32,6 +32,7 @@ pub struct TelegramConfig {
     pub owner_id: Option<i64>,
     #[serde(default)]
     pub bot_mode: BotMode,
+    pub api_url: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
