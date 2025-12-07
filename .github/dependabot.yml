@@ -11,8 +11,14 @@ updates:
       all-dependencies:
         patterns:
           - '*'
+    cooldown:
+      semver-major-days: 30  # 大版本 (1.0 -> 2.0) 等 30 天
+      semver-minor-days: 14  # 小版本 (1.2 -> 1.3) 等 14 天
+      semver-patch-days: 7   # 补丁 (1.2.1 -> 1.2.2) 等 7 天
 
   - package-ecosystem: 'github-actions'
     directory: '/'
     schedule:
       interval: 'monthly'
+    cooldown:
+      default-days: 30
