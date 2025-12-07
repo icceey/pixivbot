@@ -24,6 +24,8 @@ max_task_interval_sec = 10800
 cache_retention_days = 7
 # Cache directory path for downloaded images
 cache_dir = "data/cache"
+# Maximum retry count for failed pushes (default: 3, <=0 means no retry)
+max_retry_count = 3
 
 [content]
 # Default sensitive tags for new chats. Each chat can customize their own sensitive tags.
