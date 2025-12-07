@@ -105,7 +105,21 @@ async fn main() -> Result<()> {
     info!("PixivBot initialization complete");
 
     // Initialize Telegram Bot
-    let bot = teloxide::Bot::new(config.telegram.bot_token.clone());
+    let mut bot = teloxide::Bot::new(config.telegram.bot_token.clone());
+
+    // Set custom API URL if configured
+    if let Some(api_url) = &config.telegram.api_url {
+        match url::Url::parse(api_url) {
+            Ok(parsed_url) => {
+                info!("Using custom Telegram API URL: {}", api_url);
+                bot = bot.set_api_url(parsed_url);
+            }
+            Err(e) => {
+                error!("Failed to parse custom API URL '{}': {:#}", api_url, e);
+                return Err(anyhow::anyhow!("Invalid Telegram API URL in configuration"));
+            }
+        }
+    }
 
     // Initialize Notifier
     let notifier = bot::notifier::Notifier::new(bot.clone(), downloader.clone());
