@@ -389,7 +389,8 @@ impl SchedulerEngine {
             }));
         }
 
-        if pending.retry_count >= self.max_retry_count as u8 {
+        // Compare retry_count (u8) with max_retry_count (i32) safely
+        if (pending.retry_count as i32) >= self.max_retry_count {
             // Max retries reached, abandon
             warn!(
                 "Max retry count reached ({}/{}), abandoning pending illust {} for chat {}",
@@ -477,8 +478,8 @@ impl SchedulerEngine {
             }
             PushResult::Failure { illust_id } => {
                 let new_retry_count = pending.retry_count + 1;
-                // Check if we should give up after this failure
-                if self.max_retry_count > 0 && new_retry_count >= self.max_retry_count as u8 {
+                // Check if we should give up after this failure (compare u8 with i32 safely)
+                if self.max_retry_count > 0 && (new_retry_count as i32) >= self.max_retry_count {
                     error!(
                         "❌ Failed to send pending illust {} to chat {}, max retries reached ({}/{}), abandoning",
                         illust_id, chat_id, new_retry_count, self.max_retry_count
