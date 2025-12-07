@@ -119,6 +119,7 @@ async fn main() -> Result<()> {
         scheduler_config.tick_interval_sec,
         scheduler_config.min_task_interval_sec,
         scheduler_config.max_task_interval_sec,
+        scheduler_config.max_retry_count,
     );
 
     info!("✅ Scheduler initialized");

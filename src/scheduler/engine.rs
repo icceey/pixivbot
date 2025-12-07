@@ -51,6 +51,7 @@ pub struct SchedulerEngine {
     tick_interval_sec: u64,
     min_task_interval_sec: u64,
     max_task_interval_sec: u64,
+    max_retry_count: i32,
 }
 
 impl SchedulerEngine {
@@ -62,6 +63,7 @@ impl SchedulerEngine {
         tick_interval_sec: u64,
         min_task_interval_sec: u64,
         max_task_interval_sec: u64,
+        max_retry_count: i32,
     ) -> Self {
         Self {
             repo,
@@ -70,6 +72,7 @@ impl SchedulerEngine {
             tick_interval_sec,
             min_task_interval_sec,
             max_task_interval_sec,
+            max_retry_count,
         }
     }
 
@@ -373,6 +376,32 @@ impl SchedulerEngine {
         let chat_id = ChatId(ctx.subscription.chat_id);
         let state = ctx.subscription_state.as_ref().unwrap();
 
+        // Check retry limit
+        if self.max_retry_count <= 0 {
+            // Retry disabled, abandon immediately
+            warn!(
+                "Retry disabled (max_retry_count={}), abandoning pending illust {} for chat {}",
+                self.max_retry_count, pending.illust_id, chat_id
+            );
+            return Ok(Some(AuthorState {
+                latest_illust_id: state.latest_illust_id,
+                pending_illust: None,
+            }));
+        }
+
+        // Compare retry_count (u8) with max_retry_count (i32) safely
+        if (pending.retry_count as i32) >= self.max_retry_count {
+            // Max retries reached, abandon
+            warn!(
+                "Max retry count reached ({}/{}), abandoning pending illust {} for chat {}",
+                pending.retry_count, self.max_retry_count, pending.illust_id, chat_id
+            );
+            return Ok(Some(AuthorState {
+                latest_illust_id: state.latest_illust_id,
+                pending_illust: None,
+            }));
+        }
+
         // Find the illust in API response
         let Some(illust) = illusts.iter().find(|i| i.id == pending.illust_id) else {
             // Pending illust not found (deleted or too old), abandon it
@@ -387,10 +416,12 @@ impl SchedulerEngine {
         };
 
         info!(
-            "Resuming pending illust {} ({}/{} pages sent)",
+            "Resuming pending illust {} ({}/{} pages sent, retry {}/{})",
             pending.illust_id,
             pending.sent_pages.len(),
-            pending.total_pages
+            pending.total_pages,
+            pending.retry_count,
+            self.max_retry_count
         );
 
         // Calculate remaining pages
@@ -441,17 +472,39 @@ impl SchedulerEngine {
                         illust_id,
                         sent_pages,
                         total_pages,
-                        retry_count: pending.retry_count + 1,
+                        retry_count: pending.retry_count.saturating_add(1),
                     }),
                 }
             }
             PushResult::Failure { illust_id } => {
-                error!(
-                    "❌ Failed to send pending illust {} to chat {}",
-                    illust_id, chat_id
-                );
-                // Keep pending state for retry, no state change
-                return Ok(None);
+                // Use saturating_add to prevent u8 overflow
+                let new_retry_count = pending.retry_count.saturating_add(1);
+                // Check if we should give up after this failure (compare u8 with i32 safely)
+                if self.max_retry_count > 0 && (new_retry_count as i32) >= self.max_retry_count {
+                    error!(
+                        "❌ Failed to send pending illust {} to chat {}, max retries reached ({}/{}), abandoning",
+                        illust_id, chat_id, new_retry_count, self.max_retry_count
+                    );
+                    AuthorState {
+                        latest_illust_id: state.latest_illust_id,
+                        pending_illust: None,
+                    }
+                } else {
+                    error!(
+                        "❌ Failed to send pending illust {} to chat {}, will retry (attempt {}/{})",
+                        illust_id, chat_id, new_retry_count, self.max_retry_count
+                    );
+                    // Increment retry count and keep pending state
+                    AuthorState {
+                        latest_illust_id: state.latest_illust_id,
+                        pending_illust: Some(PendingIllust {
+                            illust_id: pending.illust_id,
+                            sent_pages: pending.sent_pages.clone(),
+                            total_pages: pending.total_pages,
+                            retry_count: new_retry_count,
+                        }),
+                    }
+                }
             }
         };
 

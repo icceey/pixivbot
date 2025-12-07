@@ -76,6 +76,9 @@ pub struct SchedulerConfig {
     /// Cache directory path (default: "data/cache")
     #[serde(default = "default_cache_dir")]
     pub cache_dir: String,
+    /// Maximum retry count for failed pushes (default: 3, <=0 means no retry)
+    #[serde(default = "default_max_retry_count")]
+    pub max_retry_count: i32,
 }
 
 fn default_tick_interval_sec() -> u64 {
@@ -96,6 +99,10 @@ fn default_cache_retention_days() -> u64 {
 
 fn default_cache_dir() -> String {
     "data/cache".to_string()
+}
+
+fn default_max_retry_count() -> i32 {
+    3
 }
 
 #[derive(Debug, Deserialize, Clone)]
