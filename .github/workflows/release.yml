@@ -10,18 +10,31 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: -Dwarnings
   BINARY_NAME: pixivbot
 
 jobs:
   validate:
-    name: Validate Input
+    name: Validate
     runs-on: ubuntu-latest
     steps:
-      - name: Validate version format
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Validate version input
         run: |
           if [[ ! "${{ inputs.version }}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "Error: Version must be in format vX.Y.Z (e.g., v0.0.1)"
+            exit 1
+          fi
+
+      - name: Check Cargo.toml version
+        run: |
+          CARGO_VERSION=$(grep -m 1 "^version" Cargo.toml | cut -d '"' -f 2)
+          INPUT_VERSION=${{ inputs.version }}
+          CLEAN_VERSION=${INPUT_VERSION#v}
+          
+          if [ "$CARGO_VERSION" != "$CLEAN_VERSION" ]; then
+            echo "::error::Version mismatch! Input: $CLEAN_VERSION, Cargo.toml: $CARGO_VERSION"
             exit 1
           fi
 
@@ -33,102 +46,99 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Linux
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             archive: tar.gz
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
             archive: tar.gz
-            cross: true
-          # macOS
+            cross: false 
           - target: x86_64-apple-darwin
             os: macos-latest
             archive: tar.gz
           - target: aarch64-apple-darwin
             os: macos-latest
             archive: tar.gz
-          # Windows
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             archive: zip
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v6
 
-      - name: Install Rust toolchain
+      - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
-      - name: Install cross-compilation tools
-        if: matrix.cross
-        uses: taiki-e/setup-cross-toolchain-action@v1
-        with:
-          target: ${{ matrix.target }}
-
-      - name: Cache cargo registry
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-${{ matrix.target }}-cargo-
-
-      - name: Build release binary
-        run: cargo build --release --target ${{ matrix.target }}
-
-      - name: Prepare archive (Unix)
-        id: archive-unix
-        if: runner.os != 'Windows'
+      - name: Install Linker (ARM64)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # Configure linker environment variables and build
+      # LTO and stripping disabled to preserve symbols and prioritize build speed
+      - name: Build Binary
+        shell: bash
+        run: |
+          # Specify linker for ARM64 Linux
+          if [ "${{ matrix.target }}" == "aarch64-unknown-linux-gnu" ]; then
+            export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+          fi
+          
+          cargo build --release --target ${{ matrix.target }}
+
+      - name: Prepare Archive
+        id: prepare_archive
+        shell: bash
+        run: |
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            BIN_EXT=".exe"
+          else
+            BIN_EXT=""
+          fi
+          
           ARCHIVE_NAME="${{ env.BINARY_NAME }}-${{ inputs.version }}-${{ matrix.target }}"
-          mkdir -p "${ARCHIVE_NAME}"
-          cp "target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}" "${ARCHIVE_NAME}/"
-          cp README.md LICENSE config.toml.example "${ARCHIVE_NAME}/" 2>/dev/null || true
-          tar -czvf "${ARCHIVE_NAME}.${{ matrix.archive }}" "${ARCHIVE_NAME}"
-          echo "archive=${ARCHIVE_NAME}.${{ matrix.archive }}" >> $GITHUB_OUTPUT
+          mkdir -p "$ARCHIVE_NAME"
+          
+          cp "target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}${BIN_EXT}" "$ARCHIVE_NAME/"
+          cp README.md LICENSE config.toml.example "$ARCHIVE_NAME/" 2>/dev/null || true
+          
+          if [[ "${{ matrix.archive }}" == "zip" ]]; then
+            7z a "${ARCHIVE_NAME}.zip" "$ARCHIVE_NAME"
+            echo "archive=${ARCHIVE_NAME}.zip" >> $GITHUB_OUTPUT
+          else
+            tar -czvf "${ARCHIVE_NAME}.tar.gz" "$ARCHIVE_NAME"
+            echo "archive=${ARCHIVE_NAME}.tar.gz" >> $GITHUB_OUTPUT
+          fi
 
-      - name: Prepare archive (Windows)
-        id: archive-windows
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $ARCHIVE_NAME = "${{ env.BINARY_NAME }}-${{ inputs.version }}-${{ matrix.target }}"
-          New-Item -ItemType Directory -Force -Path $ARCHIVE_NAME
-          Copy-Item "target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}.exe" -Destination "$ARCHIVE_NAME/"
-          if (Test-Path "README.md") { Copy-Item "README.md" -Destination "$ARCHIVE_NAME/" }
-          if (Test-Path "LICENSE") { Copy-Item "LICENSE" -Destination "$ARCHIVE_NAME/" }
-          if (Test-Path "config.toml.example") { Copy-Item "config.toml.example" -Destination "$ARCHIVE_NAME/" }
-          Compress-Archive -Path "$ARCHIVE_NAME/*" -DestinationPath "$ARCHIVE_NAME.${{ matrix.archive }}"
-          echo "archive=$ARCHIVE_NAME.${{ matrix.archive }}" >> $env:GITHUB_OUTPUT
-
-      - name: Upload artifact
+      - name: Upload Artifact
         uses: actions/upload-artifact@v5
         with:
           name: ${{ env.BINARY_NAME }}-${{ matrix.target }}
-          path: ${{ steps.archive-unix.outputs.archive || steps.archive-windows.outputs.archive }}
+          path: ${{ steps.prepare_archive.outputs.archive || format('{0}-{1}-{2}.{3}', env.BINARY_NAME, inputs.version, matrix.target, matrix.archive) }}
           retention-days: 1
 
   release:
-    name: Create Release
+    name: Create GitHub Release
     needs: build
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v6
         with:
-          fetch-depth: 0
+          fetch-depth: 0 # Full history required for changelog generation
 
-      - name: Download all artifacts
+      - name: Download Artifacts
         uses: actions/download-artifact@v6
         with:
           path: artifacts

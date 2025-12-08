@@ -72,6 +72,26 @@ If you prefer running directly on your machine:
    cargo run --release
    ```
 
+## Getting Required Tokens
+
+Before configuring the bot, you need to obtain two essential tokens:
+
+### 1. Telegram Bot Token
+
+1. Open Telegram and search for [@BotFather](https://t.me/BotFather)
+2. Send `/newbot` and follow the instructions
+3. Choose a name and username for your bot
+4. You'll receive a token like `123456789:ABCdefGHIjklMNOpqrsTUVwxyz`
+5. Copy this token to `config.toml` under `telegram.bot_token`
+
+### 2. Pixiv Refresh Token
+
+**Recommended Method**: Use [get-pixivpy-token](https://github.com/eggplants/get-pixivpy-token)
+
+Once you have the refresh token, copy it to `config.toml` under `pixiv.refresh_token`.
+
+⚠️ **Important**: Keep your tokens secure and never commit them to version control!
+
 ## Configuration
 
 Supported configuration options in `config.toml` or via Environment Variables (prefix `PIX__` with double underscores):

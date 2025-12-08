@@ -1,10 +1,18 @@
 [workspace]
 members = [".", "migration", "pixiv_client"]
 
+[workspace.package]
+version = "0.1.1"
+edition = "2021"
+authors = ["icceey"]
+license = "MIT"
+
 [package]
 name = "pixivbot"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
 
 [dependencies]
 anyhow = "1.0.100"
@@ -16,7 +24,7 @@ migration = { path = "migration" }
 pixiv_client = { path = "pixiv_client" }
 rand = "0.9.2"
 regex = "1.12.2"
-reqwest = { version = "0.12.24", features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12.24", default-features = false, features = ["json", "rustls-tls"] }
 sea-orm = { version = "1.1.19", features = ["sqlx-sqlite", "runtime-tokio-rustls", "macros", "sqlx-dep"] }
 sea-orm-migration = { version = "1.1.19", features = ["runtime-tokio-rustls", "sqlx-sqlite"] }
 serde = { version = "1.0.228", features = ["derive"] }
