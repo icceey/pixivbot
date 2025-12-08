@@ -298,7 +298,7 @@ impl BotHandler {
             Ok(illust) => illust,
             Err(e) => {
                 error!("Failed to get illust {}: {:#}", illust_id, e);
-                bot.send_message(chat_id, format!("❌ 获取作品 {} 失败: {:#}", illust_id, e))
+                bot.send_message(chat_id, format!("❌ 获取作品 {} 失败", illust_id))
                     .await?;
                 return Ok(());
             }
@@ -364,7 +364,7 @@ impl BotHandler {
             Ok(user) => user,
             Err(e) => {
                 error!("Failed to get user {}: {:#}", user_id, e);
-                bot.send_message(chat_id, format!("❌ 获取用户 {} 失败: {:#}", user_id, e))
+                bot.send_message(chat_id, format!("❌ 获取用户 {} 失败", user_id))
                     .await?;
                 return Ok(());
             }

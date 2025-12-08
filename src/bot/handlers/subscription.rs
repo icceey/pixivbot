@@ -309,11 +309,7 @@ impl BotHandler {
                 }
                 Err(e) => {
                     error!("Failed to unsubscribe from author {}: {:#}", author_id, e);
-                    result.add_failure(format!(
-                        "`{}` \\({}\\)",
-                        author_id,
-                        markdown::escape(&e.to_string())
-                    ));
+                    result.add_failure(format!("`{}` \\(未找到订阅\\)", author_id));
                 }
             }
         }
@@ -377,8 +373,7 @@ impl BotHandler {
                     mode.as_str(),
                     e
                 );
-                bot.send_message(chat_id, format!("❌ 取消订阅失败: {}", e))
-                    .await?;
+                bot.send_message(chat_id, "❌ 取消订阅失败").await?;
             }
         }
 
