@@ -658,14 +658,21 @@ impl SchedulerEngine {
                 tags
             )
         } else {
-            // Continuing from previous attempt
+            // Continuing from previous attempt - calculate batch numbers like normal send
+            // Normal batch size is 10 (MAX_PER_GROUP in notifier)
+            const MAX_PER_GROUP: usize = 10;
+            let total_batches = total_pages.div_ceil(MAX_PER_GROUP);
+            let current_batch = (already_sent_pages.len() / MAX_PER_GROUP) + 1;
+            let tags = tag::format_tags_escaped(illust);
+
             format!(
-                "🎨 {} \\(continued, {}/{} remaining\\)\nby *{}*\n\n🔗 [来源](https://pixiv\\.net/artworks/{})",
+                "🎨 {} \\(continued {}/{}\\)\nby *{}*\n\n🔗 [来源](https://pixiv\\.net/artworks/{}){}", 
                 markdown::escape(&illust.title),
-                urls_to_send.len(),
-                total_pages,
+                current_batch,
+                total_batches,
                 markdown::escape(&illust.user.name),
-                illust.id
+                illust.id,
+                tags
             )
         };
 
