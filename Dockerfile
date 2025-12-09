@@ -15,7 +15,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,id=registry-$TARGETPLATF
     cargo build --release --locked && \
     cp target/release/pixivbot /app/pixivbot
 
-FROM gcr.io/distroless/cc-debian12:nonroot
+FROM gcr.io/distroless/cc-debian12
 WORKDIR /app
 COPY --from=builder /app/pixivbot /app/pixivbot
 ENTRYPOINT ["/app/pixivbot"]
