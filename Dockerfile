@@ -1,9 +1,9 @@
-FROM lukemathwalker/cargo-chef:latest-rust-1-slim-bookworm AS planner
+FROM lukemathwalker/cargo-chef:latest-rust-1.91-slim-bookworm AS planner
 WORKDIR /app
 COPY . .
 RUN cargo chef prepare --recipe-path recipe.json
 
-FROM lukemathwalker/cargo-chef:latest-rust-1-slim-bookworm AS builder
+FROM lukemathwalker/cargo-chef:latest-rust-1.91-slim-bookworm AS builder
 WORKDIR /app
 COPY --from=planner /app/recipe.json recipe.json
 ARG TARGETPLATFORM

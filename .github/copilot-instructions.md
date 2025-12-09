@@ -6,6 +6,8 @@ A Rust-based Telegram bot for subscribing to Pixiv artists and rankings. When ar
 
 **Tech Stack**: Rust 2021, teloxide (Telegram), SeaORM (SQLite), reqwest, tokio, regex
 
+**Architecture Philosophy**: The project follows a layered architecture with clear separation between Pixiv API access (`pixiv_client/`), business logic (`pixiv/`, `scheduler/`), and presentation (`bot/`). Components communicate via `Arc`-wrapped shared state.
+
 ## Architecture
 
 ```
@@ -43,23 +45,37 @@ src/
 
 ## Key Patterns
 
-### Error Handling
-Use `anyhow::Result<T>` for all fallible functions. Use `.context()` to add context to errors:
-```rust
-use anyhow::{Context, Result};
+### Error Handling & User-Facing Messages
 
-async fn example() -> Result<()> {
-    let chat = repo.get_chat(id).await.context("Failed to get chat")?;
-    Ok(())
+**CRITICAL SECURITY PATTERN**: Never expose raw errors to users. Always separate internal logging from user-facing messages:
+
+```rust
+// ❌ WRONG - Exposes internal error details
+bot.send_message(chat_id, format!("❌ 失败: {:#}", e)).await?;
+
+// ✅ CORRECT - Log details, send friendly message
+error!("Failed to process request: {:#}", e);
+bot.send_message(chat_id, "❌ 操作失败").await?;
+```
+
+**Error Handling Rules**:
+1. Use `anyhow::Result<T>` for all fallible functions
+2. Add context with `.context()` for debugging
+3. Log errors with `{:#}` to show full error chain in logs
+4. Send generic, user-friendly messages to Telegram (no technical details)
+5. The `pixiv_client/` module has its own `Error` type, auto-converts to anyhow
+
+**Example Pattern**:
+```rust
+match pixiv.get_illust_detail(illust_id).await {
+    Ok(illust) => illust,
+    Err(e) => {
+        error!("Failed to get illust {}: {:#}", illust_id, e);  // Detailed logging
+        bot.send_message(chat_id, format!("❌ 获取作品 {} 失败", illust_id)).await?;  // Generic user message
+        return Ok(());
+    }
 }
 ```
-
-When logging errors, use `{:#}` format specifier to show the full error chain:
-```rust
-error!("Failed to process: {:#}", e);
-```
-
-The `pixiv_client/` module has its own `Error` type for API-specific errors, but these are automatically converted to anyhow errors when propagated up.
 
 ### Shared State
 Components use `Arc<T>` for sharing, `Arc<RwLock<T>>` when mutable access needed:
@@ -95,8 +111,36 @@ pub async fn download(&self, url: &str) -> Result<PathBuf> {
 
 Use `downloader.download(url)` for single, `downloader.download_all(&urls)` for batch with partial failure tolerance.
 
-### Telegram Media Groups
-Max 10 images per media group. `Notifier::notify_with_images` auto-splits larger sets into multiple groups.
+### Telegram Media Groups & Batch Sending
+
+**Key Constants**: `MAX_PER_GROUP = 10` (defined in both `notifier.rs` and `scheduler/engine.rs`)
+
+**Batch Caption Pattern**: The notifier uses a sophisticated caption system:
+- First batch shows original caption
+- Subsequent batches show `(continued 2/3)` format
+- This pattern MUST be replicated in retry logic for consistency
+
+```rust
+// In notifier.rs - normal batch sending
+if batch_idx == 0 {
+    base_cap.map(|s| s.to_string())  // First batch: full caption
+} else {
+    Some(format!("\\(continued {}/{}\\)", batch_idx + 1, total_batches))  // Later batches
+}
+```
+
+**Retry Caption Pattern** (in `scheduler/engine.rs`):
+```rust
+// Calculate batch numbers for consistency with normal sends
+const MAX_PER_GROUP: usize = 10;
+let total_batches = total_pages.div_ceil(MAX_PER_GROUP);
+let current_batch = (already_sent_pages.len() / MAX_PER_GROUP) + 1;
+
+format!("🎨 {} \\(continued {}/{}\\)\nby *{}*\n\n🔗 [来源](...){}", 
+    title, current_batch, total_batches, author, id, tags)
+```
+
+**Critical**: Retry messages MUST include tags (use `tag::format_tags_escaped(illust)`) to match normal send format.
 
 ### Teloxide Dispatcher Pattern
 The bot uses teloxide's `Dispatcher` with a handler tree:
@@ -113,18 +157,24 @@ fn build_handler_tree() {
     dptree::entry()
         .branch(command_handler)
         .branch(message_handler)
-}
+## Development Commands
+
+```bash
+make ci          # Run all CI checks (fmt, clippy, check, test, build) - MANDATORY before commit
+make quick       # Fast checks without full build (fmt-check, clippy, check)
+make fmt         # Auto-format code
+make clippy      # Run linter (warnings = errors, matches CI)
+make dev         # cargo run
+make fix         # Auto-fix formatting and clippy issues
+make watch       # Watch for changes and rebuild (requires cargo-watch)
 ```
 
-### Pixiv Link Detection
-The bot detects Pixiv links in messages via `link_handler.rs`:
-- **Artwork links** (`https://pixiv.net/artworks/xxx`): Push images immediately
-- **User links** (`https://pixiv.net/users/xxx`): Subscribe to the author
-- In groups, the bot only responds when **@mentioned**
-- Uses `LazyLock<Regex>` for efficient pattern matching
+**CRITICAL**: CI uses `RUSTFLAGS=-Dwarnings` - all warnings are treated as errors. Always run `make ci` before committing to catch issues locally that would fail in CI.
 
-```rust
-// Parse links from message text
+**Common Clippy Patterns to Watch**:
+- Use `.div_ceil()` instead of `(a + b - 1) / b` for ceiling division
+- Avoid manual `Vec` construction when ranges can be used
+- Prefer `matches!()` macro for enum pattern matching
 let links = parse_pixiv_links(text);  // Returns Vec<PixivLink>
 
 // Check if bot is @mentioned (for groups)
@@ -141,19 +191,6 @@ bot::run(..., sensitive_tags).await;
 
 Use `self.sensitive_tags` in BotHandler, NOT hardcoded constants.
 
-## Development Commands
-
-```bash
-make ci          # Run all CI checks (fmt, clippy, check, test, build)
-make quick       # Fast checks without full build
-make fmt         # Auto-format code
-make clippy      # Run linter (warnings = errors, matches CI)
-make dev         # cargo run
-make fix         # Auto-fix formatting and clippy issues
-```
-
-CI uses `RUSTFLAGS=-Dwarnings` - all warnings are errors. Run `make ci` before committing.
-
 ## Adding Dependencies
 
 **Always use `cargo add`**, never manually edit Cargo.toml:
@@ -162,18 +199,34 @@ cargo add serde --features derive
 cargo add tokio --features full
 cargo add regex  # Already added for link parsing
 ```
-
 ## Code Conventions
 
-- Use `tracing::{info, warn, error}` for logging (not `println!`)
-- Mark unused but intentional public APIs with `#[allow(dead_code)]`
-- Prefer `MarkdownV2` for Telegram message formatting
-- Use `chrono` for datetime handling (with `serde` feature)
-- Async functions should return `anyhow::Result<T>` for consistency
-- Use `.context()` to add meaningful error context
-- Use `{:#}` format specifier when logging errors to show full error chain
-- Use `LazyLock<Regex>` for compile-once regex patterns
-- Derive `Clone` for types that need to be shared across async contexts
+**Logging & Output**:
+- Use `tracing::{info, warn, error}` for logging (NEVER `println!`)
+- Error logs: `error!("Operation failed: {:#}", e)` - shows full error chain
+- Info logs: `info!("Processing {} items", count)` - structured data preferred
+- User messages: Always escape with `markdown::escape()` for MarkdownV2
+
+**Type Safety & Async**:
+- All async functions return `anyhow::Result<T>` for consistency
+- Use `.context("Meaningful description")` on all `?` operations
+- Derive `Clone` for types shared across async contexts
+- Use `Arc<T>` for immutable shared state, `Arc<RwLock<T>>` for mutable
+
+**Performance Patterns**:
+- Use `LazyLock<Regex>` for compile-once regex patterns (see `link_handler.rs`)
+- Prefer `const` for compile-time constants (`MAX_PER_GROUP`, batch sizes)
+- Use `.div_ceil()` instead of manual ceiling division
+
+**Telegram Formatting**:
+- Always use `ParseMode::MarkdownV2` (not Markdown or HTML)
+- Escape all dynamic text: `markdown::escape(&user_input)`
+- Special chars needing escape: `_*[]()~`>#+-=|{}.!`
+- Format patterns: `*bold*`, `_italic_`, `` `code` ``, `[link](url)`
+
+**Intentional Patterns**:
+- Mark unused public APIs with `#[allow(dead_code)]` (not `#[allow(unused)]`)
+- Use `#[allow(clippy::too_many_arguments)]` only when unavoidable (e.g., `SchedulerEngine::new`)
 
 ## Bot Command Filtering
 
@@ -195,24 +248,6 @@ Three roles defined in `db/entities/role.rs`:
 
 Role checks: `user_role.is_owner()`, `user_role.is_admin()`
 
-## Testing
-
-```bash
-make test        # Run all tests
-cargo test -p pixivbot -- --nocapture  # Run with output
-```
-
-Tests located alongside code in `#[cfg(test)]` modules. See `link_handler.rs` for regex test examples.
-
-## Before Committing
-
-**Always run `make ci` before committing** to ensure code passes all CI checks:
-```bash
-make ci          # Runs: fmt-check → clippy → check → test → build
-```
-
-This matches the exact checks in `.github/workflows/ci.yml`. Fix any issues before pushing.
-
 ## Configuration
 
 Copy `config.toml.example` → `config.toml`. Key sections:
@@ -233,16 +268,52 @@ Environment variables override config with prefix `PIX` and double underscores: 
 ## Feature Implementation Checklist
 
 When adding new features:
-1. **Understand before coding** - Read and fully understand existing logic before making changes
-2. Design a reasonable solution, then implement
-3. Read config from `config.rs` if needed
-4. Pass config values through component chain (don't use globals)
-5. Respect chat enabled/disabled status
-6. In groups, check for @mention when appropriate
-7. Use `MarkdownV2` for formatted messages (escape with `utils::markdown::escape`)
-8. Add tests in `#[cfg(test)]` modules
-9. **Review your changes** - Carefully review all modifications before committing
-10. Run `make ci` before committing
+1. **Understand before coding** - Read existing logic in related files completely before changes
+2. **Design then implement** - Sketch solution architecture, identify affected components
+3. **Configuration** - Load from `config.rs`, pass through component chain (NO globals)
+4. **Authorization** - Respect chat enabled/disabled status and user roles
+5. **Group behavior** - Check for @mention in groups when appropriate
+6. **Error handling** - Log details with `error!()`, send generic messages to users
+7. **User messages** - Use `MarkdownV2`, escape all dynamic content
+8. **Consistency** - Match existing patterns (e.g., batch caption format in retries)
+9. **Testing** - Add tests in `#[cfg(test)]` modules (see `link_handler.rs`)
+10. **Pre-commit** - Run `make ci` to catch all issues locally
+
+**Common Integration Points**:
+- Scheduler ↔ Notifier: Use `BatchSendResult` to track partial sends
+- Handler ↔ Repo: Always use `.context()` for database operations
+- Notifier ↔ Downloader: Check cache first with `cache.get()`, then download
+- Bot ↔ Pixiv: Wrap client in `Arc<RwLock<>>` for safe concurrent access
+
+## Scheduler Architecture & Retry Logic
+
+**Orchestrator-Dispatcher-Worker Pattern** (see `scheduler/engine.rs`):
+
+```
+execute_author_task (Orchestrator)
+  ├─ Fetches illusts from Pixiv once
+  ├─ Iterates all subscriptions for task
+  └─ For each subscription:
+      └─ process_single_author_sub (Dispatcher)
+          ├─ Checks for pending retry → handle_existing_pending (Worker)
+          └─ Processes new illusts → handle_new_illusts (Worker)
+```
+
+**Retry State Machine**:
+- `PushResult::Success` → Update `latest_illust_id`, clear `pending_illust`
+- `PushResult::Partial` → Store `PendingIllust{sent_pages, retry_count++}`
+- `PushResult::Failure` → Increment `retry_count`, retry next tick OR abandon if `max_retry_count` reached
+
+**Key Constants**:
+- `MAX_PER_GROUP = 10` - Pages per batch (MUST match `notifier.rs`)
+- `max_retry_count` - Configurable retry limit (default: 3)
+- Polling intervals: Randomized between `min_task_interval_sec` and `max_task_interval_sec`
+
+**Critical Pattern**: When resuming partial sends, calculate batch numbers to match normal flow:
+```rust
+let total_batches = total_pages.div_ceil(MAX_PER_GROUP);
+let current_batch = (already_sent_pages.len() / MAX_PER_GROUP) + 1;
+```
 
 ## Crate Usage Guidelines
 
@@ -263,3 +334,33 @@ Or check [docs.rs](https://docs.rs) for published crate documentation.
 - `sea-orm` - Database ORM, verify entity relationships and query builders
 - `tokio` - Async runtime, understand spawn/select/channel patterns
 - `regex` - Pattern matching, test patterns before using
+
+## Testing Patterns
+
+Tests are co-located with code in `#[cfg(test)]` modules. Run with:
+```bash
+make test                              # All tests
+cargo test -p pixivbot -- --nocapture  # With output
+cargo test link_handler                # Specific module
+```
+
+**Test Examples**:
+- `link_handler.rs`: Regex pattern tests for Pixiv URL parsing
+- `cache/mod.rs`: Hash bucketing and path resolution tests
+- `db/types/tag.rs`: TagFilter parsing and serialization tests
+
+**Test Structure**:
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_pixiv_link() {
+        let text = "Check out https://pixiv.net/artworks/12345";
+        let links = parse_pixiv_links(text);
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0], PixivLink::Illust(12345));
+    }
+}
+```
