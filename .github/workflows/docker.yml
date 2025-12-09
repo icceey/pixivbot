@@ -124,6 +124,12 @@ jobs:
       packages: write
     
     steps:
+      - name: Validate branch for stable release
+        if: ${{ inputs.channel == 'stable' && github.ref_name != 'master' }}
+        run: |
+          echo "::error::Stable releases are only allowed from the master branch. Current branch: ${{ github.ref_name }}"
+          exit 1
+
       - name: Download digests
         uses: actions/download-artifact@v6
         with:
@@ -150,8 +156,11 @@ jobs:
             type=raw,value=${{ inputs.version }},enable=${{ inputs.channel == 'stable' }}
             type=raw,value=latest,enable=${{ inputs.channel == 'stable' }}
             type=raw,value=${{ inputs.version }}-${{ inputs.channel }},enable=${{ inputs.channel != 'stable' }}
+            type=raw,value=latest-${{ inputs.channel }},enable=${{ inputs.channel != 'stable' }}
           labels: |
             org.opencontainers.image.title=pixivbot
+            org.opencontainers.image.description=${{ github.event.repository.description || 'Pixivbot container image' }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.vendor=${{ github.repository_owner }}
 
       - name: Create manifest list and push
