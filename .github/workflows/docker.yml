@@ -50,8 +50,10 @@ jobs:
         include:
           - platform: linux/amd64
             runner: ubuntu-latest
+            slug: linux-amd64
           - platform: linux/arm64
             runner: ubuntu-24.04-arm
+            slug: linux-arm64
             
     permissions:
       contents: read
@@ -107,7 +109,7 @@ jobs:
         if: ${{ inputs.push_to_ghcr }}
         uses: actions/upload-artifact@v5
         with:
-          name: digests-${{ matrix.platform }}
+          name: digests-${{ matrix.slug }}
           path: /tmp/digests/*
           if-no-files-found: error
           retention-days: 1
