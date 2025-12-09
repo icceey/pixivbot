@@ -11,7 +11,7 @@ env:
 
 jobs:
   ci-pipeline:
-    name: Lint & Test
+    name: Lint & Test & Build
     runs-on: ubuntu-latest
     steps:
       - name: Checkout sources
@@ -34,5 +34,5 @@ jobs:
       - name: Run Tests
         run: cargo test --workspace --all-targets
 
-      - name: Build Release (Dry Run)
+      - name: Build Release
         run: cargo build --release --workspace

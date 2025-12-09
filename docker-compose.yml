@@ -1,6 +1,5 @@
 services:
   pixivbot:
-    # build: .
     image: ghcr.io/icceey/pixivbot:latest
     container_name: pixivbot
     restart: unless-stopped

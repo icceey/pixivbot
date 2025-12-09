@@ -77,23 +77,18 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Generate Docker tags
-        id: tags
-        run: |
-          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
-          VERSION="${{ inputs.version }}"
-          CHANNEL="${{ inputs.channel }}"
-          
-          if [[ "$CHANNEL" == "stable" ]]; then
-            # stable: publish version tag and latest tag
-            TAGS="${IMAGE}:${VERSION},${IMAGE}:latest"
-          else
-            # alpha/beta: publish version-channel tag only
-            TAGS="${IMAGE}:${VERSION}-${CHANNEL}"
-          fi
-          
-          echo "tags=${TAGS}" >> $GITHUB_OUTPUT
-          echo "Generated tags: ${TAGS}"
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=${{ inputs.version }},enable=${{ inputs.channel == 'stable' }}
+            type=raw,value=latest,enable=${{ inputs.channel == 'stable' }}
+            type=raw,value=${{ inputs.version }}-${{ inputs.channel }},enable=${{ inputs.channel != 'stable' }}
+          labels: |
+            org.opencontainers.image.title=pixivbot
+            org.opencontainers.image.vendor=${{ github.repository_owner }}
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v6
@@ -101,9 +96,7 @@ jobs:
           context: .
           platforms: linux/amd64,linux/arm64
           push: ${{ inputs.push_to_ghcr }}
-          tags: ${{ steps.tags.outputs.tags }}
-          labels: |
-            org.opencontainers.image.version=${{ inputs.version }}
-            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
