@@ -2,10 +2,9 @@ use crate::bot::link_handler::{parse_pixiv_links, PixivLink};
 use crate::bot::notifier::Notifier;
 use crate::bot::Command;
 use crate::db::repo::Repo;
-use crate::db::types::{TagFilter, Tags, TaskType, UserRole};
+use crate::db::types::{TagFilter, TaskType, UserRole};
 use crate::pixiv::client::PixivClient;
 use crate::utils::tag;
-use anyhow::{Context, Result};
 use std::sync::Arc;
 use teloxide::prelude::*;
 use teloxide::types::ParseMode;
@@ -53,7 +52,13 @@ impl BotHandler {
     // Command Entry Point
     // ------------------------------------------------------------------------
 
-    pub async fn handle_command(&self, bot: Bot, msg: Message, cmd: Command) -> ResponseResult<()> {
+    pub async fn handle_command(
+        &self,
+        bot: Bot,
+        msg: Message,
+        cmd: Command,
+        ctx: crate::bot::UserChatContext,
+    ) -> ResponseResult<()> {
         let chat_id = msg.chat.id;
         let user_id = msg.from.as_ref().map(|u| u.id.0 as i64).unwrap_or(0);
 
@@ -62,41 +67,9 @@ impl BotHandler {
             user_id, chat_id, cmd
         );
 
-        // Ensure user and chat exist in database
-        let (user_role, chat_enabled) = match self.ensure_user_and_chat(&msg).await {
-            Ok(data) => data,
-            Err(e) => {
-                error!("Failed to ensure user/chat: {:#}", e);
-                bot.send_message(chat_id, "⚠️ 数据库错误").await?;
-                return Ok(());
-            }
-        };
-
-        // Check if chat is enabled (private chat with admin/owner is always considered enabled)
-        if !self.is_chat_accessible(chat_id, chat_enabled, &user_role) {
-            info!(
-                "Ignoring command from disabled chat {} (user: {}, role: {:?})",
-                chat_id, user_id, user_role
-            );
-            return Ok(());
-        }
-
         // Route command to appropriate handler
-        self.dispatch_command(bot, chat_id, cmd, &user_role).await
-    }
-
-    /// Check if the chat is accessible for command processing
-    fn is_chat_accessible(
-        &self,
-        chat_id: ChatId,
-        chat_enabled: bool,
-        user_role: &UserRole,
-    ) -> bool {
-        if chat_enabled {
-            return true;
-        }
-        // Special case: private chat with admin/owner is always accessible
-        chat_id.is_user() && user_role.is_admin()
+        self.dispatch_command(bot, chat_id, cmd, ctx.user_role())
+            .await
     }
 
     /// Dispatch command to the appropriate handler
@@ -151,70 +124,6 @@ impl BotHandler {
     }
 
     // ------------------------------------------------------------------------
-    // User/Chat Management
-    // ------------------------------------------------------------------------
-
-    async fn ensure_user_and_chat(&self, msg: &Message) -> Result<(UserRole, bool)> {
-        let chat_id = msg.chat.id.0;
-        let chat_type = match msg.chat.is_group() || msg.chat.is_supergroup() {
-            true => "group",
-            false => "private",
-        };
-        let chat_title = msg.chat.title().map(|s| s.to_string());
-
-        // Convert default sensitive tags to Tags for new chats
-        let default_sensitive_tags = Tags::from(self.default_sensitive_tags.clone());
-
-        // Upsert chat - new chats get enabled status based on bot mode
-        let chat = self
-            .repo
-            .upsert_chat(
-                chat_id,
-                chat_type.to_string(),
-                chat_title,
-                self.is_public_mode,
-                default_sensitive_tags,
-            )
-            .await
-            .context("Failed to upsert chat")?;
-
-        if let Some(user) = msg.from.as_ref() {
-            let user_id = user.id.0 as i64;
-            let username = user.username.clone();
-
-            // Check if user already exists
-            let user_model = match self
-                .repo
-                .get_user(user_id)
-                .await
-                .context("Failed to get user")?
-            {
-                Some(existing_user) => existing_user,
-                None => {
-                    // New user - determine role
-                    let role = if self.owner_id == Some(user_id) {
-                        UserRole::Owner
-                    } else {
-                        UserRole::User
-                    };
-
-                    info!("Creating new user {} with role {:?}", user_id, role);
-
-                    self.repo
-                        .upsert_user(user_id, username, role)
-                        .await
-                        .context("Failed to upsert user")?
-                }
-            };
-
-            return Ok((user_model.role, chat.enabled));
-        }
-
-        // If no user info, return default user with chat enabled status
-        Ok((UserRole::User, chat.enabled))
-    }
-
-    // ------------------------------------------------------------------------
     // Message Handler (for Pixiv links)
     // ------------------------------------------------------------------------
 
@@ -224,7 +133,13 @@ impl BotHandler {
     /// - 作者链接 (https://www.pixiv.net/users/xxx): 订阅作者
     ///
     /// 群组中只在被 @ 时响应
-    pub async fn handle_message(&self, bot: Bot, msg: Message, text: &str) -> ResponseResult<()> {
+    pub async fn handle_message(
+        &self,
+        bot: Bot,
+        msg: Message,
+        text: &str,
+        ctx: crate::bot::UserChatContext,
+    ) -> ResponseResult<()> {
         // 检查是否包含 Pixiv 链接
         let links = parse_pixiv_links(text);
         if links.is_empty() {
@@ -239,39 +154,15 @@ impl BotHandler {
             user_id, chat_id, links
         );
 
-        // 确保用户和聊天存在于数据库中
-        let (user_role, chat_enabled) = match self.ensure_user_and_chat(&msg).await {
-            Ok(data) => data,
-            Err(e) => {
-                error!("Failed to ensure user/chat: {:#}", e);
-                return Ok(());
-            }
-        };
-
-        // 检查聊天是否启用
-        let is_private_chat_with_admin = chat_id.is_user() && user_role.is_admin();
-        if !chat_enabled && !is_private_chat_with_admin {
-            info!(
-                "Ignoring message from disabled chat {} (user: {}, role: {:?})",
-                chat_id, user_id, user_role
-            );
-            return Ok(());
-        }
-
         // 获取聊天设置（用于模糊敏感内容）
-        let chat_settings = self.repo.get_chat(chat_id.0).await.ok().flatten();
+        let chat_settings = &ctx.chat;
 
         // 处理每个链接
         for link in links {
             match link {
                 PixivLink::Illust(illust_id) => {
-                    self.handle_illust_link(
-                        bot.clone(),
-                        chat_id,
-                        illust_id,
-                        chat_settings.as_ref(),
-                    )
-                    .await?;
+                    self.handle_illust_link(bot.clone(), chat_id, illust_id, Some(chat_settings))
+                        .await?;
                 }
                 PixivLink::User(user_id) => {
                     self.handle_user_link(bot.clone(), chat_id, user_id).await?;
