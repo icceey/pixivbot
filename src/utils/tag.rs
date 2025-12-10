@@ -2,10 +2,11 @@ use regex::Regex;
 use std::sync::LazyLock;
 
 /// Regex pattern to match non-word characters.
-/// Uses Unicode mode to support international characters (Chinese, Japanese, etc.).
-/// Only keeps: Letters, Numbers, Underscores, and Unicode word characters.
-static NON_WORD_PATTERN: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"[^\w]").expect("Failed to compile regex pattern"));
+/// The regex crate has Unicode support enabled by default, so \w matches Unicode word characters.
+/// Only keeps: Letters, Numbers, Underscores, and Unicode word characters (e.g., Chinese, Japanese).
+static NON_WORD_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"[^\w]").expect("BUG: Failed to compile hardcoded regex pattern [^\\w]")
+});
 
 /// Remove non-word characters from a tag string using whitelist approach.
 /// Only keeps letters, numbers, underscores, and Unicode characters.
