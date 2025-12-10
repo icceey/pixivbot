@@ -1,13 +1,18 @@
-/// Special characters that should be removed from tags.
-/// These characters are not compatible with Telegram hashtags or cause matching issues.
-const SPECIAL_CHARS: &[char] = &[
-    ' ', '-', '(', ')', '・', '/', ':', '…', '「', '」', '_', '!', '♡',
-];
+use regex::Regex;
+use std::sync::LazyLock;
 
-/// Remove special characters from a tag string.
+/// Regex pattern to match non-word characters.
+/// The regex crate has Unicode support enabled by default, so \w matches Unicode word characters.
+/// Only keeps: Letters, Numbers, Underscores, and Unicode word characters (e.g., Chinese, Japanese).
+static NON_WORD_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"[^\w]").expect("BUG: Failed to compile hardcoded regex pattern [^\\w]")
+});
+
+/// Remove non-word characters from a tag string using whitelist approach.
+/// Only keeps letters, numbers, underscores, and Unicode characters.
 /// Used by both normalize_tag and format_tags.
 fn remove_special_chars(tag: &str) -> String {
-    tag.chars().filter(|c| !SPECIAL_CHARS.contains(c)).collect()
+    NON_WORD_PATTERN.replace_all(tag, "").to_string()
 }
 
 /// Normalize a tag string for comparison purposes
@@ -110,7 +115,8 @@ mod tests {
     fn test_format_tags_no_escape() {
         let tags = vec!["R-18", "test+tag"];
         let result = format_tags(&tags);
-        assert_eq!(result, vec!["R18", "test+tag"]);
+        // Whitelist approach: + is removed, only word chars kept
+        assert_eq!(result, vec!["R18", "testtag"]);
     }
 
     #[test]
@@ -146,30 +152,65 @@ mod tests {
     #[test]
     fn test_normalize_tag_special_chars() {
         assert_eq!(normalize_tag("R-18"), "r18");
-        assert_eq!(normalize_tag("R_18"), "r18");
+        // Underscores are kept (part of \w in regex)
+        assert_eq!(normalize_tag("R_18"), "r_18");
         assert_eq!(normalize_tag("r-18"), "r18");
-        assert_eq!(normalize_tag("r_18"), "r18");
+        assert_eq!(normalize_tag("r_18"), "r_18");
     }
 
     #[test]
     fn test_normalize_tag_spaces() {
         assert_eq!(normalize_tag("Genshin Impact"), "genshinimpact");
-        assert_eq!(normalize_tag("Genshin_Impact"), "genshinimpact");
+        // Underscores are kept (part of \w in regex)
+        assert_eq!(normalize_tag("Genshin_Impact"), "genshin_impact");
     }
 
     #[test]
     fn test_normalize_tag_match() {
         // Test that different variations normalize to the same value
-        let filter = normalize_tag("R-18");
-        assert_eq!(normalize_tag("R-18"), filter);
-        assert_eq!(normalize_tag("R_18"), filter);
-        assert_eq!(normalize_tag("r-18"), filter);
-        assert_eq!(normalize_tag("r_18"), filter);
+        // Note: R-18 and R_18 now normalize differently (underscore is kept)
+        assert_eq!(normalize_tag("R-18"), "r18");
+        assert_eq!(normalize_tag("r-18"), "r18");
+        // With underscores kept:
+        assert_eq!(normalize_tag("R_18"), "r_18");
+        assert_eq!(normalize_tag("r_18"), "r_18");
     }
 
     #[test]
     fn test_normalize_tag_japanese_chars() {
         assert_eq!(normalize_tag("「テスト」"), "テスト");
         assert_eq!(normalize_tag("テスト…"), "テスト");
+    }
+
+    // New tests from requirements
+    #[test]
+    fn test_format_tags_requirements() {
+        // Hello World -> HelloWorld
+        assert_eq!(format_tags(&["Hello World"]), vec!["HelloWorld"]);
+
+        // C++ & Rust -> CRust
+        assert_eq!(format_tags(&["C++ & Rust"]), vec!["CRust"]);
+
+        // User-Name -> UserName
+        assert_eq!(format_tags(&["User-Name"]), vec!["UserName"]);
+
+        // 你好，世界！ -> 你好世界
+        assert_eq!(format_tags(&["你好，世界！"]), vec!["你好世界"]);
+    }
+
+    #[test]
+    fn test_format_tags_underscores_kept() {
+        // Underscores should be kept (part of \w)
+        assert_eq!(format_tags(&["test_tag"]), vec!["test_tag"]);
+        assert_eq!(format_tags(&["R_18"]), vec!["R_18"]);
+    }
+
+    #[test]
+    fn test_format_tags_unicode_support() {
+        // Test various Unicode scripts
+        assert_eq!(format_tags(&["日本語"]), vec!["日本語"]);
+        assert_eq!(format_tags(&["中文测试"]), vec!["中文测试"]);
+        assert_eq!(format_tags(&["한국어"]), vec!["한국어"]);
+        assert_eq!(format_tags(&["Русский"]), vec!["Русский"]);
     }
 }
