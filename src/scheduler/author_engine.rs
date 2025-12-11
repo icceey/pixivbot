@@ -243,7 +243,10 @@ impl AuthorEngine {
         pending: &PendingIllust,
     ) -> Result<Option<AuthorState>> {
         let chat_id = ChatId(ctx.subscription.chat_id);
-        let state = ctx.subscription_state.as_ref().unwrap();
+        let state = ctx
+            .subscription_state
+            .as_ref()
+            .context("Missing subscription state for pending illust")?;
 
         // Check retry limit
         if self.max_retry_count <= 0 {

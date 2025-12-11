@@ -283,19 +283,6 @@ impl Repo {
         }
     }
 
-    /// Get tasks that need to be polled (next_poll_at <= now)
-    pub async fn get_pending_tasks(&self, limit: u64) -> Result<Vec<tasks::Model>> {
-        let now = Local::now().naive_local();
-
-        tasks::Entity::find()
-            .filter(tasks::Column::NextPollAt.lte(now))
-            .order_by_asc(tasks::Column::NextPollAt)
-            .limit(limit)
-            .all(&self.db)
-            .await
-            .context("Failed to get pending tasks")
-    }
-
     /// Get pending tasks filtered by type
     pub async fn get_pending_tasks_by_type(
         &self,
