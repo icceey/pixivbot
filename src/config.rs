@@ -80,6 +80,12 @@ pub struct SchedulerConfig {
     /// Maximum retry count for failed pushes (default: 3, <=0 means no retry)
     #[serde(default = "default_max_retry_count")]
     pub max_retry_count: i32,
+    /// Hour of day (0-23) to execute ranking tasks (default: 19)
+    #[serde(default = "default_ranking_execution_hour")]
+    pub ranking_execution_hour: u32,
+    /// Minute of hour (0-59) to execute ranking tasks (default: 0)
+    #[serde(default = "default_ranking_execution_minute")]
+    pub ranking_execution_minute: u32,
 }
 
 fn default_tick_interval_sec() -> u64 {
@@ -104,6 +110,14 @@ fn default_cache_dir() -> String {
 
 fn default_max_retry_count() -> i32 {
     3
+}
+
+fn default_ranking_execution_hour() -> u32 {
+    19
+}
+
+fn default_ranking_execution_minute() -> u32 {
+    0
 }
 
 #[derive(Debug, Deserialize, Clone)]
