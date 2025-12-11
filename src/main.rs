@@ -140,8 +140,7 @@ async fn main() -> Result<()> {
         repo.clone(),
         pixiv_client.clone(),
         notifier.clone(),
-        scheduler_config.ranking_execution_hour,
-        scheduler_config.ranking_execution_minute,
+        scheduler_config.ranking_execution_time.clone(),
     );
 
     info!("✅ Author and Ranking engines initialized");

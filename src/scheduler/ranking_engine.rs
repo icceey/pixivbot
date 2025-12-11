@@ -4,7 +4,7 @@ use crate::db::types::{SubscriptionState, TaskType};
 use crate::pixiv::client::PixivClient;
 use crate::scheduler::helpers::{get_chat_if_should_notify, RankingContext};
 use anyhow::{Context, Result};
-use chrono::{Local, TimeZone};
+use chrono::{Local, NaiveTime, TimeZone, Timelike};
 use pixiv_client::Illust;
 use std::sync::Arc;
 use teloxide::prelude::*;
@@ -15,8 +15,7 @@ pub struct RankingEngine {
     repo: Arc<Repo>,
     pixiv_client: Arc<tokio::sync::RwLock<PixivClient>>,
     notifier: Notifier,
-    execution_hour: u32,
-    execution_minute: u32,
+    execution_time: String,
 }
 
 impl RankingEngine {
@@ -24,23 +23,21 @@ impl RankingEngine {
         repo: Arc<Repo>,
         pixiv_client: Arc<tokio::sync::RwLock<PixivClient>>,
         notifier: Notifier,
-        execution_hour: u32,
-        execution_minute: u32,
+        execution_time: String,
     ) -> Self {
         Self {
             repo,
             pixiv_client,
             notifier,
-            execution_hour,
-            execution_minute,
+            execution_time,
         }
     }
 
     /// Main scheduler loop - runs indefinitely at specified time daily
     pub async fn run(&self) {
         info!(
-            "🚀 Ranking engine started (execution time: {:02}:{:02})",
-            self.execution_hour, self.execution_minute
+            "🚀 Ranking engine started (execution time: {})",
+            self.execution_time
         );
 
         loop {
@@ -78,32 +75,29 @@ impl RankingEngine {
 
     /// Calculate next execution time based on current time
     fn calculate_next_execution_time(&self) -> Result<chrono::DateTime<Local>> {
+        let (h, m) = self.parse_execution_time()?;
+
+        let target_time = NaiveTime::from_hms_opt(h, m, 0).context("Invalid time configuration")?;
+
         let now = Local::now();
-        let today = now.date_naive();
-
-        // Try today's execution time
-        let today_execution = today
-            .and_hms_opt(self.execution_hour, self.execution_minute, 0)
-            .context("Invalid execution time configuration")?;
-        let today_execution_time = Local
-            .from_local_datetime(&today_execution)
-            .single()
-            .context("Ambiguous local datetime for today's execution time")?;
-
-        if now < today_execution_time {
-            // Today's execution time hasn't passed yet
-            Ok(today_execution_time)
+        let target_date = if now.time() < target_time {
+            now.date_naive()
         } else {
-            // Today's execution time has passed, schedule for tomorrow
-            let tomorrow = today + chrono::Duration::days(1);
-            let tomorrow_execution = tomorrow
-                .and_hms_opt(self.execution_hour, self.execution_minute, 0)
-                .context("Invalid execution time configuration for tomorrow")?;
-            Ok(Local
-                .from_local_datetime(&tomorrow_execution)
-                .single()
-                .context("Ambiguous local datetime for tomorrow's execution time")?)
-        }
+            now.date_naive() + chrono::Duration::days(1)
+        };
+
+        let target_naive = target_date.and_time(target_time);
+        Local::from_local_datetime(&Local, &target_naive)
+            .single()
+            .context("Ambiguous or invalid local time (e.g. skipped by DST)")
+    }
+
+    /// Parse execution time string (HH:MM format) into (hour, minute)
+    fn parse_execution_time(&self) -> Result<(u32, u32)> {
+        let time = NaiveTime::parse_from_str(&self.execution_time, "%H:%M")
+            .with_context(|| format!("Invalid execution_time format '{}'", self.execution_time))?;
+
+        Ok((time.hour(), time.minute()))
     }
 
     /// Execute all pending ranking tasks

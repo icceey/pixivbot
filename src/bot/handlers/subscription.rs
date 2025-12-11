@@ -209,7 +209,7 @@ impl BotHandler {
                 chat_id,
                 format!(
                     "❌ 用法: `/subrank <mode> [+tag1 -tag2]`\n可用模式: {}",
-                    available_modes
+                    markdown::escape(&available_modes)
                 ),
             )
             .parse_mode(ParseMode::MarkdownV2)
