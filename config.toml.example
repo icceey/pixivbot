@@ -27,6 +27,9 @@ cache_retention_days = 7
 cache_dir = "data/cache"
 # Maximum retry count for failed pushes (default: 3, <=0 means no retry)
 max_retry_count = 3
+# Ranking task execution time (default: 19:00 local time)
+ranking_execution_hour = 19
+ranking_execution_minute = 0
 
 [content]
 # Default sensitive tags for new chats. Each chat can customize their own sensitive tags.

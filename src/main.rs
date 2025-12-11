@@ -123,9 +123,9 @@ async fn main() -> Result<()> {
     // Initialize Notifier
     let notifier = bot::notifier::Notifier::new(bot.clone(), downloader.clone());
 
-    // Initialize scheduler
+    // Initialize author engine
     let scheduler_config = config.scheduler.clone();
-    let scheduler = scheduler::SchedulerEngine::new(
+    let author_engine = scheduler::AuthorEngine::new(
         repo.clone(),
         pixiv_client.clone(),
         notifier.clone(),
@@ -135,11 +135,24 @@ async fn main() -> Result<()> {
         scheduler_config.max_retry_count,
     );
 
-    info!("✅ Scheduler initialized");
+    // Initialize ranking engine
+    let ranking_engine = scheduler::RankingEngine::new(
+        repo.clone(),
+        pixiv_client.clone(),
+        notifier.clone(),
+        scheduler_config.ranking_execution_hour,
+        scheduler_config.ranking_execution_minute,
+    );
 
-    // Spawn scheduler in background
-    let scheduler_handle = tokio::spawn(async move {
-        scheduler.run().await;
+    info!("✅ Author and Ranking engines initialized");
+
+    // Spawn both engines in background
+    let author_engine_handle = tokio::spawn(async move {
+        author_engine.run().await;
+    });
+
+    let ranking_engine_handle = tokio::spawn(async move {
+        ranking_engine.run().await;
     });
 
     info!("🤖 Starting Telegram Bot...");
@@ -177,7 +190,8 @@ async fn main() -> Result<()> {
 
     // Abort tasks
     bot_handle.abort();
-    scheduler_handle.abort();
+    author_engine_handle.abort();
+    ranking_engine_handle.abort();
 
     info!("✅ Shutdown complete");
     Ok(())

@@ -296,6 +296,34 @@ impl Repo {
             .context("Failed to get pending tasks")
     }
 
+    /// Get pending tasks filtered by type
+    pub async fn get_pending_tasks_by_type(
+        &self,
+        task_type: TaskType,
+        limit: u64,
+    ) -> Result<Vec<tasks::Model>> {
+        let now = Local::now().naive_local();
+
+        tasks::Entity::find()
+            .filter(tasks::Column::NextPollAt.lte(now))
+            .filter(tasks::Column::Type.eq(task_type))
+            .order_by_asc(tasks::Column::NextPollAt)
+            .limit(limit)
+            .all(&self.db)
+            .await
+            .context("Failed to get pending tasks by type")
+    }
+
+    /// Get all tasks of a specific type (regardless of next_poll_at)
+    pub async fn get_all_tasks_by_type(&self, task_type: TaskType) -> Result<Vec<tasks::Model>> {
+        tasks::Entity::find()
+            .filter(tasks::Column::Type.eq(task_type))
+            .order_by_asc(tasks::Column::Id)
+            .all(&self.db)
+            .await
+            .context("Failed to get all tasks by type")
+    }
+
     /// Update task after polling
     pub async fn update_task_after_poll(
         &self,
