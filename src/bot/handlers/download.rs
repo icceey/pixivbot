@@ -17,6 +17,9 @@ use teloxide::utils::markdown;
 use tokio::time::{sleep, Duration};
 use tracing::{error, info, warn};
 
+/// Page number prefix for multi-page artworks in filenames
+const PAGE_PREFIX: &str = "p";
+
 impl BotHandler {
     /// Handle /download command
     ///
@@ -124,6 +127,7 @@ impl BotHandler {
                                 if let Some(text) = reply_msg.text() {
                                     let start = entity.offset;
                                     let end = start + entity.length;
+                                    // text.get() safely handles out-of-bounds ranges
                                     if let Some(url_text) = text.get(start..end) {
                                         for link in parse_pixiv_links(url_text) {
                                             if let PixivLink::Illust(id) = link {
@@ -254,7 +258,7 @@ impl BotHandler {
                     let filename = if urls.len() > 1 {
                         format!(
                             "{}_{}_{}{}.{}",
-                            sanitized_title, illust_id, "p", page_idx, ext
+                            sanitized_title, illust_id, PAGE_PREFIX, page_idx, ext
                         )
                     } else {
                         format!("{}_{}.{}", sanitized_title, illust_id, ext)
