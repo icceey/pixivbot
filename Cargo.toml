@@ -30,7 +30,6 @@ sea-orm-migration = { version = "1.1.19", features = ["runtime-tokio-rustls", "s
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 teloxide = { version = "0.17.0", features = ["macros", "ctrlc_handler", "rustls"], default-features = false}
-tempfile = "3.23.0"
 tokio = { version = "1.48.0", features = ["macros", "rt", "time"] }
 tokio-cron-scheduler = "0.15.1"
 tracing = "0.1.43"

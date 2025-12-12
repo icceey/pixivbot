@@ -254,7 +254,7 @@ impl BotHandler {
                     let filename = if urls.len() > 1 {
                         format!(
                             "{}_{}_{}{}.{}",
-                            sanitized_title, illust_id, 'p', page_idx, ext
+                            sanitized_title, illust_id, "p", page_idx, ext
                         )
                     } else {
                         format!("{}_{}.{}", sanitized_title, illust_id, ext)
@@ -287,23 +287,32 @@ impl BotHandler {
         );
         let zip_path = temp_dir.join(zip_filename);
 
-        let zip_file = std::fs::File::create(&zip_path).context("Failed to create ZIP file")?;
-        let mut zip = zip::ZipWriter::new(zip_file);
-        let options = zip::write::SimpleFileOptions::default()
-            .compression_method(zip::CompressionMethod::Deflated);
+        // Clone data needed for the blocking task
+        let files_clone: Vec<(PathBuf, String)> = files.to_vec();
+        let zip_path_clone = zip_path.clone();
 
-        for (local_path, filename) in files {
-            zip.start_file(filename, options)
-                .context("Failed to start ZIP file entry")?;
-            let file_data = tokio::fs::read(local_path)
-                .await
-                .context(format!("Failed to read file {:?}", local_path))?;
-            zip.write_all(&file_data)
-                .context("Failed to write to ZIP")?;
-        }
+        // Run synchronous ZIP operations in a blocking task
+        tokio::task::spawn_blocking(move || {
+            let zip_file =
+                std::fs::File::create(&zip_path_clone).context("Failed to create ZIP file")?;
+            let mut zip = zip::ZipWriter::new(zip_file);
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
 
-        zip.finish().context("Failed to finalize ZIP")?;
-        Ok(zip_path)
+            for (local_path, filename) in files_clone {
+                zip.start_file(&filename, options)
+                    .context("Failed to start ZIP file entry")?;
+                let file_data = std::fs::read(&local_path)
+                    .context(format!("Failed to read file {:?}", local_path))?;
+                zip.write_all(&file_data)
+                    .context("Failed to write to ZIP")?;
+            }
+
+            zip.finish().context("Failed to finalize ZIP")?;
+            Ok::<PathBuf, anyhow::Error>(zip_path_clone)
+        })
+        .await
+        .context("ZIP creation task panicked")?
     }
 
     /// Send a document file
