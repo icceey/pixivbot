@@ -36,4 +36,5 @@ tracing = "0.1.43"
 tracing-appender = "0.2.4"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter", "chrono"] }
 url = "2.5.7"
+zip = "6.0.0"
 

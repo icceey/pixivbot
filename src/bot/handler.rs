@@ -68,7 +68,7 @@ impl BotHandler {
         );
 
         // Route command to appropriate handler
-        self.dispatch_command(bot, chat_id, cmd, ctx.user_role())
+        self.dispatch_command(bot, msg, chat_id, cmd, ctx.user_role())
             .await
     }
 
@@ -76,6 +76,7 @@ impl BotHandler {
     async fn dispatch_command(
         &self,
         bot: Bot,
+        msg: Message,
         chat_id: ChatId,
         cmd: Command,
         user_role: &UserRole,
@@ -101,6 +102,9 @@ impl BotHandler {
             Command::ExcludeTags(args) => self.handle_exclude_tags(bot, chat_id, args).await,
             Command::ClearExcludedTags => self.handle_clear_excluded_tags(bot, chat_id).await,
             Command::Settings => self.handle_settings(bot, chat_id).await,
+
+            // Download command (defined in handlers/download.rs)
+            Command::Download(args) => self.handle_download(bot.clone(), msg, chat_id, args).await,
 
             // Admin commands (require admin or owner role, defined in handlers/admin.rs)
             Command::EnableChat(args) if user_role.is_admin() => {

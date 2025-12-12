@@ -38,6 +38,8 @@ pub enum Command {
     ClearExcludedTags,
     #[command(description = "显示聊天设置")]
     Settings,
+    #[command(description = "下载作品原图\n  用法: /download <url|id> 或回复消息")]
+    Download(String),
 }
 
 impl Command {
@@ -64,6 +66,7 @@ impl Command {
             ),
             BotCommand::new("clearexcludedtags", "清除所有排除的标签"),
             BotCommand::new("settings", "显示聊天设置"),
+            BotCommand::new("download", "下载作品原图 - /download <url|id> 或回复消息"),
             BotCommand::new("help", "显示帮助信息"),
         ]
     }

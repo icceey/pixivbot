@@ -53,6 +53,11 @@ impl Notifier {
         Self { bot, downloader }
     }
 
+    /// Get reference to the downloader (used by download handler)
+    pub fn get_downloader(&self) -> &Arc<Downloader> {
+        &self.downloader
+    }
+
     /// 下载并发送单张图片
     pub async fn notify_with_image(
         &self,
