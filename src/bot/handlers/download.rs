@@ -7,6 +7,7 @@
 use crate::bot::link_handler::{parse_pixiv_links, PixivLink};
 use crate::bot::BotHandler;
 use anyhow::{Context, Result};
+use chrono::Local;
 use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -190,10 +191,8 @@ impl BotHandler {
             // Multiple files - create ZIP and send
             match self.create_zip_file(&all_files).await {
                 Ok(zip_path) => {
-                    let zip_filename = format!(
-                        "pixiv_{}_works.zip",
-                        chrono::Local::now().format("%Y%m%d_%H%M%S")
-                    );
+                    let zip_filename =
+                        format!("pixiv_{}_works.zip", Local::now().format("%Y%m%d_%H%M%S"));
                     if let Err(e) = self
                         .send_document(&bot, chat_id, &zip_path, &zip_filename, &caption)
                         .await
@@ -253,7 +252,10 @@ impl BotHandler {
                     // Create sanitized filename
                     let sanitized_title = sanitize_filename(&title);
                     let filename = if urls.len() > 1 {
-                        format!("{}_{}_{}.{}", sanitized_title, illust_id, page_idx, ext)
+                        format!(
+                            "{}_{}_{}{}.{}",
+                            sanitized_title, illust_id, 'p', page_idx, ext
+                        )
                     } else {
                         format!("{}_{}.{}", sanitized_title, illust_id, ext)
                     };
@@ -281,7 +283,7 @@ impl BotHandler {
         let temp_dir = std::env::temp_dir();
         let zip_filename = format!(
             "pixivbot_download_{}.zip",
-            chrono::Local::now().format("%Y%m%d_%H%M%S%3f")
+            Local::now().format("%Y%m%d_%H%M%S%3f")
         );
         let zip_path = temp_dir.join(zip_filename);
 
