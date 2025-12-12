@@ -3,9 +3,9 @@ use crate::db::types::{TagFilter, TaskType};
 use crate::pixiv::model::RankingMode;
 use anyhow::{Context, Result};
 use teloxide::prelude::*;
-use teloxide::types::ParseMode;
+use teloxide::types::{ChatAction, ParseMode};
 use teloxide::utils::markdown;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 // ============================================================================
 // Helper Types
@@ -92,6 +92,11 @@ impl BotHandler {
         chat_id: ChatId,
         args: String,
     ) -> ResponseResult<()> {
+        // Set bot status to typing
+        if let Err(e) = bot.send_chat_action(chat_id, ChatAction::Typing).await {
+            warn!("Failed to set chat action for chat {}: {:#}", chat_id, e);
+        }
+
         let parts: Vec<&str> = args.split_whitespace().collect();
 
         if parts.is_empty() {
@@ -201,6 +206,11 @@ impl BotHandler {
         chat_id: ChatId,
         args: String,
     ) -> ResponseResult<()> {
+        // Set bot status to typing
+        if let Err(e) = bot.send_chat_action(chat_id, ChatAction::Typing).await {
+            warn!("Failed to set chat action for chat {}: {:#}", chat_id, e);
+        }
+
         let parts: Vec<&str> = args.split_whitespace().collect();
 
         if parts.is_empty() {
