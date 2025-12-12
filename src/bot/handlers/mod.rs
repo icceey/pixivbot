@@ -9,3 +9,6 @@ mod settings;
 
 // Subscription related handlers
 mod subscription;
+
+// Download handler
+mod download;
