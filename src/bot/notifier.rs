@@ -66,7 +66,11 @@ impl Notifier {
             chat_id, image_url
         );
         // Set bot status to uploading photo
-        if let Err(e) = self.bot.send_chat_action(chat_id, ChatAction::UploadPhoto).await {
+        if let Err(e) = self
+            .bot
+            .send_chat_action(chat_id, ChatAction::UploadPhoto)
+            .await
+        {
             warn!("Failed to set chat action for chat {}: {:#}", chat_id, e);
         }
         let local_path = self.downloader.download(image_url).await?;
@@ -152,7 +156,11 @@ impl Notifier {
         info!("Batch processing {} images for chat {}", total, chat_id);
 
         // Set bot status to uploading photo before downloading
-        if let Err(e) = self.bot.send_chat_action(chat_id, ChatAction::UploadPhoto).await {
+        if let Err(e) = self
+            .bot
+            .send_chat_action(chat_id, ChatAction::UploadPhoto)
+            .await
+        {
             warn!("Failed to set chat action for chat {}: {:#}", chat_id, e);
         }
 
