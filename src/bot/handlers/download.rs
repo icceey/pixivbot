@@ -12,7 +12,7 @@ use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use teloxide::prelude::*;
-use teloxide::types::{ChatAction, InputFile, MessageEntityKind, ParseMode};
+use teloxide::types::{ChatAction, InputFile, MessageEntityKind, MessageEntityRef, ParseMode};
 use teloxide::utils::markdown;
 use tokio::time::{sleep, Duration};
 use tracing::{error, info, warn};
@@ -104,7 +104,7 @@ impl BotHandler {
         if ids.is_empty() {
             if let Some(reply_msg) = msg.reply_to_message() {
                 // Parse text content for links
-                if let Some(text) = reply_msg.text() {
+                if let Some(text) = reply_msg.text().or_else(|| reply_msg.caption()) {
                     for link in parse_pixiv_links(text) {
                         if let PixivLink::Illust(id) = link {
                             ids.insert(id);
@@ -113,32 +113,35 @@ impl BotHandler {
                 }
 
                 // Parse message entities for hidden links (TextLink and Url)
-                if let Some(entities) = reply_msg.entities() {
-                    for entity in entities {
-                        match &entity.kind {
-                            MessageEntityKind::TextLink { url } => {
-                                for link in parse_pixiv_links(url.as_str()) {
-                                    if let PixivLink::Illust(id) = link {
-                                        ids.insert(id);
-                                    }
+                let entities: Vec<MessageEntityRef<'_>> = reply_msg
+                    .parse_entities()
+                    .into_iter()
+                    .flatten()
+                    .chain(reply_msg.parse_caption_entities().into_iter().flatten())
+                    .collect();
+
+                for entity in entities {
+                    match &entity.kind() {
+                        MessageEntityKind::TextLink { url } => {
+                            for link in parse_pixiv_links(url.as_str()) {
+                                if let PixivLink::Illust(id) = link {
+                                    ids.insert(id);
                                 }
                             }
-                            MessageEntityKind::Url => {
-                                if let Some(text) = reply_msg.text() {
-                                    let start = entity.offset;
-                                    let end = start + entity.length;
-                                    // text.get() safely handles out-of-bounds ranges
-                                    if let Some(url_text) = text.get(start..end) {
-                                        for link in parse_pixiv_links(url_text) {
-                                            if let PixivLink::Illust(id) = link {
-                                                ids.insert(id);
-                                            }
+                        }
+                        MessageEntityKind::Url => {
+                            if let Some(text) = reply_msg.text() {
+                                // text.get() safely handles out-of-bounds ranges
+                                if let Some(url_text) = text.get(entity.range()) {
+                                    for link in parse_pixiv_links(url_text) {
+                                        if let PixivLink::Illust(id) = link {
+                                            ids.insert(id);
                                         }
                                     }
                                 }
                             }
-                            _ => {}
                         }
+                        _ => {}
                     }
                 }
             }
