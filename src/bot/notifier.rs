@@ -3,7 +3,7 @@ use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use teloxide::prelude::*;
-use teloxide::types::{InputFile, InputMedia, InputMediaPhoto, ParseMode};
+use teloxide::types::{ChatAction, InputFile, InputMedia, InputMediaPhoto, ParseMode};
 use tokio::time::{sleep, Duration};
 use tracing::{error, info, warn};
 
@@ -65,6 +65,10 @@ impl Notifier {
             "Downloading and sending image to chat {}: {}",
             chat_id, image_url
         );
+        // Set bot status to uploading photo
+        if let Err(e) = self.bot.send_chat_action(chat_id, ChatAction::UploadPhoto).await {
+            warn!("Failed to set chat action for chat {}: {:#}", chat_id, e);
+        }
         let local_path = self.downloader.download(image_url).await?;
         self.send_photo_file(chat_id, &local_path, caption, has_spoiler)
             .await
@@ -146,6 +150,11 @@ impl Notifier {
         }
 
         info!("Batch processing {} images for chat {}", total, chat_id);
+
+        // Set bot status to uploading photo before downloading
+        if let Err(e) = self.bot.send_chat_action(chat_id, ChatAction::UploadPhoto).await {
+            warn!("Failed to set chat action for chat {}: {:#}", chat_id, e);
+        }
 
         // 2. 批量下载
         let local_paths = match self.downloader.download_all(image_urls).await {
