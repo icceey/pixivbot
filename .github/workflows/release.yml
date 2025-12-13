@@ -4,8 +4,8 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Version (e.g., v0.0.1)'
-        required: true
+        description: 'Version (e.g., v0.0.1, leave empty to extract from Cargo.toml)'
+        required: false
         type: string
 
 env:
@@ -16,25 +16,42 @@ jobs:
   validate:
     name: Validate
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.determine_version.outputs.version }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
 
-      - name: Validate version input
+      - name: Determine version
+        id: determine_version
         run: |
-          if [[ ! "${{ inputs.version }}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+          if [ -z "${{ inputs.version }}" ]; then
+            # Extract version from Cargo.toml
+            CARGO_VERSION=$(grep -m 1 "^version" Cargo.toml | cut -d '"' -f 2)
+            VERSION="v${CARGO_VERSION}"
+            echo "Version not provided, extracted from Cargo.toml: $VERSION"
+          else
+            VERSION="${{ inputs.version }}"
+            echo "Using provided version: $VERSION"
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Validate version format
+        run: |
+          VERSION="${{ steps.determine_version.outputs.version }}"
+          if [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "Error: Version must be in format vX.Y.Z (e.g., v0.0.1)"
             exit 1
           fi
 
-      - name: Check Cargo.toml version
+      - name: Check Cargo.toml version consistency
         run: |
           CARGO_VERSION=$(grep -m 1 "^version" Cargo.toml | cut -d '"' -f 2)
-          INPUT_VERSION=${{ inputs.version }}
-          CLEAN_VERSION=${INPUT_VERSION#v}
+          VERSION="${{ steps.determine_version.outputs.version }}"
+          CLEAN_VERSION=${VERSION#v}
           
           if [ "$CARGO_VERSION" != "$CLEAN_VERSION" ]; then
-            echo "::error::Version mismatch! Input: $CLEAN_VERSION, Cargo.toml: $CARGO_VERSION"
+            echo "::error::Version mismatch! Determined: $CLEAN_VERSION, Cargo.toml: $CARGO_VERSION"
             exit 1
           fi
 
@@ -93,7 +110,7 @@ jobs:
             BIN_EXT=""
           fi
           
-          ARCHIVE_NAME="${{ env.BINARY_NAME }}-${{ inputs.version }}-${{ matrix.target }}"
+          ARCHIVE_NAME="${{ env.BINARY_NAME }}-${{ needs.validate.outputs.version }}-${{ matrix.target }}"
           mkdir -p "$ARCHIVE_NAME"
           
           cp "target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}${BIN_EXT}" "$ARCHIVE_NAME/"
@@ -111,12 +128,12 @@ jobs:
         uses: actions/upload-artifact@v5
         with:
           name: ${{ env.BINARY_NAME }}-${{ matrix.target }}
-          path: ${{ steps.prepare_archive.outputs.archive || format('{0}-{1}-{2}.{3}', env.BINARY_NAME, inputs.version, matrix.target, matrix.archive) }}
+          path: ${{ steps.prepare_archive.outputs.archive || format('{0}-{1}-{2}.{3}', env.BINARY_NAME, needs.validate.outputs.version, matrix.target, matrix.archive) }}
           retention-days: 1
 
   release:
     name: Create GitHub Release
-    needs: build
+    needs: [validate, build]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -135,8 +152,8 @@ jobs:
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ inputs.version }}
-          name: Release ${{ inputs.version }}
+          tag_name: ${{ needs.validate.outputs.version }}
+          name: Release ${{ needs.validate.outputs.version }}
           generate_release_notes: true
           prerelease: false
           files: artifacts/*
@@ -145,11 +162,11 @@ jobs:
 
   docker:
     name: Build and Push Docker Image
-    needs: release
+    needs: [validate, release]
     uses: ./.github/workflows/docker.yml
     with:
       channel: stable
-      version: ${{ inputs.version }}
+      version: ${{ needs.validate.outputs.version }}
       push_to_ghcr: true
     permissions:
       contents: read
