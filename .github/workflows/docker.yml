@@ -56,7 +56,7 @@ jobs:
           if [ -z "${{ inputs.version }}" ]; then
             # Extract version from Cargo.toml (matches workspace.package version)
             # grep -m 1 ensures we get the first 'version = "X.Y.Z"' line
-            CARGO_VERSION=$(grep -m 1 "^version" Cargo.toml | cut -d '"' -f 2)
+            CARGO_VERSION=$(grep -m 1 '^version = ' Cargo.toml | cut -d '"' -f 2)
             VERSION="v${CARGO_VERSION}"
             echo "Version not provided, extracted from Cargo.toml: $VERSION"
           else
