@@ -13,8 +13,8 @@ on:
           - stable
         default: alpha
       version:
-        description: 'Version (e.g., v0.0.1)'
-        required: true
+        description: 'Version (e.g., v0.0.1, leave empty to extract from Cargo.toml)'
+        required: false
         type: string
       push_to_ghcr:
         description: 'Push image to GHCR'
@@ -28,7 +28,7 @@ on:
         required: true
         type: string
       version:
-        description: 'Version (e.g., v0.0.1)'
+        description: 'Version (e.g., v0.0.1) - Required when called from other workflows'
         required: true
         type: string
       push_to_ghcr:
@@ -41,8 +41,41 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
+  validate:
+    name: Validate
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.determine_version.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Determine version
+        id: determine_version
+        run: |
+          if [ -z "${{ inputs.version }}" ]; then
+            # Extract version from Cargo.toml (workspace.package section)
+            # -m 1 ensures we get the first match, which is the workspace version
+            CARGO_VERSION=$(grep -m 1 '^version = ' Cargo.toml | cut -d '"' -f 2)
+            VERSION="v${CARGO_VERSION}"
+            echo "Version not provided, extracted from Cargo.toml: $VERSION"
+          else
+            VERSION="${{ inputs.version }}"
+            echo "Using provided version: $VERSION"
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Validate version format
+        run: |
+          VERSION="${{ steps.determine_version.outputs.version }}"
+          if [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Error: Version must be in format vX.Y.Z (e.g., v0.0.1)"
+            exit 1
+          fi
+
   build:
     name: Build (${{ matrix.platform }})
+    needs: [validate]
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -60,13 +93,6 @@ jobs:
       packages: write
 
     steps:
-      - name: Validate version format
-        run: |
-          if [[ ! "${{ inputs.version }}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "Error: Version must be in format vX.Y.Z (e.g., v0.0.1)"
-            exit 1
-          fi
-
       - name: Checkout repository
         uses: actions/checkout@v6
 
@@ -117,7 +143,7 @@ jobs:
   merge:
     name: Merge Multi-Arch Image
     if: ${{ inputs.push_to_ghcr }}
-    needs: build
+    needs: [validate, build]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -153,9 +179,9 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=raw,value=${{ inputs.version }},enable=${{ inputs.channel == 'stable' }}
+            type=raw,value=${{ needs.validate.outputs.version }},enable=${{ inputs.channel == 'stable' }}
             type=raw,value=latest,enable=${{ inputs.channel == 'stable' }}
-            type=raw,value=${{ inputs.version }}-${{ inputs.channel }},enable=${{ inputs.channel != 'stable' }}
+            type=raw,value=${{ needs.validate.outputs.version }}-${{ inputs.channel }},enable=${{ inputs.channel != 'stable' }}
             type=raw,value=latest-${{ inputs.channel }},enable=${{ inputs.channel != 'stable' }}
           labels: |
             org.opencontainers.image.title=pixivbot
@@ -171,4 +197,4 @@ jobs:
 
       - name: Inspect image
         run: |
-          docker buildx imagetools inspect ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ inputs.version }}${{ inputs.channel != 'stable' && format('-{0}', inputs.channel) || '' }}
+          docker buildx imagetools inspect ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.validate.outputs.version }}${{ inputs.channel != 'stable' && format('-{0}', inputs.channel) || '' }}
