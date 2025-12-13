@@ -300,11 +300,7 @@ impl AuthorEngine {
         );
 
         // Calculate remaining pages
-        let total_pages = if illust.is_multi_page() {
-            illust.page_count as usize
-        } else {
-            1
-        };
+        let total_pages = illust.get_all_image_urls_with_size(self.image_size).len();
         let remaining_pages: Vec<usize> = (0..total_pages)
             .filter(|i| !pending.sent_pages.contains(i))
             .collect();

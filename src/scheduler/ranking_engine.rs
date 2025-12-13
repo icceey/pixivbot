@@ -286,18 +286,11 @@ impl RankingEngine {
 
         for (index, illust) in filtered_illusts.iter().enumerate() {
             // Get image URL (single image per ranking item)
-            let image_url = match self.image_size {
-                pixiv_client::ImageSize::Original => {
-                    if let Some(url) = &illust.meta_single_page.original_image_url {
-                        url.clone()
-                    } else {
-                        illust.image_urls.large.clone()
-                    }
-                }
-                pixiv_client::ImageSize::Large => illust.image_urls.large.clone(),
-                pixiv_client::ImageSize::Medium => illust.image_urls.medium.clone(),
-                pixiv_client::ImageSize::SquareMedium => illust.image_urls.square_medium.clone(),
-            };
+            let image_url = illust
+                .get_all_image_urls_with_size(self.image_size)
+                .first()
+                .cloned()
+                .unwrap_or_else(|| illust.image_urls.large.clone());
             image_urls.push(image_url);
             illust_ids.push(illust.id);
 
