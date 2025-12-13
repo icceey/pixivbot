@@ -22,6 +22,7 @@ pub struct AuthorEngine {
     min_task_interval_sec: u64,
     max_task_interval_sec: u64,
     max_retry_count: i32,
+    image_size: pixiv_client::ImageSize,
 }
 
 impl AuthorEngine {
@@ -34,6 +35,7 @@ impl AuthorEngine {
         min_task_interval_sec: u64,
         max_task_interval_sec: u64,
         max_retry_count: i32,
+        image_size: pixiv_client::ImageSize,
     ) -> Self {
         Self {
             repo,
@@ -43,6 +45,7 @@ impl AuthorEngine {
             min_task_interval_sec,
             max_task_interval_sec,
             max_retry_count,
+            image_size,
         }
     }
 
@@ -297,8 +300,12 @@ impl AuthorEngine {
         );
 
         // Calculate remaining pages
-        let all_urls = illust.get_all_image_urls();
-        let remaining_pages: Vec<usize> = (0..all_urls.len())
+        let total_pages = if illust.is_multi_page() {
+            illust.page_count as usize
+        } else {
+            1
+        };
+        let remaining_pages: Vec<usize> = (0..total_pages)
             .filter(|i| !pending.sent_pages.contains(i))
             .collect();
 
@@ -311,8 +318,14 @@ impl AuthorEngine {
         }
 
         // Send remaining pages
-        let push_result =
-            process_illust_push(&self.notifier, ctx, illust, &pending.sent_pages).await?;
+        let push_result = process_illust_push(
+            &self.notifier,
+            ctx,
+            illust,
+            &pending.sent_pages,
+            self.image_size,
+        )
+        .await?;
 
         // Calculate new state based on result
         let new_state = match push_result {
@@ -433,7 +446,8 @@ impl AuthorEngine {
             .expect("filtered_illusts is not empty");
 
         // Push this single illust
-        let push_result = process_illust_push(&self.notifier, ctx, illust, &[]).await?;
+        let push_result =
+            process_illust_push(&self.notifier, ctx, illust, &[], self.image_size).await?;
 
         // Calculate new state based on result
         let new_state = match push_result {

@@ -69,9 +69,10 @@ pub async fn process_illust_push(
     ctx: &AuthorContext<'_>,
     illust: &Illust,
     already_sent_pages: &[usize],
+    image_size: pixiv_client::ImageSize,
 ) -> Result<PushResult> {
     let chat_id = ChatId(ctx.subscription.chat_id);
-    let all_urls = illust.get_all_image_urls();
+    let all_urls = illust.get_all_image_urls_with_size(image_size);
     let total_pages = all_urls.len();
 
     // Calculate pages to send

@@ -16,6 +16,7 @@ pub struct RankingEngine {
     pixiv_client: Arc<tokio::sync::RwLock<PixivClient>>,
     notifier: Notifier,
     execution_time: String,
+    image_size: pixiv_client::ImageSize,
 }
 
 impl RankingEngine {
@@ -24,12 +25,14 @@ impl RankingEngine {
         pixiv_client: Arc<tokio::sync::RwLock<PixivClient>>,
         notifier: Notifier,
         execution_time: String,
+        image_size: pixiv_client::ImageSize,
     ) -> Self {
         Self {
             repo,
             pixiv_client,
             notifier,
             execution_time,
+            image_size,
         }
     }
 
@@ -283,10 +286,17 @@ impl RankingEngine {
 
         for (index, illust) in filtered_illusts.iter().enumerate() {
             // Get image URL (single image per ranking item)
-            let image_url = if let Some(url) = &illust.meta_single_page.original_image_url {
-                url.clone()
-            } else {
-                illust.image_urls.large.clone()
+            let image_url = match self.image_size {
+                pixiv_client::ImageSize::Original => {
+                    if let Some(url) = &illust.meta_single_page.original_image_url {
+                        url.clone()
+                    } else {
+                        illust.image_urls.large.clone()
+                    }
+                }
+                pixiv_client::ImageSize::Large => illust.image_urls.large.clone(),
+                pixiv_client::ImageSize::Medium => illust.image_urls.medium.clone(),
+                pixiv_client::ImageSize::SquareMedium => illust.image_urls.square_medium.clone(),
             };
             image_urls.push(image_url);
             illust_ids.push(illust.id);

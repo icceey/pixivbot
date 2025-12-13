@@ -23,6 +23,7 @@ pub struct BotHandler {
     pub(crate) default_sensitive_tags: Vec<String>,
     pub(crate) owner_id: Option<i64>,
     pub(crate) is_public_mode: bool,
+    pub(crate) image_size: pixiv_client::ImageSize,
 }
 
 impl BotHandler {
@@ -37,6 +38,7 @@ impl BotHandler {
         default_sensitive_tags: Vec<String>,
         owner_id: Option<i64>,
         is_public_mode: bool,
+        image_size: pixiv_client::ImageSize,
     ) -> Self {
         Self {
             repo,
@@ -45,6 +47,7 @@ impl BotHandler {
             default_sensitive_tags,
             owner_id,
             is_public_mode,
+            image_size,
         }
     }
 
@@ -232,8 +235,8 @@ impl BotHandler {
         let has_spoiler =
             blur_sensitive && sensitive::contains_sensitive_tags(&illust, sensitive_tags);
 
-        // 获取所有图片 URL
-        let image_urls = illust.get_all_image_urls();
+        // 获取所有图片 URL (使用配置的尺寸)
+        let image_urls = illust.get_all_image_urls_with_size(self.image_size);
 
         // 发送图片
         let _ = self

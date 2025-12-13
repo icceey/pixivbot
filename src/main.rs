@@ -125,6 +125,7 @@ async fn main() -> Result<()> {
 
     // Initialize author engine
     let scheduler_config = config.scheduler.clone();
+    let image_size = config.content.image_size.to_pixiv_image_size();
     let author_engine = scheduler::AuthorEngine::new(
         repo.clone(),
         pixiv_client.clone(),
@@ -133,6 +134,7 @@ async fn main() -> Result<()> {
         scheduler_config.min_task_interval_sec,
         scheduler_config.max_task_interval_sec,
         scheduler_config.max_retry_count,
+        image_size,
     );
 
     // Initialize ranking engine
@@ -141,6 +143,7 @@ async fn main() -> Result<()> {
         pixiv_client.clone(),
         notifier.clone(),
         scheduler_config.ranking_execution_time.clone(),
+        image_size,
     );
 
     info!("✅ Author and Ranking engines initialized");
@@ -168,6 +171,7 @@ async fn main() -> Result<()> {
 
     // Start Bot in a separate task (non-blocking)
     let sensitive_tags_for_bot = config.content.sensitive_tags.clone();
+    let image_size_for_bot = config.content.image_size.to_pixiv_image_size();
     let bot_handle = tokio::spawn(async move {
         if let Err(e) = bot::run(
             bot,
@@ -176,6 +180,7 @@ async fn main() -> Result<()> {
             pixiv_client.clone(),
             notifier.clone(),
             sensitive_tags_for_bot,
+            image_size_for_bot,
         )
         .await
         {

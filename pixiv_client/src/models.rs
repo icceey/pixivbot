@@ -77,6 +77,19 @@ pub struct Illust {
     pub total_comments: Option<u64>,
 }
 
+/// 图片尺寸选项
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageSize {
+    /// 原图 (最高质量)
+    Original,
+    /// 大图 (推荐，平衡质量和大小)
+    Large,
+    /// 中图
+    Medium,
+    /// 正方形缩略图
+    SquareMedium,
+}
+
 impl Illust {
     /// 是否为多图作品
     pub fn is_multi_page(&self) -> bool {
@@ -86,24 +99,40 @@ impl Illust {
     /// 获取所有图片的原图 URL
     /// 单图返回1个URL,多图返回所有页的URL
     pub fn get_all_image_urls(&self) -> Vec<String> {
+        self.get_all_image_urls_with_size(ImageSize::Original)
+    }
+
+    /// 获取所有图片指定尺寸的 URL
+    /// 单图返回1个URL,多图返回所有页的URL
+    pub fn get_all_image_urls_with_size(&self, size: ImageSize) -> Vec<String> {
         if self.is_multi_page() {
             // 多图: 从 meta_pages 获取每页的图片
             self.meta_pages
                 .iter()
-                .map(|page| {
-                    page.image_urls
-                        .original
-                        .clone()
-                        .unwrap_or_else(|| page.image_urls.large.clone())
-                })
+                .map(|page| self.select_image_url(&page.image_urls, size))
                 .collect()
         } else {
-            // 单图: 优先使用 original_image_url,否则用 large
-            vec![self
-                .meta_single_page
-                .original_image_url
-                .clone()
-                .unwrap_or_else(|| self.image_urls.large.clone())]
+            // 单图: 根据 size 选择对应的 URL
+            vec![match size {
+                ImageSize::Original => self
+                    .meta_single_page
+                    .original_image_url
+                    .clone()
+                    .unwrap_or_else(|| self.image_urls.large.clone()),
+                ImageSize::Large => self.image_urls.large.clone(),
+                ImageSize::Medium => self.image_urls.medium.clone(),
+                ImageSize::SquareMedium => self.image_urls.square_medium.clone(),
+            }]
+        }
+    }
+
+    /// 从 ImageUrls 中选择指定尺寸的 URL
+    fn select_image_url(&self, urls: &ImageUrls, size: ImageSize) -> String {
+        match size {
+            ImageSize::Original => urls.original.clone().unwrap_or_else(|| urls.large.clone()),
+            ImageSize::Large => urls.large.clone(),
+            ImageSize::Medium => urls.medium.clone(),
+            ImageSize::SquareMedium => urls.square_medium.clone(),
         }
     }
 
