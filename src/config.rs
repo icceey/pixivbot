@@ -113,16 +113,59 @@ fn default_ranking_execution_time() -> String {
     "19:00".to_string()
 }
 
+/// 图片尺寸选项
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ImageSize {
+    /// 原图 (最高质量)
+    Original,
+    /// 大图 (推荐，平衡质量和大小)
+    #[default]
+    Large,
+    /// 中图
+    Medium,
+    /// 正方形缩略图
+    SquareMedium,
+}
+
+impl ImageSize {
+    #[allow(dead_code)]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ImageSize::Original => "original",
+            ImageSize::Large => "large",
+            ImageSize::Medium => "medium",
+            ImageSize::SquareMedium => "square_medium",
+        }
+    }
+
+    /// Convert to pixiv_client::ImageSize
+    pub fn to_pixiv_image_size(self) -> pixiv_client::ImageSize {
+        match self {
+            ImageSize::Original => pixiv_client::ImageSize::Original,
+            ImageSize::Large => pixiv_client::ImageSize::Large,
+            ImageSize::Medium => pixiv_client::ImageSize::Medium,
+            ImageSize::SquareMedium => pixiv_client::ImageSize::SquareMedium,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct ContentConfig {
     #[serde(default)]
     pub sensitive_tags: Vec<String>,
+    /// 推送图片时使用的默认尺寸 (original, large, medium, square_medium)
+    /// 默认: large (平衡质量和大小)
+    /// 注意: 下载功能永远使用原图
+    #[serde(default)]
+    pub image_size: ImageSize,
 }
 
 impl Default for ContentConfig {
     fn default() -> Self {
         Self {
             sensitive_tags: vec!["R-18".to_string(), "R-18G".to_string(), "NSFW".to_string()],
+            image_size: ImageSize::default(),
         }
     }
 }

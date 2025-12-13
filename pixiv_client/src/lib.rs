@@ -10,4 +10,4 @@ mod error;
 mod models;
 
 pub use client::PixivClient;
-pub use models::{Illust, User};
+pub use models::{Illust, ImageSize, User};

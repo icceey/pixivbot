@@ -31,6 +31,7 @@ pub async fn run(
     pixiv_client: Arc<tokio::sync::RwLock<PixivClient>>,
     notifier: notifier::Notifier,
     sensitive_tags: Vec<String>,
+    image_size: pixiv_client::ImageSize,
 ) -> Result<()> {
     info!("Starting Telegram Bot...");
 
@@ -54,6 +55,7 @@ pub async fn run(
         sensitive_tags,
         config.owner_id,
         is_public_mode,
+        image_size,
     );
 
     info!("✅ Bot initialized, starting command handler");
