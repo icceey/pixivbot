@@ -81,6 +81,20 @@ pub async fn run(
 /// 构建消息处理树
 fn build_handler_tree(
 ) -> teloxide::dispatching::UpdateHandler<Box<dyn std::error::Error + Send + Sync + 'static>> {
+    // 管理员启用/禁用聊天命令 - 只检查用户权限，不检查聊天是否启用
+    // 这允许管理员在禁用的聊天中使用 /enablechat 命令
+    // 注意：此处的 is_admin() 检查与 handler 中 dispatch_command 的 pattern guard 是有意重复的（纵深防御）
+    let admin_chat_control_handler = Message::filter_text()
+        .chain(middleware::filter_hybrid_command::<Command, HandlerResult>())
+        .chain(middleware::filter_user_chat())
+        .filter(|cmd: Command, ctx: UserChatContext| {
+            // 仅当用户是管理员且命令是 EnableChat 或 DisableChat 时处理
+            ctx.user_role().is_admin()
+                && matches!(cmd, Command::EnableChat(_) | Command::DisableChat(_))
+        })
+        .endpoint(handle_command);
+
+    // 常规命令 - 保持原有的聊天可访问性检查
     let command_handler = Message::filter_text()
         .chain(middleware::filter_hybrid_command::<Command, HandlerResult>())
         .chain(middleware::filter_user_chat())
@@ -95,6 +109,7 @@ fn build_handler_tree(
 
     dptree::entry()
         .chain(Update::filter_message())
+        .branch(admin_chat_control_handler) // Check admin commands first
         .branch(command_handler)
         .branch(message_handler)
 }
