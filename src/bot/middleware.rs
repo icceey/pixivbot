@@ -220,16 +220,9 @@ pub fn filter_relevant_message<Output>() -> Handler<'static, Output, DpHandlerDe
 where
     Output: Send + Sync + 'static,
 {
-    dptree::filter_map(move |message: Message, me: Me, text: String| {
+    dptree::filter_map(move |message: Message, me: Me| {
         // 私聊总是处理
         if message.chat.is_private() {
-            return Some(message);
-        }
-
-        // 群组：检查是否提及 Bot（大小写不敏感）
-        let bot_name = me.user.username.expect("Bots must have a username");
-        let mention = format!("@{}", bot_name);
-        if text.to_lowercase().contains(&mention.to_lowercase()) {
             return Some(message);
         }
 

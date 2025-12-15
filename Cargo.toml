@@ -2,7 +2,7 @@
 members = [".", "migration", "pixiv_client"]
 
 [workspace.package]
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 authors = ["icceey"]
 license = "MIT"
