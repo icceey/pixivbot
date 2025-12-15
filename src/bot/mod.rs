@@ -81,6 +81,19 @@ pub async fn run(
 /// 构建消息处理树
 fn build_handler_tree(
 ) -> teloxide::dispatching::UpdateHandler<Box<dyn std::error::Error + Send + Sync + 'static>> {
+    // Admin enable/disable commands - 只检查用户权限，不检查聊天是否启用
+    // This allows admins to enable disabled chats
+    let admin_chat_control_handler = Message::filter_text()
+        .chain(middleware::filter_hybrid_command::<Command, HandlerResult>())
+        .chain(middleware::filter_user_chat())
+        .filter(|cmd: Command, ctx: UserChatContext| {
+            // Only handle EnableChat and DisableChat commands when user is admin
+            ctx.user_role().is_admin()
+                && matches!(cmd, Command::EnableChat(_) | Command::DisableChat(_))
+        })
+        .endpoint(handle_command);
+
+    // Regular commands - 保持原有的聊天可访问性检查
     let command_handler = Message::filter_text()
         .chain(middleware::filter_hybrid_command::<Command, HandlerResult>())
         .chain(middleware::filter_user_chat())
@@ -95,6 +108,7 @@ fn build_handler_tree(
 
     dptree::entry()
         .chain(Update::filter_message())
+        .branch(admin_chat_control_handler) // Check admin commands first
         .branch(command_handler)
         .branch(message_handler)
 }
