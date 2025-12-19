@@ -148,6 +148,16 @@
 
 有关开发指南，请参阅 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
+### 手动合并 PR 冲突示例（#25）
+
+1. 切换到主分支并更新：`git checkout master && git pull origin master`。
+2. 拉取并检出 PR 分支：`git fetch origin pull/25/head:pr-25 && git checkout pr-25`。
+3. 合并主分支：`git merge master`。
+4. 如果出现冲突，打开带有 `<<<<<<<` 标记的文件，按期望保留内容并删除冲突标记（`<<<<<<<`/`=======`/`>>>>>>>`）。
+5. 使用 `git status` 确认冲突已处理，随后 `git add <文件>` 并 `git commit` 记录解决。
+6. 运行基本校验（如 `make quick` 或 `make ci`）确保编译和测试通过。
+7. 推送回 PR 分支：`git push origin pr-25`，GitHub 会自动更新 #25。
+
 ## 许可证
 
 [MIT](LICENSE)
