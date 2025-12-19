@@ -16,6 +16,8 @@ pub enum Command {
     Unsub(String),
     #[command(description = "取消订阅排行榜\n  用法: /unsubrank <mode>")]
     UnsubRank(String),
+    #[command(description = "回复消息取消对应订阅")]
+    UnsubThis,
     #[command(description = "列出当前订阅")]
     List,
     #[command(description = "[仅Owner] 设置用户为管理员\n  用法: /setadmin <user_id>")]
@@ -51,6 +53,7 @@ impl Command {
             BotCommand::new("list", "列出当前订阅"),
             BotCommand::new("unsub", "取消订阅作者 - /unsub <author_id,...>"),
             BotCommand::new("unsubrank", "取消订阅排行榜 - /unsubrank <mode>"),
+            BotCommand::new("unsubthis", "回复消息取消对应订阅"),
             BotCommand::new(
                 "blursensitive",
                 "启用或禁用敏感内容模糊 - /blursensitive <on|off>",

@@ -22,13 +22,25 @@ impl MigrationTrait for Migration {
                     )
                     .col(ColumnDef::new(Messages::ChatId).big_integer().not_null())
                     .col(ColumnDef::new(Messages::MessageId).integer().not_null())
-                    .col(ColumnDef::new(Messages::AuthorId).big_unsigned())
+                    .col(
+                        ColumnDef::new(Messages::SubscriptionId)
+                            .integer()
+                            .not_null(),
+                    )
                     .col(ColumnDef::new(Messages::IllustId).big_unsigned())
                     .col(
                         ColumnDef::new(Messages::CreatedAt)
                             .timestamp()
                             .not_null()
                             .default(Expr::current_timestamp()),
+                    )
+                    .foreign_key(
+                        ForeignKey::create()
+                            .name("fk_messages_subscription")
+                            .from(Messages::Table, Messages::SubscriptionId)
+                            .to(Subscriptions::Table, Subscriptions::Id)
+                            .on_delete(ForeignKeyAction::Cascade)
+                            .on_update(ForeignKeyAction::Cascade),
                     )
                     .to_owned(),
             )
@@ -48,14 +60,14 @@ impl MigrationTrait for Migration {
             )
             .await?;
 
-        // Create index on author_id for finding messages by author
+        // Create index on subscription_id for finding messages by subscription
         manager
             .create_index(
                 Index::create()
                     .if_not_exists()
-                    .name("idx_messages_author")
+                    .name("idx_messages_subscription")
                     .table(Messages::Table)
-                    .col(Messages::AuthorId)
+                    .col(Messages::SubscriptionId)
                     .to_owned(),
             )
             .await?;
@@ -77,7 +89,13 @@ enum Messages {
     Id,
     ChatId,
     MessageId,
-    AuthorId,
+    SubscriptionId,
     IllustId,
     CreatedAt,
+}
+
+#[derive(DeriveIden)]
+enum Subscriptions {
+    Table,
+    Id,
 }

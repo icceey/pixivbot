@@ -96,6 +96,7 @@ impl BotHandler {
             Command::SubRank(args) => self.handle_sub_ranking(bot, chat_id, args).await,
             Command::Unsub(args) => self.handle_unsub_author(bot, chat_id, args).await,
             Command::UnsubRank(args) => self.handle_unsub_ranking(bot, chat_id, args).await,
+            Command::UnsubThis => self.handle_unsub_this(bot, msg, chat_id).await,
             Command::List => self.handle_list(bot, chat_id).await,
 
             // Chat settings commands (defined in handlers/settings.rs)
