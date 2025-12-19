@@ -1,9 +1,10 @@
 use crate::bot::BotHandler;
 use crate::db::types::{TagFilter, TaskType};
 use crate::pixiv::model::RankingMode;
+use crate::utils::{args, channel};
 use anyhow::{Context, Result};
 use teloxide::prelude::*;
-use teloxide::types::{ChatAction, ParseMode};
+use teloxide::types::{ChatAction, ChatId, ParseMode, UserId};
 use teloxide::utils::markdown;
 use tracing::{error, info, warn};
 
@@ -80,29 +81,103 @@ impl BatchResult {
 
 impl BotHandler {
     // ------------------------------------------------------------------------
+    // Channel Target Resolution Helper
+    // ------------------------------------------------------------------------
+
+    /// Resolve the target chat ID for a subscription operation.
+    ///
+    /// If a channel parameter is specified, validates permissions and returns the channel ID.
+    /// Otherwise, returns the current chat ID.
+    ///
+    /// Returns:
+    /// - Ok((target_chat_id, is_channel)) if successful
+    /// - Err with error message if channel validation fails
+    async fn resolve_subscription_target(
+        &self,
+        bot: &Bot,
+        current_chat_id: ChatId,
+        user_id: Option<UserId>,
+        parsed_args: &args::ParsedArgs,
+    ) -> Result<(ChatId, bool), String> {
+        // Check for channel parameter (channel= or ch=)
+        let channel_param = parsed_args.get_any(&["channel", "ch"]);
+
+        match channel_param {
+            Some(channel_str) if !channel_str.is_empty() => {
+                // Parse channel ID
+                let channel_id = channel::parse_channel_id(channel_str)?;
+
+                // Validate user_id is available
+                let user_id = user_id.ok_or("无法获取用户信息")?;
+
+                // Validate channel permissions
+                channel::validate_channel_permissions(bot, channel_id, user_id).await?;
+
+                // Ensure chat exists in database for the channel
+                if let Err(e) = self
+                    .repo
+                    .upsert_chat(
+                        channel_id.0,
+                        "channel".to_string(),
+                        None,
+                        true, // Enable by default
+                        crate::db::types::Tags::from(self.default_sensitive_tags.clone()),
+                    )
+                    .await
+                {
+                    error!("Failed to create chat for channel {}: {:#}", channel_id, e);
+                    return Err("创建频道记录失败".to_string());
+                }
+
+                Ok((channel_id, true))
+            }
+            _ => Ok((current_chat_id, false)),
+        }
+    }
+
+    // ------------------------------------------------------------------------
     // Subscribe to Author
     // ------------------------------------------------------------------------
 
     /// 订阅 Pixiv 作者
     ///
-    /// 用法: `/sub <id,...> [+tag1 -tag2]`
+    /// 用法: `/sub [channel=<id>] <id,...> [+tag1 -tag2]`
     pub async fn handle_sub_author(
         &self,
         bot: Bot,
         chat_id: ChatId,
-        args: String,
+        user_id: Option<UserId>,
+        args_str: String,
     ) -> ResponseResult<()> {
         // Set bot status to typing
         if let Err(e) = bot.send_chat_action(chat_id, ChatAction::Typing).await {
             warn!("Failed to set chat action for chat {}: {:#}", chat_id, e);
         }
 
-        let parts: Vec<&str> = args.split_whitespace().collect();
+        // Parse key-value parameters from the beginning
+        let parsed = args::parse_args(&args_str);
+
+        // Resolve target chat (channel or current)
+        let (target_chat_id, is_channel) = match self
+            .resolve_subscription_target(&bot, chat_id, user_id, &parsed)
+            .await
+        {
+            Ok(result) => result,
+            Err(e) => {
+                bot.send_message(chat_id, format!("❌ {}", e)).await?;
+                return Ok(());
+            }
+        };
+
+        let parts: Vec<&str> = parsed.remaining.split_whitespace().collect();
 
         if parts.is_empty() {
-            bot.send_message(chat_id, "❌ 用法: `/sub <id,...> [+tag1 -tag2]`")
-                .parse_mode(ParseMode::MarkdownV2)
-                .await?;
+            bot.send_message(
+                chat_id,
+                "❌ 用法: `/sub [channel=<id>] <id,...> [+tag1 -tag2]`",
+            )
+            .parse_mode(ParseMode::MarkdownV2)
+            .await?;
             return Ok(());
         }
 
@@ -150,7 +225,7 @@ impl BotHandler {
             // Create or get task and subscription
             match self
                 .create_subscription(
-                    chat_id.0,
+                    target_chat_id.0,
                     TaskType::Author,
                     author_id_str,
                     Some(&author_name),
@@ -173,10 +248,17 @@ impl BotHandler {
         }
 
         // Build filter tags suffix if any
-        let filter_suffix = if filter_tags.is_empty() {
+        let mut suffix_parts = Vec::new();
+        if !filter_tags.is_empty() {
+            suffix_parts.push(format!("🏷 {}", filter_tags.format_for_display()));
+        }
+        if is_channel {
+            suffix_parts.push(format!("📢 频道: `{}`", target_chat_id.0));
+        }
+        let filter_suffix = if suffix_parts.is_empty() {
             None
         } else {
-            Some(format!("\n🏷 {}", filter_tags.format_for_display()))
+            Some(format!("\n{}", suffix_parts.join("\n")))
         };
 
         // Build response message with filter suffix
@@ -199,26 +281,42 @@ impl BotHandler {
 
     /// 订阅 Pixiv 排行榜
     ///
-    /// 用法: `/subrank <mode> [+tag1 -tag2]`
+    /// 用法: `/subrank [channel=<id>] <mode> [+tag1 -tag2]`
     pub async fn handle_sub_ranking(
         &self,
         bot: Bot,
         chat_id: ChatId,
-        args: String,
+        user_id: Option<UserId>,
+        args_str: String,
     ) -> ResponseResult<()> {
         // Set bot status to typing
         if let Err(e) = bot.send_chat_action(chat_id, ChatAction::Typing).await {
             warn!("Failed to set chat action for chat {}: {:#}", chat_id, e);
         }
 
-        let parts: Vec<&str> = args.split_whitespace().collect();
+        // Parse key-value parameters from the beginning
+        let parsed = args::parse_args(&args_str);
+
+        // Resolve target chat (channel or current)
+        let (target_chat_id, is_channel) = match self
+            .resolve_subscription_target(&bot, chat_id, user_id, &parsed)
+            .await
+        {
+            Ok(result) => result,
+            Err(e) => {
+                bot.send_message(chat_id, format!("❌ {}", e)).await?;
+                return Ok(());
+            }
+        };
+
+        let parts: Vec<&str> = parsed.remaining.split_whitespace().collect();
 
         if parts.is_empty() {
             let available_modes = RankingMode::all_modes().join(", ");
             bot.send_message(
                 chat_id,
                 format!(
-                    "❌ 用法: `/subrank <mode> [+tag1 -tag2]`\n可用模式: {}",
+                    "❌ 用法: `/subrank [channel=<id>] <mode> [+tag1 -tag2]`\n可用模式: {}",
                     markdown::escape(&available_modes)
                 ),
             )
@@ -247,7 +345,7 @@ impl BotHandler {
         // Create subscription
         match self
             .create_subscription(
-                chat_id.0,
+                target_chat_id.0,
                 TaskType::Ranking,
                 mode.as_str(),
                 None,
@@ -259,6 +357,9 @@ impl BotHandler {
                 let mut message = format!("✅ 成功订阅 {}", mode.display_name());
                 if !filter_tags.is_empty() {
                     message.push_str(&format!("\n\n🏷 {}", filter_tags.format_for_display()));
+                }
+                if is_channel {
+                    message.push_str(&format!("\n📢 频道: `{}`", target_chat_id.0));
                 }
                 bot.send_message(chat_id, message)
                     .parse_mode(ParseMode::MarkdownV2)
@@ -279,17 +380,33 @@ impl BotHandler {
 
     /// 取消订阅作者
     ///
-    /// 用法: `/unsub <author_id,...>`
+    /// 用法: `/unsub [channel=<id>] <author_id,...>`
     pub async fn handle_unsub_author(
         &self,
         bot: Bot,
         chat_id: ChatId,
-        args: String,
+        user_id: Option<UserId>,
+        args_str: String,
     ) -> ResponseResult<()> {
-        let ids_str = args.trim();
+        // Parse key-value parameters from the beginning
+        let parsed = args::parse_args(&args_str);
+
+        // Resolve target chat (channel or current)
+        let (target_chat_id, is_channel) = match self
+            .resolve_subscription_target(&bot, chat_id, user_id, &parsed)
+            .await
+        {
+            Ok(result) => result,
+            Err(e) => {
+                bot.send_message(chat_id, format!("❌ {}", e)).await?;
+                return Ok(());
+            }
+        };
+
+        let ids_str = parsed.remaining.trim();
 
         if ids_str.is_empty() {
-            bot.send_message(chat_id, "❌ 用法: `/unsub <author_id,...>`")
+            bot.send_message(chat_id, "❌ 用法: `/unsub [channel=<id>] <author_id,...>`")
                 .parse_mode(ParseMode::MarkdownV2)
                 .await?;
             return Ok(());
@@ -305,7 +422,7 @@ impl BotHandler {
 
         for author_id in author_ids {
             match self
-                .delete_subscription(chat_id.0, TaskType::Author, author_id)
+                .delete_subscription(target_chat_id.0, TaskType::Author, author_id)
                 .await
             {
                 Ok(author_name) => {
@@ -324,7 +441,10 @@ impl BotHandler {
             }
         }
 
-        let response = result.build_response("✅ 成功取消订阅:", "❌ 取消订阅失败:");
+        let mut response = result.build_response("✅ 成功取消订阅:", "❌ 取消订阅失败:");
+        if is_channel && !result.success.is_empty() {
+            response.push_str(&format!("\n📢 频道: `{}`", target_chat_id.0));
+        }
         bot.send_message(chat_id, response)
             .parse_mode(ParseMode::MarkdownV2)
             .await?;
@@ -338,17 +458,33 @@ impl BotHandler {
 
     /// 取消订阅排行榜
     ///
-    /// 用法: `/unsubrank <mode>`
+    /// 用法: `/unsubrank [channel=<id>] <mode>`
     pub async fn handle_unsub_ranking(
         &self,
         bot: Bot,
         chat_id: ChatId,
-        args: String,
+        user_id: Option<UserId>,
+        args_str: String,
     ) -> ResponseResult<()> {
-        let mode_str = args.trim();
+        // Parse key-value parameters from the beginning
+        let parsed = args::parse_args(&args_str);
+
+        // Resolve target chat (channel or current)
+        let (target_chat_id, is_channel) = match self
+            .resolve_subscription_target(&bot, chat_id, user_id, &parsed)
+            .await
+        {
+            Ok(result) => result,
+            Err(e) => {
+                bot.send_message(chat_id, format!("❌ {}", e)).await?;
+                return Ok(());
+            }
+        };
+
+        let mode_str = parsed.remaining.trim();
 
         if mode_str.is_empty() {
-            bot.send_message(chat_id, "❌ 用法: `/unsubrank <mode>`")
+            bot.send_message(chat_id, "❌ 用法: `/unsubrank [channel=<id>] <mode>`")
                 .parse_mode(ParseMode::MarkdownV2)
                 .await?;
             return Ok(());
@@ -369,11 +505,15 @@ impl BotHandler {
         };
 
         match self
-            .delete_subscription(chat_id.0, TaskType::Ranking, mode.as_str())
+            .delete_subscription(target_chat_id.0, TaskType::Ranking, mode.as_str())
             .await
         {
             Ok(_) => {
-                bot.send_message(chat_id, format!("✅ 成功取消订阅 {}", mode.display_name()))
+                let mut message = format!("✅ 成功取消订阅 {}", mode.display_name());
+                if is_channel {
+                    message.push_str(&format!("\n📢 频道: `{}`", target_chat_id.0));
+                }
+                bot.send_message(chat_id, message)
                     .parse_mode(ParseMode::MarkdownV2)
                     .await?;
             }
