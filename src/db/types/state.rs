@@ -47,7 +47,8 @@ pub struct EhGalleryState {
 /// E-Hentai 搜索订阅状态
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EhSearchState {
-    /// 已推送的画廊 gid 列表 (最近 100 个)
+    /// 已推送的画廊 gid 列表
+    /// 注意: 引擎实现应限制数量避免无限增长
     pub pushed_gids: Vec<u64>,
     /// 最后检查时间 (Unix timestamp)
     #[serde(default)]

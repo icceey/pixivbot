@@ -14,7 +14,7 @@ const EXHENTAI_HOST: &str = "https://exhentai.org";
 const API_URL: &str = "https://api.e-hentai.org/api.php";
 
 const USER_AGENT_VALUE: &str =
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36";
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
 /// E-Hentai 源选择
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -265,59 +265,7 @@ impl EhClient {
         }
 
         // Parse search results from HTML
-        self.parse_search_results(&html, page)
-    }
-
-    /// 从 HTML 解析搜索结果
-    fn parse_search_results(&self, html: &str, page: u32) -> Result<SearchResult> {
-        let mut galleries = Vec::new();
-        let mut gid_tokens = Vec::new();
-
-        // Simple regex-based parsing for gallery links
-        // Format: /g/{gid}/{token}/
-        let gallery_regex =
-            regex::Regex::new(r#"href="https://e[x-]?hentai\.org/g/(\d+)/([a-f0-9]+)/""#).unwrap();
-
-        for cap in gallery_regex.captures_iter(html) {
-            if let (Some(gid_str), Some(token)) = (cap.get(1), cap.get(2)) {
-                if let Ok(gid) = gid_str.as_str().parse::<u64>() {
-                    let token_str = token.as_str().to_string();
-                    // Avoid duplicates
-                    if !gid_tokens.iter().any(|(g, _): &(u64, String)| *g == gid) {
-                        gid_tokens.push((gid, token_str));
-                    }
-                }
-            }
-        }
-
-        // Fetch metadata for all found galleries
-        if !gid_tokens.is_empty() {
-            // Convert to the format expected by get_gallery_metadata
-            let gidlist: Vec<(u64, &str)> =
-                gid_tokens.iter().map(|(g, t)| (*g, t.as_str())).collect();
-
-            // Limit to 25 per API call
-            for chunk in gidlist.chunks(25) {
-                match tokio::runtime::Handle::current()
-                    .block_on(async { self.get_gallery_metadata(chunk).await })
-                {
-                    Ok(metas) => galleries.extend(metas),
-                    Err(e) => {
-                        tracing::warn!("Failed to fetch gallery metadata: {}", e);
-                    }
-                }
-            }
-        }
-
-        // Check if there are more pages (look for "next" link)
-        let has_next = html.contains(">Next<") || html.contains(&format!("page={}", page + 1));
-
-        Ok(SearchResult {
-            galleries,
-            has_next,
-            page,
-            total: None,
-        })
+        self.parse_search_results_async(&html, page).await
     }
 
     /// 异步解析搜索结果
@@ -364,68 +312,6 @@ impl EhClient {
             page,
             total: None,
         })
-    }
-
-    /// 搜索画廊 (异步版本)
-    pub async fn search_async(
-        &self,
-        query: &str,
-        categories: Option<&[Category]>,
-        min_rating: Option<u8>,
-        page: u32,
-    ) -> Result<SearchResult> {
-        let host = self.config.source.host();
-
-        let cat_filter = if let Some(cats) = categories {
-            let mut mask = 0u32;
-            for cat in cats {
-                mask |= category_bitmask(*cat);
-            }
-            1023 ^ mask
-        } else {
-            0
-        };
-
-        let mut url = format!("{}/?f_search={}", host, urlencoding::encode(query));
-
-        if cat_filter > 0 {
-            url.push_str(&format!("&f_cats={}", cat_filter));
-        }
-
-        if let Some(rating) = min_rating {
-            if (2..=5).contains(&rating) {
-                url.push_str(&format!("&f_srdd={}", rating));
-            }
-        }
-
-        if page > 0 {
-            url.push_str(&format!("&page={}", page));
-        }
-
-        tracing::debug!("Searching: {}", url);
-
-        let response = self
-            .client
-            .get(&url)
-            .headers(self.build_headers())
-            .send()
-            .await?;
-
-        let status = response.status();
-        let html = response.text().await?;
-
-        if !status.is_success() {
-            return Err(Error::Api {
-                message: html,
-                status: status.as_u16(),
-            });
-        }
-
-        if html.contains("sadpanda.jpg") || html.len() < 1000 {
-            return Err(Error::ExhentaiRequired);
-        }
-
-        self.parse_search_results_async(&html, page).await
     }
 
     /// 检查画廊是否有更新版本
