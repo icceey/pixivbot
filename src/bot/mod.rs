@@ -10,12 +10,13 @@ use crate::db::repo::Repo;
 use crate::db::types::UserRole;
 use crate::pixiv::client::PixivClient;
 use anyhow::Result;
+use handlers::LIST_CALLBACK_PREFIX;
 use std::sync::Arc;
 use teloxide::dispatching::{Dispatcher, UpdateFilterExt};
 use teloxide::dptree;
 use teloxide::prelude::*;
 use teloxide::types::BotCommandScope;
-use tracing::info;
+use tracing::{info, warn};
 
 pub use commands::Command;
 pub use handler::BotHandler;
@@ -107,11 +108,23 @@ fn build_handler_tree(
         .chain(middleware::filter_chat_accessible())
         .endpoint(handle_message);
 
-    dptree::entry()
-        .chain(Update::filter_message())
-        .branch(admin_chat_control_handler) // Check admin commands first
-        .branch(command_handler)
-        .branch(message_handler)
+    // Callback query handler for pagination
+    let callback_handler = Update::filter_callback_query()
+        .filter_map(|q: CallbackQuery| {
+            // Filter for list pagination callbacks
+            q.data
+                .as_ref()
+                .filter(|data| data.starts_with(LIST_CALLBACK_PREFIX))
+                .cloned()
+        })
+        .endpoint(handle_list_callback);
+
+    dptree::entry().branch(callback_handler).branch(
+        Update::filter_message()
+            .branch(admin_chat_control_handler)
+            .branch(command_handler)
+            .branch(message_handler),
+    )
 }
 
 /// 处理命令
@@ -135,6 +148,47 @@ async fn handle_message(
     ctx: UserChatContext,
 ) -> HandlerResult {
     handler.handle_message(bot, msg, &text, ctx).await?;
+    Ok(())
+}
+
+/// 处理列表分页回调
+async fn handle_list_callback(
+    bot: Bot,
+    q: CallbackQuery,
+    callback_data: String,
+    handler: BotHandler,
+) -> HandlerResult {
+    // Answer the callback to remove loading indicator
+    if let Err(e) = bot.answer_callback_query(q.id.clone()).await {
+        warn!("Failed to answer callback query: {:#}", e);
+    }
+
+    // Parse page number from callback data (format: "list:N" or "list:noop")
+    let page_str = callback_data
+        .strip_prefix(LIST_CALLBACK_PREFIX)
+        .unwrap_or("0");
+
+    // Handle noop (page indicator button)
+    if page_str == "noop" {
+        return Ok(());
+    }
+
+    let page: usize = page_str.parse().unwrap_or_else(|_| {
+        warn!("Invalid page number in callback data: {}", page_str);
+        0
+    });
+
+    // Get message and chat info from the callback query
+    if let Some(msg) = q.message {
+        let chat_id = msg.chat().id;
+        let message_id = msg.id();
+
+        // Update the subscription list message
+        handler
+            .send_subscription_list(bot, chat_id, page, Some(message_id))
+            .await?;
+    }
+
     Ok(())
 }
 
