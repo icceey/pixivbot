@@ -10,7 +10,8 @@ use std::sync::LazyLock;
 
 /// Regex for matching key-value pairs in command arguments.
 /// Format: `key=value` where key is alphanumeric (including underscore) and
-/// value is alphanumeric or digits (including underscore, dash, and can be empty).
+/// value can contain alphanumerics, underscores, and hyphens (for negative channel IDs like -1001234567890).
+/// The value can also be empty.
 static KV_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^(\w+)=([\w\-]*)$").unwrap());
 
 /// Result of parsing command arguments with key-value parameters.

@@ -101,9 +101,8 @@ pub async fn validate_channel_permissions(
 
 /// Parse a channel identifier from string.
 ///
-/// Supports:
-/// - Channel ID as number (e.g., "-1001234567890")
-/// - Channel username (e.g., "@channelname" or "channelname")
+/// Currently only supports numeric channel IDs (e.g., "-1001234567890").
+/// Channel usernames are not supported.
 ///
 /// Returns the ChatId for the channel.
 pub fn parse_channel_id(input: &str) -> Result<ChatId, String> {
