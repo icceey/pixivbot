@@ -334,6 +334,27 @@ impl Repo {
             .context("Failed to update task after poll")
     }
 
+    /// Update the author_name field of a task
+    pub async fn update_task_author_name(
+        &self,
+        task_id: i32,
+        author_name: Option<String>,
+    ) -> Result<tasks::Model> {
+        let task = tasks::Entity::find_by_id(task_id)
+            .one(&self.db)
+            .await
+            .context("Failed to query task")?
+            .ok_or_else(|| anyhow::anyhow!("Task {} not found", task_id))?;
+
+        let mut active: tasks::ActiveModel = task.into_active_model();
+        active.author_name = Set(author_name);
+
+        active
+            .update(&self.db)
+            .await
+            .context("Failed to update task author_name")
+    }
+
     /// Delete a task (and cascade delete subscriptions)
     pub async fn delete_task(&self, task_id: i32) -> Result<()> {
         tasks::Entity::delete_by_id(task_id)
@@ -541,7 +562,7 @@ impl Repo {
         chat_id: i64,
         message_id: i32,
         subscription_id: i32,
-        illust_id: Option<u64>,
+        illust_id: Option<i64>,
     ) -> Result<messages::Model> {
         let now = Local::now().naive_local();
 

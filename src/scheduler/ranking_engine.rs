@@ -346,7 +346,7 @@ impl RankingEngine {
 
         // Save message record for reply-based unsubscribe (use first illust_id)
         if let Some(msg_id) = send_result.first_message_id {
-            let first_illust_id = illust_ids.first().copied();
+            let first_illust_id = illust_ids.first().map(|&id| id as i64);
             if let Err(e) = self
                 .repo
                 .save_message(chat_id.0, msg_id, ctx.subscription.id, first_illust_id)

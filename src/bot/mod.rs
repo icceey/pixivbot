@@ -184,8 +184,9 @@ async fn handle_list_callback(
         let message_id = msg.id();
 
         // Update the subscription list message
+        // For pagination callback, use same chat_id for reply and target (no channel support in pagination)
         handler
-            .send_subscription_list(bot, chat_id, page, Some(message_id))
+            .send_subscription_list(bot, chat_id, chat_id, page, Some(message_id), false)
             .await?;
     }
 

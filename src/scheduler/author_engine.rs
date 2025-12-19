@@ -337,7 +337,12 @@ impl AuthorEngine {
                 if let Some(msg_id) = first_message_id {
                     if let Err(e) = self
                         .repo
-                        .save_message(chat_id.0, msg_id, ctx.subscription.id, Some(illust_id))
+                        .save_message(
+                            chat_id.0,
+                            msg_id,
+                            ctx.subscription.id,
+                            Some(illust_id as i64),
+                        )
                         .await
                     {
                         warn!("Failed to save message record: {:#}", e);
@@ -364,7 +369,12 @@ impl AuthorEngine {
                 if let Some(msg_id) = first_message_id {
                     if let Err(e) = self
                         .repo
-                        .save_message(chat_id.0, msg_id, ctx.subscription.id, Some(illust_id))
+                        .save_message(
+                            chat_id.0,
+                            msg_id,
+                            ctx.subscription.id,
+                            Some(illust_id as i64),
+                        )
                         .await
                     {
                         warn!("Failed to save message record: {:#}", e);
@@ -483,7 +493,12 @@ impl AuthorEngine {
                 if let Some(msg_id) = first_message_id {
                     if let Err(e) = self
                         .repo
-                        .save_message(chat_id.0, msg_id, ctx.subscription.id, Some(illust_id))
+                        .save_message(
+                            chat_id.0,
+                            msg_id,
+                            ctx.subscription.id,
+                            Some(illust_id as i64),
+                        )
                         .await
                     {
                         warn!("Failed to save message record: {:#}", e);
@@ -510,7 +525,12 @@ impl AuthorEngine {
                 if let Some(msg_id) = first_message_id {
                     if let Err(e) = self
                         .repo
-                        .save_message(chat_id.0, msg_id, ctx.subscription.id, Some(illust_id))
+                        .save_message(
+                            chat_id.0,
+                            msg_id,
+                            ctx.subscription.id,
+                            Some(illust_id as i64),
+                        )
                         .await
                     {
                         warn!("Failed to save message record: {:#}", e);
