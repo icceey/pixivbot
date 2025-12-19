@@ -325,11 +325,24 @@ impl AuthorEngine {
 
         // Calculate new state based on result
         let new_state = match push_result {
-            PushResult::Success { illust_id } => {
+            PushResult::Success {
+                illust_id,
+                first_message_id,
+            } => {
                 info!(
                     "✅ Completed pending illust {} for chat {}",
                     illust_id, chat_id
                 );
+                // Save message record for reply-based unsubscribe
+                if let Some(msg_id) = first_message_id {
+                    if let Err(e) = self
+                        .repo
+                        .save_message(chat_id.0, msg_id, ctx.subscription.id, Some(illust_id))
+                        .await
+                    {
+                        warn!("Failed to save message record: {:#}", e);
+                    }
+                }
                 AuthorState {
                     latest_illust_id: illust_id,
                     pending_illust: None,
@@ -339,6 +352,7 @@ impl AuthorEngine {
                 illust_id,
                 sent_pages,
                 total_pages,
+                first_message_id,
             } => {
                 warn!(
                     "⚠️  Partially sent illust {} ({}/{} pages)",
@@ -346,6 +360,16 @@ impl AuthorEngine {
                     sent_pages.len(),
                     total_pages
                 );
+                // Save message record even for partial success
+                if let Some(msg_id) = first_message_id {
+                    if let Err(e) = self
+                        .repo
+                        .save_message(chat_id.0, msg_id, ctx.subscription.id, Some(illust_id))
+                        .await
+                    {
+                        warn!("Failed to save message record: {:#}", e);
+                    }
+                }
                 AuthorState {
                     latest_illust_id: state.latest_illust_id,
                     pending_illust: Some(PendingIllust {
@@ -447,11 +471,24 @@ impl AuthorEngine {
 
         // Calculate new state based on result
         let new_state = match push_result {
-            PushResult::Success { illust_id } => {
+            PushResult::Success {
+                illust_id,
+                first_message_id,
+            } => {
                 info!(
                     "✅ Successfully sent illust {} to chat {}",
                     illust_id, chat_id
                 );
+                // Save message record for reply-based unsubscribe
+                if let Some(msg_id) = first_message_id {
+                    if let Err(e) = self
+                        .repo
+                        .save_message(chat_id.0, msg_id, ctx.subscription.id, Some(illust_id))
+                        .await
+                    {
+                        warn!("Failed to save message record: {:#}", e);
+                    }
+                }
                 AuthorState {
                     latest_illust_id: illust_id,
                     pending_illust: None,
@@ -461,6 +498,7 @@ impl AuthorEngine {
                 illust_id,
                 sent_pages,
                 total_pages,
+                first_message_id,
             } => {
                 warn!(
                     "⚠️  Partially sent illust {} ({}/{} pages)",
@@ -468,6 +506,16 @@ impl AuthorEngine {
                     sent_pages.len(),
                     total_pages
                 );
+                // Save message record even for partial success
+                if let Some(msg_id) = first_message_id {
+                    if let Err(e) = self
+                        .repo
+                        .save_message(chat_id.0, msg_id, ctx.subscription.id, Some(illust_id))
+                        .await
+                    {
+                        warn!("Failed to save message record: {:#}", e);
+                    }
+                }
                 AuthorState {
                     latest_illust_id: last_illust_id.unwrap_or(0),
                     pending_illust: Some(PendingIllust {

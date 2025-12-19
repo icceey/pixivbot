@@ -12,12 +12,16 @@ use tracing::info;
 #[derive(Debug)]
 pub enum PushResult {
     /// All pages sent successfully
-    Success { illust_id: u64 },
+    Success {
+        illust_id: u64,
+        first_message_id: Option<i32>,
+    },
     /// Some pages failed, need to retry
     Partial {
         illust_id: u64,
         sent_pages: Vec<usize>,
         total_pages: usize,
+        first_message_id: Option<i32>,
     },
     /// Complete failure, retry later
     Failure { illust_id: u64 },
@@ -83,6 +87,7 @@ pub async fn process_illust_push(
     if pages_to_send.is_empty() {
         return Ok(PushResult::Success {
             illust_id: illust.id,
+            first_message_id: None,
         });
     }
 
@@ -160,6 +165,8 @@ fn map_send_result_to_push_result(
     attempted_pages: &[usize],
     total_pages: usize,
 ) -> PushResult {
+    let first_message_id = send_result.first_message_id;
+
     if send_result.is_complete_success() {
         // All attempted pages succeeded
         let mut all_sent = already_sent.to_vec();
@@ -168,13 +175,17 @@ fn map_send_result_to_push_result(
         all_sent.dedup();
 
         if all_sent.len() == total_pages {
-            PushResult::Success { illust_id }
+            PushResult::Success {
+                illust_id,
+                first_message_id,
+            }
         } else {
             // Should not happen, but handle gracefully
             PushResult::Partial {
                 illust_id,
                 sent_pages: all_sent,
                 total_pages,
+                first_message_id,
             }
         }
     } else if send_result.is_complete_failure() {
@@ -194,6 +205,7 @@ fn map_send_result_to_push_result(
             illust_id,
             sent_pages: all_sent,
             total_pages,
+            first_message_id,
         }
     }
 }

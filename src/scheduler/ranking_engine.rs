@@ -9,7 +9,7 @@ use pixiv_client::Illust;
 use std::sync::Arc;
 use teloxide::prelude::*;
 use tokio::time::{sleep, Duration};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 pub struct RankingEngine {
     repo: Arc<Repo>,
@@ -342,6 +342,18 @@ impl RankingEngine {
             );
             // Don't update pushed_ids, retry next tick
             return Ok(());
+        }
+
+        // Save message record for reply-based unsubscribe (use first illust_id)
+        if let Some(msg_id) = send_result.first_message_id {
+            let first_illust_id = illust_ids.first().copied();
+            if let Err(e) = self
+                .repo
+                .save_message(chat_id.0, msg_id, ctx.subscription.id, first_illust_id)
+                .await
+            {
+                warn!("Failed to save message record: {:#}", e);
+            }
         }
 
         // Update pushed_ids with successfully sent illusts

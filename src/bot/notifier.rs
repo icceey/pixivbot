@@ -11,19 +11,16 @@ use tracing::{error, info, warn};
 pub struct BatchSendResult {
     pub succeeded_indices: Vec<usize>,
     pub failed_indices: Vec<usize>,
+    /// The first message ID from the batch (for tracking/reply purposes)
+    pub first_message_id: Option<i32>,
 }
 
 impl BatchSendResult {
-    pub fn all_succeeded(total: usize) -> Self {
-        Self {
-            succeeded_indices: (0..total).collect(),
-            failed_indices: Vec::new(),
-        }
-    }
-    pub fn all_failed(total: usize) -> Self {
+    fn all_failed(total: usize) -> Self {
         Self {
             succeeded_indices: Vec::new(),
             failed_indices: (0..total).collect(),
+            first_message_id: None,
         }
     }
     pub fn is_complete_success(&self) -> bool {
@@ -56,31 +53,6 @@ impl Notifier {
     /// Get reference to the downloader (used by download handler)
     pub fn get_downloader(&self) -> &Arc<Downloader> {
         &self.downloader
-    }
-
-    /// 下载并发送单张图片
-    pub async fn notify_with_image(
-        &self,
-        chat_id: ChatId,
-        image_url: &str,
-        caption: Option<&str>,
-        has_spoiler: bool,
-    ) -> Result<()> {
-        info!(
-            "Downloading and sending image to chat {}: {}",
-            chat_id, image_url
-        );
-        // Set bot status to uploading photo
-        if let Err(e) = self
-            .bot
-            .send_chat_action(chat_id, ChatAction::UploadPhoto)
-            .await
-        {
-            warn!("Failed to set chat action for chat {}: {:#}", chat_id, e);
-        }
-        let local_path = self.downloader.download(image_url).await?;
-        self.send_photo_file(chat_id, &local_path, caption, has_spoiler)
-            .await
     }
 
     /// 发送多张图片（共享文案）
@@ -144,12 +116,16 @@ impl Notifier {
             };
 
             match self
-                .notify_with_image(chat_id, &image_urls[0], cap, has_spoiler)
+                .send_single_image(chat_id, &image_urls[0], cap, has_spoiler)
                 .await
             {
-                Ok(_) => {
+                Ok(msg_id) => {
                     sleep(Duration::from_secs(2)).await;
-                    return BatchSendResult::all_succeeded(1);
+                    return BatchSendResult {
+                        succeeded_indices: vec![0],
+                        failed_indices: Vec::new(),
+                        first_message_id: Some(msg_id),
+                    };
                 }
                 Err(e) => {
                     error!("Single image send failed for chat {}: {:#}", chat_id, e);
@@ -186,6 +162,7 @@ impl Notifier {
         let mut succeeded = Vec::new();
         let mut failed = Vec::new();
         let mut current_idx = 0;
+        let mut first_message_id: Option<i32> = None;
 
         for (batch_idx, path_chunk) in chunks.into_iter().enumerate() {
             let batch_size = path_chunk.len();
@@ -200,7 +177,7 @@ impl Notifier {
 
             let silent = batch_idx > 0;
 
-            if let Err(e) = self
+            match self
                 .send_media_batch(
                     chat_id,
                     path_chunk,
@@ -213,16 +190,23 @@ impl Notifier {
                 )
                 .await
             {
-                warn!(
-                    "Batch {}/{} failed for chat {}: {:#}",
-                    batch_idx + 1,
-                    total_batches,
-                    chat_id,
-                    e
-                );
-                failed.extend(current_idx..batch_end_idx);
-            } else {
-                succeeded.extend(current_idx..batch_end_idx);
+                Ok(msg_id) => {
+                    succeeded.extend(current_idx..batch_end_idx);
+                    // Capture the first message ID from the first successful batch
+                    if first_message_id.is_none() {
+                        first_message_id = msg_id;
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        "Batch {}/{} failed for chat {}: {:#}",
+                        batch_idx + 1,
+                        total_batches,
+                        chat_id,
+                        e
+                    );
+                    failed.extend(current_idx..batch_end_idx);
+                }
             }
 
             current_idx += batch_size;
@@ -247,10 +231,36 @@ impl Notifier {
         BatchSendResult {
             succeeded_indices: succeeded,
             failed_indices: failed,
+            first_message_id,
         }
     }
 
-    /// 底层发送：构建 InputMedia 并调用 API
+    /// 发送单张图片并返回消息ID
+    async fn send_single_image(
+        &self,
+        chat_id: ChatId,
+        image_url: &str,
+        caption: Option<&str>,
+        has_spoiler: bool,
+    ) -> Result<i32> {
+        info!(
+            "Downloading and sending image to chat {}: {}",
+            chat_id, image_url
+        );
+        // Set bot status to uploading photo
+        if let Err(e) = self
+            .bot
+            .send_chat_action(chat_id, ChatAction::UploadPhoto)
+            .await
+        {
+            warn!("Failed to set chat action for chat {}: {:#}", chat_id, e);
+        }
+        let local_path = self.downloader.download(image_url).await?;
+        self.send_photo_file_with_id(chat_id, &local_path, caption, has_spoiler)
+            .await
+    }
+
+    /// 底层发送：构建 InputMedia 并调用 API，返回第一条消息的ID
     #[allow(clippy::too_many_arguments)]
     async fn send_media_batch(
         &self,
@@ -262,7 +272,7 @@ impl Notifier {
         batch_idx: usize,
         total_batches: usize,
         silent: bool,
-    ) -> Result<()> {
+    ) -> Result<Option<i32>> {
         let media_group: Vec<InputMedia> = paths
             .iter()
             .enumerate()
@@ -326,17 +336,19 @@ impl Notifier {
         if silent {
             req = req.disable_notification(true);
         }
-        req.await.context("Send media group failed")?;
-        Ok(())
+        let messages = req.await.context("Send media group failed")?;
+        // Return the first message ID from the group
+        let first_msg_id = messages.first().map(|m| m.id.0);
+        Ok(first_msg_id)
     }
 
-    async fn send_photo_file(
+    async fn send_photo_file_with_id(
         &self,
         chat_id: ChatId,
         path: &Path,
         caption: Option<&str>,
         has_spoiler: bool,
-    ) -> Result<()> {
+    ) -> Result<i32> {
         let mut req = self.bot.send_photo(chat_id, InputFile::file(path));
         if let Some(c) = caption {
             req = req.caption(c).parse_mode(ParseMode::MarkdownV2);
@@ -344,7 +356,7 @@ impl Notifier {
         if has_spoiler {
             req = req.has_spoiler(true);
         }
-        req.await.context("Send photo failed")?;
-        Ok(())
+        let message = req.await.context("Send photo failed")?;
+        Ok(message.id.0)
     }
 }

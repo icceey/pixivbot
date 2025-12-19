@@ -538,6 +538,105 @@ impl BotHandler {
     }
 
     // ------------------------------------------------------------------------
+    // Unsubscribe by Reply (unsub this)
+    // ------------------------------------------------------------------------
+
+    /// 通过回复消息取消订阅
+    ///
+    /// 用法: 回复 bot 发送的订阅推送消息，发送 `/unsubthis`
+    pub async fn handle_unsub_this(
+        &self,
+        bot: Bot,
+        msg: Message,
+        chat_id: ChatId,
+    ) -> ResponseResult<()> {
+        // Check if this is a reply to a message
+        let reply_to = match msg.reply_to_message() {
+            Some(reply) => reply,
+            None => {
+                bot.send_message(chat_id, "❌ 请回复一条订阅推送消息来取消对应的订阅")
+                    .await?;
+                return Ok(());
+            }
+        };
+
+        let reply_message_id = reply_to.id.0;
+
+        // Look up the message in our database
+        let message_info = match self
+            .repo
+            .get_message_with_subscription(chat_id.0, reply_message_id)
+            .await
+        {
+            Ok(Some((msg_record, Some((sub, task))))) => (msg_record, sub, task),
+            Ok(Some((_, None))) => {
+                bot.send_message(chat_id, "❌ 该订阅已不存在").await?;
+                return Ok(());
+            }
+            Ok(None) => {
+                bot.send_message(chat_id, "❌ 未找到该消息对应的订阅记录")
+                    .await?;
+                return Ok(());
+            }
+            Err(e) => {
+                error!("Failed to get message: {:#}", e);
+                bot.send_message(chat_id, "❌ 查询订阅记录失败").await?;
+                return Ok(());
+            }
+        };
+
+        let (_msg_record, subscription, task) = message_info;
+        let task = match task {
+            Some(t) => t,
+            None => {
+                bot.send_message(chat_id, "❌ 该订阅的任务已不存在").await?;
+                return Ok(());
+            }
+        };
+
+        // Delete the subscription
+        let subscription_id = subscription.id;
+        let task_id = task.id;
+        let task_type = task.r#type;
+        let task_value = task.value.clone();
+
+        if let Err(e) = self.repo.delete_subscription(subscription_id).await {
+            error!("Failed to delete subscription {}: {:#}", subscription_id, e);
+            bot.send_message(chat_id, "❌ 取消订阅失败").await?;
+            return Ok(());
+        }
+
+        // Cleanup orphaned task
+        self.cleanup_orphaned_task(task_id, task_type, &task_value)
+            .await;
+
+        // Build success message based on task type
+        let display_name = match task_type {
+            TaskType::Author => {
+                if let Some(ref name) = task.author_name {
+                    format!(
+                        "作者 *{}* \\(ID: `{}`\\)",
+                        markdown::escape(name),
+                        task_value
+                    )
+                } else {
+                    format!("作者 `{}`", task_value)
+                }
+            }
+            TaskType::Ranking => match RankingMode::from_str(&task_value) {
+                Some(mode) => mode.display_name().to_string(),
+                None => format!("排行榜 `{}`", markdown::escape(&task_value)),
+            },
+        };
+
+        bot.send_message(chat_id, format!("✅ 成功取消订阅 {}", display_name))
+            .parse_mode(ParseMode::MarkdownV2)
+            .await?;
+
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------------
     // List Subscriptions
     // ------------------------------------------------------------------------
 
