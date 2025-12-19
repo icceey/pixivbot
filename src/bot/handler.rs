@@ -104,6 +104,11 @@ impl BotHandler {
             Command::UnsubThis => self.handle_unsub_this(bot, msg, chat_id).await,
             Command::List(args) => self.handle_list(bot, chat_id, user_id, args).await,
 
+            // E-Hentai commands (defined in handlers/ehentai.rs)
+            Command::EhSub(args) => self.handle_eh_sub(bot, chat_id, user_id, args).await,
+            Command::EhUnsub(args) => self.handle_eh_unsub(bot, chat_id, user_id, args).await,
+            Command::EhList(args) => self.handle_eh_list(bot, chat_id, user_id, args).await,
+
             // Chat settings commands (defined in handlers/settings.rs)
             Command::BlurSensitive(args) => self.handle_blur_sensitive(bot, chat_id, args).await,
             Command::SensitiveTags(args) => self.handle_sensitive_tags(bot, chat_id, args).await,

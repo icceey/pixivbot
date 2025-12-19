@@ -24,6 +24,10 @@ pub struct Config {
     pub scheduler: SchedulerConfig,
     #[serde(default)]
     pub content: ContentConfig,
+    /// E-Hentai 配置 (可选)
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub ehentai: Option<EhConfig>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -175,6 +179,100 @@ impl Default for ContentConfig {
             sensitive_tags: vec!["R-18".to_string(), "R-18G".to_string(), "NSFW".to_string()],
             image_size: ImageSize::default(),
         }
+    }
+}
+
+/// E-Hentai 源选择
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+#[allow(dead_code)]
+pub enum EhSource {
+    /// e-hentai.org (不需要登录)
+    #[default]
+    EHentai,
+    /// exhentai.org (需要登录)
+    ExHentai,
+}
+
+impl EhSource {
+    /// 转换为 eh_client::EhSource
+    #[allow(dead_code)]
+    pub fn to_client_source(self) -> eh_client::EhSource {
+        match self {
+            EhSource::EHentai => eh_client::EhSource::EHentai,
+            EhSource::ExHentai => eh_client::EhSource::ExHentai,
+        }
+    }
+}
+
+/// E-Hentai 订阅输出模式
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+#[allow(dead_code)]
+pub enum EhOutputMode {
+    /// 仅发送通知消息 (带画廊链接)
+    #[default]
+    NotifyOnly,
+    /// 发送预览图片
+    Preview,
+    /// 发送完整画廊
+    Full,
+}
+
+/// E-Hentai 配置
+#[derive(Debug, Deserialize, Clone)]
+#[allow(dead_code)]
+pub struct EhConfig {
+    /// 使用的源 (ehentai 或 exhentai)
+    #[serde(default)]
+    pub source: EhSource,
+    /// ipb_member_id cookie (登录后获取)
+    pub member_id: Option<String>,
+    /// ipb_pass_hash cookie (登录后获取)
+    pub pass_hash: Option<String>,
+    /// igneous cookie (exhentai 可能需要)
+    pub igneous: Option<String>,
+    /// 订阅输出模式
+    #[serde(default)]
+    pub output_mode: EhOutputMode,
+    /// 预览图片数量 (用于 Preview 模式)
+    #[serde(default = "default_preview_count")]
+    pub preview_count: u32,
+    /// 搜索最低评分过滤 (2-5)
+    #[serde(default)]
+    pub min_rating: Option<u8>,
+}
+
+fn default_preview_count() -> u32 {
+    5
+}
+
+#[allow(dead_code)]
+impl EhConfig {
+    /// 获取凭据 (如果已配置)
+    pub fn credentials(&self) -> Option<eh_client::EhCredentials> {
+        match (&self.member_id, &self.pass_hash) {
+            (Some(member_id), Some(pass_hash)) => Some(eh_client::EhCredentials {
+                member_id: member_id.clone(),
+                pass_hash: pass_hash.clone(),
+                igneous: self.igneous.clone(),
+            }),
+            _ => None,
+        }
+    }
+
+    /// 检查是否已配置登录
+    pub fn is_authenticated(&self) -> bool {
+        self.member_id.is_some() && self.pass_hash.is_some()
+    }
+
+    /// 验证配置
+    pub fn validate(&self) -> Result<()> {
+        // ExHentai requires authentication
+        if self.source == EhSource::ExHentai && !self.is_authenticated() {
+            anyhow::bail!("ExHentai requires member_id and pass_hash");
+        }
+        Ok(())
     }
 }
 

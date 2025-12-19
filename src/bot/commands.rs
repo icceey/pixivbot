@@ -42,6 +42,13 @@ pub enum Command {
     Settings,
     #[command(description = "下载作品原图\n  用法: /download <url|id> 或回复消息")]
     Download(String),
+    // E-Hentai commands
+    #[command(description = "订阅E-Hentai\n  用法: /ehsub [stars=N] [cats=...] <搜索词|画廊URL>")]
+    EhSub(String),
+    #[command(description = "取消E-Hentai订阅\n  用法: /ehunsub <搜索词|画廊ID>")]
+    EhUnsub(String),
+    #[command(description = "列出E-Hentai订阅\n  用法: /ehlist [ch=<频道ID>]")]
+    EhList(String),
 }
 
 impl Command {
@@ -73,6 +80,13 @@ impl Command {
             BotCommand::new("clearexcludedtags", "清除所有排除的标签"),
             BotCommand::new("settings", "显示聊天设置"),
             BotCommand::new("download", "下载作品原图 - /download <url|id> 或回复消息"),
+            // E-Hentai commands
+            BotCommand::new(
+                "ehsub",
+                "订阅E-Hentai - /ehsub [stars=N] [cats=...] <搜索词|画廊URL>",
+            ),
+            BotCommand::new("ehunsub", "取消E-Hentai订阅 - /ehunsub <搜索词|画廊ID>"),
+            BotCommand::new("ehlist", "列出E-Hentai订阅 - /ehlist [ch=<频道ID>]"),
             BotCommand::new("help", "显示帮助信息"),
         ]
     }

@@ -41,3 +41,20 @@ sensitive_tags = ["R-18", "R-18G", "NSFW"]
 # Default: "large" (balances quality and size)
 # Note: Download feature always uses original size
 image_size = "large"
+
+# E-Hentai configuration (optional)
+# Uncomment and configure to enable E-Hentai subscription features
+# [ehentai]
+# Source to use: "ehentai" (no login required) or "exhentai" (requires login)
+# source = "ehentai"
+# Login cookies (required for exhentai, optional for ehentai)
+# Get these from your browser after logging in to e-hentai.org
+# member_id = "YOUR_IPB_MEMBER_ID"
+# pass_hash = "YOUR_IPB_PASS_HASH"
+# igneous = "YOUR_IGNEOUS_COOKIE"  # Optional, may be required for exhentai
+# Output mode: "notifyonly" (just link), "preview" (few images), "full" (all images)
+# output_mode = "notifyonly"
+# Number of preview images when output_mode = "preview"
+# preview_count = 5
+# Minimum rating filter for searches (2-5)
+# min_rating = 4

@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 pub enum SubscriptionState {
     Author(AuthorState),
     Ranking(RankingState),
+    EhGallery(EhGalleryState),
+    EhSearch(EhSearchState),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -28,4 +30,26 @@ pub struct PendingIllust {
     pub sent_pages: Vec<usize>,
     pub total_pages: usize,
     pub retry_count: u8,
+}
+
+/// E-Hentai 画廊订阅状态
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EhGalleryState {
+    /// 当前订阅的画廊 gid
+    pub current_gid: u64,
+    /// 当前订阅的画廊 token
+    pub current_token: String,
+    /// 最后检查时间 (Unix timestamp)
+    #[serde(default)]
+    pub last_checked_at: Option<i64>,
+}
+
+/// E-Hentai 搜索订阅状态
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EhSearchState {
+    /// 已推送的画廊 gid 列表 (最近 100 个)
+    pub pushed_gids: Vec<u64>,
+    /// 最后检查时间 (Unix timestamp)
+    #[serde(default)]
+    pub last_checked_at: Option<i64>,
 }

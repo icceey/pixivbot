@@ -13,3 +13,6 @@ pub use subscription::LIST_CALLBACK_PREFIX;
 
 // Download handler
 mod download;
+
+// E-Hentai subscription handlers
+mod ehentai;

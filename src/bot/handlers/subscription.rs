@@ -97,7 +97,7 @@ impl BotHandler {
     /// Returns:
     /// - Ok((target_chat_id, is_channel)) if successful
     /// - Err with error message if channel validation fails
-    async fn resolve_subscription_target(
+    pub(crate) async fn resolve_subscription_target(
         &self,
         bot: &Bot,
         current_chat_id: ChatId,
@@ -627,6 +627,12 @@ impl BotHandler {
                 Some(mode) => mode.display_name().to_string(),
                 None => format!("排行榜 `{}`", markdown::escape(&task_value)),
             },
+            TaskType::EhGallery => {
+                format!("E\\-Hentai 画廊 `{}`", markdown::escape(&task_value))
+            }
+            TaskType::EhSearch => {
+                format!("E\\-Hentai 搜索 `{}`", markdown::escape(&task_value))
+            }
         };
 
         bot.send_message(chat_id, format!("✅ 成功取消订阅 {}", display_name))
@@ -759,6 +765,8 @@ impl BotHandler {
                     let type_emoji = match task.r#type {
                         TaskType::Author => "🎨",
                         TaskType::Ranking => "📊",
+                        TaskType::EhGallery => "🖼",
+                        TaskType::EhSearch => "🔍",
                     };
 
                     // 构建显示名称：对于 author 类型显示作者名字，对于 ranking 类型显示排行榜类型和模式
@@ -788,6 +796,10 @@ impl BotHandler {
                                 )
                             }
                         }
+                    } else if task.r#type == TaskType::EhGallery {
+                        format!("E\\-Hentai 画廊: `{}`", markdown::escape(&task.value))
+                    } else if task.r#type == TaskType::EhSearch {
+                        format!("E\\-Hentai 搜索: `{}`", markdown::escape(&task.value))
                     } else {
                         task.value.replace('_', "\\_")
                     };

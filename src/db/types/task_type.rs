@@ -10,6 +10,12 @@ pub enum TaskType {
     Author,
     #[sea_orm(string_value = "ranking")]
     Ranking,
+    /// E-Hentai 画廊订阅
+    #[sea_orm(string_value = "eh_gallery")]
+    EhGallery,
+    /// E-Hentai 搜索订阅
+    #[sea_orm(string_value = "eh_search")]
+    EhSearch,
 }
 
 impl fmt::Display for TaskType {
@@ -17,6 +23,15 @@ impl fmt::Display for TaskType {
         match self {
             TaskType::Author => write!(f, "author"),
             TaskType::Ranking => write!(f, "ranking"),
+            TaskType::EhGallery => write!(f, "eh_gallery"),
+            TaskType::EhSearch => write!(f, "eh_search"),
         }
+    }
+}
+
+impl TaskType {
+    /// 是否是 E-Hentai 相关任务
+    pub fn is_ehentai(&self) -> bool {
+        matches!(self, TaskType::EhGallery | TaskType::EhSearch)
     }
 }
