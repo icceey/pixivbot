@@ -9,6 +9,7 @@ mod settings;
 
 // Subscription related handlers
 mod subscription;
+pub use subscription::LIST_CALLBACK_PREFIX;
 
 // Download handler
 mod download;

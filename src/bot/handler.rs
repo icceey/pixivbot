@@ -84,6 +84,9 @@ impl BotHandler {
         cmd: Command,
         user_role: &UserRole,
     ) -> ResponseResult<()> {
+        // Get user_id for subscription commands that may need it for channel validation
+        let user_id = msg.from.as_ref().map(|u| u.id);
+
         match cmd {
             // Help and Info commands (defined in handlers/info.rs)
             Command::Help => self.handle_help(bot, chat_id).await,
@@ -92,10 +95,12 @@ impl BotHandler {
             }
 
             // Subscription commands (defined in handlers/subscription.rs)
-            Command::Sub(args) => self.handle_sub_author(bot, chat_id, args).await,
-            Command::SubRank(args) => self.handle_sub_ranking(bot, chat_id, args).await,
-            Command::Unsub(args) => self.handle_unsub_author(bot, chat_id, args).await,
-            Command::UnsubRank(args) => self.handle_unsub_ranking(bot, chat_id, args).await,
+            Command::Sub(args) => self.handle_sub_author(bot, chat_id, user_id, args).await,
+            Command::SubRank(args) => self.handle_sub_ranking(bot, chat_id, user_id, args).await,
+            Command::Unsub(args) => self.handle_unsub_author(bot, chat_id, user_id, args).await,
+            Command::UnsubRank(args) => {
+                self.handle_unsub_ranking(bot, chat_id, user_id, args).await
+            }
             Command::UnsubThis => self.handle_unsub_this(bot, msg, chat_id).await,
             Command::List => self.handle_list(bot, chat_id).await,
 

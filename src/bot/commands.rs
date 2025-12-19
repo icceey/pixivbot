@@ -8,13 +8,13 @@ pub enum Command {
     Help,
     #[command(description = "[仅Admin私聊] 查看 Bot 状态信息")]
     Info,
-    #[command(description = "订阅作者\n  用法: /sub <id,...> [+tag1 -tag2]")]
+    #[command(description = "订阅作者\n  用法: /sub [ch=<频道ID>] <id,...> [+tag1 -tag2]")]
     Sub(String),
-    #[command(description = "订阅排行榜\n  用法: /subrank <mode>")]
+    #[command(description = "订阅排行榜\n  用法: /subrank [ch=<频道ID>] <mode>")]
     SubRank(String),
-    #[command(description = "取消订阅作者\n  用法: /unsub <author_id,...>")]
+    #[command(description = "取消订阅作者\n  用法: /unsub [ch=<频道ID>] <author_id,...>")]
     Unsub(String),
-    #[command(description = "取消订阅排行榜\n  用法: /unsubrank <mode>")]
+    #[command(description = "取消订阅排行榜\n  用法: /unsubrank [ch=<频道ID>] <mode>")]
     UnsubRank(String),
     #[command(description = "回复消息取消对应订阅")]
     UnsubThis,
@@ -48,11 +48,14 @@ impl Command {
     /// 获取普通用户可见的命令列表
     pub fn user_commands() -> Vec<BotCommand> {
         vec![
-            BotCommand::new("sub", "订阅作者 - /sub <id,...> [+tag1 -tag2]"),
-            BotCommand::new("subrank", "订阅排行榜 - /subrank <mode>"),
+            BotCommand::new("sub", "订阅作者 - /sub [ch=<频道ID>] <id,...>"),
+            BotCommand::new("subrank", "订阅排行榜 - /subrank [ch=<频道ID>] <mode>"),
             BotCommand::new("list", "列出当前订阅"),
-            BotCommand::new("unsub", "取消订阅作者 - /unsub <author_id,...>"),
-            BotCommand::new("unsubrank", "取消订阅排行榜 - /unsubrank <mode>"),
+            BotCommand::new("unsub", "取消订阅作者 - /unsub [ch=<频道ID>] <id,...>"),
+            BotCommand::new(
+                "unsubrank",
+                "取消订阅排行榜 - /unsubrank [ch=<频道ID>] <mode>",
+            ),
             BotCommand::new("unsubthis", "回复消息取消对应订阅"),
             BotCommand::new(
                 "blursensitive",
