@@ -641,31 +641,67 @@ impl BotHandler {
     // ------------------------------------------------------------------------
 
     /// 列出当前聊天的所有订阅 (从命令调用，默认第一页)
-    pub async fn handle_list(&self, bot: Bot, chat_id: ChatId) -> ResponseResult<()> {
-        self.send_subscription_list(bot, chat_id, 0, None).await
+    ///
+    /// 用法: `/list [channel=<id>]`
+    pub async fn handle_list(
+        &self,
+        bot: Bot,
+        chat_id: ChatId,
+        user_id: Option<UserId>,
+        args_str: String,
+    ) -> ResponseResult<()> {
+        // Parse key-value parameters from the beginning
+        let parsed = args::parse_args(&args_str);
+
+        // Resolve target chat (channel or current)
+        let (target_chat_id, is_channel) = match self
+            .resolve_subscription_target(&bot, chat_id, user_id, &parsed)
+            .await
+        {
+            Ok(result) => result,
+            Err(e) => {
+                bot.send_message(chat_id, format!("❌ {}", e)).await?;
+                return Ok(());
+            }
+        };
+
+        self.send_subscription_list(bot, chat_id, target_chat_id, 0, None, is_channel)
+            .await
     }
 
     /// 发送订阅列表（支持分页）
     ///
+    /// - `reply_chat_id`: 发送响应消息的聊天ID
+    /// - `target_chat_id`: 查询订阅的目标聊天ID (可以是频道)
     /// - `page`: 页码 (从 0 开始)
     /// - `message_id`: 如果提供，则编辑该消息；否则发送新消息
+    /// - `is_channel`: 是否是查询频道的订阅
     pub async fn send_subscription_list(
         &self,
         bot: Bot,
-        chat_id: ChatId,
+        reply_chat_id: ChatId,
+        target_chat_id: ChatId,
         page: usize,
         message_id: Option<teloxide::types::MessageId>,
+        is_channel: bool,
     ) -> ResponseResult<()> {
-        match self.repo.list_subscriptions_by_chat(chat_id.0).await {
+        match self.repo.list_subscriptions_by_chat(target_chat_id.0).await {
             Ok(subscriptions) => {
                 if subscriptions.is_empty() {
-                    let msg = "📭 您没有生效的订阅。\n\n使用 `/sub` 开始订阅！";
+                    let msg = if is_channel {
+                        format!(
+                            "📭 频道 `{}` 没有生效的订阅。\n\n使用 `/sub ch={}` 开始订阅！",
+                            target_chat_id.0, target_chat_id.0
+                        )
+                    } else {
+                        "📭 您没有生效的订阅。\n\n使用 `/sub` 开始订阅！".to_string()
+                    };
                     if let Some(mid) = message_id {
-                        bot.edit_message_text(chat_id, mid, msg)
+                        bot.edit_message_text(reply_chat_id, mid, msg)
                             .parse_mode(ParseMode::MarkdownV2)
                             .await?;
                     } else {
-                        bot.send_message(chat_id, msg)
+                        bot.send_message(reply_chat_id, msg)
                             .parse_mode(ParseMode::MarkdownV2)
                             .await?;
                     }
@@ -691,8 +727,23 @@ impl BotHandler {
                 let end = (start + PAGE_SIZE).min(total);
                 let page_subscriptions = &all_subscriptions[start..end];
 
-                // Build message
-                let mut message = if total_pages > 1 {
+                // Build message header with channel info if applicable
+                let header = if is_channel {
+                    if total_pages > 1 {
+                        format!(
+                            "📋 *频道* `{}` *的订阅* \\(第 {}/{} 页，共 {} 条\\):\n\n",
+                            target_chat_id.0,
+                            page + 1,
+                            total_pages,
+                            total
+                        )
+                    } else {
+                        format!(
+                            "📋 *频道* `{}` *的订阅* \\(共 {} 条\\):\n\n",
+                            target_chat_id.0, total
+                        )
+                    }
+                } else if total_pages > 1 {
                     format!(
                         "📋 *您的订阅* \\(第 {}/{} 页，共 {} 条\\):\n\n",
                         page + 1,
@@ -702,6 +753,7 @@ impl BotHandler {
                 } else {
                     format!("📋 *您的订阅* \\(共 {} 条\\):\n\n", total)
                 };
+                let mut message = header;
 
                 for (sub, task) in page_subscriptions {
                     let type_emoji = match task.r#type {
@@ -750,7 +802,15 @@ impl BotHandler {
                     message.push_str(&format!("{} {}{}\n", type_emoji, display_info, filter_info));
                 }
 
-                message.push_str("\n💡 使用 `/unsub <id>` 或 `/unsubrank <mode>` 取消订阅");
+                // Add tip with channel parameter if applicable
+                if is_channel {
+                    message.push_str(&format!(
+                        "\n💡 使用 `/unsub ch={} <id>` 或 `/unsubrank ch={} <mode>` 取消订阅",
+                        target_chat_id.0, target_chat_id.0
+                    ));
+                } else {
+                    message.push_str("\n💡 使用 `/unsub <id>` 或 `/unsubrank <mode>` 取消订阅");
+                }
 
                 // Build pagination keyboard if needed
                 let keyboard = if total_pages > 1 {
@@ -761,14 +821,14 @@ impl BotHandler {
 
                 // Send or edit message
                 if let Some(mid) = message_id {
-                    let mut req = bot.edit_message_text(chat_id, mid, &message);
+                    let mut req = bot.edit_message_text(reply_chat_id, mid, &message);
                     req = req.parse_mode(ParseMode::MarkdownV2);
                     if let Some(kb) = keyboard {
                         req = req.reply_markup(kb);
                     }
                     req.await?;
                 } else {
-                    let mut req = bot.send_message(chat_id, &message);
+                    let mut req = bot.send_message(reply_chat_id, &message);
                     req = req.parse_mode(ParseMode::MarkdownV2);
                     if let Some(kb) = keyboard {
                         req = req.reply_markup(kb);
@@ -780,9 +840,9 @@ impl BotHandler {
                 error!("Failed to list subscriptions: {:#}", e);
                 let msg = "❌ 获取订阅列表失败";
                 if let Some(mid) = message_id {
-                    bot.edit_message_text(chat_id, mid, msg).await?;
+                    bot.edit_message_text(reply_chat_id, mid, msg).await?;
                 } else {
-                    bot.send_message(chat_id, msg).await?;
+                    bot.send_message(reply_chat_id, msg).await?;
                 }
             }
         }

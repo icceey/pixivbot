@@ -29,6 +29,9 @@ cache_dir = "data/cache"
 max_retry_count = 3
 # Ranking task execution time in HH:MM format (default: "19:00" local time)
 ranking_execution_time = "19:00"
+# Author name update time in HH:MM format (default: "21:00" local time)
+# Updates subscribed author names daily to sync with Pixiv profile changes
+author_name_update_time = "21:00"
 
 [content]
 # Default sensitive tags for new chats. Each chat can customize their own sensitive tags.

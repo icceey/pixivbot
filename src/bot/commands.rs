@@ -18,8 +18,8 @@ pub enum Command {
     UnsubRank(String),
     #[command(description = "回复消息取消对应订阅")]
     UnsubThis,
-    #[command(description = "列出当前订阅")]
-    List,
+    #[command(description = "列出当前订阅\n  用法: /list [ch=<频道ID>]")]
+    List(String),
     #[command(description = "[仅Owner] 设置用户为管理员\n  用法: /setadmin <user_id>")]
     SetAdmin(String),
     #[command(description = "[仅Owner] 移除用户管理员角色\n  用法: /unsetadmin <user_id>")]
@@ -50,7 +50,7 @@ impl Command {
         vec![
             BotCommand::new("sub", "订阅作者 - /sub [ch=<频道ID>] <id,...>"),
             BotCommand::new("subrank", "订阅排行榜 - /subrank [ch=<频道ID>] <mode>"),
-            BotCommand::new("list", "列出当前订阅"),
+            BotCommand::new("list", "列出当前订阅 - /list [ch=<频道ID>]"),
             BotCommand::new("unsub", "取消订阅作者 - /unsub [ch=<频道ID>] <id,...>"),
             BotCommand::new(
                 "unsubrank",

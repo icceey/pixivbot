@@ -146,15 +146,26 @@ async fn main() -> Result<()> {
         image_size,
     );
 
-    info!("✅ Author and Ranking engines initialized");
+    // Initialize name update engine
+    let name_update_engine = scheduler::NameUpdateEngine::new(
+        repo.clone(),
+        pixiv_client.clone(),
+        scheduler_config.author_name_update_time.clone(),
+    );
 
-    // Spawn both engines in background
+    info!("✅ Author, Ranking, and Name Update engines initialized");
+
+    // Spawn all engines in background
     let author_engine_handle = tokio::spawn(async move {
         author_engine.run().await;
     });
 
     let ranking_engine_handle = tokio::spawn(async move {
         ranking_engine.run().await;
+    });
+
+    let name_update_engine_handle = tokio::spawn(async move {
+        name_update_engine.run().await;
     });
 
     info!("🤖 Starting Telegram Bot...");
@@ -196,6 +207,7 @@ async fn main() -> Result<()> {
     bot_handle.abort();
     author_engine_handle.abort();
     ranking_engine_handle.abort();
+    name_update_engine_handle.abort();
 
     info!("✅ Shutdown complete");
     Ok(())

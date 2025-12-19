@@ -9,7 +9,7 @@ pub struct Model {
     pub chat_id: i64,
     pub message_id: i32,
     pub subscription_id: i32,
-    pub illust_id: Option<u64>,
+    pub illust_id: Option<i64>,
     pub created_at: DateTime,
 }
 

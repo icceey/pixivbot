@@ -83,6 +83,10 @@ pub struct SchedulerConfig {
     /// Ranking task execution time in HH:MM format (default: "19:00")
     #[serde(default = "default_ranking_execution_time")]
     pub ranking_execution_time: String,
+    /// Author name update time in HH:MM format (default: "21:00")
+    /// Updates author names daily to sync with Pixiv profile changes
+    #[serde(default = "default_author_name_update_time")]
+    pub author_name_update_time: String,
 }
 
 fn default_tick_interval_sec() -> u64 {
@@ -111,6 +115,10 @@ fn default_max_retry_count() -> i32 {
 
 fn default_ranking_execution_time() -> String {
     "19:00".to_string()
+}
+
+fn default_author_name_update_time() -> String {
+    "21:00".to_string()
 }
 
 /// 图片尺寸选项
