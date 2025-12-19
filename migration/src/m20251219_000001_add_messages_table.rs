@@ -8,6 +8,7 @@ impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         // Create messages table to store bot-sent messages
         // This enables reply-based operations like "unsub this"
+        // Note: subscription_id is a logical foreign key, not enforced at DB level
         manager
             .create_table(
                 Table::create()
@@ -33,14 +34,6 @@ impl MigrationTrait for Migration {
                             .timestamp()
                             .not_null()
                             .default(Expr::current_timestamp()),
-                    )
-                    .foreign_key(
-                        ForeignKey::create()
-                            .name("fk_messages_subscription")
-                            .from(Messages::Table, Messages::SubscriptionId)
-                            .to(Subscriptions::Table, Subscriptions::Id)
-                            .on_delete(ForeignKeyAction::Cascade)
-                            .on_update(ForeignKeyAction::Cascade),
                     )
                     .to_owned(),
             )
@@ -92,10 +85,4 @@ enum Messages {
     SubscriptionId,
     IllustId,
     CreatedAt,
-}
-
-#[derive(DeriveIden)]
-enum Subscriptions {
-    Table,
-    Id,
 }
