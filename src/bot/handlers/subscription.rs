@@ -4,9 +4,14 @@ use crate::pixiv::model::RankingMode;
 use crate::utils::{args, channel};
 use anyhow::{Context, Result};
 use teloxide::prelude::*;
-use teloxide::types::{ChatAction, ChatId, ParseMode, UserId};
+use teloxide::types::{
+    ChatAction, ChatId, InlineKeyboardButton, InlineKeyboardMarkup, ParseMode, UserId,
+};
 use teloxide::utils::markdown;
 use tracing::{error, info, warn};
+
+/// Maximum number of subscriptions per page
+pub const PAGE_SIZE: usize = 50;
 
 // ============================================================================
 // Helper Types
@@ -104,14 +109,16 @@ impl BotHandler {
 
         match channel_param {
             Some(channel_str) if !channel_str.is_empty() => {
-                // Parse channel ID
-                let channel_id = channel::parse_channel_id(channel_str)?;
+                // Parse channel identifier (can be numeric ID or @username)
+                let channel_identifier = channel::parse_channel_id(channel_str)?;
 
                 // Validate user_id is available
                 let user_id = user_id.ok_or("无法获取用户信息")?;
 
-                // Validate channel permissions
-                channel::validate_channel_permissions(bot, channel_id, user_id).await?;
+                // Validate channel permissions and get resolved numeric ID
+                let channel_id =
+                    channel::validate_channel_permissions(bot, &channel_identifier, user_id)
+                        .await?;
 
                 // Ensure chat exists in database for the channel
                 if let Err(e) = self
@@ -534,26 +541,70 @@ impl BotHandler {
     // List Subscriptions
     // ------------------------------------------------------------------------
 
-    /// 列出当前聊天的所有订阅
+    /// 列出当前聊天的所有订阅 (从命令调用，默认第一页)
     pub async fn handle_list(&self, bot: Bot, chat_id: ChatId) -> ResponseResult<()> {
+        self.send_subscription_list(bot, chat_id, 0, None).await
+    }
+
+    /// 发送订阅列表（支持分页）
+    ///
+    /// - `page`: 页码 (从 0 开始)
+    /// - `message_id`: 如果提供，则编辑该消息；否则发送新消息
+    pub async fn send_subscription_list(
+        &self,
+        bot: Bot,
+        chat_id: ChatId,
+        page: usize,
+        message_id: Option<teloxide::types::MessageId>,
+    ) -> ResponseResult<()> {
         match self.repo.list_subscriptions_by_chat(chat_id.0).await {
             Ok(subscriptions) => {
                 if subscriptions.is_empty() {
-                    bot.send_message(chat_id, "📭 您没有生效的订阅。\n\n使用 `/sub` 开始订阅！")
-                        .parse_mode(ParseMode::MarkdownV2)
-                        .await?;
+                    let msg = "📭 您没有生效的订阅。\n\n使用 `/sub` 开始订阅！";
+                    if let Some(mid) = message_id {
+                        bot.edit_message_text(chat_id, mid, msg)
+                            .parse_mode(ParseMode::MarkdownV2)
+                            .await?;
+                    } else {
+                        bot.send_message(chat_id, msg)
+                            .parse_mode(ParseMode::MarkdownV2)
+                            .await?;
+                    }
                     return Ok(());
                 }
 
-                // Separate authors and rankings
+                // Separate authors and rankings, then combine (rankings first)
                 let (authors, rankings): (Vec<_>, Vec<_>) = subscriptions
                     .into_iter()
                     .partition(|(_, task)| task.r#type == TaskType::Author);
 
-                let mut message = "📋 *您的订阅:*\n\n".to_string();
+                let all_subscriptions: Vec<_> =
+                    rankings.into_iter().chain(authors.into_iter()).collect();
 
-                // First show authors
-                for (sub, task) in authors.iter().chain(rankings.iter()) {
+                let total = all_subscriptions.len();
+                let total_pages = total.div_ceil(PAGE_SIZE);
+
+                // Clamp page to valid range
+                let page = page.min(total_pages.saturating_sub(1));
+
+                // Get subscriptions for current page
+                let start = page * PAGE_SIZE;
+                let end = (start + PAGE_SIZE).min(total);
+                let page_subscriptions = &all_subscriptions[start..end];
+
+                // Build message
+                let mut message = if total_pages > 1 {
+                    format!(
+                        "📋 *您的订阅* \\(第 {}/{} 页，共 {} 条\\):\n\n",
+                        page + 1,
+                        total_pages,
+                        total
+                    )
+                } else {
+                    format!("📋 *您的订阅* \\(共 {} 条\\):\n\n", total)
+                };
+
+                for (sub, task) in page_subscriptions {
                     let type_emoji = match task.r#type {
                         TaskType::Author => "🎨",
                         TaskType::Ranking => "📊",
@@ -602,13 +653,38 @@ impl BotHandler {
 
                 message.push_str("\n💡 使用 `/unsub <id>` 或 `/unsubrank <mode>` 取消订阅");
 
-                bot.send_message(chat_id, message)
-                    .parse_mode(ParseMode::MarkdownV2)
-                    .await?;
+                // Build pagination keyboard if needed
+                let keyboard = if total_pages > 1 {
+                    Some(build_pagination_keyboard(page, total_pages))
+                } else {
+                    None
+                };
+
+                // Send or edit message
+                if let Some(mid) = message_id {
+                    let mut req = bot.edit_message_text(chat_id, mid, &message);
+                    req = req.parse_mode(ParseMode::MarkdownV2);
+                    if let Some(kb) = keyboard {
+                        req = req.reply_markup(kb);
+                    }
+                    req.await?;
+                } else {
+                    let mut req = bot.send_message(chat_id, &message);
+                    req = req.parse_mode(ParseMode::MarkdownV2);
+                    if let Some(kb) = keyboard {
+                        req = req.reply_markup(kb);
+                    }
+                    req.await?;
+                }
             }
             Err(e) => {
                 error!("Failed to list subscriptions: {:#}", e);
-                bot.send_message(chat_id, "❌ 获取订阅列表失败").await?;
+                let msg = "❌ 获取订阅列表失败";
+                if let Some(mid) = message_id {
+                    bot.edit_message_text(chat_id, mid, msg).await?;
+                } else {
+                    bot.send_message(chat_id, msg).await?;
+                }
             }
         }
 
@@ -702,4 +778,40 @@ impl BotHandler {
             _ => {}
         }
     }
+}
+
+// ============================================================================
+// Pagination Helper Functions
+// ============================================================================
+
+/// Callback data prefix for list pagination
+pub const LIST_CALLBACK_PREFIX: &str = "list:";
+
+/// Build inline keyboard for pagination
+fn build_pagination_keyboard(current_page: usize, total_pages: usize) -> InlineKeyboardMarkup {
+    let mut buttons = Vec::new();
+
+    // Previous button
+    if current_page > 0 {
+        buttons.push(InlineKeyboardButton::callback(
+            "⬅️ 上一页",
+            format!("{}{}", LIST_CALLBACK_PREFIX, current_page - 1),
+        ));
+    }
+
+    // Page indicator (not clickable, using a callback that does nothing)
+    buttons.push(InlineKeyboardButton::callback(
+        format!("{}/{}", current_page + 1, total_pages),
+        format!("{}noop", LIST_CALLBACK_PREFIX),
+    ));
+
+    // Next button
+    if current_page + 1 < total_pages {
+        buttons.push(InlineKeyboardButton::callback(
+            "下一页 ➡️",
+            format!("{}{}", LIST_CALLBACK_PREFIX, current_page + 1),
+        ));
+    }
+
+    InlineKeyboardMarkup::new(vec![buttons])
 }

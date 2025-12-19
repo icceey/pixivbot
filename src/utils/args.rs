@@ -8,11 +8,13 @@ use regex::Regex;
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
-/// Regex for matching key-value pairs in command arguments.
+/// Regex for matching key-value pairs at the beginning of command arguments.
 /// Format: `key=value` where key is alphanumeric (including underscore) and
-/// value can contain alphanumerics, underscores, and hyphens (for negative channel IDs like -1001234567890).
-/// The value can also be empty.
-static KV_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^(\w+)=([\w\-]*)$").unwrap());
+/// value can contain alphanumerics, underscores, hyphens (for negative channel IDs like -1001234567890),
+/// or start with @ (for channel usernames like @channelname). The value can also be empty.
+/// Matches leading whitespace and captures the key-value pair.
+static KV_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\s*(\w+)=(@?[\w\-]*)(?:\s|$)").unwrap());
 
 /// Result of parsing command arguments with key-value parameters.
 #[derive(Debug, Clone)]
@@ -69,26 +71,21 @@ impl ParsedArgs {
 /// ```
 pub fn parse_args(args: &str) -> ParsedArgs {
     let mut params = HashMap::new();
-    let parts: Vec<&str> = args.split_whitespace().collect();
-    let mut remaining_start = 0;
+    let mut input = args;
 
-    for (i, part) in parts.iter().enumerate() {
-        if let Some(caps) = KV_REGEX.captures(part) {
-            let key = caps.get(1).unwrap().as_str().to_lowercase();
-            let value = caps.get(2).unwrap().as_str().to_string();
-            params.insert(key, value);
-            remaining_start = i + 1;
-        } else {
-            // Stop parsing key-value pairs once we hit a non-matching argument
-            break;
-        }
+    // Use regex to match key-value pairs from the beginning
+    while let Some(caps) = KV_REGEX.captures(input) {
+        let key = caps.get(1).unwrap().as_str().to_lowercase();
+        let value = caps.get(2).unwrap().as_str().to_string();
+        params.insert(key, value);
+
+        // Move past the matched portion
+        let match_end = caps.get(0).unwrap().end();
+        input = &input[match_end..];
     }
 
-    let remaining = if remaining_start < parts.len() {
-        parts[remaining_start..].join(" ")
-    } else {
-        String::new()
-    };
+    // Trim any remaining leading whitespace from the remaining input
+    let remaining = input.trim_start().to_string();
 
     ParsedArgs { params, remaining }
 }
@@ -153,6 +150,13 @@ mod tests {
     fn test_parse_args_negative_number_value() {
         let parsed = parse_args("ch=-1001234567890 789");
         assert_eq!(parsed.get("ch"), Some("-1001234567890"));
+        assert_eq!(parsed.remaining, "789");
+    }
+
+    #[test]
+    fn test_parse_args_username_value() {
+        let parsed = parse_args("ch=@mychannel 789");
+        assert_eq!(parsed.get("ch"), Some("@mychannel"));
         assert_eq!(parsed.remaining, "789");
     }
 
