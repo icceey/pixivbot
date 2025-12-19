@@ -429,13 +429,13 @@ impl BotHandler {
                     return Ok(());
                 }
 
-                // Separate authors and rankings, then combine (authors first)
+                // Separate authors and rankings, then combine (rankings first)
                 let (authors, rankings): (Vec<_>, Vec<_>) = subscriptions
                     .into_iter()
                     .partition(|(_, task)| task.r#type == TaskType::Author);
 
                 let all_subscriptions: Vec<_> =
-                    authors.into_iter().chain(rankings.into_iter()).collect();
+                    rankings.into_iter().chain(authors.into_iter()).collect();
 
                 let total = all_subscriptions.len();
                 let total_pages = total.div_ceil(PAGE_SIZE);
