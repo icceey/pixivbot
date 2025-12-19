@@ -128,12 +128,12 @@ impl NameUpdateEngine {
             let pixiv = self.pixiv_client.read().await;
             match pixiv.get_user_detail(author_id).await {
                 Ok(user) => {
-                    let new_name = user.name.clone();
+                    let new_name = user.name;
                     let old_name = task.author_name.clone();
 
                     // Only update if name changed or was empty
                     if old_name.as_ref() != Some(&new_name) {
-                        drop(pixiv); // Release read lock before write operation
+                        drop(pixiv); // Release read lock before database operation
                         if let Err(e) = self
                             .repo
                             .update_task_author_name(task.id, Some(new_name.clone()))
