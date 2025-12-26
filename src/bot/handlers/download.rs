@@ -170,7 +170,25 @@ impl BotHandler {
                 }
                 Err(e) => {
                     error!("Failed to download illust {}: {:#}", illust_id, e);
-                    failed_ids.push(*illust_id);
+
+                    // Retry once after 1 second
+                    info!(
+                        "Retrying download for illust {} after 1 second...",
+                        illust_id
+                    );
+                    sleep(Duration::from_secs(1)).await;
+
+                    match self.download_illust(*illust_id).await {
+                        Ok((files, title, artist)) => {
+                            info!("Retry successful for illust {}", illust_id);
+                            all_files.extend(files);
+                            work_info.push((title, artist));
+                        }
+                        Err(e) => {
+                            error!("Retry failed for illust {}: {:#}", illust_id, e);
+                            failed_ids.push(*illust_id);
+                        }
+                    }
                 }
             }
         }
