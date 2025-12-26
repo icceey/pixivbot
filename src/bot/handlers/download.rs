@@ -187,22 +187,17 @@ impl BotHandler {
         let threshold = self.download_original_threshold as usize;
         if all_files.len() <= threshold {
             // Within threshold - send each file separately
-            let mut first = true;
-            for (path, filename) in &all_files {
+            let file_count = all_files.len();
+            for (idx, (path, filename)) in all_files.iter().enumerate() {
                 // Only show caption on first file
-                let cap = if first {
-                    first = false;
-                    caption.as_str()
-                } else {
-                    ""
-                };
+                let cap = if idx == 0 { caption.as_str() } else { "" };
                 if let Err(e) = self.send_document(&bot, chat_id, path, filename, cap).await {
                     error!("Failed to send document {}: {:#}", filename, e);
-                    bot.send_message(chat_id, "❌ 发送文件失败").await?;
+                    let _ = bot.send_message(chat_id, "❌ 发送文件失败").await;
                     break;
                 }
-                // Small delay between files to avoid rate limiting
-                if all_files.len() > 1 {
+                // Small delay between files to avoid rate limiting (skip after last file)
+                if file_count > 1 && idx < file_count - 1 {
                     sleep(Duration::from_millis(500)).await;
                 }
             }
