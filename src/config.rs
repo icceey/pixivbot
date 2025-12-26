@@ -167,6 +167,15 @@ pub struct ContentConfig {
     /// 注意: 下载功能永远使用原图
     #[serde(default)]
     pub image_size: ImageSize,
+    /// 下载时发送原图的阈值 (1-10)
+    /// 图片总数不超过此值时逐张发送原图，超过时打包为 ZIP
+    /// 默认: 1
+    #[serde(default = "default_download_original_threshold")]
+    pub download_original_threshold: u8,
+}
+
+fn default_download_original_threshold() -> u8 {
+    1
 }
 
 impl Default for ContentConfig {
@@ -174,7 +183,15 @@ impl Default for ContentConfig {
         Self {
             sensitive_tags: vec!["R-18".to_string(), "R-18G".to_string(), "NSFW".to_string()],
             image_size: ImageSize::default(),
+            download_original_threshold: default_download_original_threshold(),
         }
+    }
+}
+
+impl ContentConfig {
+    /// 获取经过验证的下载原图阈值 (限制在 1-10 范围内)
+    pub fn download_threshold(&self) -> u8 {
+        self.download_original_threshold.clamp(1, 10)
     }
 }
 
@@ -200,5 +217,53 @@ impl Config {
             "trace" => tracing::Level::TRACE,
             _ => tracing::Level::INFO,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_download_threshold_default() {
+        let config = ContentConfig::default();
+        assert_eq!(config.download_threshold(), 1);
+    }
+
+    #[test]
+    fn test_download_threshold_clamped() {
+        // Test lower bound clamping (0 -> 1)
+        let config = ContentConfig {
+            download_original_threshold: 0,
+            ..Default::default()
+        };
+        assert_eq!(config.download_threshold(), 1);
+
+        // Test upper bound clamping (15 -> 10)
+        let config = ContentConfig {
+            download_original_threshold: 15,
+            ..Default::default()
+        };
+        assert_eq!(config.download_threshold(), 10);
+
+        // Test within range (5 -> 5)
+        let config = ContentConfig {
+            download_original_threshold: 5,
+            ..Default::default()
+        };
+        assert_eq!(config.download_threshold(), 5);
+
+        // Test exact boundaries
+        let config = ContentConfig {
+            download_original_threshold: 1,
+            ..Default::default()
+        };
+        assert_eq!(config.download_threshold(), 1);
+
+        let config = ContentConfig {
+            download_original_threshold: 10,
+            ..Default::default()
+        };
+        assert_eq!(config.download_threshold(), 10);
     }
 }

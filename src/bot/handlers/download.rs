@@ -183,19 +183,26 @@ impl BotHandler {
         // Build caption with work info and errors
         let caption = self.build_download_caption(&work_info, &failed_ids);
 
-        // Send files
-        if all_files.len() == 1 {
-            // Single file - send directly
-            let (path, filename) = &all_files[0];
-            if let Err(e) = self
-                .send_document(&bot, chat_id, path, filename, &caption)
-                .await
-            {
-                error!("Failed to send document: {:#}", e);
-                bot.send_message(chat_id, "❌ 发送文件失败").await?;
+        // Send files based on threshold
+        let threshold = self.download_original_threshold as usize;
+        if all_files.len() <= threshold {
+            // Within threshold - send each file separately
+            let file_count = all_files.len();
+            for (idx, (path, filename)) in all_files.iter().enumerate() {
+                // Only show caption on first file
+                let cap = if idx == 0 { caption.as_str() } else { "" };
+                if let Err(e) = self.send_document(&bot, chat_id, path, filename, cap).await {
+                    error!("Failed to send document {}: {:#}", filename, e);
+                    let _ = bot.send_message(chat_id, "❌ 发送文件失败").await;
+                    break;
+                }
+                // Small delay between files to avoid rate limiting (skip after last file)
+                if file_count > 1 && idx < file_count - 1 {
+                    sleep(Duration::from_millis(500)).await;
+                }
             }
         } else {
-            // Multiple files - create ZIP and send
+            // Exceeds threshold - create ZIP and send
             match self.create_zip_file(&all_files).await {
                 Ok(zip_path) => {
                     let zip_filename =

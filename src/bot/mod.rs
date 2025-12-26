@@ -25,6 +25,7 @@ pub use middleware::UserChatContext;
 /// Handler 返回类型
 type HandlerResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     bot: Bot,
     config: TelegramConfig,
@@ -33,6 +34,7 @@ pub async fn run(
     notifier: notifier::Notifier,
     sensitive_tags: Vec<String>,
     image_size: pixiv_client::ImageSize,
+    download_original_threshold: u8,
 ) -> Result<()> {
     info!("Starting Telegram Bot...");
 
@@ -57,6 +59,7 @@ pub async fn run(
         config.owner_id,
         is_public_mode,
         image_size,
+        download_original_threshold,
     );
 
     info!("✅ Bot initialized, starting command handler");

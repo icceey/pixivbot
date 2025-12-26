@@ -24,6 +24,8 @@ pub struct BotHandler {
     pub(crate) owner_id: Option<i64>,
     pub(crate) is_public_mode: bool,
     pub(crate) image_size: pixiv_client::ImageSize,
+    /// 下载原图阈值 (1-10): 图片数量不超过此值时逐张发送原图
+    pub(crate) download_original_threshold: u8,
 }
 
 impl BotHandler {
@@ -31,6 +33,7 @@ impl BotHandler {
     // Constructor
     // ------------------------------------------------------------------------
 
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         repo: Arc<Repo>,
         pixiv_client: Arc<tokio::sync::RwLock<PixivClient>>,
@@ -39,6 +42,7 @@ impl BotHandler {
         owner_id: Option<i64>,
         is_public_mode: bool,
         image_size: pixiv_client::ImageSize,
+        download_original_threshold: u8,
     ) -> Self {
         Self {
             repo,
@@ -48,6 +52,7 @@ impl BotHandler {
             owner_id,
             is_public_mode,
             image_size,
+            download_original_threshold,
         }
     }
 

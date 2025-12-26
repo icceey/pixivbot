@@ -41,3 +41,8 @@ sensitive_tags = ["R-18", "R-18G", "NSFW"]
 # Default: "large" (balances quality and size)
 # Note: Download feature always uses original size
 image_size = "large"
+# Threshold for sending original images in download command (1-10)
+# When total images <= this value, send each image separately as original files
+# When total images > this value, pack all images into a ZIP file
+# Default: 1 (only single-image works are sent as original files)
+download_original_threshold = 1
