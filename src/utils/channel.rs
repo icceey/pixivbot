@@ -31,10 +31,13 @@ impl ChannelIdentifier {
 ///
 /// Returns true if the bot is a member and has the right to post messages.
 pub async fn check_bot_can_post(bot: &Bot, channel: &ChannelIdentifier) -> Result<bool, String> {
-    let me = bot
-        .get_me()
-        .await
-        .map_err(|e| format!("获取机器人信息失败: {}", e))?;
+    let me = match bot.get_me().await {
+        Ok(me) => me,
+        Err(e) => {
+            tracing::error!("Failed to get bot info: {:#}", e);
+            return Err("获取机器人信息失败".to_string());
+        }
+    };
     let bot_user_id = me.id;
 
     let recipient = channel.to_recipient();
@@ -59,7 +62,14 @@ pub async fn check_bot_can_post(bot: &Bot, channel: &ChannelIdentifier) -> Resul
 
             Ok(can_post)
         }
-        Err(e) => Err(format!("无法获取机器人在频道中的状态: {}", e)),
+        Err(e) => {
+            tracing::error!(
+                "Failed to get bot member status in channel {:?}: {:#}",
+                channel,
+                e
+            );
+            Err("无法获取机器人在频道中的状态".to_string())
+        }
     }
 }
 
@@ -89,7 +99,15 @@ pub async fn check_user_is_channel_admin(
 
             Ok(is_admin)
         }
-        Err(e) => Err(format!("无法获取用户在频道中的状态: {}", e)),
+        Err(e) => {
+            tracing::error!(
+                "Failed to get user {} member status in channel {:?}: {:#}",
+                user_id,
+                channel,
+                e
+            );
+            Err("无法获取用户在频道中的状态".to_string())
+        }
     }
 }
 
@@ -104,7 +122,10 @@ pub async fn resolve_channel_id(bot: &Bot, channel: &ChannelIdentifier) -> Resul
             let recipient = Recipient::ChannelUsername(username.clone());
             match bot.get_chat(recipient).await {
                 Ok(chat) => Ok(chat.id),
-                Err(e) => Err(format!("无法获取频道信息: {}", e)),
+                Err(e) => {
+                    tracing::error!("Failed to get channel info for {:?}: {:#}", channel, e);
+                    Err("无法获取频道信息".to_string())
+                }
             }
         }
     }
