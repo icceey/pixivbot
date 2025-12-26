@@ -183,6 +183,7 @@ async fn main() -> Result<()> {
     // Start Bot in a separate task (non-blocking)
     let sensitive_tags_for_bot = config.content.sensitive_tags.clone();
     let image_size_for_bot = config.content.image_size.to_pixiv_image_size();
+    let download_threshold_for_bot = config.content.download_threshold();
     let bot_handle = tokio::spawn(async move {
         if let Err(e) = bot::run(
             bot,
@@ -192,6 +193,7 @@ async fn main() -> Result<()> {
             notifier.clone(),
             sensitive_tags_for_bot,
             image_size_for_bot,
+            download_threshold_for_bot,
         )
         .await
         {
