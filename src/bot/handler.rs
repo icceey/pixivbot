@@ -26,6 +26,8 @@ pub struct BotHandler {
     pub(crate) image_size: pixiv_client::ImageSize,
     /// 下载原图阈值 (1-10): 图片数量不超过此值时逐张发送原图
     pub(crate) download_original_threshold: u8,
+    /// 群组中是否需要 @bot 才响应 (默认: true)
+    pub(crate) require_mention_in_group: bool,
 }
 
 impl BotHandler {
@@ -43,6 +45,7 @@ impl BotHandler {
         is_public_mode: bool,
         image_size: pixiv_client::ImageSize,
         download_original_threshold: u8,
+        require_mention_in_group: bool,
     ) -> Self {
         Self {
             repo,
@@ -53,6 +56,7 @@ impl BotHandler {
             is_public_mode,
             image_size,
             download_original_threshold,
+            require_mention_in_group,
         }
     }
 

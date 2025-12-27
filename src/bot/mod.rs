@@ -51,6 +51,11 @@ pub async fn run(
         }
     );
 
+    info!(
+        "Require mention in group: {}",
+        config.require_mention_in_group
+    );
+
     let handler = BotHandler::new(
         repo.clone(),
         pixiv_client.clone(),
@@ -60,6 +65,7 @@ pub async fn run(
         is_public_mode,
         image_size,
         download_original_threshold,
+        config.require_mention_in_group,
     );
 
     info!("✅ Bot initialized, starting command handler");

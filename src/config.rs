@@ -33,6 +33,15 @@ pub struct TelegramConfig {
     #[serde(default)]
     pub bot_mode: BotMode,
     pub api_url: Option<String>,
+    /// Whether to require @mention to respond in group chats (default: true)
+    /// When true, the bot only responds to messages in groups when @mentioned or replied to
+    /// When false, the bot responds to all messages in groups without requiring @mention
+    #[serde(default = "default_require_mention_in_group")]
+    pub require_mention_in_group: bool,
+}
+
+fn default_require_mention_in_group() -> bool {
+    true
 }
 
 #[derive(Debug, Deserialize, Clone)]

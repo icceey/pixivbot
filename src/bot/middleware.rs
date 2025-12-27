@@ -172,12 +172,15 @@ fn is_chat_accessible(chat_id: ChatId, ctx: &UserChatContext) -> bool {
 ///
 /// 根据聊天类型应用不同的命令解析策略：
 /// - **私聊**: 接受 `/cmd` 和 `/cmd@bot` (宽松)
-/// - **群组**: 只接受 `/cmd@bot` (严格)
+/// - **群组**:
+///   - 如果 `require_mention_in_group` 为 true: 只接受 `/cmd@bot` (严格)
+///   - 如果 `require_mention_in_group` 为 false: 接受 `/cmd` 和 `/cmd@bot` (宽松)
 ///
 /// **依赖要求:**
 /// - `Message` - 当前消息
 /// - `Me` - Bot 信息
 /// - `String` - 消息文本
+/// - `BotHandler` - Bot 处理器（获取配置）
 ///
 /// **注入依赖:**
 /// - `C` - 解析后的命令类型
@@ -187,52 +190,71 @@ where
     C: BotCommands + Send + Sync + 'static,
     Output: Send + Sync + 'static,
 {
-    dptree::filter_map(move |message: Message, me: Me, text: String| {
-        let bot_name = me.user.username.expect("Bots must have a username");
+    dptree::filter_map(
+        move |message: Message, me: Me, text: String, handler: super::BotHandler| {
+            let bot_name = me.user.username.expect("Bots must have a username");
 
-        // 解析命令（验证格式正确性）
-        let cmd = C::parse(&text, &bot_name).ok()?;
+            // 解析命令（验证格式正确性）
+            let cmd = C::parse(&text, &bot_name).ok()?;
 
-        // 私聊：接受所有格式
-        if message.chat.is_private() {
-            return Some(cmd);
-        }
+            // 私聊：接受所有格式
+            if message.chat.is_private() {
+                return Some(cmd);
+            }
 
-        // 群组：只接受带 @bot 的命令
-        // 技巧：用空字符串解析，如果成功说明是裸命令（如 /start），失败说明带点名（如 /start@bot）
-        let is_bare_command = C::parse(&text, "").is_ok();
-        (!is_bare_command).then_some(cmd)
-    })
+            // 群组：根据配置决定是否需要 @bot
+            if !handler.require_mention_in_group {
+                // 不需要 @bot，接受所有格式
+                return Some(cmd);
+            }
+
+            // 需要 @bot：只接受带 @bot 的命令
+            // 技巧：用空字符串解析，如果成功说明是裸命令（如 /start），失败说明带点名（如 /start@bot）
+            let is_bare_command = C::parse(&text, "").is_ok();
+            (!is_bare_command).then_some(cmd)
+        },
+    )
 }
 
 /// 过滤相关消息
 ///
 /// 根据聊天类型判断消息是否需要处理：
 /// - **私聊**: 总是相关
-/// - **群组**: 只有 @Bot 或回复 Bot 的消息才相关
+/// - **群组**:
+///   - 如果 `require_mention_in_group` 为 true: 只有回复 Bot 的消息才相关
+///   - 如果 `require_mention_in_group` 为 false: 所有消息都相关
 ///
 /// **依赖要求:**
 /// - `Message` - 当前消息
 /// - `Me` - Bot 信息
 /// - `String` - 消息文本
+/// - `BotHandler` - Bot 处理器（获取配置）
 #[must_use]
 pub fn filter_relevant_message<Output>() -> Handler<'static, Output, DpHandlerDescription>
 where
     Output: Send + Sync + 'static,
 {
-    dptree::filter_map(move |message: Message, me: Me| {
-        // 私聊总是处理
-        if message.chat.is_private() {
-            return Some(message);
-        }
+    dptree::filter_map(
+        move |message: Message, me: Me, handler: super::BotHandler| {
+            // 私聊总是处理
+            if message.chat.is_private() {
+                return Some(message);
+            }
 
-        // 群组：检查是否回复 Bot
-        let is_reply_to_bot = message
-            .reply_to_message()
-            .and_then(|reply| reply.from.as_ref())
-            .map(|user| user.id == me.user.id)
-            .unwrap_or(false);
+            // 群组：根据配置决定是否需要回复 Bot
+            if !handler.require_mention_in_group {
+                // 不需要 @bot，处理所有消息
+                return Some(message);
+            }
 
-        is_reply_to_bot.then_some(message)
-    })
+            // 需要 @bot：检查是否回复 Bot
+            let is_reply_to_bot = message
+                .reply_to_message()
+                .and_then(|reply| reply.from.as_ref())
+                .map(|user| user.id == me.user.id)
+                .unwrap_or(false);
+
+            is_reply_to_bot.then_some(message)
+        },
+    )
 }
