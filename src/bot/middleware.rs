@@ -227,7 +227,6 @@ where
 /// **依赖要求:**
 /// - `Message` - 当前消息
 /// - `Me` - Bot 信息
-/// - `String` - 消息文本
 /// - `BotHandler` - Bot 处理器（获取配置）
 #[must_use]
 pub fn filter_relevant_message<Output>() -> Handler<'static, Output, DpHandlerDescription>
