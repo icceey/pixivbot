@@ -3,6 +3,8 @@ bot_token = "YOUR_BOT_TOKEN"
 owner_id = 123456789  # Required: Owner user ID (highest privilege)
 bot_mode = "private"  # Bot mode: "private" (chats disabled by default) or "public" (chats enabled by default)
 # api_url = "https://api.telegram.org"  # Optional: Custom Telegram API URL (e.g., for local bot API server)
+# require_mention_in_group = true  # Whether bot requires @mention to respond in groups (default: true)
+                                   # Set to false to allow bot to respond without @mention in groups
 
 [pixiv]
 refresh_token = "YOUR_PIXIV_REFRESH_TOKEN"
