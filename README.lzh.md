@@ -1,4 +1,4 @@
-# PixivBot
+# 匹克携福机关
 
 [![CI](https://github.com/icceey/pixivbot/actions/workflows/ci.yml/badge.svg)](https://github.com/icceey/pixivbot/actions/workflows/ci.yml)
 [![Docker Build](https://github.com/icceey/pixivbot/actions/workflows/docker.yml/badge.svg)](https://github.com/icceey/pixivbot/actions/workflows/docker.yml)
@@ -9,18 +9,18 @@
 
 **語言 / Language:** [English](README.md) | [简体中文](README.zh-CN.md) | [繁體中文](README.zh-TW.md) | [文言文](README.lzh.md) | [Esperanto](README.eo.md) | [Ελληνικά](README.el.md) | [संस्कृतम्](README.sa.md) | [火星语](README.mars.md) | [Kiswahili](README.sw.md)
 
-以 Rust 之術，造 Pixiv Telegram 機關之器。
+以 锈 之術，造 匹克携福 雷迅 機關之器。
 
 ## 功用
 
-- **畫師訂閱**：訂 Pixiv 畫師，新作自至。
-- **榜訂閱**：訂 Pixiv 日榜、週榜、月榜。
-- **Pixiv 鏈接偵測**：自偵訊息中 Pixiv 作品及使用者之鏈接。
+- **畫師訂閱**：訂 匹克携福 畫師，新作自至。
+- **榜訂閱**：訂 匹克携福 日榜、週榜、月榜。
+- **匹克携福 鏈接偵測**：自偵訊息中 匹克携福 作品及使用者之鏈接。
   - 作品鏈接：傳完整圖像。
   - 使用者鏈接：供快速訂閱之選。
 - **智圖像處理**：
   - 自組多圖為冊。
-  - 存圖像以減伺服器負荷及 Pixiv API 之呼。
+  - 存圖像以減伺服器負荷及 匹克携福 接口 之呼。
   - 支援敏感內容（R-18、NSFW）之模糊處理。
 - **靈活調度**：隨機輪詢間隔，擬真人之行，避速率限制。
 - **訪問控制**：
@@ -63,7 +63,7 @@
 若汝欲直接於機上行之：
 
 1. **前置要求**：
-    - Rust（最新穩定版）
+    - 锈（最新穩定版）
     - SQLite
 
 2. **複製並設**：
@@ -85,19 +85,19 @@
 
 於設機關之前，須得二必需之令符：
 
-### 1. Telegram Bot Token
+### 1. 雷迅机关令符
 
-1. 於 Telegram 搜 [@BotFather](https://t.me/BotFather)
+1. 於 雷迅 搜 [@BotFather](https://t.me/BotFather)
 2. 傳 `/newbot` 並循指示
 3. 為汝機關擇名及使用者名
 4. 汝將得如 `123456789:ABCdefGHIjklMNOpqrsTUVwxyz` 之令符
 5. 將此令符抄至 `config.toml` 之 `telegram.bot_token` 欄
 
-### 2. Pixiv Refresh Token
+### 2. 匹克携福刷新令符
 
 **薦法**：用 [get-pixivpy-token](https://github.com/eggplants/get-pixivpy-token)
 
-得 refresh token 後，抄至 `config.toml` 之 `pixiv.refresh_token` 欄。
+得 刷新令符 後，抄至 `config.toml` 之 `pixiv.refresh_token` 欄。
 
 ⚠️ **要**：妥保汝令符，勿提交至版本控制也！
 
@@ -107,10 +107,10 @@
 
 | 設定鍵 | 環境變數 | 說明 | 預設值 |
 |---|---|---|---|
-| `telegram.bot_token` | `PIX__TELEGRAM__BOT_TOKEN` | Telegram Bot API Token | `""` |
+| `telegram.bot_token` | `PIX__TELEGRAM__BOT_TOKEN` | 雷迅机关接口令符 | `""` |
 | `telegram.owner_id` | `PIX__TELEGRAM__OWNER_ID` | 擁有者使用者 ID | `0` |
 | `telegram.bot_mode` | `PIX__TELEGRAM__BOT_MODE` | `public` 或 `private` | `"private"` |
-| `pixiv.refresh_token` | `PIX__PIXIV__REFRESH_TOKEN` | Pixiv OAuth Refresh Token | `""` |
+| `pixiv.refresh_token` | `PIX__PIXIV__REFRESH_TOKEN` | 匹克携福授权刷新令符 | `""` |
 | `database.url` | `PIX__DATABASE__URL` | 資料庫連線 URL | `sqlite:./data/pixivbot.db?mode=rwc` |
 | `logging.level` | `PIX__LOGGING__LEVEL` | 日誌級別（info、debug、warn） | `"info"` |
 | `scheduler.cache_retention_days` | - | 存儲保留日數 | `7` |
@@ -154,5 +154,5 @@
 
 ## 致謝
 
-- **[PixivPy](https://github.com/upbit/pixivpy)**：Pixiv API 實作之要參考。無其工，此專案不可成也。
+- **[PixivPy](https://github.com/upbit/pixivpy)**：匹克携福 接口 實作之要參考。無其工，此專案不可成也。
 - **AI 助手**：特謝 GitHub Copilot、Claude 及 Gemini 於開發中所供技術支援及代碼生成。

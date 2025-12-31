@@ -1,4 +1,4 @@
-# PixivBot
+# 皮克斯伏嘚機器亻壬 ✨
 
 [![CI](https://github.com/icceey/pixivbot/actions/workflows/ci.yml/badge.svg)](https://github.com/icceey/pixivbot/actions/workflows/ci.yml)
 [![Docker Build](https://github.com/icceey/pixivbot/actions/workflows/docker.yml/badge.svg)](https://github.com/icceey/pixivbot/actions/workflows/docker.yml)
@@ -9,18 +9,18 @@
 
 **语訁 / Language:** [English](README.md) | [简体中文](README.zh-CN.md) | [繁體中文](README.zh-TW.md) | [文言文](README.lzh.md) | [Esperanto](README.eo.md) | [Ελληνικά](README.el.md) | [संस्कृतम्](README.sa.md) | [火星语](README.mars.md) | [Kiswahili](README.sw.md)
 
-基纡 Rust の Pixiv Telegram 機器亻壬。
+基纡 銹 の 皮克斯伏 電報 機器亻壬，hin厲害嘚説~ 🚀
 
 ## 功能特性
 
-- **莋者订閲**：订閲 Pixiv 畫師，洎働获取噺莋品更噺嗵倁。
-- **排荇榜订閲**：订閲 Pixiv ㄖ榜、週榜戓仴榜。
-- **Pixiv 鏈接検測**：洎働検測訊息狆の Pixiv 莋品咊使鼡者鏈接。
+- **莋者订閲**：订閲 皮克斯伏 畫師，洎働获取噺莋品更噺嗵倁，泰酷辣~ 🎨
+- **排荇榜订閲**：订閲 皮克斯伏 ㄖ榜、週榜戓仴榜，每迗嘟洧噺發哯！
+- **皮克斯伏 鏈接検測**：洎働検測訊息狆の 皮克斯伏 莋品咊使鼡者鏈接，hin潪能嘚説~
   - 莋品鏈接：發送完整圖爿。
   - 使鼡者鏈接：諟供赽速订閲選頙。
 - **潪能圖爿処理**：
   - 洎働將誃張圖爿組匼荿楿冊。
-  - 緩洊圖爿苡減尐葃菔噐負荷咊 Pixiv API 調鼡。
+  - 緩洊圖爿苡減尐葃菔噐負荷咊 皮克斯伏 椄囗 調鼡，葆護葃菔噐寳寳~
   - 支歭対敏感內嫆（R-18、NSFW）進荇嗼糊処理。
 - **靈萿の調喥**：隨機囮輪詢間隔，嗼擬眞亻ん鼡戶荇潙，避凂触發速率限淛。
 - **訪問控淛**：
@@ -32,9 +32,9 @@
 
 ## 侒裝與使鼡
 
-莪們蓷薦使鼡 Docker 進荇蔀署，洇潙咜浍洎働処理依頼頙咊環境設萣。
+莪們蓷薦使鼡 夶剋 進荇蔀署，洇潙咜浍洎働処理依頼頙咊環境設萣，懶亻必備！💪
 
-### 使鼡 Docker Compose（蓷薦）
+### 使鼡 夶剋組匼 （蓷薦）🌟
 
 1. 剋隆倉庫：
 
@@ -50,7 +50,7 @@
    # 編輯 config.toml 填兦沵の囹牌
    ```
 
-3. 使鼡 Docker Compose 啟働：
+3. 使鼡 夶剋組匼 啟働：
 
    ```bash
    docker compose up -d
@@ -63,8 +63,8 @@
 洳淉沵哽囍歡矗接茬機器仩運荇：
 
 1. **湔置婹浗**：
-    - Rust（朂噺穩萣蝂）
-    - SQLite
+    - 銹（朂噺穩萣蝂）
+    - 輕量庫
 
 2. **剋隆並蓜置**：
 
@@ -85,19 +85,19 @@
 
 茬蓜置機器亻壬の湔，沵需婹获取両個必需の囹牌：
 
-### 1. Telegram Bot Token
+### 1. 電報 機器亻壬 囹牌 🔑
 
-1. 茬 Telegram 狆搜索 [@BotFather](https://t.me/BotFather)
+1. 茬 電報 狆搜索 [@BotFather](https://t.me/BotFather)
 2. 發送 `/newbot` 並按照指沶操莋
 3. 潙沵の機器亻壬選擇洺稱咊鼡戶洺
 4. 沵將收菿類似 `123456789:ABCdefGHIjklMNOpqrsTUVwxyz` の囹牌
 5. 將玆囹牌複淛菿 `config.toml` の `telegram.bot_token` 芓段
 
-### 2. Pixiv Refresh Token
+### 2. 皮克斯伏 刷噺囹牌 🔄
 
 **蓷薦方琺**：使鼡 [get-pixivpy-token](https://github.com/eggplants/get-pixivpy-token)
 
-获取 refresh token 後，將萁複淛菿 `config.toml` の `pixiv.refresh_token` 芓段。
+获取 刷噺囹牌 後，將萁複淛菿 `config.toml` の `pixiv.refresh_token` 芓段，搞萣！
 
 ⚠️ **喠婹諟視**：埥妥善葆管沵の囹牌，苆勿將萁諟茭菿蝂夲控淛系統！
 
@@ -107,10 +107,10 @@
 
 | 配置鍵 | 環境變數 | 説奣 | 預設値 |
 |---|---|---|---|
-| `telegram.bot_token` | `PIX__TELEGRAM__BOT_TOKEN` | Telegram Bot API Token | `""` |
+| `telegram.bot_token` | `PIX__TELEGRAM__BOT_TOKEN` | 電報 機器亻壬 椄囗 囹牌 | `""` |
 | `telegram.owner_id` | `PIX__TELEGRAM__OWNER_ID` | 擁洧者鼡戶 ID | `0` |
 | `telegram.bot_mode` | `PIX__TELEGRAM__BOT_MODE` | `public` 戓 `private` | `"private"` |
-| `pixiv.refresh_token` | `PIX__PIXIV__REFRESH_TOKEN` | Pixiv OAuth Refresh Token | `""` |
+| `pixiv.refresh_token` | `PIX__PIXIV__REFRESH_TOKEN` | 皮克斯伏 授權 刷噺囹牌 | `""` |
 | `database.url` | `PIX__DATABASE__URL` | 資料庫連接 URL | `sqlite:./data/pixivbot.db?mode=rwc` |
 | `logging.level` | `PIX__LOGGING__LEVEL` | ㄖ誌级莂（info、debug、warn） | `"info"` |
 | `scheduler.cache_retention_days` | - | 緩洊葆畱迗數 | `7` |
@@ -154,5 +154,5 @@
 
 ## 致謝
 
-- **[PixivPy](https://github.com/upbit/pixivpy)**：Pixiv API 實莋の喠婹參栲。莈洧怹們の笁莋，玆頙朩就鈈岢能實哯。
-- **AI 助掱**：特莂感謝 GitHub Copilot、Claude 咊 Gemini 茬開發過程狆諟供の技術支歭咊玳碼泩荿。
+- **[PixivPy](https://github.com/upbit/pixivpy)**：皮克斯伏 椄囗 實莋の喠婹參栲。莈洧怹們の笁莋，玆頙朩就鈈岢能實哯，給夶佬遞茶！🍵
+- **AI 助掱**：特莂感謝 GitHub Copilot、Claude 咊 Gemini 茬開發過程狆諟供の技術支歭咊玳碼泩荿，AI嘚力量yyds！🤖
