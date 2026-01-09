@@ -258,18 +258,27 @@ impl Repo {
             value: Set(value.clone()),
             next_poll_at: Set(next_poll.naive_local()),
             last_polled_at: Set(None),
-            author_name: Set(author_name),
+            author_name: Set(author_name.clone()),
             ..Default::default()
         };
 
-        // INSERT ... ON CONFLICT(type, value) DO UPDATE SET author_name = excluded.author_name
+        // INSERT ... ON CONFLICT(type, value) DO UPDATE ...
+        // Only update author_name if a new value is provided (not None)
         // The unique constraint is on (type, value) composite index
+        let conflict_handler = if author_name.is_some() {
+            // Update author_name when provided
+            OnConflict::columns([tasks::Column::Type, tasks::Column::Value])
+                .update_column(tasks::Column::AuthorName)
+                .to_owned()
+        } else {
+            // Don't update author_name when None (preserves existing value)
+            OnConflict::columns([tasks::Column::Type, tasks::Column::Value])
+                .do_nothing()
+                .to_owned()
+        };
+
         tasks::Entity::insert(new_task)
-            .on_conflict(
-                OnConflict::columns([tasks::Column::Type, tasks::Column::Value])
-                    .update_column(tasks::Column::AuthorName)
-                    .to_owned(),
-            )
+            .on_conflict(conflict_handler)
             .exec(&self.db)
             .await
             .context("Failed to upsert task")?;
