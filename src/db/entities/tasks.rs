@@ -9,7 +9,7 @@ pub struct Model {
     #[sea_orm(primary_key)]
     pub id: i32,
     pub r#type: TaskType,
-    #[sea_orm(unique)]
+    // Note: (type, value) has a composite unique index in the database
     pub value: String, // author_id, ranking_mode
     #[sea_orm(indexed)]
     pub next_poll_at: DateTime,
