@@ -29,7 +29,13 @@ RUN rustup component add \
     clippy
 
 # Install cargo-binstall for fast binary installation
-RUN curl -L --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash
+# Pin to a specific version to avoid supply-chain attacks
+ARG CARGO_BINSTALL_VERSION=v1.10.16
+RUN curl -L --proto '=https' --tlsv1.2 -sSf \
+    "https://github.com/cargo-bins/cargo-binstall/releases/download/${CARGO_BINSTALL_VERSION}/cargo-binstall-x86_64-unknown-linux-musl.tgz" \
+    -o /tmp/cargo-binstall.tgz \
+    && tar -xzf /tmp/cargo-binstall.tgz -C /usr/local/cargo/bin \
+    && rm /tmp/cargo-binstall.tgz
 
 # Install useful cargo tools via binstall (pre-compiled binaries, ~10x faster)
 RUN cargo binstall -y --locked \

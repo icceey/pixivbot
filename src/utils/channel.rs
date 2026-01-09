@@ -101,12 +101,14 @@ fn normalize_channel_id(id: i64) -> i64 {
     // Get the absolute value for easier processing
     let abs_id = id.abs();
 
-    // Check if already has -100 prefix by examining the number of digits
-    // A properly prefixed ID like -100123456 has abs value 100123456
-    // We check if abs_id starts with "100" and is long enough
+    // Check if already has -100 prefix by examining the number of digits.
+    // A properly prefixed channel/supergroup ID like -1001234567890 has
+    // abs value 1001234567890, i.e. it starts with "100" and is fairly long.
+    // Require a minimum length to avoid treating short IDs like 100123
+    // as already-prefixed.
     let abs_str = abs_id.to_string();
 
-    if abs_str.starts_with("100") && abs_str.len() > 3 {
+    if abs_str.starts_with("100") && abs_str.len() >= 12 {
         // Already has the 100 prefix, just ensure it's negative
         -abs_id
     } else {
@@ -121,6 +123,10 @@ fn normalize_channel_id(id: i64) -> i64 {
 /// This trait adds fluent methods to the `Bot` type for checking channel permissions,
 /// allowing calls like `bot.can_post_to_channel(&channel)` instead of
 /// `check_bot_can_post(&bot, &channel)`.
+// NOTE: This trait is only ever implemented for the concrete `teloxide::Bot` type and
+// is not used as a trait object. Using `async fn` in the trait is therefore safe in
+// this context, and we explicitly allow `async_fn_in_trait` for ergonomic async methods
+// on Rust 2021.
 #[allow(async_fn_in_trait)]
 pub trait BotChannelExt {
     /// Check if the bot has permission to post messages in a channel.

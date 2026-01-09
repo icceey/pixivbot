@@ -143,8 +143,14 @@ impl BotHandler {
                     )
                     .await
                 {
-                    error!("Failed to create chat for channel {}: {:#}", channel_id, e);
-                    return Err("创建频道记录失败".to_string());
+                    error!(
+                        "Failed to create chat record for channel {} during subscription: {:#}",
+                        channel_id, e
+                    );
+                    return Err(format!(
+                        "创建频道记录失败 (Failed to create chat record for channel {})",
+                        channel_id
+                    ));
                 }
 
                 Ok((channel_id, true))
