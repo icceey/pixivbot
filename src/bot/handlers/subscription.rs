@@ -1,7 +1,8 @@
 use crate::bot::BotHandler;
 use crate::db::types::{TagFilter, TaskType};
 use crate::pixiv::model::RankingMode;
-use crate::utils::{args, channel};
+use crate::utils::args;
+use crate::utils::channel::{self, BotChannelExt};
 use anyhow::{Context, Result};
 use teloxide::prelude::*;
 use teloxide::types::{
@@ -110,15 +111,25 @@ impl BotHandler {
         match channel_param {
             Some(channel_str) if !channel_str.is_empty() => {
                 // Parse channel identifier (can be numeric ID or @username)
-                let channel_identifier: channel::ChannelIdentifier = channel_str.parse()?;
+                let channel_identifier: channel::ChannelIdentifier =
+                    channel_str.parse().map_err(|e| {
+                        warn!(
+                            "Failed to parse channel identifier '{}': {}",
+                            channel_str, e
+                        );
+                        e
+                    })?;
 
                 // Validate user_id is available
-                let user_id = user_id.ok_or("无法获取用户信息")?;
+                let user_id = user_id.ok_or_else(|| {
+                    warn!("User ID not available for channel subscription");
+                    "无法获取用户信息".to_string()
+                })?;
 
                 // Validate channel permissions and get resolved numeric ID
-                let channel_id =
-                    channel::validate_channel_permissions(bot, &channel_identifier, user_id)
-                        .await?;
+                let channel_id = bot
+                    .validate_channel_permissions(&channel_identifier, user_id)
+                    .await?;
 
                 // Ensure chat exists in database for the channel
                 if let Err(e) = self
@@ -570,10 +581,18 @@ impl BotHandler {
         {
             Ok(Some((msg_record, Some((sub, task))))) => (msg_record, sub, task),
             Ok(Some((_, None))) => {
+                warn!(
+                    "Subscription not found for message {} in chat {}",
+                    reply_message_id, chat_id
+                );
                 bot.send_message(chat_id, "❌ 该订阅已不存在").await?;
                 return Ok(());
             }
             Ok(None) => {
+                warn!(
+                    "No message record found for message {} in chat {}",
+                    reply_message_id, chat_id
+                );
                 bot.send_message(chat_id, "❌ 未找到该消息对应的订阅记录")
                     .await?;
                 return Ok(());
@@ -589,6 +608,10 @@ impl BotHandler {
         let task = match task {
             Some(t) => t,
             None => {
+                warn!(
+                    "Task not found for subscription {} in chat {}",
+                    subscription.id, chat_id
+                );
                 bot.send_message(chat_id, "❌ 该订阅的任务已不存在").await?;
                 return Ok(());
             }
