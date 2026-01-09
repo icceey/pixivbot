@@ -46,7 +46,10 @@ impl FromStr for ChannelIdentifier {
     /// Parse a channel identifier from string.
     ///
     /// Supports:
-    /// - Numeric channel IDs (e.g., "-1001234567890")
+    /// - Numeric channel IDs with automatic `-100` prefix normalization:
+    ///   - `123456` → `-100123456`
+    ///   - `-123456` → `-100123456`
+    ///   - `-100123456` → `-100123456` (unchanged)
     /// - Channel usernames starting with @ (e.g., "@channelname")
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let input = s.trim();
@@ -57,7 +60,8 @@ impl FromStr for ChannelIdentifier {
 
         // Try parsing as a numeric ID first
         if let Ok(id) = input.parse::<i64>() {
-            return Ok(ChannelIdentifier::Id(ChatId(id)));
+            let normalized_id = normalize_channel_id(id);
+            return Ok(ChannelIdentifier::Id(ChatId(normalized_id)));
         }
 
         // If starts with @, it's a username
@@ -75,6 +79,40 @@ impl FromStr for ChannelIdentifier {
         }
 
         Err(format!("无效的频道 ID: {}", input))
+    }
+}
+
+/// Normalize a channel ID by ensuring it has the `-100` prefix.
+///
+/// Telegram channel/supergroup IDs always have the format `-100XXXXXXXXXX`.
+/// Users may input:
+/// - `123456` → `-100123456`
+/// - `-123456` → `-100123456`
+/// - `-100123456` → `-100123456` (already normalized)
+///
+/// # Examples
+///
+/// ```
+/// assert_eq!(normalize_channel_id(123456), -100123456);
+/// assert_eq!(normalize_channel_id(-123456), -100123456);
+/// assert_eq!(normalize_channel_id(-100123456), -100123456);
+/// ```
+fn normalize_channel_id(id: i64) -> i64 {
+    // Get the absolute value for easier processing
+    let abs_id = id.abs();
+
+    // Check if already has -100 prefix by examining the number of digits
+    // A properly prefixed ID like -100123456 has abs value 100123456
+    // We check if abs_id starts with "100" and is long enough
+    let abs_str = abs_id.to_string();
+
+    if abs_str.starts_with("100") && abs_str.len() > 3 {
+        // Already has the 100 prefix, just ensure it's negative
+        -abs_id
+    } else {
+        // Add -100 prefix: multiply by -1 and prepend 100
+        let prefixed = format!("100{}", abs_id);
+        -prefixed.parse::<i64>().unwrap_or(-abs_id)
     }
 }
 
@@ -234,5 +272,75 @@ impl BotChannelExt for Bot {
 
         // Resolve to numeric ID for database storage
         self.resolve_channel_id(channel).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_normalize_channel_id() {
+        // Positive input without prefix
+        assert_eq!(normalize_channel_id(123456), -100123456);
+        assert_eq!(normalize_channel_id(1234567890), -1001234567890);
+
+        // Negative input without -100 prefix
+        assert_eq!(normalize_channel_id(-123456), -100123456);
+        assert_eq!(normalize_channel_id(-1234567890), -1001234567890);
+
+        // Already has -100 prefix
+        assert_eq!(normalize_channel_id(-100123456), -100123456);
+        assert_eq!(normalize_channel_id(-1001234567890), -1001234567890);
+
+        // Positive with 100 prefix (rare but possible user input)
+        assert_eq!(normalize_channel_id(100123456), -100123456);
+        assert_eq!(normalize_channel_id(1001234567890), -1001234567890);
+    }
+
+    #[test]
+    fn test_channel_identifier_from_str_numeric() {
+        // Test positive ID normalization
+        let id: ChannelIdentifier = "123456".parse().unwrap();
+        match id {
+            ChannelIdentifier::Id(chat_id) => assert_eq!(chat_id.0, -100123456),
+            _ => panic!("Expected Id variant"),
+        }
+
+        // Test negative ID normalization
+        let id: ChannelIdentifier = "-123456".parse().unwrap();
+        match id {
+            ChannelIdentifier::Id(chat_id) => assert_eq!(chat_id.0, -100123456),
+            _ => panic!("Expected Id variant"),
+        }
+
+        // Test already normalized ID
+        let id: ChannelIdentifier = "-100123456".parse().unwrap();
+        match id {
+            ChannelIdentifier::Id(chat_id) => assert_eq!(chat_id.0, -100123456),
+            _ => panic!("Expected Id variant"),
+        }
+    }
+
+    #[test]
+    fn test_channel_identifier_from_str_username() {
+        let id: ChannelIdentifier = "@testchannel".parse().unwrap();
+        match id {
+            ChannelIdentifier::Username(name) => assert_eq!(name, "@testchannel"),
+            _ => panic!("Expected Username variant"),
+        }
+    }
+
+    #[test]
+    fn test_channel_identifier_from_str_errors() {
+        // Empty string
+        assert!("".parse::<ChannelIdentifier>().is_err());
+        assert!("   ".parse::<ChannelIdentifier>().is_err());
+
+        // Invalid username (too short)
+        assert!("@abc".parse::<ChannelIdentifier>().is_err());
+
+        // Invalid format
+        assert!("not_a_valid_id".parse::<ChannelIdentifier>().is_err());
     }
 }
