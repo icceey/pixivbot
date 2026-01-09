@@ -1,6 +1,48 @@
 use crate::bot::BotHandler;
+use std::path::Path;
 use teloxide::prelude::*;
 use teloxide::types::ParseMode;
+
+/// 计算目录的总大小（递归）
+fn calculate_dir_size(path: &Path) -> u64 {
+    if !path.exists() || !path.is_dir() {
+        return 0;
+    }
+
+    let mut total_size = 0u64;
+
+    if let Ok(entries) = std::fs::read_dir(path) {
+        for entry in entries.flatten() {
+            let entry_path = entry.path();
+            if entry_path.is_file() {
+                if let Ok(metadata) = entry.metadata() {
+                    total_size += metadata.len();
+                }
+            } else if entry_path.is_dir() {
+                total_size += calculate_dir_size(&entry_path);
+            }
+        }
+    }
+
+    total_size
+}
+
+/// 格式化文件大小为人类可读格式
+fn format_size(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    const GB: u64 = MB * 1024;
+
+    if bytes >= GB {
+        format!("{:.2} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.2} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.2} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{} B", bytes)
+    }
+}
 
 impl BotHandler {
     // ------------------------------------------------------------------------
@@ -75,13 +117,28 @@ impl BotHandler {
         let subscription_count = self.repo.count_all_subscriptions().await.unwrap_or(0);
         let task_count = self.repo.count_all_tasks().await.unwrap_or(0);
 
+        // Calculate disk usage for cache and log directories
+        let cache_path = Path::new(&self.cache_dir);
+        let log_path = Path::new(&self.log_dir);
+
+        let cache_size = calculate_dir_size(cache_path);
+        let log_size = calculate_dir_size(log_path);
+
         let message = format!(
             "📊 *PixivBot 状态信息*\n\n\
             👥 管理员人数: `{}`\n\
             💬 启用的聊天数: `{}`\n\
             📋 订阅数: `{}`\n\
-            📝 任务数: `{}`",
-            admin_count, enabled_chat_count, subscription_count, task_count
+            📝 任务数: `{}`\n\n\
+            💾 *磁盘占用*\n\
+            📁 缓存目录: `{}`\n\
+            📄 日志目录: `{}`",
+            admin_count,
+            enabled_chat_count,
+            subscription_count,
+            task_count,
+            format_size(cache_size),
+            format_size(log_size)
         );
 
         bot.send_message(chat_id, message)

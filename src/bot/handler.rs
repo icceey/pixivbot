@@ -28,6 +28,10 @@ pub struct BotHandler {
     pub(crate) download_original_threshold: u8,
     /// 群组中是否需要 @bot 才响应 (默认: true)
     pub(crate) require_mention_in_group: bool,
+    /// 缓存目录路径 (用于管理员查看磁盘占用)
+    pub(crate) cache_dir: String,
+    /// 日志目录路径 (用于管理员查看磁盘占用)
+    pub(crate) log_dir: String,
 }
 
 impl BotHandler {
@@ -46,6 +50,8 @@ impl BotHandler {
         image_size: pixiv_client::ImageSize,
         download_original_threshold: u8,
         require_mention_in_group: bool,
+        cache_dir: String,
+        log_dir: String,
     ) -> Self {
         Self {
             repo,
@@ -57,6 +63,8 @@ impl BotHandler {
             image_size,
             download_original_threshold,
             require_mention_in_group,
+            cache_dir,
+            log_dir,
         }
     }
 
