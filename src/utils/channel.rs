@@ -4,6 +4,8 @@
 //! 1. The bot has permission to post in a channel
 //! 2. The user is an administrator of the channel
 
+use std::str::FromStr;
+
 use teloxide::prelude::*;
 use teloxide::types::{ChatId, ChatMemberKind, ChatMemberStatus, Recipient};
 use tracing::info;
@@ -24,6 +26,44 @@ impl ChannelIdentifier {
             ChannelIdentifier::Id(id) => Recipient::Id(*id),
             ChannelIdentifier::Username(username) => Recipient::ChannelUsername(username.clone()),
         }
+    }
+}
+
+impl FromStr for ChannelIdentifier {
+    type Err = String;
+
+    /// Parse a channel identifier from string.
+    ///
+    /// Supports:
+    /// - Numeric channel IDs (e.g., "-1001234567890")
+    /// - Channel usernames starting with @ (e.g., "@channelname")
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let input = s.trim();
+
+        if input.is_empty() {
+            return Err("频道 ID 不能为空".to_string());
+        }
+
+        // Try parsing as a numeric ID first
+        if let Ok(id) = input.parse::<i64>() {
+            return Ok(ChannelIdentifier::Id(ChatId(id)));
+        }
+
+        // If starts with @, it's a username
+        if let Some(username) = input.strip_prefix('@') {
+            // Validate username format: @ followed by alphanumeric and underscores, min 5 chars after @
+            if username.len() >= 5
+                && username
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_')
+            {
+                return Ok(ChannelIdentifier::Username(input.to_string()));
+            } else {
+                return Err("无效的频道用户名格式 (用户名需至少5个字符)".to_string());
+            }
+        }
+
+        Err(format!("无效的频道 ID: {}", input))
     }
 }
 
@@ -158,40 +198,4 @@ pub async fn validate_channel_permissions(
 
     // Resolve to numeric ID for database storage
     resolve_channel_id(bot, channel).await
-}
-
-/// Parse a channel identifier from string.
-///
-/// Supports:
-/// - Numeric channel IDs (e.g., "-1001234567890")
-/// - Channel usernames starting with @ (e.g., "@channelname")
-///
-/// Returns a ChannelIdentifier.
-pub fn parse_channel_id(input: &str) -> Result<ChannelIdentifier, String> {
-    let input = input.trim();
-
-    if input.is_empty() {
-        return Err("频道 ID 不能为空".to_string());
-    }
-
-    // Try parsing as a numeric ID first
-    if let Ok(id) = input.parse::<i64>() {
-        return Ok(ChannelIdentifier::Id(ChatId(id)));
-    }
-
-    // If starts with @, it's a username
-    if let Some(username) = input.strip_prefix('@') {
-        // Validate username format: @ followed by alphanumeric and underscores, min 5 chars after @
-        if username.len() >= 5
-            && username
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_')
-        {
-            return Ok(ChannelIdentifier::Username(input.to_string()));
-        } else {
-            return Err("无效的频道用户名格式 (用户名需至少5个字符)".to_string());
-        }
-    }
-
-    Err(format!("无效的频道 ID: {}", input))
 }

@@ -110,7 +110,7 @@ impl BotHandler {
         match channel_param {
             Some(channel_str) if !channel_str.is_empty() => {
                 // Parse channel identifier (can be numeric ID or @username)
-                let channel_identifier = channel::parse_channel_id(channel_str)?;
+                let channel_identifier: channel::ChannelIdentifier = channel_str.parse()?;
 
                 // Validate user_id is available
                 let user_id = user_id.ok_or("无法获取用户信息")?;
