@@ -35,6 +35,8 @@ pub async fn run(
     sensitive_tags: Vec<String>,
     image_size: pixiv_client::ImageSize,
     download_original_threshold: u8,
+    cache_dir: String,
+    log_dir: String,
 ) -> Result<()> {
     info!("Starting Telegram Bot...");
 
@@ -66,6 +68,8 @@ pub async fn run(
         image_size,
         download_original_threshold,
         config.require_mention_in_group,
+        cache_dir,
+        log_dir,
     );
 
     info!("✅ Bot initialized, starting command handler");

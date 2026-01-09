@@ -1,9 +1,9 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Local};
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait,
-    FromQueryResult, IntoActiveModel, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set,
-    Statement,
+    sea_query::OnConflict, ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection,
+    EntityTrait, FromQueryResult, IntoActiveModel, PaginatorTrait, QueryFilter, QueryOrder,
+    QuerySelect, Set, Statement,
 };
 
 use super::entities::{chats, messages, subscriptions, tasks, users};
@@ -24,7 +24,8 @@ impl Repo {
 
     // ==================== Users ====================
 
-    /// Create or update a user
+    /// Create or update a user (atomic upsert)
+    /// On conflict: only updates username, preserves existing role
     pub async fn upsert_user(
         &self,
         user_id: i64,
@@ -33,32 +34,31 @@ impl Repo {
     ) -> Result<users::Model> {
         let now = Local::now().naive_local();
 
-        // Try to find existing user
-        if let Some(existing) = users::Entity::find_by_id(user_id)
+        let new_user = users::ActiveModel {
+            id: Set(user_id),
+            username: Set(username.clone()),
+            role: Set(role),
+            created_at: Set(now),
+        };
+
+        // INSERT ... ON CONFLICT(id) DO UPDATE SET username = excluded.username
+        // This preserves the existing role when updating
+        users::Entity::insert(new_user)
+            .on_conflict(
+                OnConflict::column(users::Column::Id)
+                    .update_column(users::Column::Username)
+                    .to_owned(),
+            )
+            .exec(&self.db)
+            .await
+            .context("Failed to upsert user")?;
+
+        // Fetch the result (needed because exec_with_returning is not available for SQLite with ON CONFLICT)
+        users::Entity::find_by_id(user_id)
             .one(&self.db)
             .await
-            .context("Failed to query user")?
-        {
-            // Update existing (only update username, don't change role)
-            let mut active: users::ActiveModel = existing.into_active_model();
-            active.username = Set(username);
-            active
-                .update(&self.db)
-                .await
-                .context("Failed to update user")
-        } else {
-            // Create new user with specified role
-            let new_user = users::ActiveModel {
-                id: Set(user_id),
-                username: Set(username),
-                role: Set(role),
-                created_at: Set(now),
-            };
-            new_user
-                .insert(&self.db)
-                .await
-                .context("Failed to insert new user")
-        }
+            .context("Failed to fetch upserted user")?
+            .ok_or_else(|| anyhow::anyhow!("User {} not found after upsert", user_id))
     }
 
     pub async fn get_user(&self, user_id: i64) -> Result<Option<users::Model>> {
@@ -95,7 +95,8 @@ impl Repo {
 
     // ==================== Chats ====================
 
-    /// Create or update a chat
+    /// Create or update a chat (atomic upsert)
+    /// On conflict: only updates type and title, preserves other settings
     pub async fn upsert_chat(
         &self,
         chat_id: i64,
@@ -106,71 +107,69 @@ impl Repo {
     ) -> Result<chats::Model> {
         let now = Local::now().naive_local();
 
-        if let Some(existing) = chats::Entity::find_by_id(chat_id)
+        let new_chat = chats::ActiveModel {
+            id: Set(chat_id),
+            r#type: Set(chat_type),
+            title: Set(title),
+            enabled: Set(default_enabled),
+            blur_sensitive_tags: Set(true), // Default to enabled
+            excluded_tags: Set(Tags::default()),
+            sensitive_tags: Set(default_sensitive_tags),
+            created_at: Set(now),
+        };
+
+        // INSERT ... ON CONFLICT(id) DO UPDATE SET type = excluded.type, title = excluded.title
+        // This preserves enabled, blur_sensitive_tags, excluded_tags, sensitive_tags when updating
+        chats::Entity::insert(new_chat)
+            .on_conflict(
+                OnConflict::column(chats::Column::Id)
+                    .update_columns([chats::Column::Type, chats::Column::Title])
+                    .to_owned(),
+            )
+            .exec(&self.db)
+            .await
+            .context("Failed to upsert chat")?;
+
+        // Fetch the result
+        chats::Entity::find_by_id(chat_id)
             .one(&self.db)
             .await
-            .context("Failed to query chat")?
-        {
-            // Update existing (keep enabled status)
-            let mut active: chats::ActiveModel = existing.into_active_model();
-            active.r#type = Set(chat_type);
-            active.title = Set(title);
-            active
-                .update(&self.db)
-                .await
-                .context("Failed to update chat")
-        } else {
-            // Create new with default enabled status and blur enabled by default
-            let new_chat = chats::ActiveModel {
-                id: Set(chat_id),
-                r#type: Set(chat_type),
-                title: Set(title),
-                enabled: Set(default_enabled),
-                blur_sensitive_tags: Set(true), // Default to enabled
-                excluded_tags: Set(Tags::default()),
-                sensitive_tags: Set(default_sensitive_tags),
-                created_at: Set(now),
-            };
-            new_chat
-                .insert(&self.db)
-                .await
-                .context("Failed to insert new chat")
-        }
+            .context("Failed to fetch upserted chat")?
+            .ok_or_else(|| anyhow::anyhow!("Chat {} not found after upsert", chat_id))
     }
 
-    /// Enable or disable a chat (creates if not exists)
+    /// Enable or disable a chat (atomic upsert - creates if not exists)
     pub async fn set_chat_enabled(&self, chat_id: i64, enabled: bool) -> Result<chats::Model> {
         let now = Local::now().naive_local();
 
-        if let Some(existing) = chats::Entity::find_by_id(chat_id)
+        let new_chat = chats::ActiveModel {
+            id: Set(chat_id),
+            r#type: Set("unknown".to_string()), // Unknown type for manually added chats
+            title: Set(None),
+            enabled: Set(enabled),
+            blur_sensitive_tags: Set(true), // Default to enabled
+            excluded_tags: Set(Tags::default()),
+            sensitive_tags: Set(Tags::default()),
+            created_at: Set(now),
+        };
+
+        // INSERT ... ON CONFLICT(id) DO UPDATE SET enabled = excluded.enabled
+        chats::Entity::insert(new_chat)
+            .on_conflict(
+                OnConflict::column(chats::Column::Id)
+                    .update_column(chats::Column::Enabled)
+                    .to_owned(),
+            )
+            .exec(&self.db)
+            .await
+            .context("Failed to upsert chat enabled status")?;
+
+        // Fetch the result
+        chats::Entity::find_by_id(chat_id)
             .one(&self.db)
             .await
-            .context("Failed to query chat")?
-        {
-            // Update existing chat
-            let mut active: chats::ActiveModel = existing.into_active_model();
-            active.enabled = Set(enabled);
-            active
-                .update(&self.db)
-                .await
-                .context("Failed to update chat enabled status")
-        } else {
-            // Create new chat with specified enabled status
-            let new_chat = chats::ActiveModel {
-                id: Set(chat_id),
-                r#type: Set("unknown".to_string()), // Unknown type for manually added chats
-                title: Set(None),
-                enabled: Set(enabled),
-                blur_sensitive_tags: Set(true), // Default to enabled
-                excluded_tags: Set(Tags::default()),
-                sensitive_tags: Set(Tags::default()),
-                created_at: Set(now),
-            };
-            new_chat
-                .insert(&self.db)
-                .await
-                .context("Failed to insert new chat")
-        }
+            .context("Failed to fetch chat")?
+            .ok_or_else(|| anyhow::anyhow!("Chat {} not found after upsert", chat_id))
     }
 
     /// Set blur_sensitive_tags for a chat
@@ -230,29 +229,6 @@ impl Repo {
 
     // ==================== Tasks ====================
 
-    /// Create a new task
-    pub async fn create_task(
-        &self,
-        task_type: TaskType,
-        value: String,
-        next_poll_at: DateTime<Local>,
-        author_name: Option<String>,
-    ) -> Result<tasks::Model> {
-        let new_task = tasks::ActiveModel {
-            r#type: Set(task_type),
-            value: Set(value),
-            next_poll_at: Set(next_poll_at.naive_local()),
-            last_polled_at: Set(None),
-            author_name: Set(author_name),
-            ..Default::default()
-        };
-
-        new_task
-            .insert(&self.db)
-            .await
-            .context("Failed to create task")
-    }
-
     /// Find task by type and value
     pub async fn get_task_by_type_value(
         &self,
@@ -267,20 +243,50 @@ impl Repo {
             .context("Failed to find task by type and value")
     }
 
-    /// Get or create a task (for subscription flow)
+    /// Get or create a task (atomic upsert for subscription flow)
+    /// On conflict: preserves existing task, optionally updates author_name if provided
     pub async fn get_or_create_task(
         &self,
         task_type: TaskType,
         value: String,
         author_name: Option<String>,
     ) -> Result<tasks::Model> {
-        if let Some(existing) = self.get_task_by_type_value(task_type, &value).await? {
-            Ok(existing)
+        let next_poll = Local::now() + chrono::Duration::seconds(60); // Poll in 1 minute
+
+        let new_task = tasks::ActiveModel {
+            r#type: Set(task_type),
+            value: Set(value.clone()),
+            next_poll_at: Set(next_poll.naive_local()),
+            last_polled_at: Set(None),
+            author_name: Set(author_name.clone()),
+            ..Default::default()
+        };
+
+        // INSERT ... ON CONFLICT(type, value) DO UPDATE ...
+        // Only update author_name if a new value is provided (not None)
+        // The unique constraint is on (type, value) composite index
+        let conflict_handler = if author_name.is_some() {
+            // Update author_name when provided
+            OnConflict::columns([tasks::Column::Type, tasks::Column::Value])
+                .update_column(tasks::Column::AuthorName)
+                .to_owned()
         } else {
-            let next_poll = Local::now() + chrono::Duration::seconds(60); // Poll in 1 minute
-            self.create_task(task_type, value, next_poll, author_name)
-                .await
-        }
+            // Don't update author_name when None (preserves existing value)
+            OnConflict::columns([tasks::Column::Type, tasks::Column::Value])
+                .do_nothing()
+                .to_owned()
+        };
+
+        tasks::Entity::insert(new_task)
+            .on_conflict(conflict_handler)
+            .exec(&self.db)
+            .await
+            .context("Failed to upsert task")?;
+
+        // Fetch the result by type and value
+        self.get_task_by_type_value(task_type, &value)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Task with value {} not found after upsert", value))
     }
 
     /// Get pending tasks filtered by type
@@ -366,8 +372,8 @@ impl Repo {
 
     // ==================== Subscriptions ====================
 
-    /// Create a subscription
-    pub async fn create_subscription(
+    /// Get or create subscription (atomic upsert - updates filter_tags if exists)
+    pub async fn upsert_subscription(
         &self,
         chat_id: i64,
         task_id: i32,
@@ -383,39 +389,31 @@ impl Repo {
             ..Default::default()
         };
 
-        new_sub
-            .insert(&self.db)
+        // INSERT ... ON CONFLICT(chat_id, task_id) DO UPDATE SET filter_tags = excluded.filter_tags
+        subscriptions::Entity::insert(new_sub)
+            .on_conflict(
+                OnConflict::columns([subscriptions::Column::ChatId, subscriptions::Column::TaskId])
+                    .update_column(subscriptions::Column::FilterTags)
+                    .to_owned(),
+            )
+            .exec(&self.db)
             .await
-            .context("Failed to create subscription")
-    }
+            .context("Failed to upsert subscription")?;
 
-    /// Get or create subscription (upsert filter_tags if exists)
-    pub async fn upsert_subscription(
-        &self,
-        chat_id: i64,
-        task_id: i32,
-        filter_tags: TagFilter,
-    ) -> Result<subscriptions::Model> {
-        // Check if subscription exists
-        if let Some(existing) = subscriptions::Entity::find()
+        // Fetch the result
+        subscriptions::Entity::find()
             .filter(subscriptions::Column::ChatId.eq(chat_id))
             .filter(subscriptions::Column::TaskId.eq(task_id))
             .one(&self.db)
             .await
-            .context("Failed to query subscription")?
-        {
-            // Update filter_tags
-            let mut active: subscriptions::ActiveModel = existing.into_active_model();
-            active.filter_tags = Set(filter_tags);
-            active
-                .update(&self.db)
-                .await
-                .context("Failed to update subscription")
-        } else {
-            // Create new
-            self.create_subscription(chat_id, task_id, filter_tags)
-                .await
-        }
+            .context("Failed to fetch upserted subscription")?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Subscription for chat {} task {} not found after upsert",
+                    chat_id,
+                    task_id
+                )
+            })
     }
 
     /// List all subscriptions for a chat

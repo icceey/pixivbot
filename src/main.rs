@@ -184,6 +184,8 @@ async fn main() -> Result<()> {
     let sensitive_tags_for_bot = config.content.sensitive_tags.clone();
     let image_size_for_bot = config.content.image_size.to_pixiv_image_size();
     let download_threshold_for_bot = config.content.download_threshold();
+    let cache_dir_for_bot = config.scheduler.cache_dir.clone();
+    let log_dir_for_bot = config.logging.dir.clone();
     let bot_handle = tokio::spawn(async move {
         if let Err(e) = bot::run(
             bot,
@@ -194,6 +196,8 @@ async fn main() -> Result<()> {
             sensitive_tags_for_bot,
             image_size_for_bot,
             download_threshold_for_bot,
+            cache_dir_for_bot,
+            log_dir_for_bot,
         )
         .await
         {
