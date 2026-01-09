@@ -104,11 +104,11 @@ fn normalize_channel_id(id: i64) -> i64 {
     // Check if already has -100 prefix by examining the number of digits.
     // A properly prefixed channel/supergroup ID like -1001234567890 has
     // abs value 1001234567890, i.e. it starts with "100" and is fairly long.
-    // Require a minimum length to avoid treating short IDs like 100123
-    // as already-prefixed.
+    // Require a minimum length to avoid treating short IDs like 100123 (6 digits)
+    // as already-prefixed. Real channel IDs with "100" prefix are at least 9 digits.
     let abs_str = abs_id.to_string();
 
-    if abs_str.starts_with("100") && abs_str.len() >= 12 {
+    if abs_str.starts_with("100") && abs_str.len() >= 9 {
         // Already has the 100 prefix, just ensure it's negative
         -abs_id
     } else {
