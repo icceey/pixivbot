@@ -2,10 +2,13 @@ use crate::pixiv::downloader::Downloader;
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use teloxide::adaptors::Throttle;
 use teloxide::prelude::*;
 use teloxide::types::{ChatAction, InputFile, InputMedia, InputMediaPhoto, ParseMode};
-use tokio::time::{sleep, Duration};
 use tracing::{error, info, warn};
+
+/// Type alias for the throttled bot
+pub type ThrottledBot = Throttle<Bot>;
 
 #[derive(Debug, Clone)]
 pub struct BatchSendResult {
@@ -41,12 +44,12 @@ enum CaptionStrategy<'a> {
 
 #[derive(Clone)]
 pub struct Notifier {
-    bot: Bot,
+    bot: ThrottledBot,
     downloader: Arc<Downloader>,
 }
 
 impl Notifier {
-    pub fn new(bot: Bot, downloader: Arc<Downloader>) -> Self {
+    pub fn new(bot: ThrottledBot, downloader: Arc<Downloader>) -> Self {
         Self { bot, downloader }
     }
 
@@ -120,7 +123,6 @@ impl Notifier {
                 .await
             {
                 Ok(msg_id) => {
-                    sleep(Duration::from_secs(2)).await;
                     return BatchSendResult {
                         succeeded_indices: vec![0],
                         failed_indices: Vec::new(),
@@ -210,11 +212,7 @@ impl Notifier {
             }
 
             current_idx += batch_size;
-
-            if batch_idx < total_batches - 1 {
-                let cooldown = Duration::from_secs((batch_size * 2) as u64);
-                sleep(cooldown).await;
-            }
+            // Rate limiting is now handled by the Throttle adaptor
         }
 
         if !failed.is_empty() {

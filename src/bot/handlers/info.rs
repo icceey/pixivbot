@@ -1,3 +1,4 @@
+use crate::bot::notifier::ThrottledBot;
 use crate::bot::BotHandler;
 use std::path::Path;
 use teloxide::prelude::*;
@@ -50,7 +51,7 @@ impl BotHandler {
     // ------------------------------------------------------------------------
 
     /// 显示帮助信息
-    pub async fn handle_help(&self, bot: Bot, chat_id: ChatId) -> ResponseResult<()> {
+    pub async fn handle_help(&self, bot: ThrottledBot, chat_id: ChatId) -> ResponseResult<()> {
         let help_text = r#"
 📚 *PixivBot 帮助*
 
@@ -110,7 +111,7 @@ impl BotHandler {
     // ------------------------------------------------------------------------
 
     /// 显示 Bot 状态信息（仅管理员可用）
-    pub async fn handle_info(&self, bot: Bot, chat_id: ChatId) -> ResponseResult<()> {
+    pub async fn handle_info(&self, bot: ThrottledBot, chat_id: ChatId) -> ResponseResult<()> {
         // Gather statistics
         let admin_count = self.repo.count_admin_users().await.unwrap_or(0);
         let enabled_chat_count = self.repo.count_enabled_chats().await.unwrap_or(0);

@@ -1,5 +1,5 @@
 use crate::bot::link_handler::{parse_pixiv_links, PixivLink};
-use crate::bot::notifier::Notifier;
+use crate::bot::notifier::{Notifier, ThrottledBot};
 use crate::bot::Command;
 use crate::db::repo::Repo;
 use crate::db::types::{TagFilter, TaskType, UserRole};
@@ -74,7 +74,7 @@ impl BotHandler {
 
     pub async fn handle_command(
         &self,
-        bot: Bot,
+        bot: ThrottledBot,
         msg: Message,
         cmd: Command,
         ctx: crate::bot::UserChatContext,
@@ -95,7 +95,7 @@ impl BotHandler {
     /// Dispatch command to the appropriate handler
     async fn dispatch_command(
         &self,
-        bot: Bot,
+        bot: ThrottledBot,
         msg: Message,
         chat_id: ChatId,
         cmd: Command,
@@ -165,7 +165,7 @@ impl BotHandler {
     /// 群组中只在被 @ 时响应
     pub async fn handle_message(
         &self,
-        bot: Bot,
+        bot: ThrottledBot,
         msg: Message,
         text: &str,
         ctx: crate::bot::UserChatContext,
@@ -206,7 +206,7 @@ impl BotHandler {
     /// 处理作品链接 - 推送作品图片
     async fn handle_illust_link(
         &self,
-        bot: Bot,
+        bot: ThrottledBot,
         chat_id: ChatId,
         illust_id: u64,
         chat_settings: Option<&crate::db::entities::chats::Model>,
@@ -273,7 +273,7 @@ impl BotHandler {
     /// 处理用户链接 - 订阅作者
     async fn handle_user_link(
         &self,
-        bot: Bot,
+        bot: ThrottledBot,
         chat_id: ChatId,
         user_id: u64,
     ) -> ResponseResult<()> {
