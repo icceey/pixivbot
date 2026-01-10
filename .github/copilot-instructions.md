@@ -1,5 +1,21 @@
 # PixivBot Copilot Instructions
 
+## ⚠️ HIGHEST PRIORITY: CI Verification
+
+**MANDATORY**: Before completing ANY code changes, you MUST run `make ci` to verify all checks pass:
+
+```bash
+make ci  # Runs: fmt, clippy, check, test, build
+```
+
+- CI uses `RUSTFLAGS=-Dwarnings` - ALL warnings are treated as errors
+- Never mark a task as complete without successful `make ci` execution
+- If `make ci` fails, fix all issues before proceeding
+
+This requirement is NON-NEGOTIABLE and applies to every code modification.
+
+---
+
 ## Project Overview
 
 A Rust-based Telegram bot for subscribing to Pixiv artists and rankings. When artists publish new works, the bot automatically downloads and pushes images to subscribers. Also supports detecting Pixiv links in messages and responding accordingly.
@@ -277,7 +293,7 @@ When adding new features:
 7. **User messages** - Use `MarkdownV2`, escape all dynamic content
 8. **Consistency** - Match existing patterns (e.g., batch caption format in retries)
 9. **Testing** - Add tests in `#[cfg(test)]` modules (see `link_handler.rs`)
-10. **Pre-commit** - Run `make ci` to catch all issues locally
+10. **Pre-commit** - Run `make ci` to catch all issues locally (see ⚠️ HIGHEST PRIORITY section)
 
 **Common Integration Points**:
 - Scheduler ↔ Notifier: Use `BatchSendResult` to track partial sends
