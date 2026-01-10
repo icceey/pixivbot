@@ -227,6 +227,93 @@ impl Repo {
             .context("Failed to get chat")
     }
 
+    /// Migrate chat from old_chat_id to new_chat_id
+    /// This updates the chat's primary key and cascades to all related tables
+    /// (subscriptions and messages will be updated automatically via foreign key CASCADE)
+    pub async fn migrate_chat(&self, old_chat_id: i64, new_chat_id: i64) -> Result<()> {
+        use sea_orm::TransactionTrait;
+
+        // Get the old chat record
+        let old_chat = self
+            .get_chat(old_chat_id)
+            .await?
+            .context(format!("Old chat {} not found", old_chat_id))?;
+
+        // Start a transaction to ensure atomicity
+        let txn = self
+            .db
+            .begin()
+            .await
+            .context("Failed to begin transaction")?;
+
+        // Update chat ID in chats table
+        // Since we can't update primary keys directly in SQLite, we need to:
+        // 1. Insert a new chat with the new ID
+        // 2. Update all foreign key references (handled by CASCADE)
+        // 3. Delete the old chat
+        let new_chat = chats::ActiveModel {
+            id: Set(new_chat_id),
+            r#type: Set(old_chat.r#type),
+            title: Set(old_chat.title),
+            enabled: Set(old_chat.enabled),
+            blur_sensitive_tags: Set(old_chat.blur_sensitive_tags),
+            excluded_tags: Set(old_chat.excluded_tags),
+            sensitive_tags: Set(old_chat.sensitive_tags),
+            created_at: Set(old_chat.created_at),
+        };
+
+        // Insert new chat (or update if it already exists)
+        chats::Entity::insert(new_chat)
+            .on_conflict(
+                OnConflict::column(chats::Column::Id)
+                    .update_columns([
+                        chats::Column::Type,
+                        chats::Column::Title,
+                        chats::Column::Enabled,
+                        chats::Column::BlurSensitiveTags,
+                        chats::Column::ExcludedTags,
+                        chats::Column::SensitiveTags,
+                    ])
+                    .to_owned(),
+            )
+            .exec(&txn)
+            .await
+            .context("Failed to insert new chat")?;
+
+        // Manually update subscriptions since CASCADE doesn't work for primary key changes
+        let update_subscriptions = Statement::from_sql_and_values(
+            self.db.get_database_backend(),
+            "UPDATE subscriptions SET chat_id = ? WHERE chat_id = ?",
+            vec![new_chat_id.into(), old_chat_id.into()],
+        );
+
+        txn.execute(update_subscriptions)
+            .await
+            .context("Failed to update subscriptions")?;
+
+        // Manually update messages
+        let update_messages = Statement::from_sql_and_values(
+            self.db.get_database_backend(),
+            "UPDATE messages SET chat_id = ? WHERE chat_id = ?",
+            vec![new_chat_id.into(), old_chat_id.into()],
+        );
+
+        txn.execute(update_messages)
+            .await
+            .context("Failed to update messages")?;
+
+        // Delete the old chat record
+        chats::Entity::delete_by_id(old_chat_id)
+            .exec(&txn)
+            .await
+            .context("Failed to delete old chat")?;
+
+        // Commit the transaction
+        txn.commit().await.context("Failed to commit transaction")?;
+
+        Ok(())
+    }
+
     // ==================== Tasks ====================
 
     /// Find task by type and value
