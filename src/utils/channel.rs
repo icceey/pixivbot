@@ -18,6 +18,7 @@
 use std::str::FromStr;
 
 use teloxide::prelude::*;
+use teloxide::requests::Requester;
 use teloxide::types::{ChatId, ChatMemberKind, ChatMemberStatus, Recipient};
 use tracing::info;
 
@@ -163,7 +164,10 @@ pub trait BotChannelExt {
     ) -> Result<ChatId, String>;
 }
 
-impl BotChannelExt for Bot {
+impl<R> BotChannelExt for R
+where
+    R: Requester + Sync,
+{
     async fn can_post_to_channel(&self, channel: &ChannelIdentifier) -> Result<bool, String> {
         let me = match self.get_me().await {
             Ok(me) => me,

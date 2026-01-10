@@ -11,6 +11,7 @@ use crate::db::types::UserRole;
 use crate::pixiv::client::PixivClient;
 use anyhow::Result;
 use handlers::LIST_CALLBACK_PREFIX;
+use notifier::ThrottledBot;
 use std::sync::Arc;
 use teloxide::dispatching::{Dispatcher, UpdateFilterExt};
 use teloxide::dptree;
@@ -27,7 +28,7 @@ type HandlerResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
-    bot: Bot,
+    bot: ThrottledBot,
     config: TelegramConfig,
     repo: Arc<Repo>,
     pixiv_client: Arc<tokio::sync::RwLock<PixivClient>>,
@@ -142,7 +143,7 @@ fn build_handler_tree(
 
 /// 处理命令
 async fn handle_command(
-    bot: Bot,
+    bot: ThrottledBot,
     msg: Message,
     cmd: Command,
     handler: BotHandler,
@@ -154,7 +155,7 @@ async fn handle_command(
 
 /// 处理普通消息（检查 Pixiv 链接）
 async fn handle_message(
-    bot: Bot,
+    bot: ThrottledBot,
     msg: Message,
     handler: BotHandler,
     text: String,
@@ -166,7 +167,7 @@ async fn handle_message(
 
 /// 处理列表分页回调
 async fn handle_list_callback(
-    bot: Bot,
+    bot: ThrottledBot,
     q: CallbackQuery,
     callback_data: String,
     handler: BotHandler,
@@ -210,7 +211,7 @@ async fn handle_list_callback(
 /// - 普通用户看到基础命令
 /// - 数据库中的 Admin 用户看到管理员命令
 /// - 数据库中的 Owner 用户看到所有命令
-async fn setup_commands(bot: &Bot, repo: &Repo) {
+async fn setup_commands(bot: &ThrottledBot, repo: &Repo) {
     // 1. 设置默认命令（所有用户都能看到的基础命令）
     if let Err(e) = bot
         .set_my_commands(Command::user_commands())

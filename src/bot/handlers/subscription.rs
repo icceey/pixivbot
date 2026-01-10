@@ -1,3 +1,4 @@
+use crate::bot::notifier::ThrottledBot;
 use crate::bot::BotHandler;
 use crate::db::types::{TagFilter, TaskType};
 use crate::pixiv::model::RankingMode;
@@ -100,7 +101,7 @@ impl BotHandler {
     /// - Err with error message if channel validation fails
     async fn resolve_subscription_target(
         &self,
-        bot: &Bot,
+        bot: &ThrottledBot,
         current_chat_id: ChatId,
         user_id: Option<UserId>,
         parsed_args: &args::ParsedArgs,
@@ -168,7 +169,7 @@ impl BotHandler {
     /// 用法: `/sub [channel=<id>] <id,...> [+tag1 -tag2]`
     pub async fn handle_sub_author(
         &self,
-        bot: Bot,
+        bot: ThrottledBot,
         chat_id: ChatId,
         user_id: Option<UserId>,
         args_str: String,
@@ -308,7 +309,7 @@ impl BotHandler {
     /// 用法: `/subrank [channel=<id>] <mode> [+tag1 -tag2]`
     pub async fn handle_sub_ranking(
         &self,
-        bot: Bot,
+        bot: ThrottledBot,
         chat_id: ChatId,
         user_id: Option<UserId>,
         args_str: String,
@@ -407,7 +408,7 @@ impl BotHandler {
     /// 用法: `/unsub [channel=<id>] <author_id,...>`
     pub async fn handle_unsub_author(
         &self,
-        bot: Bot,
+        bot: ThrottledBot,
         chat_id: ChatId,
         user_id: Option<UserId>,
         args_str: String,
@@ -485,7 +486,7 @@ impl BotHandler {
     /// 用法: `/unsubrank [channel=<id>] <mode>`
     pub async fn handle_unsub_ranking(
         &self,
-        bot: Bot,
+        bot: ThrottledBot,
         chat_id: ChatId,
         user_id: Option<UserId>,
         args_str: String,
@@ -563,7 +564,7 @@ impl BotHandler {
     /// 用法: 回复 bot 发送的订阅推送消息，发送 `/unsubthis`
     pub async fn handle_unsub_this(
         &self,
-        bot: Bot,
+        bot: ThrottledBot,
         msg: Message,
         chat_id: ChatId,
     ) -> ResponseResult<()> {
@@ -674,7 +675,7 @@ impl BotHandler {
     /// 用法: `/list [channel=<id>]`
     pub async fn handle_list(
         &self,
-        bot: Bot,
+        bot: ThrottledBot,
         chat_id: ChatId,
         user_id: Option<UserId>,
         args_str: String,
@@ -707,7 +708,7 @@ impl BotHandler {
     /// - `is_channel`: 是否是查询频道的订阅
     pub async fn send_subscription_list(
         &self,
-        bot: Bot,
+        bot: ThrottledBot,
         reply_chat_id: ChatId,
         target_chat_id: ChatId,
         page: usize,

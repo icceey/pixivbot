@@ -9,6 +9,7 @@ mod utils;
 use crate::config::Config;
 use anyhow::Result;
 use sea_orm_migration::MigratorTrait;
+use teloxide::requests::RequesterExt;
 use tracing::{error, info};
 use tracing_subscriber::fmt::time::ChronoLocal;
 use tracing_subscriber::{prelude::*, EnvFilter};
@@ -49,7 +50,8 @@ async fn main() -> Result<()> {
     let filter_layer = EnvFilter::from_default_env()
         .add_directive(log_level.into())
         .add_directive("sqlx=warn".parse().unwrap())
-        .add_directive("sea_orm=warn".parse().unwrap());
+        .add_directive("sea_orm=warn".parse().unwrap())
+        .add_directive("hyper_util=warn".parse().unwrap());
 
     // Combine layers
     tracing_subscriber::registry()
@@ -103,7 +105,7 @@ async fn main() -> Result<()> {
 
     info!("PixivBot initialization complete");
 
-    // Initialize Telegram Bot
+    // Initialize Telegram Bot with automatic rate limiting
     let mut bot = teloxide::Bot::new(config.telegram.bot_token.clone());
 
     // Set custom API URL if configured
@@ -119,6 +121,11 @@ async fn main() -> Result<()> {
             }
         }
     }
+
+    // Wrap bot with Throttle adaptor for automatic rate limiting
+    // This replaces manual sleep() calls throughout the codebase
+    let bot = bot.throttle(teloxide::adaptors::throttle::Limits::default());
+    info!("✅ Telegram bot initialized with automatic rate limiting");
 
     // Initialize Notifier
     let notifier = bot::notifier::Notifier::new(bot.clone(), downloader.clone());

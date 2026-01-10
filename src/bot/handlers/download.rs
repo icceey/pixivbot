@@ -5,6 +5,7 @@
 //! - /download (as reply to bot message)
 
 use crate::bot::link_handler::{parse_pixiv_links, PixivLink};
+use crate::bot::notifier::ThrottledBot;
 use crate::bot::BotHandler;
 use anyhow::{Context, Result};
 use chrono::Local;
@@ -30,7 +31,7 @@ impl BotHandler {
     /// - Download images and send as files (single or ZIP)
     pub async fn handle_download(
         &self,
-        bot: Bot,
+        bot: ThrottledBot,
         msg: Message,
         chat_id: ChatId,
         args: String,
@@ -153,7 +154,7 @@ impl BotHandler {
     /// Process downloads for multiple illusts
     async fn process_downloads(
         &self,
-        bot: Bot,
+        bot: ThrottledBot,
         chat_id: ChatId,
         illust_ids: Vec<u64>,
     ) -> ResponseResult<()> {
@@ -187,7 +188,6 @@ impl BotHandler {
         let threshold = self.download_original_threshold as usize;
         if all_files.len() <= threshold {
             // Within threshold - send each file separately
-            let file_count = all_files.len();
             for (idx, (path, filename)) in all_files.iter().enumerate() {
                 // Only show caption on first file
                 let cap = if idx == 0 { caption.as_str() } else { "" };
@@ -196,10 +196,7 @@ impl BotHandler {
                     let _ = bot.send_message(chat_id, "❌ 发送文件失败").await;
                     break;
                 }
-                // Small delay between files to avoid rate limiting (skip after last file)
-                if file_count > 1 && idx < file_count - 1 {
-                    sleep(Duration::from_millis(500)).await;
-                }
+                // Rate limiting is now handled by the Throttle adaptor
             }
         } else {
             // Exceeds threshold - create ZIP and send
@@ -332,7 +329,7 @@ impl BotHandler {
     /// Send a document file
     async fn send_document(
         &self,
-        bot: &Bot,
+        bot: &ThrottledBot,
         chat_id: ChatId,
         path: &Path,
         filename: &str,

@@ -18,45 +18,43 @@ This requirement is NON-NEGOTIABLE and applies to every code modification.
 
 ## Project Overview
 
-A Rust-based Telegram bot for subscribing to Pixiv artists and rankings. When artists publish new works, the bot automatically downloads and pushes images to subscribers. Also supports detecting Pixiv links in messages and responding accordingly.
+A Rust-based Telegram bot for subscribing to Pixiv artists and rankings. When artists publish new works, the bot automatically downloads and pushes images to subscribers.
 
-**Tech Stack**: Rust 2021, teloxide (Telegram), SeaORM (SQLite), reqwest, tokio, regex
+**Tech Stack**: Rust 2021, teloxide (Telegram), SeaORM (SQLite), reqwest, tokio
 
-**Architecture Philosophy**: The project follows a layered architecture with clear separation between Pixiv API access (`pixiv_client/`), business logic (`pixiv/`, `scheduler/`), and presentation (`bot/`). Components communicate via `Arc`-wrapped shared state.
+**Architecture Philosophy**: Layered architecture with clear separation between Pixiv API access (`pixiv_client/`), business logic (`pixiv/`, `scheduler/`), and presentation (`bot/`). Components communicate via `Arc`-wrapped shared state.
 
 ## Architecture
 
 ```
 src/
-├── main.rs              # Entry point, initializes all components
-├── config.rs            # Configuration loading (config.toml + env vars)
-├── pixiv_client/        # Low-level Pixiv API (independent, no project deps)
-│   ├── auth.rs          # OAuth refresh_token → access_token
-│   ├── client.rs        # API calls: user_illusts, illust_ranking, user_detail, illust_detail
-│   ├── models.rs        # Raw API response types
-│   └── error.rs         # Custom Error type for API errors
-├── pixiv/               # Business layer (wraps pixiv_client)
-│   ├── client.rs        # PixivClient with login/auth management
-│   ├── downloader.rs    # Image download with hash-based caching
-│   └── model.rs         # Domain models (Illust, User, RankingMode)
-├── bot/                 # Telegram bot layer
-│   ├── mod.rs           # Dispatcher setup, handler tree building
-│   ├── handler.rs       # BotHandler: commands + message handling
+├── main.rs              # Entry point, spawns all engines + bot
+├── config.rs            # Configuration (config.toml + env vars)
+├── bot/
+│   ├── mod.rs           # Dispatcher setup, handler tree
+│   ├── handler.rs       # BotHandler struct, command dispatch
+│   ├── handlers/        # Command handlers by category
+│   │   ├── admin.rs     # Owner/Admin commands
+│   │   ├── subscription.rs  # Subscribe/unsubscribe logic
+│   │   ├── settings.rs  # Chat settings (tags, filters)
+│   │   ├── info.rs      # Help, status commands
+│   │   └── download.rs  # /download command
+│   ├── middleware.rs    # UserChatContext injection, access control
 │   ├── commands.rs      # Command enum definitions
-│   ├── link_handler.rs  # Pixiv URL parsing, @mention detection
-│   └── notifier.rs      # Send text/images to Telegram
-├── scheduler/           # Background task engine
-│   └── engine.rs        # Polls DB, executes tasks serially with randomized intervals
-├── cache/               # File-based cache system
-│   └── mod.rs           # FileCacheManager with hash-bucketing and auto-cleanup
-├── utils/               # Utility functions
-│   ├── markdown.rs      # MarkdownV2 escaping
-│   └── html.rs          # HTML formatting, tag processing
-└── db/                  # Database layer
-    ├── entities/        # SeaORM entities (users, chats, tasks, subscriptions)
-    ├── types/           # Custom DB types (TaskType, UserRole, TagFilter, Tags)
-    ├── repo.rs          # CRUD operations
-    └── mod.rs           # Connection management
+│   ├── link_handler.rs  # Pixiv URL regex parsing
+│   └── notifier.rs      # ThrottledBot wrapper, image batching
+├── scheduler/           # Background task engines (run independently)
+│   ├── author_engine.rs    # Author subscription polling
+│   ├── ranking_engine.rs   # Daily ranking push
+│   ├── name_update_engine.rs # Author name sync
+│   └── helpers.rs       # Shared push logic, PushResult enum
+├── pixiv_client/        # Low-level Pixiv API (independent crate)
+├── pixiv/               # Business layer wrapping pixiv_client
+│   ├── client.rs        # PixivClient with auth management
+│   └── downloader.rs    # Image download with caching
+├── cache/               # FileCacheManager with hash-bucketing
+├── db/                  # SeaORM entities, Repo CRUD
+└── utils/               # Markdown escaping, tag formatting
 ```
 
 ## Key Patterns
@@ -66,155 +64,58 @@ src/
 **CRITICAL SECURITY PATTERN**: Never expose raw errors to users. Always separate internal logging from user-facing messages:
 
 ```rust
-// ❌ WRONG - Exposes internal error details
+// ❌ WRONG - Exposes internal error details to user
 bot.send_message(chat_id, format!("❌ 失败: {:#}", e)).await?;
 
-// ✅ CORRECT - Log details, send friendly message
+// ✅ CORRECT - Log details internally, send friendly message
 error!("Failed to process request: {:#}", e);
 bot.send_message(chat_id, "❌ 操作失败").await?;
 ```
 
-**Error Handling Rules**:
-1. Use `anyhow::Result<T>` for all fallible functions
-2. Add context with `.context()` for debugging
-3. Log errors with `{:#}` to show full error chain in logs
-4. Send generic, user-friendly messages to Telegram (no technical details)
-5. The `pixiv_client/` module has its own `Error` type, auto-converts to anyhow
+- Use `anyhow::Result<T>` everywhere, `.context()` for debugging
+- Log errors with `{:#}` to show full chain; never expose to users
+- `pixiv_client/` has its own `Error` type, auto-converts to anyhow
 
-**Example Pattern**:
+### Shared State & Rate Limiting
+
+- Components use `Arc<T>` for sharing, `Arc<RwLock<T>>` when mutable
+- Bot uses `ThrottledBot` (teloxide's `Throttle<Bot>` adaptor) for automatic rate limiting
+- No manual `sleep()` needed for Telegram API calls
+
+### Middleware Pattern (bot/middleware.rs)
+
+The dispatcher uses filter middleware to inject context:
 ```rust
-match pixiv.get_illust_detail(illust_id).await {
-    Ok(illust) => illust,
-    Err(e) => {
-        error!("Failed to get illust {}: {:#}", illust_id, e);  // Detailed logging
-        bot.send_message(chat_id, format!("❌ 获取作品 {} 失败", illust_id)).await?;  // Generic user message
-        return Ok(());
-    }
-}
+// filter_user_chat() → injects UserChatContext
+// filter_chat_accessible() → checks chat enabled + user role
+dptree::entry()
+    .branch(filter_user_chat().chain(filter_chat_accessible().chain(...)))
 ```
 
-### Shared State
-Components use `Arc<T>` for sharing, `Arc<RwLock<T>>` when mutable access needed:
-```rust
-let pixiv_client = Arc::new(RwLock::new(PixivClient::new(config)?));
-let repo = Arc::new(Repo::new(db));
-```
+### Image Batching
 
-### Database Migrations
-Located in `migration/src/`. Run automatically on startup via `migration::Migrator::up(&db, None).await?`.
+**Constant**: `MAX_PER_GROUP = 10` (Telegram limit for media groups)
 
-### Image Caching & Background Cleanup
-The `FileCacheManager` (`cache/mod.rs`) provides:
-- **Hash-bucketed storage**: Files stored at `data/cache/{hash_prefix}/{filename}` (256 buckets: `00`-`ff`)
-- **Cache-before-download**: Always call `cache.get(url)` before downloading
-- **Automatic cleanup**: Background task runs every 24 hours, deleting files older than `cache_retention_days`
-- **Lifecycle**: Cleanup task spawned in `FileCacheManager::new()`, runs for lifetime of cache manager
+Caption strategy:
+- First batch: full caption with title, author, tags
+- Subsequent batches: `(continued 2/3)` format
+- Retry logic in `scheduler/helpers.rs` must match this pattern
 
-```rust
-// In downloader.rs
-pub async fn download(&self, url: &str) -> Result<PathBuf> {
-    // Check cache first
-    if let Some(path) = self.cache.get(url).await {
-        return Ok(path);
-    }
-    // Download and save to cache
-    let bytes = self.http_client.get(url)
-        .header("Referer", "https://app-api.pixiv.net/")
-        .send().await?...;
-    self.cache.save(url, &bytes).await
-}
-```
+### Scheduler Engines
 
-Use `downloader.download(url)` for single, `downloader.download_all(&urls)` for batch with partial failure tolerance.
+Three independent engines run as separate tokio tasks:
+- `AuthorEngine`: Polls subscribed authors for new works
+- `RankingEngine`: Daily ranking push at configured time
+- `NameUpdateEngine`: Syncs author names with Pixiv profiles
 
-### Telegram Media Groups & Batch Sending
-
-**Key Constants**: `MAX_PER_GROUP = 10` (defined in both `notifier.rs` and `scheduler/engine.rs`)
-
-**Batch Caption Pattern**: The notifier uses a sophisticated caption system:
-- First batch shows original caption
-- Subsequent batches show `(continued 2/3)` format
-- This pattern MUST be replicated in retry logic for consistency
-
-```rust
-// In notifier.rs - normal batch sending
-if batch_idx == 0 {
-    base_cap.map(|s| s.to_string())  // First batch: full caption
-} else {
-    Some(format!("\\(continued {}/{}\\)", batch_idx + 1, total_batches))  // Later batches
-}
-```
-
-**Retry Caption Pattern** (in `scheduler/engine.rs`):
-```rust
-// Calculate batch numbers for consistency with normal sends
-const MAX_PER_GROUP: usize = 10;
-let total_batches = total_pages.div_ceil(MAX_PER_GROUP);
-let current_batch = (already_sent_pages.len() / MAX_PER_GROUP) + 1;
-
-format!("🎨 {} \\(continued {}/{}\\)\nby *{}*\n\n🔗 [来源](...){}", 
-    title, current_batch, total_batches, author, id, tags)
-```
-
-**Critical**: Retry messages MUST include tags (use `tag::format_tags_escaped(illust)`) to match normal send format.
-
-### Teloxide Dispatcher Pattern
-The bot uses teloxide's `Dispatcher` with a handler tree:
-```rust
-// In bot/mod.rs
-fn build_handler_tree() {
-    let command_handler = Update::filter_message()
-        .filter_command::<Command>()
-        .endpoint(handle_command);
-
-    let message_handler = Update::filter_message()
-        .endpoint(handle_message);
-
-    dptree::entry()
-        .branch(command_handler)
-        .branch(message_handler)
-## Development Commands
-
-```bash
-make ci          # Run all CI checks (fmt, clippy, check, test, build) - MANDATORY before commit
-make quick       # Fast checks without full build (fmt-check, clippy, check)
-make fmt         # Auto-format code
-make clippy      # Run linter (warnings = errors, matches CI)
-make dev         # cargo run
-make fix         # Auto-fix formatting and clippy issues
-make watch       # Watch for changes and rebuild (requires cargo-watch)
-```
-
-**CRITICAL**: CI uses `RUSTFLAGS=-Dwarnings` - all warnings are treated as errors. Always run `make ci` before committing to catch issues locally that would fail in CI.
-
-**Common Clippy Patterns to Watch**:
-- Use `.div_ceil()` instead of `(a + b - 1) / b` for ceiling division
-- Avoid manual `Vec` construction when ranges can be used
-- Prefer `matches!()` macro for enum pattern matching
-let links = parse_pixiv_links(text);  // Returns Vec<PixivLink>
-
-// Check if bot is @mentioned (for groups)
-let mentioned = is_bot_mentioned(text, entities, bot_username);
-```
-
-### Sensitive Tags Configuration
-Sensitive tags are loaded from `config.content.sensitive_tags` and passed through the component chain:
-```rust
-// main.rs → bot::run → BotHandler
-let sensitive_tags = config.content.sensitive_tags.clone();
-bot::run(..., sensitive_tags).await;
-```
-
-Use `self.sensitive_tags` in BotHandler, NOT hardcoded constants.
+Each engine has its own `run()` loop with configurable intervals.
 
 ## Adding Dependencies
 
-**Always use `cargo add`**, never manually edit Cargo.toml:
 ```bash
-cargo add serde --features derive
-cargo add tokio --features full
-cargo add regex  # Already added for link parsing
+cargo add serde --features derive  # Always use cargo add, never edit Cargo.toml manually
 ```
+
 ## Code Conventions
 
 **Logging & Output**:
@@ -303,7 +204,7 @@ When adding new features:
 
 ## Scheduler Architecture & Retry Logic
 
-**Orchestrator-Dispatcher-Worker Pattern** (see `scheduler/engine.rs`):
+**Orchestrator-Dispatcher-Worker Pattern** (see `scheduler/author_engine.rs`):
 
 ```
 execute_author_task (Orchestrator)
@@ -358,25 +259,4 @@ Tests are co-located with code in `#[cfg(test)]` modules. Run with:
 make test                              # All tests
 cargo test -p pixivbot -- --nocapture  # With output
 cargo test link_handler                # Specific module
-```
-
-**Test Examples**:
-- `link_handler.rs`: Regex pattern tests for Pixiv URL parsing
-- `cache/mod.rs`: Hash bucketing and path resolution tests
-- `db/types/tag.rs`: TagFilter parsing and serialization tests
-
-**Test Structure**:
-```rust
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_parse_pixiv_link() {
-        let text = "Check out https://pixiv.net/artworks/12345";
-        let links = parse_pixiv_links(text);
-        assert_eq!(links.len(), 1);
-        assert_eq!(links[0], PixivLink::Illust(12345));
-    }
-}
 ```

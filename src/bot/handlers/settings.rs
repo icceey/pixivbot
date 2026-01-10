@@ -1,3 +1,4 @@
+use crate::bot::notifier::ThrottledBot;
 use crate::bot::BotHandler;
 use crate::db::types::Tags;
 use teloxide::prelude::*;
@@ -15,7 +16,7 @@ impl BotHandler {
     /// 用法: `/blursensitive <on|off>`
     pub async fn handle_blur_sensitive(
         &self,
-        bot: Bot,
+        bot: ThrottledBot,
         chat_id: ChatId,
         args: String,
     ) -> ResponseResult<()> {
@@ -61,7 +62,7 @@ impl BotHandler {
     /// 用法: `/sensitivetags <tag1,tag2,...>`
     pub async fn handle_sensitive_tags(
         &self,
-        bot: Bot,
+        bot: ThrottledBot,
         chat_id: ChatId,
         args: String,
     ) -> ResponseResult<()> {
@@ -118,7 +119,7 @@ impl BotHandler {
     /// 清除所有敏感标签
     pub async fn handle_clear_sensitive_tags(
         &self,
-        bot: Bot,
+        bot: ThrottledBot,
         chat_id: ChatId,
     ) -> ResponseResult<()> {
         match self
@@ -145,7 +146,7 @@ impl BotHandler {
     /// 用法: `/excludetags <tag1,tag2,...>`
     pub async fn handle_exclude_tags(
         &self,
-        bot: Bot,
+        bot: ThrottledBot,
         chat_id: ChatId,
         args: String,
     ) -> ResponseResult<()> {
@@ -198,7 +199,7 @@ impl BotHandler {
     /// 清除所有排除的标签
     pub async fn handle_clear_excluded_tags(
         &self,
-        bot: Bot,
+        bot: ThrottledBot,
         chat_id: ChatId,
     ) -> ResponseResult<()> {
         match self
@@ -221,7 +222,7 @@ impl BotHandler {
     }
 
     /// 显示聊天设置
-    pub async fn handle_settings(&self, bot: Bot, chat_id: ChatId) -> ResponseResult<()> {
+    pub async fn handle_settings(&self, bot: ThrottledBot, chat_id: ChatId) -> ResponseResult<()> {
         match self.repo.get_chat(chat_id.0).await {
             Ok(Some(chat)) => {
                 let blur_status = if chat.blur_sensitive_tags {

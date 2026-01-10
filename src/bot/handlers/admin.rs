@@ -1,3 +1,4 @@
+use crate::bot::notifier::ThrottledBot;
 use crate::bot::BotHandler;
 use crate::db::types::UserRole;
 use teloxide::prelude::*;
@@ -15,7 +16,7 @@ impl BotHandler {
     /// * `is_admin` - true: 设置为管理员, false: 设置为普通用户
     pub async fn handle_set_admin(
         &self,
-        bot: Bot,
+        bot: ThrottledBot,
         chat_id: ChatId,
         args: String,
         is_admin: bool,
@@ -72,7 +73,7 @@ impl BotHandler {
     /// * `enabled` - true: 启用, false: 禁用
     pub async fn handle_enable_chat(
         &self,
-        bot: Bot,
+        bot: ThrottledBot,
         current_chat_id: ChatId,
         args: String,
         enabled: bool,
