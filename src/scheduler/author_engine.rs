@@ -12,7 +12,7 @@ use rand::Rng;
 use std::sync::Arc;
 use teloxide::prelude::*;
 use tokio::time::{sleep, Duration};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 pub struct AuthorEngine {
     repo: Arc<Repo>,
@@ -79,7 +79,7 @@ impl AuthorEngine {
             None => return Ok(()),
         };
 
-        info!(
+        debug!(
             "⚙️  Executing author task [{}] {} {}",
             task.id, task.r#type, task.value
         );
