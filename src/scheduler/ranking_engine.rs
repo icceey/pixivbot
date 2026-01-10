@@ -9,7 +9,7 @@ use pixiv_client::Illust;
 use std::sync::Arc;
 use teloxide::prelude::*;
 use tokio::time::{sleep, Duration};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 pub struct RankingEngine {
     repo: Arc<Repo>,
@@ -105,7 +105,7 @@ impl RankingEngine {
 
     /// Execute all pending ranking tasks
     async fn execute_all_ranking_tasks(&self) -> Result<()> {
-        info!("⚙️  Executing all ranking tasks");
+        debug!("⚙️  Executing all ranking tasks");
 
         // Get all ranking tasks (not just pending ones, execute all at the scheduled time)
         let tasks = self.repo.get_all_tasks_by_type(TaskType::Ranking).await?;
@@ -118,7 +118,7 @@ impl RankingEngine {
         info!("Found {} ranking tasks to execute", tasks.len());
 
         for task in tasks {
-            info!(
+            debug!(
                 "⚙️  Executing ranking task [{}] {} {}",
                 task.id, task.r#type, task.value
             );

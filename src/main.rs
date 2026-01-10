@@ -25,8 +25,8 @@ async fn main() -> Result<()> {
     // Create log directory if it doesn't exist
     std::fs::create_dir_all(log_dir)?;
 
-    // Setup file appender (daily rotation)
-    let file_appender = tracing_appender::rolling::daily(log_dir, "pixivbot.log");
+    // Setup file appender (single file, no rotation)
+    let file_appender = tracing_appender::rolling::never(log_dir, "pixivbot.log");
     let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
 
     // Use local time for log timestamps
