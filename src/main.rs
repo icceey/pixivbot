@@ -50,7 +50,8 @@ async fn main() -> Result<()> {
     let filter_layer = EnvFilter::from_default_env()
         .add_directive(log_level.into())
         .add_directive("sqlx=warn".parse().unwrap())
-        .add_directive("sea_orm=warn".parse().unwrap());
+        .add_directive("sea_orm=warn".parse().unwrap())
+        .add_directive("hyper_util=warn".parse().unwrap());
 
     // Combine layers
     tracing_subscriber::registry()
