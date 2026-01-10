@@ -262,8 +262,8 @@ impl Repo {
             ..Default::default()
         };
 
-        // INSERT ... ON CONFLICT(type, value) DO UPDATE ...
-        // Only update author_name if a new value is provided (not None)
+        // INSERT ... ON CONFLICT(type, value) DO UPDATE SET author_name = excluded.author_name
+        // This ensures the upsert always succeeds (either insert or update)
         // The unique constraint is on (type, value) composite index
         let conflict_handler = if author_name.is_some() {
             // Update author_name when provided
@@ -271,15 +271,18 @@ impl Repo {
                 .update_column(tasks::Column::AuthorName)
                 .to_owned()
         } else {
-            // Don't update author_name when None (preserves existing value)
+            // When author_name is None, we still need to update something for the upsert
+            // to succeed without error. Update value to itself (no-op but valid SQL).
             OnConflict::columns([tasks::Column::Type, tasks::Column::Value])
-                .do_nothing()
+                .update_column(tasks::Column::Value)
                 .to_owned()
         };
 
+        // Use exec_without_returning to avoid "None of the records are inserted" error
+        // when ON CONFLICT triggers an update instead of an insert
         tasks::Entity::insert(new_task)
             .on_conflict(conflict_handler)
-            .exec(&self.db)
+            .exec_without_returning(&self.db)
             .await
             .context("Failed to upsert task")?;
 
