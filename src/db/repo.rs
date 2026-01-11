@@ -228,16 +228,27 @@ impl Repo {
     }
 
     /// Migrate chat from old_chat_id to new_chat_id
-    /// This updates the chat's primary key and cascades to all related tables
-    /// (subscriptions and messages will be updated automatically via foreign key CASCADE)
+    /// This updates the chat's primary key and manually updates all related tables
+    /// (subscriptions and messages) since SQLite doesn't support CASCADE on primary key changes.
+    /// This function is idempotent - calling it multiple times with the same parameters is safe.
     pub async fn migrate_chat(&self, old_chat_id: i64, new_chat_id: i64) -> Result<()> {
         use sea_orm::TransactionTrait;
 
         // Get the old chat record
-        let old_chat = self
-            .get_chat(old_chat_id)
-            .await?
-            .context(format!("Old chat {} not found", old_chat_id))?;
+        let old_chat = match self.get_chat(old_chat_id).await? {
+            Some(chat) => chat,
+            None => {
+                // If the old chat doesn't exist but the new chat already does,
+                // treat this as a successful no-op to keep the operation idempotent.
+                if self.get_chat(new_chat_id).await?.is_some() {
+                    return Ok(());
+                }
+                return Err(anyhow::Error::msg(format!(
+                    "Old chat {} not found",
+                    old_chat_id
+                )));
+            }
+        };
 
         // Start a transaction to ensure atomicity
         let txn = self
@@ -249,7 +260,7 @@ impl Repo {
         // Update chat ID in chats table
         // Since we can't update primary keys directly in SQLite, we need to:
         // 1. Insert a new chat with the new ID
-        // 2. Update all foreign key references (handled by CASCADE)
+        // 2. Manually update all foreign key references (CASCADE doesn't work for PK changes)
         // 3. Delete the old chat
         let new_chat = chats::ActiveModel {
             id: Set(new_chat_id),
@@ -699,5 +710,235 @@ impl Repo {
             }
             None => Ok(None),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sea_orm::{Database, DbBackend, Statement};
+
+    async fn setup_test_db() -> Result<Repo> {
+        // Create an in-memory SQLite database for testing
+        let db = Database::connect("sqlite::memory:").await?;
+
+        // Run migrations to set up the schema
+        // Create tables directly since we can't use migrations in tests
+        db.execute(Statement::from_string(
+            DbBackend::Sqlite,
+            r#"
+            CREATE TABLE chats (
+                id INTEGER PRIMARY KEY NOT NULL,
+                type TEXT NOT NULL,
+                title TEXT,
+                enabled BOOLEAN NOT NULL DEFAULT 0,
+                blur_sensitive_tags BOOLEAN NOT NULL DEFAULT 1,
+                excluded_tags TEXT NOT NULL DEFAULT '[]',
+                sensitive_tags TEXT NOT NULL DEFAULT '[]',
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            "#,
+        ))
+        .await?;
+
+        db.execute(Statement::from_string(
+            DbBackend::Sqlite,
+            r#"
+            CREATE TABLE tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                type TEXT NOT NULL,
+                value TEXT NOT NULL,
+                author_name TEXT,
+                next_poll_at TIMESTAMP NOT NULL,
+                last_polled_at TIMESTAMP,
+                UNIQUE(type, value)
+            )
+            "#,
+        ))
+        .await?;
+
+        db.execute(Statement::from_string(
+            DbBackend::Sqlite,
+            r#"
+            CREATE TABLE subscriptions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                chat_id INTEGER NOT NULL,
+                task_id INTEGER NOT NULL,
+                filter_tags TEXT NOT NULL DEFAULT '{"include":[],"exclude":[]}',
+                latest_data TEXT,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (chat_id) REFERENCES chats(id) ON DELETE CASCADE ON UPDATE CASCADE,
+                FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE ON UPDATE CASCADE,
+                UNIQUE(chat_id, task_id)
+            )
+            "#,
+        ))
+        .await?;
+
+        db.execute(Statement::from_string(
+            DbBackend::Sqlite,
+            r#"
+            CREATE TABLE messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                chat_id INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                subscription_id INTEGER NOT NULL,
+                illust_id INTEGER,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            "#,
+        ))
+        .await?;
+
+        Ok(Repo::new(db))
+    }
+
+    #[tokio::test]
+    async fn test_migrate_chat_success() {
+        let repo = setup_test_db().await.unwrap();
+
+        // Create a test chat with settings
+        let old_chat_id = -888888;
+        let new_chat_id = -1009999999999;
+
+        let chat = repo
+            .upsert_chat(
+                old_chat_id,
+                "group".to_string(),
+                Some("Test Group".to_string()),
+                true,
+                Tags::from(vec!["nsfw".to_string()]),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(chat.id, old_chat_id);
+        assert!(chat.enabled);
+        assert_eq!(chat.title, Some("Test Group".to_string()));
+
+        // Create a task and subscription
+        let task = repo
+            .get_or_create_task(
+                crate::db::types::TaskType::Author,
+                "12345".to_string(),
+                Some("TestAuthor".to_string()),
+            )
+            .await
+            .unwrap();
+
+        let sub = repo
+            .upsert_subscription(old_chat_id, task.id, crate::db::types::TagFilter::default())
+            .await
+            .unwrap();
+
+        assert_eq!(sub.chat_id, old_chat_id);
+
+        // Create a message
+        repo.save_message(old_chat_id, 12345, sub.id, Some(67890))
+            .await
+            .unwrap();
+
+        // Perform migration
+        repo.migrate_chat(old_chat_id, new_chat_id).await.unwrap();
+
+        // Verify old chat is gone
+        let old_chat = repo.get_chat(old_chat_id).await.unwrap();
+        assert!(old_chat.is_none());
+
+        // Verify new chat exists with same settings
+        let new_chat = repo.get_chat(new_chat_id).await.unwrap().unwrap();
+        assert_eq!(new_chat.id, new_chat_id);
+        assert!(new_chat.enabled);
+        assert_eq!(new_chat.title, Some("Test Group".to_string()));
+        assert_eq!(new_chat.r#type, "group");
+
+        // Verify subscriptions were updated
+        let subs = repo.list_subscriptions_by_chat(new_chat_id).await.unwrap();
+        assert_eq!(subs.len(), 1);
+        assert_eq!(subs[0].0.chat_id, new_chat_id);
+
+        // Verify no subscriptions remain for old chat
+        let old_subs = repo.list_subscriptions_by_chat(old_chat_id).await.unwrap();
+        assert_eq!(old_subs.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_migrate_chat_idempotent() {
+        let repo = setup_test_db().await.unwrap();
+
+        let old_chat_id = -888888;
+        let new_chat_id = -1009999999999;
+
+        // Create old chat
+        repo.upsert_chat(
+            old_chat_id,
+            "group".to_string(),
+            Some("Test Group".to_string()),
+            true,
+            Tags::default(),
+        )
+        .await
+        .unwrap();
+
+        // First migration should succeed
+        repo.migrate_chat(old_chat_id, new_chat_id).await.unwrap();
+
+        // Second migration should be a no-op and not error
+        let result = repo.migrate_chat(old_chat_id, new_chat_id).await;
+        assert!(result.is_ok());
+
+        // New chat should still exist
+        let new_chat = repo.get_chat(new_chat_id).await.unwrap();
+        assert!(new_chat.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_migrate_chat_old_not_found() {
+        let repo = setup_test_db().await.unwrap();
+
+        let old_chat_id = -888888;
+        let new_chat_id = -1009999999999;
+
+        // Try to migrate non-existent chat
+        let result = repo.migrate_chat(old_chat_id, new_chat_id).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn test_migrate_chat_with_preexisting_new_chat() {
+        let repo = setup_test_db().await.unwrap();
+
+        let old_chat_id = -888888;
+        let new_chat_id = -1009999999999;
+
+        // Create both old and new chats
+        repo.upsert_chat(
+            old_chat_id,
+            "group".to_string(),
+            Some("Old Group".to_string()),
+            true,
+            Tags::default(),
+        )
+        .await
+        .unwrap();
+
+        repo.upsert_chat(
+            new_chat_id,
+            "supergroup".to_string(),
+            Some("New Supergroup".to_string()),
+            false,
+            Tags::default(),
+        )
+        .await
+        .unwrap();
+
+        // Migration should update the new chat with old chat's settings
+        repo.migrate_chat(old_chat_id, new_chat_id).await.unwrap();
+
+        // Verify new chat was updated with old chat's settings
+        let new_chat = repo.get_chat(new_chat_id).await.unwrap().unwrap();
+        assert!(new_chat.enabled); // From old chat
+        assert_eq!(new_chat.title, Some("Old Group".to_string())); // From old chat
     }
 }
