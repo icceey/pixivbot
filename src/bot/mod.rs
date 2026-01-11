@@ -17,7 +17,7 @@ use teloxide::dispatching::{Dispatcher, UpdateFilterExt};
 use teloxide::dptree;
 use teloxide::prelude::*;
 use teloxide::types::BotCommandScope;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 pub use commands::Command;
 pub use handler::BotHandler;
@@ -133,8 +133,16 @@ fn build_handler_tree(
         })
         .endpoint(handle_list_callback);
 
+    // Chat migration handler - handles group to supergroup upgrades
+    let migration_handler = dptree::filter(|msg: Message| {
+        // Only process migration messages
+        msg.migrate_to_chat_id().is_some() || msg.migrate_from_chat_id().is_some()
+    })
+    .endpoint(handle_chat_migration);
+
     dptree::entry().branch(callback_handler).branch(
         Update::filter_message()
+            .branch(migration_handler)
             .branch(admin_chat_control_handler)
             .branch(command_handler)
             .branch(message_handler),
@@ -202,6 +210,45 @@ async fn handle_list_callback(
         handler
             .send_subscription_list(bot, chat_id, chat_id, page, Some(message_id), false)
             .await?;
+    }
+
+    Ok(())
+}
+
+/// 处理聊天迁移（普通群组升级为超级群组）
+async fn handle_chat_migration(msg: Message, repo: Arc<Repo>) -> HandlerResult {
+    let chat_id = msg.chat.id;
+
+    // Handle migrate_to_chat_id (old group → new supergroup)
+    if let Some(new_chat_id) = msg.migrate_to_chat_id() {
+        info!(
+            "Chat migration detected: old chat {} → new supergroup {}",
+            chat_id, new_chat_id
+        );
+
+        // Migrate all data from old chat_id to new chat_id
+        if let Err(e) = repo.migrate_chat(chat_id.0, new_chat_id.0).await {
+            error!(
+                "Failed to migrate chat {} to {}: {:#}",
+                chat_id, new_chat_id, e
+            );
+        } else {
+            info!(
+                "✅ Successfully migrated chat data from {} to {}",
+                chat_id, new_chat_id
+            );
+        }
+    }
+
+    // Handle migrate_from_chat_id (new supergroup ← old group)
+    if let Some(old_chat_id) = msg.migrate_from_chat_id() {
+        info!(
+            "Supergroup {} created from old chat {}",
+            chat_id, old_chat_id
+        );
+        // This is the notification from the new supergroup side
+        // The actual migration is already handled by migrate_to_chat_id
+        // We just log it for debugging purposes
     }
 
     Ok(())
