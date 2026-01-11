@@ -139,6 +139,13 @@ async fn ensure_user_and_chat(
         None => {
             // New user - determine role
             let role = if handler.owner_id == Some(user_id) {
+                // If owner_id is configured and matches this user, assign Owner role
+                UserRole::Owner
+            } else if handler.owner_id.is_none()
+                && !repo.has_owner().await.context("Failed to check for owner users")?
+            {
+                // If no owner_id is configured and no owner exists, assign Owner role to first user
+                info!("No owner configured and no owner exists, assigning owner role to first user {}", user_id);
                 UserRole::Owner
             } else {
                 UserRole::User

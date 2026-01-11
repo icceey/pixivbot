@@ -1,6 +1,7 @@
 [telegram]
 bot_token = "YOUR_BOT_TOKEN"
-owner_id = 123456789  # Required: Owner user ID (highest privilege)
+# owner_id = 123456789  # Optional: Owner user ID (highest privilege)
+                         # If not set, first user to talk to the bot will automatically become owner
 bot_mode = "private"  # Bot mode: "private" (chats disabled by default) or "public" (chats enabled by default)
 # api_url = "https://api.telegram.org"  # Optional: Custom Telegram API URL (e.g., for local bot API server)
 # require_mention_in_group = true  # Whether bot requires @mention to respond in groups (default: true)

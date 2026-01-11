@@ -77,6 +77,16 @@ impl Repo {
             .context("Failed to get admin users")
     }
 
+    /// Check if any owner exists in the database
+    pub async fn has_owner(&self) -> Result<bool> {
+        let count = users::Entity::find()
+            .filter(users::Column::Role.eq(UserRole::Owner))
+            .count(&self.db)
+            .await
+            .context("Failed to check for owner users")?;
+        Ok(count > 0)
+    }
+
     /// Set user role
     pub async fn set_user_role(&self, user_id: i64, role: UserRole) -> Result<users::Model> {
         let user = users::Entity::find_by_id(user_id)
