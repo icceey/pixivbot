@@ -78,6 +78,7 @@ impl Repo {
     }
 
     /// Check if any owner exists in the database
+    #[allow(dead_code)]
     pub async fn has_owner(&self) -> Result<bool> {
         let count = users::Entity::find()
             .filter(users::Column::Role.eq(UserRole::Owner))
@@ -85,6 +86,71 @@ impl Repo {
             .await
             .context("Failed to check for owner users")?;
         Ok(count > 0)
+    }
+
+    /// Atomically create first owner if no owner exists (using database transaction)
+    /// Returns the created/existing user with their actual role
+    pub async fn create_user_with_auto_owner(
+        &self,
+        user_id: i64,
+        username: Option<String>,
+    ) -> Result<users::Model> {
+        use sea_orm::TransactionTrait;
+
+        let now = Local::now().naive_local();
+
+        // Start a transaction for atomic check-and-create
+        let txn = self
+            .db
+            .begin()
+            .await
+            .context("Failed to begin transaction")?;
+
+        // Check if any owner exists (within transaction)
+        let owner_count = users::Entity::find()
+            .filter(users::Column::Role.eq(UserRole::Owner))
+            .count(&txn)
+            .await
+            .context("Failed to check for owner users")?;
+
+        // Determine role: Owner if no owner exists, otherwise User
+        let role = if owner_count == 0 {
+            UserRole::Owner
+        } else {
+            UserRole::User
+        };
+
+        // Create the user with the determined role
+        let new_user = users::ActiveModel {
+            id: Set(user_id),
+            username: Set(username.clone()),
+            role: Set(role),
+            created_at: Set(now),
+        };
+
+        // INSERT ... ON CONFLICT(id) DO UPDATE SET username = excluded.username
+        // This preserves the existing role when updating
+        users::Entity::insert(new_user)
+            .on_conflict(
+                OnConflict::column(users::Column::Id)
+                    .update_column(users::Column::Username)
+                    .to_owned(),
+            )
+            .exec(&txn)
+            .await
+            .context("Failed to upsert user")?;
+
+        // Fetch the result
+        let user = users::Entity::find_by_id(user_id)
+            .one(&txn)
+            .await
+            .context("Failed to fetch upserted user")?
+            .ok_or_else(|| anyhow::anyhow!("User {} not found after upsert", user_id))?;
+
+        // Commit the transaction
+        txn.commit().await.context("Failed to commit transaction")?;
+
+        Ok(user)
     }
 
     /// Set user role
@@ -1029,5 +1095,63 @@ mod tests {
         // Should return true when multiple owners exist (edge case)
         let has_owner = repo.has_owner().await.unwrap();
         assert!(has_owner);
+    }
+
+    #[tokio::test]
+    async fn test_create_user_with_auto_owner_first_user() {
+        let repo = setup_test_db().await.unwrap();
+
+        // First user should become owner
+        let user1 = repo
+            .create_user_with_auto_owner(11111, Some("user1".to_string()))
+            .await
+            .unwrap();
+
+        assert_eq!(user1.id, 11111);
+        assert_eq!(user1.role, UserRole::Owner);
+
+        // Second user should be regular user
+        let user2 = repo
+            .create_user_with_auto_owner(22222, Some("user2".to_string()))
+            .await
+            .unwrap();
+
+        assert_eq!(user2.id, 22222);
+        assert_eq!(user2.role, UserRole::User);
+    }
+
+    #[tokio::test]
+    async fn test_create_user_with_auto_owner_concurrent() {
+        use std::sync::Arc;
+        use tokio::task::JoinSet;
+
+        let repo = Arc::new(setup_test_db().await.unwrap());
+
+        // Simulate concurrent user creation
+        let mut set = JoinSet::new();
+        for i in 1..=10 {
+            let repo_clone = Arc::clone(&repo);
+            set.spawn(async move {
+                repo_clone
+                    .create_user_with_auto_owner(i, Some(format!("user{}", i)))
+                    .await
+            });
+        }
+
+        // Collect all results
+        let mut owners = 0;
+        let mut users = 0;
+        while let Some(result) = set.join_next().await {
+            let user = result.unwrap().unwrap();
+            match user.role {
+                UserRole::Owner => owners += 1,
+                UserRole::User => users += 1,
+                _ => {}
+            }
+        }
+
+        // Verify exactly one owner was created despite concurrent attempts
+        assert_eq!(owners, 1, "Exactly one owner should be created");
+        assert_eq!(users, 9, "Nine regular users should be created");
     }
 }

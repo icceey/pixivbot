@@ -9,7 +9,6 @@ use std::sync::Arc;
 use teloxide::prelude::*;
 use teloxide::types::ParseMode;
 use teloxide::utils::markdown;
-use tokio::sync::Mutex;
 use tracing::{error, info};
 
 // ============================================================================
@@ -33,8 +32,6 @@ pub struct BotHandler {
     pub(crate) cache_dir: String,
     /// 日志目录路径 (用于管理员查看磁盘占用)
     pub(crate) log_dir: String,
-    /// Mutex to prevent race condition in auto-owner assignment
-    pub(crate) auto_owner_lock: Arc<Mutex<()>>,
 }
 
 impl BotHandler {
@@ -68,7 +65,6 @@ impl BotHandler {
             require_mention_in_group,
             cache_dir,
             log_dir,
-            auto_owner_lock: Arc::new(Mutex::new(())),
         }
     }
 
