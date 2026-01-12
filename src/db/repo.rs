@@ -1154,4 +1154,35 @@ mod tests {
         assert_eq!(owners, 1, "Exactly one owner should be created");
         assert_eq!(users, 9, "Nine regular users should be created");
     }
+
+    #[tokio::test]
+    async fn test_create_user_with_auto_owner_preserves_existing_owner() {
+        let repo = setup_test_db().await.unwrap();
+
+        // Create an owner user
+        let owner = repo
+            .upsert_user(11111, Some("owner".to_string()), UserRole::Owner)
+            .await
+            .unwrap();
+        assert_eq!(owner.role, UserRole::Owner);
+
+        // Create another user to ensure owner exists
+        let user = repo
+            .upsert_user(22222, Some("user".to_string()), UserRole::User)
+            .await
+            .unwrap();
+        assert_eq!(user.role, UserRole::User);
+
+        // Call create_user_with_auto_owner on the existing owner
+        // This should preserve their Owner role (ON CONFLICT only updates username)
+        let owner_updated = repo
+            .create_user_with_auto_owner(11111, Some("owner_updated".to_string()))
+            .await
+            .unwrap();
+
+        // Verify the owner role is preserved (not downgraded to User)
+        assert_eq!(owner_updated.id, 11111);
+        assert_eq!(owner_updated.role, UserRole::Owner);
+        assert_eq!(owner_updated.username, Some("owner_updated".to_string()));
+    }
 }
