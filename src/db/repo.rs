@@ -737,6 +737,19 @@ mod tests {
         db.execute(Statement::from_string(
             DbBackend::Sqlite,
             r#"
+            CREATE TABLE users (
+                id INTEGER PRIMARY KEY NOT NULL,
+                username TEXT,
+                role TEXT NOT NULL DEFAULT 'user',
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            "#,
+        ))
+        .await?;
+
+        db.execute(Statement::from_string(
+            DbBackend::Sqlite,
+            r#"
             CREATE TABLE chats (
                 id INTEGER PRIMARY KEY NOT NULL,
                 type TEXT NOT NULL,
@@ -950,5 +963,71 @@ mod tests {
         let new_chat = repo.get_chat(new_chat_id).await.unwrap().unwrap();
         assert!(new_chat.enabled); // From old chat
         assert_eq!(new_chat.title, Some("Old Group".to_string())); // From old chat
+    }
+
+    #[tokio::test]
+    async fn test_has_owner_empty_database() {
+        let repo = setup_test_db().await.unwrap();
+
+        // Fresh database should have no owner
+        let has_owner = repo.has_owner().await.unwrap();
+        assert!(!has_owner);
+    }
+
+    #[tokio::test]
+    async fn test_has_owner_only_non_owner_users() {
+        let repo = setup_test_db().await.unwrap();
+
+        // Create regular user
+        repo.upsert_user(12345, Some("user1".to_string()), UserRole::User)
+            .await
+            .unwrap();
+
+        // Create admin user
+        repo.upsert_user(67890, Some("admin1".to_string()), UserRole::Admin)
+            .await
+            .unwrap();
+
+        // Should return false when only non-owner users exist
+        let has_owner = repo.has_owner().await.unwrap();
+        assert!(!has_owner);
+    }
+
+    #[tokio::test]
+    async fn test_has_owner_with_owner() {
+        let repo = setup_test_db().await.unwrap();
+
+        // Create regular user
+        repo.upsert_user(12345, Some("user1".to_string()), UserRole::User)
+            .await
+            .unwrap();
+
+        // Create owner user
+        repo.upsert_user(99999, Some("owner1".to_string()), UserRole::Owner)
+            .await
+            .unwrap();
+
+        // Should return true when at least one owner exists
+        let has_owner = repo.has_owner().await.unwrap();
+        assert!(has_owner);
+    }
+
+    #[tokio::test]
+    async fn test_has_owner_multiple_owners() {
+        let repo = setup_test_db().await.unwrap();
+
+        // Create first owner
+        repo.upsert_user(11111, Some("owner1".to_string()), UserRole::Owner)
+            .await
+            .unwrap();
+
+        // Create second owner
+        repo.upsert_user(22222, Some("owner2".to_string()), UserRole::Owner)
+            .await
+            .unwrap();
+
+        // Should return true when multiple owners exist (edge case)
+        let has_owner = repo.has_owner().await.unwrap();
+        assert!(has_owner);
     }
 }
