@@ -138,17 +138,32 @@ async fn ensure_user_and_chat(
         Some(existing_user) => existing_user,
         None => {
             // New user - determine role
-            let role = if handler.owner_id == Some(user_id) {
-                UserRole::Owner
+            if handler.owner_id == Some(user_id) {
+                // If owner_id is configured and matches this user, assign Owner role
+                repo.upsert_user(user_id, username, UserRole::Owner)
+                    .await
+                    .context("Failed to create owner user")?
+            } else if handler.owner_id.is_none() {
+                // Auto-assignment logic: use database transaction for atomicity
+                let user = repo
+                    .create_user_with_auto_owner(user_id, username)
+                    .await
+                    .context("Failed to create user with auto-owner check")?;
+
+                if user.role.is_owner() {
+                    info!(
+                        "No owner configured and no owner exists, assigned owner role to first user {}",
+                        user_id
+                    );
+                }
+
+                user
             } else {
-                UserRole::User
-            };
-
-            info!("Creating new user {} with role {:?}", user_id, role);
-
-            repo.upsert_user(user_id, username, role)
-                .await
-                .context("Failed to upsert user")?
+                // Regular user
+                repo.upsert_user(user_id, username, UserRole::User)
+                    .await
+                    .context("Failed to create user")?
+            }
         }
     };
 
