@@ -380,15 +380,15 @@ impl RankingEngine {
         Ok(())
     }
 
-    /// Helper: Trim pushed_ids to last 100 and update state
+    /// Helper: Trim pushed_ids to last 200 and update state
     async fn trim_and_update_pushed_ids(
         &self,
         subscription_id: i32,
         mut pushed_ids: Vec<u64>,
     ) -> Result<()> {
-        // Keep only the last 100 IDs to prevent unbounded growth
-        if pushed_ids.len() > 100 {
-            let skip_count = pushed_ids.len() - 100;
+        // Keep only the last 200 IDs to prevent unbounded growth
+        if pushed_ids.len() > 200 {
+            let skip_count = pushed_ids.len() - 200;
             pushed_ids = pushed_ids.into_iter().skip(skip_count).collect();
         }
 
