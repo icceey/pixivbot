@@ -14,9 +14,6 @@ use tracing::{error, info, warn};
 /// Button label for download button
 const DOWNLOAD_BUTTON_LABEL: &str = "📥 下载";
 
-/// Message text for download button follow-up message (for media groups)
-const DOWNLOAD_BUTTON_MESSAGE: &str = "📥 点击下载原图";
-
 /// Type alias for the throttled bot
 pub type ThrottledBot = Throttle<Bot>;
 
@@ -317,15 +314,8 @@ impl Notifier {
             // Rate limiting is now handled by the Throttle adaptor
         }
 
-        // 4. For multi-image batches, send a separate button message if configured
-        // This is needed because sendMediaGroup doesn't support reply_markup
-        if let Some(kb) = keyboard {
-            if !succeeded.is_empty() {
-                if let Err(e) = self.send_download_button_message(chat_id, kb).await {
-                    warn!("Failed to send download button message: {:#}", e);
-                }
-            }
-        }
+        // Note: For multi-image batches (media groups), download button is NOT shown
+        // because Telegram's sendMediaGroup API doesn't support reply_markup
 
         if !failed.is_empty() {
             error!(
@@ -472,23 +462,6 @@ impl Notifier {
             req = req.reply_markup(kb);
         }
         let message = req.await.context("Send photo failed")?;
-        Ok(message.id.0)
-    }
-
-    /// Send a follow-up message with download button after media group
-    /// This is needed because sendMediaGroup doesn't support reply_markup
-    async fn send_download_button_message(
-        &self,
-        chat_id: ChatId,
-        keyboard: InlineKeyboardMarkup,
-    ) -> Result<i32> {
-        let message = self
-            .bot
-            .send_message(chat_id, DOWNLOAD_BUTTON_MESSAGE)
-            .reply_markup(keyboard)
-            .disable_notification(true)
-            .await
-            .context("Send download button message failed")?;
         Ok(message.id.0)
     }
 }
