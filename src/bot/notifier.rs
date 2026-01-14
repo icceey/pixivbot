@@ -167,8 +167,9 @@ impl Notifier {
     }
 
     /// 发送多张图片（独立文案，用于榜单）并带有下载按钮
-    /// Note: For ranking, each image has a different illust_id, so the button
-    /// will use the first illust_id if provided
+    /// Note: This method accepts `download_config` for API consistency, but
+    /// ranking pushes typically use `DownloadButtonConfig::default()`, which
+    /// means no download button will be shown.
     pub async fn notify_with_individual_captions_and_button(
         &self,
         chat_id: ChatId,
