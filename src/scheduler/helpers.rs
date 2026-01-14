@@ -1,4 +1,4 @@
-use crate::bot::notifier::{BatchSendResult, Notifier};
+use crate::bot::notifier::{BatchSendResult, DownloadButtonConfig, Notifier};
 use crate::db::repo::Repo;
 use crate::db::types::RankingState;
 use crate::utils::{sensitive, tag};
@@ -140,9 +140,24 @@ pub async fn process_illust_push(
     let has_spoiler =
         ctx.chat.blur_sensitive_tags && sensitive::contains_sensitive_tags(illust, sensitive_tags);
 
-    // Send images
+    // Build download button config
+    // Skip download button for channel chats (channels don't support inline buttons)
+    let is_channel = ctx.chat.r#type == "channel";
+    let download_config = if is_channel {
+        DownloadButtonConfig::new(illust.id).for_channel()
+    } else {
+        DownloadButtonConfig::new(illust.id)
+    };
+
+    // Send images with download button
     let send_result = notifier
-        .notify_with_images(chat_id, &urls_to_send, Some(&caption), has_spoiler)
+        .notify_with_images_and_button(
+            chat_id,
+            &urls_to_send,
+            Some(&caption),
+            has_spoiler,
+            &download_config,
+        )
         .await;
 
     // Map send result to PushResult

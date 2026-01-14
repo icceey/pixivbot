@@ -372,6 +372,47 @@ impl BotHandler {
 
         caption
     }
+
+    /// Handle download callback from inline button
+    ///
+    /// Called when user clicks the "📥 下载" button on a pushed image.
+    /// This method processes the download for a single illust ID.
+    pub async fn handle_download_callback(
+        &self,
+        bot: ThrottledBot,
+        chat_id: ChatId,
+        illust_id: u64,
+    ) -> ResponseResult<()> {
+        info!(
+            "Processing download callback for illust {} in chat {}",
+            illust_id, chat_id
+        );
+
+        // Spawn background task to keep chat action alive
+        let bot_clone = bot.clone();
+        let action_task = tokio::spawn(async move {
+            loop {
+                if bot_clone
+                    .send_chat_action(chat_id, ChatAction::UploadDocument)
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                sleep(Duration::from_secs(4)).await;
+            }
+        });
+
+        // Process download for single illust
+        let result = self
+            .process_downloads(bot.clone(), chat_id, vec![illust_id])
+            .await;
+
+        // Stop the chat action task
+        action_task.abort();
+
+        result
+    }
 }
 
 /// Sanitize filename by replacing illegal filesystem characters with underscore
