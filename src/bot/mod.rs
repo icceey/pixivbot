@@ -247,9 +247,11 @@ async fn handle_download_callback(
     }
 
     // Parse illust_id from callback data (format: "dl:12345678")
-    let illust_id_str = callback_data
-        .strip_prefix(DOWNLOAD_CALLBACK_PREFIX)
-        .unwrap_or("0");
+    // The prefix is guaranteed to exist since we filtered by it in the handler tree
+    let Some(illust_id_str) = callback_data.strip_prefix(DOWNLOAD_CALLBACK_PREFIX) else {
+        warn!("Callback data missing expected prefix: {}", callback_data);
+        return Ok(());
+    };
 
     let illust_id: u64 = match illust_id_str.parse() {
         Ok(id) => id,

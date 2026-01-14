@@ -11,6 +11,12 @@ use teloxide::types::{
 };
 use tracing::{error, info, warn};
 
+/// Button label for download button
+const DOWNLOAD_BUTTON_LABEL: &str = "📥 下载";
+
+/// Message text for download button follow-up message (for media groups)
+const DOWNLOAD_BUTTON_MESSAGE: &str = "📥 点击下载原图";
+
 /// Type alias for the throttled bot
 pub type ThrottledBot = Throttle<Bot>;
 
@@ -83,9 +89,10 @@ impl DownloadButtonConfig {
             return None;
         }
 
-        let illust_id = self.illust_id?;
+        // unwrap() is safe here because should_show_button() already validated illust_id.is_some()
+        let illust_id = self.illust_id.unwrap();
         let callback_data = format!("{}{}", DOWNLOAD_CALLBACK_PREFIX, illust_id);
-        let button = InlineKeyboardButton::callback("📥 下载", callback_data);
+        let button = InlineKeyboardButton::callback(DOWNLOAD_BUTTON_LABEL, callback_data);
         Some(InlineKeyboardMarkup::new(vec![vec![button]]))
     }
 }
@@ -477,7 +484,7 @@ impl Notifier {
     ) -> Result<i32> {
         let message = self
             .bot
-            .send_message(chat_id, "📥 点击下载原图")
+            .send_message(chat_id, DOWNLOAD_BUTTON_MESSAGE)
             .reply_markup(keyboard)
             .disable_notification(true)
             .await
