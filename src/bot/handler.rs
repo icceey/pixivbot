@@ -1,5 +1,5 @@
 use crate::bot::link_handler::{parse_pixiv_links, PixivLink};
-use crate::bot::notifier::{Notifier, ThrottledBot};
+use crate::bot::notifier::{DownloadButtonConfig, Notifier, ThrottledBot};
 use crate::bot::Command;
 use crate::db::repo::Repo;
 use crate::db::types::{TagFilter, TaskType, UserRole};
@@ -261,10 +261,25 @@ impl BotHandler {
         // 获取所有图片 URL (使用配置的尺寸)
         let image_urls = illust.get_all_image_urls_with_size(self.image_size);
 
+        // Build download button config
+        // For one-off pushes via link, check chat type to skip channels
+        let is_channel = chat_settings.is_some_and(|c| c.r#type == "channel");
+        let download_config = if is_channel {
+            DownloadButtonConfig::new(illust.id).for_channel()
+        } else {
+            DownloadButtonConfig::new(illust.id)
+        };
+
         // 发送图片
         let _ = self
             .notifier
-            .notify_with_images(chat_id, &image_urls, Some(&caption), has_spoiler)
+            .notify_with_images_and_button(
+                chat_id,
+                &image_urls,
+                Some(&caption),
+                has_spoiler,
+                &download_config,
+            )
             .await;
 
         Ok(())

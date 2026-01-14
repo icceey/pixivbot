@@ -10,7 +10,7 @@ use crate::db::repo::Repo;
 use crate::db::types::UserRole;
 use crate::pixiv::client::PixivClient;
 use anyhow::Result;
-use handlers::LIST_CALLBACK_PREFIX;
+use handlers::{DOWNLOAD_CALLBACK_PREFIX, LIST_CALLBACK_PREFIX};
 use notifier::ThrottledBot;
 use std::sync::Arc;
 use teloxide::dispatching::{Dispatcher, UpdateFilterExt};
@@ -133,6 +133,17 @@ fn build_handler_tree(
         })
         .endpoint(handle_list_callback);
 
+    // Callback query handler for download button
+    let download_callback_handler = Update::filter_callback_query()
+        .filter_map(|q: CallbackQuery| {
+            // Filter for download callbacks
+            q.data
+                .as_ref()
+                .filter(|data| data.starts_with(DOWNLOAD_CALLBACK_PREFIX))
+                .cloned()
+        })
+        .endpoint(handle_download_callback);
+
     // Chat migration handler - handles group to supergroup upgrades
     let migration_handler = dptree::filter(|msg: Message| {
         // Only process migration messages
@@ -140,13 +151,16 @@ fn build_handler_tree(
     })
     .endpoint(handle_chat_migration);
 
-    dptree::entry().branch(callback_handler).branch(
-        Update::filter_message()
-            .branch(migration_handler)
-            .branch(admin_chat_control_handler)
-            .branch(command_handler)
-            .branch(message_handler),
-    )
+    dptree::entry()
+        .branch(callback_handler)
+        .branch(download_callback_handler)
+        .branch(
+            Update::filter_message()
+                .branch(migration_handler)
+                .branch(admin_chat_control_handler)
+                .branch(command_handler)
+                .branch(message_handler),
+        )
 }
 
 /// 处理命令
@@ -211,6 +225,58 @@ async fn handle_list_callback(
             .send_subscription_list(bot, chat_id, chat_id, page, Some(message_id), false)
             .await?;
     }
+
+    Ok(())
+}
+
+/// 处理下载按钮回调
+async fn handle_download_callback(
+    bot: ThrottledBot,
+    q: CallbackQuery,
+    callback_data: String,
+    handler: BotHandler,
+) -> HandlerResult {
+    // Answer the callback immediately to prevent timeout and handle concurrent clicks
+    // Using show_alert=false and cache_time to reduce flickering on repeated clicks
+    if let Err(e) = bot
+        .answer_callback_query(q.id.clone())
+        .cache_time(5) // Cache for 5 seconds to reduce duplicate processing
+        .await
+    {
+        warn!("Failed to answer callback query: {:#}", e);
+    }
+
+    // Parse illust_id from callback data (format: "dl:12345678")
+    let illust_id_str = callback_data
+        .strip_prefix(DOWNLOAD_CALLBACK_PREFIX)
+        .unwrap_or("0");
+
+    let illust_id: u64 = match illust_id_str.parse() {
+        Ok(id) => id,
+        Err(_) => {
+            warn!("Invalid illust_id in callback data: {}", illust_id_str);
+            return Ok(());
+        }
+    };
+
+    // Get chat_id from the callback query message
+    let chat_id = match &q.message {
+        Some(msg) => msg.chat().id,
+        None => {
+            warn!("No message found in download callback query");
+            return Ok(());
+        }
+    };
+
+    info!(
+        "Download button clicked: illust_id={} chat_id={} user={:?}",
+        illust_id, chat_id, q.from.id
+    );
+
+    // Process the download
+    handler
+        .handle_download_callback(bot, chat_id, illust_id)
+        .await?;
 
     Ok(())
 }

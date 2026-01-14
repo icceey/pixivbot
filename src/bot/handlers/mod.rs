@@ -13,3 +13,6 @@ pub use subscription::LIST_CALLBACK_PREFIX;
 
 // Download handler
 mod download;
+
+/// Callback data prefix for download button
+pub const DOWNLOAD_CALLBACK_PREFIX: &str = "dl:";

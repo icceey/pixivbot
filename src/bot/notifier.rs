@@ -1,10 +1,14 @@
+use crate::bot::handlers::DOWNLOAD_CALLBACK_PREFIX;
 use crate::pixiv::downloader::Downloader;
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use teloxide::adaptors::Throttle;
 use teloxide::prelude::*;
-use teloxide::types::{ChatAction, InputFile, InputMedia, InputMediaPhoto, ParseMode};
+use teloxide::types::{
+    ChatAction, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, InputMedia, InputMediaPhoto,
+    ParseMode,
+};
 use tracing::{error, info, warn};
 
 /// Type alias for the throttled bot
@@ -42,6 +46,50 @@ enum CaptionStrategy<'a> {
     Individual(&'a [String]),
 }
 
+/// Configuration for download button
+/// Only applicable to non-channel chats (private and group chats)
+#[derive(Clone, Debug, Default)]
+pub struct DownloadButtonConfig {
+    /// The illust ID to download when button is clicked
+    pub illust_id: Option<u64>,
+    /// Whether the target chat is a channel (channels don't support inline buttons)
+    pub is_channel: bool,
+}
+
+impl DownloadButtonConfig {
+    /// Create a new config with the given illust ID
+    /// By default, assumes it's NOT a channel (button will be shown)
+    pub fn new(illust_id: u64) -> Self {
+        Self {
+            illust_id: Some(illust_id),
+            is_channel: false,
+        }
+    }
+
+    /// Mark the target as a channel (button will NOT be shown)
+    pub fn for_channel(mut self) -> Self {
+        self.is_channel = true;
+        self
+    }
+
+    /// Returns true if the download button should be shown
+    fn should_show_button(&self) -> bool {
+        self.illust_id.is_some() && !self.is_channel
+    }
+
+    /// Build the inline keyboard with download button
+    fn build_keyboard(&self) -> Option<InlineKeyboardMarkup> {
+        if !self.should_show_button() {
+            return None;
+        }
+
+        let illust_id = self.illust_id?;
+        let callback_data = format!("{}{}", DOWNLOAD_CALLBACK_PREFIX, illust_id);
+        let button = InlineKeyboardButton::callback("📥 下载", callback_data);
+        Some(InlineKeyboardMarkup::new(vec![vec![button]]))
+    }
+}
+
 #[derive(Clone)]
 pub struct Notifier {
     bot: ThrottledBot,
@@ -59,6 +107,7 @@ impl Notifier {
     }
 
     /// 发送多张图片（共享文案）
+    #[allow(dead_code)]
     pub async fn notify_with_images(
         &self,
         chat_id: ChatId,
@@ -66,11 +115,31 @@ impl Notifier {
         caption: Option<&str>,
         has_spoiler: bool,
     ) -> BatchSendResult {
+        self.notify_with_images_and_button(
+            chat_id,
+            image_urls,
+            caption,
+            has_spoiler,
+            &DownloadButtonConfig::default(),
+        )
+        .await
+    }
+
+    /// 发送多张图片（共享文案）并带有下载按钮
+    pub async fn notify_with_images_and_button(
+        &self,
+        chat_id: ChatId,
+        image_urls: &[String],
+        caption: Option<&str>,
+        has_spoiler: bool,
+        download_config: &DownloadButtonConfig,
+    ) -> BatchSendResult {
         self.process_batch_send(
             chat_id,
             image_urls,
             CaptionStrategy::Shared(caption),
             has_spoiler,
+            download_config,
         )
         .await
     }
@@ -83,6 +152,27 @@ impl Notifier {
         captions: &[String],
         has_spoiler: bool,
     ) -> BatchSendResult {
+        self.notify_with_individual_captions_and_button(
+            chat_id,
+            image_urls,
+            captions,
+            has_spoiler,
+            &DownloadButtonConfig::default(),
+        )
+        .await
+    }
+
+    /// 发送多张图片（独立文案，用于榜单）并带有下载按钮
+    /// Note: For ranking, each image has a different illust_id, so the button
+    /// will use the first illust_id if provided
+    pub async fn notify_with_individual_captions_and_button(
+        &self,
+        chat_id: ChatId,
+        image_urls: &[String],
+        captions: &[String],
+        has_spoiler: bool,
+        download_config: &DownloadButtonConfig,
+    ) -> BatchSendResult {
         if image_urls.len() != captions.len() {
             warn!("Image URLs and captions count mismatch");
             return BatchSendResult::all_failed(image_urls.len());
@@ -92,6 +182,7 @@ impl Notifier {
             image_urls,
             CaptionStrategy::Individual(captions),
             has_spoiler,
+            download_config,
         )
         .await
     }
@@ -105,11 +196,15 @@ impl Notifier {
         image_urls: &[String],
         caption_strategy: CaptionStrategy<'_>,
         has_spoiler: bool,
+        download_config: &DownloadButtonConfig,
     ) -> BatchSendResult {
         let total = image_urls.len();
         if total == 0 {
             return BatchSendResult::all_failed(0);
         }
+
+        // Build keyboard from config
+        let keyboard = download_config.build_keyboard();
 
         // 1. 优化：单图特例处理
         if total == 1 {
@@ -119,7 +214,7 @@ impl Notifier {
             };
 
             match self
-                .send_single_image(chat_id, &image_urls[0], cap, has_spoiler)
+                .send_single_image(chat_id, &image_urls[0], cap, has_spoiler, keyboard)
                 .await
             {
                 Ok(msg_id) => {
@@ -215,6 +310,16 @@ impl Notifier {
             // Rate limiting is now handled by the Throttle adaptor
         }
 
+        // 4. For multi-image batches, send a separate button message if configured
+        // This is needed because sendMediaGroup doesn't support reply_markup
+        if let Some(kb) = keyboard {
+            if !succeeded.is_empty() {
+                if let Err(e) = self.send_download_button_message(chat_id, kb).await {
+                    warn!("Failed to send download button message: {:#}", e);
+                }
+            }
+        }
+
         if !failed.is_empty() {
             error!(
                 "❌ Sent {}/{} images to chat {}",
@@ -240,6 +345,7 @@ impl Notifier {
         image_url: &str,
         caption: Option<&str>,
         has_spoiler: bool,
+        keyboard: Option<InlineKeyboardMarkup>,
     ) -> Result<i32> {
         info!(
             "Downloading and sending image to chat {}: {}",
@@ -254,7 +360,7 @@ impl Notifier {
             warn!("Failed to set chat action for chat {}: {:#}", chat_id, e);
         }
         let local_path = self.downloader.download(image_url).await?;
-        self.send_photo_file_with_id(chat_id, &local_path, caption, has_spoiler)
+        self.send_photo_file_with_id(chat_id, &local_path, caption, has_spoiler, keyboard)
             .await
     }
 
@@ -346,6 +452,7 @@ impl Notifier {
         path: &Path,
         caption: Option<&str>,
         has_spoiler: bool,
+        keyboard: Option<InlineKeyboardMarkup>,
     ) -> Result<i32> {
         let mut req = self.bot.send_photo(chat_id, InputFile::file(path));
         if let Some(c) = caption {
@@ -354,7 +461,27 @@ impl Notifier {
         if has_spoiler {
             req = req.has_spoiler(true);
         }
+        if let Some(kb) = keyboard {
+            req = req.reply_markup(kb);
+        }
         let message = req.await.context("Send photo failed")?;
+        Ok(message.id.0)
+    }
+
+    /// Send a follow-up message with download button after media group
+    /// This is needed because sendMediaGroup doesn't support reply_markup
+    async fn send_download_button_message(
+        &self,
+        chat_id: ChatId,
+        keyboard: InlineKeyboardMarkup,
+    ) -> Result<i32> {
+        let message = self
+            .bot
+            .send_message(chat_id, "📥 点击下载原图")
+            .reply_markup(keyboard)
+            .disable_notification(true)
+            .await
+            .context("Send download button message failed")?;
         Ok(message.id.0)
     }
 }
