@@ -241,7 +241,7 @@ async fn handle_download_callback(
     // Use cache_time so Telegram can reuse this answer and avoid duplicate server-side processing on rapid repeated clicks
     if let Err(e) = bot
         .answer_callback_query(q.id.clone())
-        .cache_time(5) // Cache for 5 seconds to prevent duplicate server-side processing of rapid clicks
+        .cache_time(10) // Cache for 10 seconds to prevent duplicate server-side processing of rapid clicks
         .await
     {
         warn!("Failed to answer callback query: {:#}", e);
