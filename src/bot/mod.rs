@@ -235,12 +235,13 @@ async fn handle_download_callback(
     q: CallbackQuery,
     callback_data: String,
     handler: BotHandler,
+    repo: Arc<Repo>,
 ) -> HandlerResult {
-    // Answer the callback immediately to prevent timeout and handle concurrent clicks
-    // Using show_alert=false and cache_time to reduce flickering on repeated clicks
+    // Answer the callback immediately to remove the loading indicator and avoid timeouts
+    // Use cache_time so Telegram can reuse this answer and avoid duplicate server-side processing on rapid repeated clicks
     if let Err(e) = bot
         .answer_callback_query(q.id.clone())
-        .cache_time(5) // Cache for 5 seconds to reduce duplicate processing
+        .cache_time(5) // Cache for 5 seconds to prevent duplicate server-side processing of rapid clicks
         .await
     {
         warn!("Failed to answer callback query: {:#}", e);
@@ -270,15 +271,72 @@ async fn handle_download_callback(
         }
     };
 
+    // Authorization check: verify the chat is enabled and accessible
+    // This prevents malicious users from crafting callback queries to access other chats
+    let user_id = q.from.id.0 as i64;
+    match repo.get_chat(chat_id.0).await {
+        Ok(Some(chat)) => {
+            if !chat.enabled {
+                // Check if user is admin who can still access disabled chats
+                match repo.get_user(user_id).await {
+                    Ok(Some(user)) if user.role.is_admin() => {
+                        // Admin can access disabled chats
+                    }
+                    _ => {
+                        warn!(
+                            "User {} attempted to use download button in disabled chat {}",
+                            user_id, chat_id
+                        );
+                        let _ = bot
+                            .send_message(chat_id, "❌ 此聊天未启用，无法使用下载功能")
+                            .await;
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        Ok(None) => {
+            warn!(
+                "Chat {} not found in database for download callback",
+                chat_id
+            );
+            let _ = bot.send_message(chat_id, "❌ 无法处理下载请求").await;
+            return Ok(());
+        }
+        Err(e) => {
+            error!(
+                "Failed to get chat {} for authorization check: {:#}",
+                chat_id, e
+            );
+            let _ = bot.send_message(chat_id, "❌ 无法处理下载请求").await;
+            return Ok(());
+        }
+    }
+
     info!(
         "Download button clicked: illust_id={} chat_id={} user={:?}",
         illust_id, chat_id, q.from.id
     );
 
-    // Process the download
-    handler
-        .handle_download_callback(bot, chat_id, illust_id)
-        .await?;
+    // Process the download and handle errors gracefully so the user gets feedback
+    if let Err(e) = handler
+        .handle_download_callback(bot.clone(), chat_id, illust_id)
+        .await
+    {
+        error!(
+            "Failed to handle download callback for illust {} in chat {}: {:#}",
+            illust_id, chat_id, e
+        );
+
+        // Try to notify the user with a generic error message
+        if let Err(send_err) = bot.send_message(chat_id, "❌ 下载失败，请稍后重试").await
+        {
+            error!(
+                "Failed to send download error message to chat {}: {:#}",
+                chat_id, send_err
+            );
+        }
+    }
 
     Ok(())
 }
