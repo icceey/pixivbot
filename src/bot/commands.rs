@@ -28,17 +28,7 @@ pub enum Command {
     EnableChat(String),
     #[command(description = "[仅Admin] 禁用聊天\n  用法: /disablechat [chat_id]")]
     DisableChat(String),
-    #[command(description = "启用或禁用敏感内容模糊\n  用法: /blursensitive <on|off>")]
-    BlurSensitive(String),
-    #[command(description = "设置敏感标签\n  用法: /sensitivetags <tag1,tag2,...>")]
-    SensitiveTags(String),
-    #[command(description = "清除所有敏感标签")]
-    ClearSensitiveTags,
-    #[command(description = "设置排除的标签\n  用法: /excludetags <tag1,tag2,...>")]
-    ExcludeTags(String),
-    #[command(description = "清除所有排除的标签")]
-    ClearExcludedTags,
-    #[command(description = "显示聊天设置")]
+    #[command(description = "显示和管理聊天设置")]
     Settings,
     #[command(description = "下载作品原图\n  用法: /download <url|id> 或回复消息")]
     Download(String),
@@ -57,21 +47,7 @@ impl Command {
                 "取消订阅排行榜 - /unsubrank [ch=<频道ID>] <mode>",
             ),
             BotCommand::new("unsubthis", "回复消息取消对应订阅"),
-            BotCommand::new(
-                "blursensitive",
-                "启用或禁用敏感内容模糊 - /blursensitive <on|off>",
-            ),
-            BotCommand::new(
-                "sensitivetags",
-                "设置敏感标签 - /sensitivetags <tag1,tag2,...>",
-            ),
-            BotCommand::new("clearsensitivetags", "清除所有敏感标签"),
-            BotCommand::new(
-                "excludetags",
-                "设置排除的标签 - /excludetags <tag1,tag2,...>",
-            ),
-            BotCommand::new("clearexcludedtags", "清除所有排除的标签"),
-            BotCommand::new("settings", "显示聊天设置"),
+            BotCommand::new("settings", "显示和管理聊天设置"),
             BotCommand::new("download", "下载作品原图 - /download <url|id> 或回复消息"),
             BotCommand::new("help", "显示帮助信息"),
         ]

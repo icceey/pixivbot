@@ -122,11 +122,6 @@ impl BotHandler {
             Command::List(args) => self.handle_list(bot, chat_id, user_id, args).await,
 
             // Chat settings commands (defined in handlers/settings.rs)
-            Command::BlurSensitive(args) => self.handle_blur_sensitive(bot, chat_id, args).await,
-            Command::SensitiveTags(args) => self.handle_sensitive_tags(bot, chat_id, args).await,
-            Command::ClearSensitiveTags => self.handle_clear_sensitive_tags(bot, chat_id).await,
-            Command::ExcludeTags(args) => self.handle_exclude_tags(bot, chat_id, args).await,
-            Command::ClearExcludedTags => self.handle_clear_excluded_tags(bot, chat_id).await,
             Command::Settings => self.handle_settings(bot, chat_id).await,
 
             // Download command (defined in handlers/download.rs)

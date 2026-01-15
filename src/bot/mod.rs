@@ -10,7 +10,10 @@ use crate::db::repo::Repo;
 use crate::db::types::UserRole;
 use crate::pixiv::client::PixivClient;
 use anyhow::Result;
-use handlers::{DOWNLOAD_CALLBACK_PREFIX, LIST_CALLBACK_PREFIX};
+use handlers::{
+    InMemStorage, SettingsState, SettingsStorage, DOWNLOAD_CALLBACK_PREFIX, LIST_CALLBACK_PREFIX,
+    SETTINGS_CALLBACK_PREFIX,
+};
 use notifier::ThrottledBot;
 use std::sync::Arc;
 use teloxide::dispatching::{Dispatcher, UpdateFilterExt};
@@ -72,6 +75,7 @@ pub async fn run(
         cache_dir,
         log_dir,
     );
+    let settings_storage: SettingsStorage = InMemStorage::new();
 
     info!("✅ Bot initialized, starting command handler");
 
@@ -83,7 +87,7 @@ pub async fn run(
 
     // 使用 Dispatcher
     Dispatcher::builder(bot, handler_tree)
-        .dependencies(dptree::deps![handler, repo, notifier])
+        .dependencies(dptree::deps![handler, repo, notifier, settings_storage])
         .default_handler(|_| async {})
         .enable_ctrlc_handler()
         .build()
@@ -122,6 +126,30 @@ fn build_handler_tree(
         .chain(middleware::filter_chat_accessible())
         .endpoint(handle_message);
 
+    let settings_input_handler = Message::filter_text()
+        .chain(middleware::filter_relevant_message::<HandlerResult>())
+        .chain(middleware::filter_user_chat())
+        .chain(middleware::filter_chat_accessible())
+        .filter_map_async(|msg: Message, storage: SettingsStorage| async move {
+            let user_id = msg.from.as_ref().map(|user| user.id)?;
+            let state = storage
+                .get(&(msg.chat.id, user_id))
+                .await
+                .unwrap_or_default();
+            (!matches!(state, SettingsState::Idle)).then_some(state)
+        })
+        .endpoint(handle_settings_input);
+
+    // Callback query handler for settings
+    let settings_callback_handler = Update::filter_callback_query()
+        .filter_map(|q: CallbackQuery| {
+            q.data
+                .as_ref()
+                .filter(|data| data.starts_with(SETTINGS_CALLBACK_PREFIX))
+                .cloned()
+        })
+        .endpoint(handle_settings_callback);
+
     // Callback query handler for pagination
     let callback_handler = Update::filter_callback_query()
         .filter_map(|q: CallbackQuery| {
@@ -152,11 +180,13 @@ fn build_handler_tree(
     .endpoint(handle_chat_migration);
 
     dptree::entry()
+        .branch(settings_callback_handler)
         .branch(callback_handler)
         .branch(download_callback_handler)
         .branch(
             Update::filter_message()
                 .branch(migration_handler)
+                .branch(settings_input_handler)
                 .branch(admin_chat_control_handler)
                 .branch(command_handler)
                 .branch(message_handler),
@@ -226,6 +256,34 @@ async fn handle_list_callback(
             .await?;
     }
 
+    Ok(())
+}
+
+/// 处理设置回调
+async fn handle_settings_callback(
+    bot: ThrottledBot,
+    q: CallbackQuery,
+    callback_data: String,
+    handler: BotHandler,
+    storage: SettingsStorage,
+) -> HandlerResult {
+    handler
+        .handle_settings_callback(bot, q, callback_data, storage)
+        .await?;
+    Ok(())
+}
+
+/// 处理设置输入
+async fn handle_settings_input(
+    bot: ThrottledBot,
+    msg: Message,
+    state: SettingsState,
+    handler: BotHandler,
+    storage: SettingsStorage,
+) -> HandlerResult {
+    handler
+        .handle_settings_input(bot, msg, state, storage)
+        .await?;
     Ok(())
 }
 

@@ -81,23 +81,8 @@ impl BotHandler {
    取消订阅排行榜
    \- 示例: `/unsubrank day`
 
-🔒 `/blursensitive <on|off>`
-   启用或禁用敏感内容模糊
-   \- 示例: `/blursensitive on`
-
-🏷 `/sensitivetags <tag1,tag2,...>`
-   设置此聊天的敏感标签
-   \- 示例: `/sensitivetags R\-18,R\-18G`
-
-🗑 `/clearsensitivetags`
-   清除所有敏感标签
-
-🚫 `/excludetags <tag1,tag2,...>`
-   设置此聊天的全局排除标签
-   \- 示例: `/excludetags R\-18,gore`
-
-🗑 `/clearexcludedtags`
-   清除所有排除的标签
+⚙️ `/settings`
+   显示和管理聊天设置
 "#;
 
         bot.send_message(chat_id, help_text)

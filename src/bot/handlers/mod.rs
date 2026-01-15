@@ -6,6 +6,7 @@ mod info;
 
 // Chat settings handlers
 mod settings;
+pub(crate) use settings::{InMemStorage, SettingsState, SettingsStorage, SETTINGS_CALLBACK_PREFIX};
 
 // Subscription related handlers
 mod subscription;
