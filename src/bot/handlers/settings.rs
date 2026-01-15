@@ -205,7 +205,7 @@ impl BotHandler {
             (Tags::default(), true)
         } else {
             let tag_list: Vec<String> = text
-                .split(|c| c == ',' || c == '，')
+                .split([',', '，'])
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
                 .collect();
