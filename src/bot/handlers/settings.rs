@@ -236,7 +236,7 @@ impl BotHandler {
                 } else {
                     info!("Chat {} updated settings tags", chat_id);
                 }
-                bot.send_message(chat_id, "✅ Settings updated").await?;
+                bot.send_message(chat_id, "✅ 设置已更新").await?;
             }
             Err(e) => {
                 error!("Failed to update settings tags: {:#}", e);
@@ -291,19 +291,19 @@ impl BotHandler {
 
 fn settings_panel(chat: &crate::db::entities::chats::Model) -> (String, InlineKeyboardMarkup) {
     let blur_status = if chat.blur_sensitive_tags {
-        "Enabled"
+        "已启用"
     } else {
-        "Disabled"
+        "已禁用"
     };
     let sensitive_status = if chat.sensitive_tags.is_empty() {
-        "None"
+        "无"
     } else {
-        "Has tags"
+        "有标签"
     };
     let excluded_status = if chat.excluded_tags.is_empty() {
-        "None"
+        "无"
     } else {
-        "Has tags"
+        "有标签"
     };
 
     let message = format!(
@@ -312,9 +312,9 @@ fn settings_panel(chat: &crate::db::entities::chats::Model) -> (String, InlineKe
     );
 
     let blur_button = if chat.blur_sensitive_tags {
-        "🔓 Turn Off"
+        "🔓 关闭"
     } else {
-        "🔒 Turn On"
+        "🔒 开启"
     };
 
     let keyboard = InlineKeyboardMarkup::new(vec![
@@ -323,8 +323,8 @@ fn settings_panel(chat: &crate::db::entities::chats::Model) -> (String, InlineKe
             SETTINGS_BLUR_TOGGLE,
         )],
         vec![
-            InlineKeyboardButton::callback("✏️ Edit Sensitive Tags", SETTINGS_EDIT_SENSITIVE),
-            InlineKeyboardButton::callback("✏️ Edit Excluded Tags", SETTINGS_EDIT_EXCLUDE),
+            InlineKeyboardButton::callback("✏️ 编辑敏感标签", SETTINGS_EDIT_SENSITIVE),
+            InlineKeyboardButton::callback("✏️ 编辑排除标签", SETTINGS_EDIT_EXCLUDE),
         ],
     ]);
 
