@@ -109,6 +109,10 @@ impl BotHandler {
             return Ok(());
         }
 
+        if let Err(e) = bot.answer_callback_query(q.id.clone()).await {
+            warn!("Failed to answer callback query: {:#}", e);
+        }
+
         let Some(message) = q.message.as_ref() else {
             warn!("Settings callback missing message");
             return Ok(());
@@ -116,13 +120,9 @@ impl BotHandler {
 
         let chat_id = message.chat().id;
         let message_id = message.id();
-        let callback_id = q.id.clone();
 
         match callback_data.as_str() {
             SETTINGS_BLUR_TOGGLE => {
-                if let Err(e) = bot.answer_callback_query(callback_id.clone()).await {
-                    warn!("Failed to answer callback query: {:#}", e);
-                }
                 let current = match self.repo.get_chat(chat_id.0).await {
                     Ok(Some(chat)) => chat.blur_sensitive_tags,
                     Ok(None) => {
@@ -154,9 +154,6 @@ impl BotHandler {
                 }
             }
             SETTINGS_EDIT_SENSITIVE => {
-                if let Err(e) = bot.answer_callback_query(callback_id.clone()).await {
-                    warn!("Failed to answer callback query: {:#}", e);
-                }
                 storage
                     .insert((chat_id, user_id), SettingsState::WaitingForSensitiveTags)
                     .await;
@@ -173,9 +170,6 @@ impl BotHandler {
                     .await?;
             }
             SETTINGS_EDIT_EXCLUDE => {
-                if let Err(e) = bot.answer_callback_query(callback_id.clone()).await {
-                    warn!("Failed to answer callback query: {:#}", e);
-                }
                 storage
                     .insert((chat_id, user_id), SettingsState::WaitingForExcludedTags)
                     .await;
@@ -191,11 +185,7 @@ impl BotHandler {
                     .parse_mode(ParseMode::MarkdownV2)
                     .await?;
             }
-            _ => {
-                if let Err(e) = bot.answer_callback_query(callback_id).await {
-                    warn!("Failed to answer callback query: {:#}", e);
-                }
-            }
+            _ => {}
         }
 
         Ok(())
