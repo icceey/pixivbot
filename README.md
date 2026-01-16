@@ -126,14 +126,14 @@ Supported configuration options in `config.toml` or via Environment Variables (p
 - `/unsub <id,...>` - Unsubscribe from an artist
 - `/unsubrank <mode>` - Unsubscribe from a ranking
 - `/list` - List active subscriptions
-- `/settings` - Show current chat settings
-- `/blursensitive <on|off>` - Enable/disable spoiler for sensitive content
-- `/sensitivetags <tag,...>` - Set custom sensitive tags
-- `/clearsensitivetags` - Clear sensitive tags
-- `/excludetags <tag,...>` - Set excluded tags (images with these tags won't be sent)
-- `/clearexcludedtags` - Clear excluded tags
+- `/settings` - Show and manage chat settings (interactive UI with inline buttons)
+  - Toggle blur for sensitive content
+  - Edit sensitive tags
+  - Edit excluded tags
+- `/cancel` - Cancel current settings operation
+- `/download <url|id>` - Download original images (or reply to a message)
 
-### Admin Custom Commands
+### Admin Commands
 
 - `/enablechat [chat_id]` - Enable bot in a chat (if in private mode)
 - `/disablechat [chat_id]` - Disable bot in a chat

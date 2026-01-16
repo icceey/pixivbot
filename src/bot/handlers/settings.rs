@@ -22,6 +22,10 @@ impl BotHandler {
     /// - Fetch current chat settings from DB
     /// - Display a message summarizing blur status, sensitive tags, and excluded tags
     /// - Attach inline keyboard with toggle and edit buttons
+    ///
+    /// **Security Note**: Viewing settings is intentionally unrestricted to allow
+    /// all users to see current chat configuration. Modifications (via callback
+    /// handlers) require admin permissions.
     pub async fn handle_settings(&self, bot: ThrottledBot, chat_id: ChatId) -> ResponseResult<()> {
         match self.repo.get_chat(chat_id.0).await {
             Ok(Some(chat)) => {
@@ -175,11 +179,18 @@ pub async fn handle_settings_callback(
     let user_id = q.from.id;
 
     // Check if user is admin (security check)
+    // Note: The middleware ensures users exist via ensure_user_and_chat, so Ok(None)
+    // indicates a data inconsistency issue that should be logged.
     let user_role = match handler.repo.get_user(user_id.0 as i64).await {
         Ok(Some(user)) => user.role,
         Ok(None) => {
+            // This shouldn't happen as middleware ensures users exist
+            warn!(
+                "User {} not found in database during settings callback - data inconsistency",
+                user_id
+            );
             bot.answer_callback_query(q.id)
-                .text("只有管理员可以修改设置")
+                .text("发生错误，请稍后重试")
                 .show_alert(true)
                 .await?;
             return Ok(());
@@ -240,7 +251,21 @@ pub async fn handle_settings_callback(
                         }
                     }
                 }
-                _ => {
+                Ok(None) => {
+                    warn!(
+                        "Chat {} not found when toggling blur_sensitive_tags by user {}",
+                        chat_id, user_id
+                    );
+                    bot.answer_callback_query(q.id)
+                        .text("获取聊天信息失败")
+                        .show_alert(true)
+                        .await?;
+                }
+                Err(e) => {
+                    error!(
+                        "Failed to fetch chat {} for blur toggle by user {}: {:#}",
+                        chat_id, user_id, e
+                    );
                     bot.answer_callback_query(q.id)
                         .text("获取聊天信息失败")
                         .show_alert(true)
@@ -367,12 +392,7 @@ pub async fn handle_settings_input(
                 bot.send_message(chat_id, format!("✅ {}已清除", tag_type))
                     .await?;
 
-                info!(
-                    "Chat {} cleared {} by user {:?}",
-                    chat_id,
-                    tag_type,
-                    msg.from.as_ref().map(|u| u.id)
-                );
+                info!("Chat {} cleared {} by user {}", chat_id, tag_type, user_id);
             }
             Err(e) => {
                 error!("Failed to clear tags: {:#}", e);
@@ -420,12 +440,7 @@ pub async fn handle_settings_input(
                     .parse_mode(ParseMode::MarkdownV2)
                     .await?;
 
-                info!(
-                    "Chat {} updated {} by user {:?}",
-                    chat_id,
-                    tag_type,
-                    msg.from.as_ref().map(|u| u.id)
-                );
+                info!("Chat {} updated {} by user {}", chat_id, tag_type, user_id);
             }
             Err(e) => {
                 error!("Failed to update tags: {:#}", e);
@@ -478,4 +493,73 @@ pub async fn handle_settings_cancel(
     }
 
     Ok(had_state)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_tags_input_normal_comma() {
+        let result = parse_tags_input("tag1, tag2, tag3");
+        assert_eq!(result, vec!["tag1", "tag2", "tag3"]);
+    }
+
+    #[test]
+    fn test_parse_tags_input_chinese_comma() {
+        let result = parse_tags_input("tag1，tag2，tag3");
+        assert_eq!(result, vec!["tag1", "tag2", "tag3"]);
+    }
+
+    #[test]
+    fn test_parse_tags_input_mixed_commas() {
+        let result = parse_tags_input("tag1, tag2，tag3, tag4");
+        assert_eq!(result, vec!["tag1", "tag2", "tag3", "tag4"]);
+    }
+
+    #[test]
+    fn test_parse_tags_input_empty() {
+        let result = parse_tags_input("");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_parse_tags_input_whitespace_only() {
+        let result = parse_tags_input("   ,   ,   ");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_parse_tags_input_whitespace_handling() {
+        let result = parse_tags_input("  tag1  ,  tag2  ");
+        assert_eq!(result, vec!["tag1", "tag2"]);
+    }
+
+    #[test]
+    fn test_parse_tags_input_single_tag() {
+        let result = parse_tags_input("single_tag");
+        assert_eq!(result, vec!["single_tag"]);
+    }
+
+    #[test]
+    fn test_parse_tags_input_duplicate_tags() {
+        // Note: This function does NOT deduplicate - just parses
+        let result = parse_tags_input("tag1, tag1, tag2");
+        assert_eq!(result, vec!["tag1", "tag1", "tag2"]);
+    }
+
+    #[test]
+    fn test_parse_tags_input_unicode_tags() {
+        let result = parse_tags_input("日本語, R-18, 原神");
+        assert_eq!(result, vec!["日本語", "R-18", "原神"]);
+    }
+
+    #[test]
+    fn test_parse_tags_input_special_chars() {
+        let result = parse_tags_input("tag-with-dash, tag_with_underscore, tag.with.dot");
+        assert_eq!(
+            result,
+            vec!["tag-with-dash", "tag_with_underscore", "tag.with.dot"]
+        );
+    }
 }

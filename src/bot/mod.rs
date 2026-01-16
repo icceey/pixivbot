@@ -172,12 +172,19 @@ fn build_handler_tree(
 
     // Dialogue state handler for settings input - must be checked before commands
     // This handler intercepts text messages from users in a waiting state
-    let settings_dialogue_handler = Message::filter_text().endpoint(handle_settings_dialogue);
+    // Uses middleware to ensure user/chat exist and chat is accessible
+    let settings_dialogue_handler = Message::filter_text()
+        .chain(middleware::filter_user_chat())
+        .chain(middleware::filter_chat_accessible())
+        .endpoint(handle_settings_dialogue);
 
     // Cancel command handler for settings dialogue
+    // Uses middleware to ensure user/chat exist and chat is accessible
     let cancel_handler = Message::filter_text()
         .chain(middleware::filter_hybrid_command::<Command, HandlerResult>())
-        .filter(|cmd: Command| matches!(cmd, Command::Cancel))
+        .chain(middleware::filter_user_chat())
+        .chain(middleware::filter_chat_accessible())
+        .filter(|cmd: Command, _ctx: UserChatContext| matches!(cmd, Command::Cancel))
         .endpoint(handle_cancel_command);
 
     dptree::entry()
@@ -225,6 +232,7 @@ async fn handle_settings_dialogue(
     msg: Message,
     handler: BotHandler,
     storage: SettingsStorage,
+    _ctx: UserChatContext,
 ) -> HandlerResult {
     // Try to handle the message as settings input
     // If handled, return Ok and stop further processing
@@ -245,6 +253,7 @@ async fn handle_cancel_command(
     bot: ThrottledBot,
     msg: Message,
     storage: SettingsStorage,
+    _ctx: UserChatContext,
 ) -> HandlerResult {
     match handle_settings_cancel(bot, msg, storage).await {
         Ok(true) => Ok(()), // Cancellation was handled

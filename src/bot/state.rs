@@ -27,11 +27,8 @@ pub enum SettingsState {
     },
 }
 
-/// Key for the dialogue state map: (ChatId, UserId)
-pub type DialogueKey = (ChatId, UserId);
-
-/// Storage for dialogue states - thread-safe HashMap
-pub type SettingsStorage = Arc<RwLock<HashMap<DialogueKey, SettingsState>>>;
+/// Storage for dialogue states - thread-safe HashMap keyed by (ChatId, UserId)
+pub type SettingsStorage = Arc<RwLock<HashMap<(ChatId, UserId), SettingsState>>>;
 
 /// Create a new settings storage instance
 pub fn new_settings_storage() -> SettingsStorage {
