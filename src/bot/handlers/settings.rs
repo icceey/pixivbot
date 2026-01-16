@@ -177,8 +177,7 @@ impl BotHandler {
                 let prompt_middle = markdown::escape(" 清除。发送 ");
                 let prompt_suffix = markdown::escape(" 取消。注意：多人同时编辑可能覆盖。");
                 let message = format!(
-                    "{}{}{}{}{}{}",
-                    mention, prompt_prefix, clear_hint, prompt_middle, cancel_hint, prompt_suffix
+                    "{mention}{prompt_prefix}{clear_hint}{prompt_middle}{cancel_hint}{prompt_suffix}"
                 );
                 bot.send_message(chat_id, message)
                     .parse_mode(ParseMode::MarkdownV2)
@@ -195,8 +194,7 @@ impl BotHandler {
                 let prompt_middle = markdown::escape(" 清除。发送 ");
                 let prompt_suffix = markdown::escape(" 取消。注意：多人同时编辑可能覆盖。");
                 let message = format!(
-                    "{}{}{}{}{}{}",
-                    mention, prompt_prefix, clear_hint, prompt_middle, cancel_hint, prompt_suffix
+                    "{mention}{prompt_prefix}{clear_hint}{prompt_middle}{cancel_hint}{prompt_suffix}"
                 );
                 bot.send_message(chat_id, message)
                     .parse_mode(ParseMode::MarkdownV2)
