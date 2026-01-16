@@ -287,13 +287,16 @@ impl BotHandler {
                 let (message, keyboard) = settings_panel(&chat);
                 if let Some(message_id) = message_id {
                     if let Err(e) = bot
-                        .edit_message_text(chat_id, message_id, message)
+                        .edit_message_text(chat_id, message_id, message.clone())
                         .parse_mode(ParseMode::MarkdownV2)
-                        .reply_markup(keyboard)
+                        .reply_markup(keyboard.clone())
                         .await
                     {
                         warn!("Failed to edit settings panel: {:#}", e);
-                        bot.send_message(chat_id, "❌ 更新设置失败").await?;
+                        bot.send_message(chat_id, message)
+                            .parse_mode(ParseMode::MarkdownV2)
+                            .reply_markup(keyboard)
+                            .await?;
                     }
                 } else {
                     bot.send_message(chat_id, message)
@@ -358,6 +361,7 @@ fn format_user_mention(user: &User) -> String {
 }
 
 fn format_code_inline(text: &str) -> String {
+    // MarkdownV2 inline code only requires escaping backslashes and backticks.
     let escaped = text.replace('\\', "\\\\").replace('`', "\\`");
     format!("`{}`", escaped)
 }
@@ -406,4 +410,68 @@ fn settings_panel(chat: &crate::db::entities::chats::Model) -> (String, InlineKe
     ]);
 
     (message, keyboard)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_format_code_inline_escapes() {
+        let formatted = format_code_inline(r"foo\`bar");
+        assert_eq!(formatted, r"`foo\\\`bar`");
+    }
+
+    #[test]
+    fn test_format_user_mention_escapes() {
+        let user = User {
+            id: UserId(42),
+            is_bot: false,
+            first_name: "A[B]".to_string(),
+            last_name: None,
+            username: None,
+            language_code: None,
+            is_premium: false,
+            added_to_attachment_menu: false,
+        };
+        let expected_name = markdown::escape("A[B]");
+        let expected_url = markdown::escape_link_url("tg://user?id=42");
+        assert_eq!(
+            format_user_mention(&user),
+            format!("[{}]({})", expected_name, expected_url)
+        );
+    }
+
+    #[test]
+    fn test_format_tag_summary_truncates() {
+        let tags = Tags(vec![
+            "foo".to_string(),
+            "bar".to_string(),
+            "baz".to_string(),
+        ]);
+        let expected_suffix = markdown::escape("... 等 3 个");
+        let expected = format!(
+            "{}{}",
+            [format_code_inline("foo"), format_code_inline("bar")].join(", "),
+            expected_suffix
+        );
+        assert_eq!(format_tag_summary(&tags, 2), expected);
+    }
+
+    #[test]
+    fn test_format_tag_prompt() {
+        let mention = "@user";
+        let clear_hint = format_code_inline("clear");
+        let cancel_hint = format_code_inline("/cancel");
+        let prefix = markdown::escape(" 请回复");
+        let label = markdown::escape("敏感标签");
+        let middle = markdown::escape("，用逗号分隔，或发送 ");
+        let after_clear = markdown::escape(" 清除。发送 ");
+        let suffix = markdown::escape(" 取消。注意：多人同时编辑可能覆盖。");
+        let expected = format!(
+            "{mention}{prefix}{label}{middle}{clear_hint}{after_clear}{cancel_hint}{suffix}"
+        );
+        let result = format_tag_prompt(mention, "敏感标签", &clear_hint, &cancel_hint);
+        assert_eq!(result, expected);
+    }
 }
