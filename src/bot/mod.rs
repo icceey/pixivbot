@@ -75,7 +75,7 @@ pub async fn run(
         cache_dir,
         log_dir,
     );
-    let settings_storage: SettingsStorage = InMemStorage::new();
+    let settings_storage: SettingsStorage = Arc::new(InMemStorage::new());
 
     info!("✅ Bot initialized, starting command handler");
 

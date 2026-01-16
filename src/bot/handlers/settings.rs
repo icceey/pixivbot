@@ -47,10 +47,8 @@ impl<K, V> InMemStorage<K, V>
 where
     K: Eq + Hash,
 {
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self {
-            map: Mutex::new(HashMap::new()),
-        })
+    pub fn new() -> Self {
+        Self::default()
     }
 
     pub async fn get(&self, key: &K) -> Option<V>
@@ -173,12 +171,7 @@ impl BotHandler {
                 let mention = format_user_mention(&q.from);
                 let clear_hint = format_code_inline("clear");
                 let cancel_hint = format_code_inline("/cancel");
-                let prompt_prefix = markdown::escape(" 请回复敏感标签，用逗号分隔，或发送 ");
-                let prompt_middle = markdown::escape(" 清除。发送 ");
-                let prompt_suffix = markdown::escape(" 取消。注意：多人同时编辑可能覆盖。");
-                let message = format!(
-                    "{mention}{prompt_prefix}{clear_hint}{prompt_middle}{cancel_hint}{prompt_suffix}"
-                );
+                let message = format_tag_prompt(&mention, "敏感标签", &clear_hint, &cancel_hint);
                 bot.send_message(chat_id, message)
                     .parse_mode(ParseMode::MarkdownV2)
                     .await?;
@@ -190,12 +183,7 @@ impl BotHandler {
                 let mention = format_user_mention(&q.from);
                 let clear_hint = format_code_inline("clear");
                 let cancel_hint = format_code_inline("/cancel");
-                let prompt_prefix = markdown::escape(" 请回复排除标签，用逗号分隔，或发送 ");
-                let prompt_middle = markdown::escape(" 清除。发送 ");
-                let prompt_suffix = markdown::escape(" 取消。注意：多人同时编辑可能覆盖。");
-                let message = format!(
-                    "{mention}{prompt_prefix}{clear_hint}{prompt_middle}{cancel_hint}{prompt_suffix}"
-                );
+                let message = format_tag_prompt(&mention, "排除标签", &clear_hint, &cancel_hint);
                 bot.send_message(chat_id, message)
                     .parse_mode(ParseMode::MarkdownV2)
                     .await?;
@@ -345,11 +333,25 @@ fn format_tag_summary(tags: &Tags, max_tags: usize) -> String {
         .collect();
 
     if total > shown {
-        let suffix = markdown::escape(&format!("… 等 {} 个", total));
+        let suffix = markdown::escape(&format!("... 等 {} 个", total));
         format!("{}{}", parts.join(", "), suffix)
     } else {
         parts.join(", ")
     }
+}
+
+fn format_tag_prompt(
+    mention: &str,
+    tag_label: &str,
+    clear_hint: &str,
+    cancel_hint: &str,
+) -> String {
+    let prefix = markdown::escape(" 请回复");
+    let label = markdown::escape(tag_label);
+    let middle = markdown::escape("，用逗号分隔，或发送 ");
+    let after_clear = markdown::escape(" 清除。发送 ");
+    let suffix = markdown::escape(" 取消。注意：多人同时编辑可能覆盖。");
+    format!("{mention}{prefix}{label}{middle}{clear_hint}{after_clear}{cancel_hint}{suffix}")
 }
 
 fn format_user_mention(user: &User) -> String {
