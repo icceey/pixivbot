@@ -6,7 +6,7 @@ use std::hash::Hash;
 use std::sync::Arc;
 use teloxide::prelude::*;
 use teloxide::types::{
-    CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, MessageId, ParseMode, UserId,
+    CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, MessageId, ParseMode, User, UserId,
 };
 use teloxide::utils::markdown;
 use tokio::sync::Mutex;
@@ -168,10 +168,9 @@ impl BotHandler {
                 storage
                     .insert((chat_id, user_id), SettingsState::WaitingForSensitiveTags)
                     .await;
-                let mention =
-                    markdown::user_mention(user_id, &markdown::escape(&q.from.full_name()));
-                let clear_hint = markdown::code_inline("clear");
-                let cancel_hint = markdown::code_inline("/cancel");
+                let mention = format_user_mention(&q.from);
+                let clear_hint = format_code_inline("clear");
+                let cancel_hint = format_code_inline("/cancel");
                 let message = format!(
                     "{} 请回复敏感标签，用逗号分隔，或发送 {} 清除。发送 {} 取消。注意：多人同时编辑可能覆盖。",
                     mention, clear_hint, cancel_hint
@@ -184,10 +183,9 @@ impl BotHandler {
                 storage
                     .insert((chat_id, user_id), SettingsState::WaitingForExcludedTags)
                     .await;
-                let mention =
-                    markdown::user_mention(user_id, &markdown::escape(&q.from.full_name()));
-                let clear_hint = markdown::code_inline("clear");
-                let cancel_hint = markdown::code_inline("/cancel");
+                let mention = format_user_mention(&q.from);
+                let clear_hint = format_code_inline("clear");
+                let cancel_hint = format_code_inline("/cancel");
                 let message = format!(
                     "{} 请回复排除标签，用逗号分隔，或发送 {} 清除。发送 {} 取消。注意：多人同时编辑可能覆盖。",
                     mention, clear_hint, cancel_hint
@@ -337,7 +335,7 @@ fn format_tag_summary(tags: &Tags, max_tags: usize) -> String {
     let parts: Vec<String> = tags
         .iter()
         .take(shown)
-        .map(|tag| markdown::code_inline(tag))
+        .map(|tag| format_code_inline(tag))
         .collect();
 
     if total > shown {
@@ -345,6 +343,16 @@ fn format_tag_summary(tags: &Tags, max_tags: usize) -> String {
     } else {
         parts.join(", ")
     }
+}
+
+fn format_user_mention(user: &User) -> String {
+    let escaped = markdown::escape(&user.full_name());
+    format!("[{}](tg://user?id={})", escaped, user.id.0)
+}
+
+fn format_code_inline(text: &str) -> String {
+    let escaped = text.replace('\\', "\\\\").replace('`', "\\`");
+    format!("`{}`", escaped)
 }
 
 fn settings_panel(chat: &crate::db::entities::chats::Model) -> (String, InlineKeyboardMarkup) {
