@@ -139,6 +139,10 @@ fn build_handler_tree(
                     let state = storage.get(&key).await.unwrap_or_default();
                     if !matches!(state, SettingsState::Idle) {
                         storage.remove(&key).await;
+                        info!(
+                            "Cleared settings state for user {} in chat {} due to command {}",
+                            user_id, msg.chat.id, trimmed
+                        );
                     }
                     return None;
                 }

@@ -287,13 +287,12 @@ impl BotHandler {
                 let (message, keyboard) = settings_panel(&chat);
                 if let Some(message_id) = message_id {
                     if let Err(e) = bot
-                        .edit_message_text(chat_id, message_id, message)
+                        .edit_message_text(chat_id, message_id, message.clone())
                         .parse_mode(ParseMode::MarkdownV2)
-                        .reply_markup(keyboard)
+                        .reply_markup(keyboard.clone())
                         .await
                     {
                         warn!("Failed to edit settings panel: {:#}", e);
-                        let (message, keyboard) = settings_panel(&chat);
                         bot.send_message(chat_id, message)
                             .parse_mode(ParseMode::MarkdownV2)
                             .reply_markup(keyboard)
@@ -331,12 +330,13 @@ fn format_tag_summary(tags: &Tags, max_tags: usize) -> String {
         .take(shown)
         .map(|tag| format_code_inline(tag))
         .collect();
+    let joined = parts.join(", ");
 
     if total > shown {
         let suffix = markdown::escape(&format!("... 等 {} 个", total));
-        format!("{} {}", parts.join(", "), suffix)
+        format!("{} {}", joined, suffix)
     } else {
-        parts.join(", ")
+        joined
     }
 }
 
