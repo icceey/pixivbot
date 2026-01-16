@@ -6,6 +6,10 @@ mod info;
 
 // Chat settings handlers
 mod settings;
+pub use settings::{
+    handle_settings_callback, handle_settings_cancel, handle_settings_input,
+    SETTINGS_CALLBACK_PREFIX,
+};
 
 // Subscription related handlers
 mod subscription;

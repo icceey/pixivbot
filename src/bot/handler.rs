@@ -121,13 +121,13 @@ impl BotHandler {
             Command::UnsubThis => self.handle_unsub_this(bot, msg, chat_id).await,
             Command::List(args) => self.handle_list(bot, chat_id, user_id, args).await,
 
-            // Chat settings commands (defined in handlers/settings.rs)
-            Command::BlurSensitive(args) => self.handle_blur_sensitive(bot, chat_id, args).await,
-            Command::SensitiveTags(args) => self.handle_sensitive_tags(bot, chat_id, args).await,
-            Command::ClearSensitiveTags => self.handle_clear_sensitive_tags(bot, chat_id).await,
-            Command::ExcludeTags(args) => self.handle_exclude_tags(bot, chat_id, args).await,
-            Command::ClearExcludedTags => self.handle_clear_excluded_tags(bot, chat_id).await,
+            // Chat settings command (defined in handlers/settings.rs)
+            // Note: The actual settings panel is shown via handle_settings which uses inline keyboards
+            // Callback queries for settings buttons are handled in the dispatcher
             Command::Settings => self.handle_settings(bot, chat_id).await,
+
+            // Cancel command - handled via dialogue state, no-op here
+            Command::Cancel => Ok(()),
 
             // Download command (defined in handlers/download.rs)
             Command::Download(args) => self.handle_download(bot.clone(), msg, chat_id, args).await,

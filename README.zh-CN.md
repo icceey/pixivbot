@@ -126,12 +126,12 @@
 - `/unsub <id,...>` - 取消订阅画师
 - `/unsubrank <mode>` - 取消订阅排行榜
 - `/list` - 列出活跃的订阅
-- `/settings` - 显示当前聊天设置
-- `/blursensitive <on|off>` - 启用/禁用敏感内容的模糊处理
-- `/sensitivetags <tag,...>` - 设置自定义敏感标签
-- `/clearsensitivetags` - 清除敏感标签
-- `/excludetags <tag,...>` - 设置排除标签（带有这些标签的图片将不会被发送）
-- `/clearexcludedtags` - 清除排除标签
+- `/settings` - 显示和管理聊天设置（交互式界面，带有内联按钮）
+  - 切换敏感内容模糊
+  - 编辑敏感标签
+  - 编辑排除标签
+- `/cancel` - 取消当前设置操作
+- `/download <url|id>` - 下载原图（或回复消息）
 
 ### 管理员命令
 

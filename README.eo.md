@@ -126,12 +126,12 @@ Subtenataj agordaj opcioj en `config.toml` aŭ per Mediaj Variabloj (prefikso `P
 - `/unsub <id,...>` - Malaboni artiston
 - `/unsubrank <mode>` - Malaboni rangaron
 - `/list` - Listigi aktivajn abonojn
-- `/settings` - Montri nunajn babilajn agordojn
-- `/blursensitive <on|off>` - Ebligi/malebligi malklarigilon por delikata enhavo
-- `/sensitivetags <tag,...>` - Agordi personajn delikatajn etikedojn
-- `/clearsensitivetags` - Forviŝi delikatajn etikedojn
-- `/excludetags <tag,...>` - Agordi ekskluditajn etikedojn (bildoj kun ĉi tiuj etikedoj ne estos senditaj)
-- `/clearexcludedtags` - Forviŝi ekskluditajn etikedojn
+- `/settings` - Montri kaj administri babilajn agordojn (interaga interfaco kun enliniaj butonoj)
+  - Ŝanĝi malklarigilon por delikata enhavo
+  - Redakti delikatajn etikedojn
+  - Redakti ekskluditajn etikedojn
+- `/cancel` - Nuligi nunan agordan operacion
+- `/download <url|id>` - Elŝuti originalajn bildojn (aŭ respondi al mesaĝo)
 
 ### Administrantaj Komandoj
 
