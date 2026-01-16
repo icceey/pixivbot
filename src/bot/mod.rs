@@ -180,10 +180,11 @@ fn build_handler_tree(
 
     // Cancel command handler for settings dialogue
     // Uses middleware to ensure user/chat exist and chat is accessible
+    // Middleware is applied before command parsing to avoid unnecessary parsing for inaccessible chats
     let cancel_handler = Message::filter_text()
-        .chain(middleware::filter_hybrid_command::<Command, HandlerResult>())
         .chain(middleware::filter_user_chat())
         .chain(middleware::filter_chat_accessible())
+        .chain(middleware::filter_hybrid_command::<Command, HandlerResult>())
         .filter(|cmd: Command, _ctx: UserChatContext| matches!(cmd, Command::Cancel))
         .endpoint(handle_cancel_command);
 
