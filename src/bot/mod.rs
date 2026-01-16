@@ -4,14 +4,19 @@ mod handlers;
 pub mod link_handler;
 pub mod middleware;
 pub mod notifier;
+pub mod state;
 
 use crate::config::TelegramConfig;
 use crate::db::repo::Repo;
 use crate::db::types::UserRole;
 use crate::pixiv::client::PixivClient;
 use anyhow::Result;
-use handlers::{DOWNLOAD_CALLBACK_PREFIX, LIST_CALLBACK_PREFIX};
+use handlers::{
+    handle_settings_callback, handle_settings_cancel, handle_settings_input,
+    DOWNLOAD_CALLBACK_PREFIX, LIST_CALLBACK_PREFIX, SETTINGS_CALLBACK_PREFIX,
+};
 use notifier::ThrottledBot;
+use state::SettingsStorage;
 use std::sync::Arc;
 use teloxide::dispatching::{Dispatcher, UpdateFilterExt};
 use teloxide::dptree;
@@ -75,6 +80,9 @@ pub async fn run(
 
     info!("✅ Bot initialized, starting command handler");
 
+    // Initialize settings dialogue storage
+    let settings_storage = state::new_settings_storage();
+
     // 设置命令可见性
     setup_commands(&bot, &repo).await;
 
@@ -83,7 +91,7 @@ pub async fn run(
 
     // 使用 Dispatcher
     Dispatcher::builder(bot, handler_tree)
-        .dependencies(dptree::deps![handler, repo, notifier])
+        .dependencies(dptree::deps![handler, repo, notifier, settings_storage])
         .default_handler(|_| async {})
         .enable_ctrlc_handler()
         .build()
@@ -144,6 +152,17 @@ fn build_handler_tree(
         })
         .endpoint(handle_download_callback);
 
+    // Callback query handler for settings buttons
+    let settings_callback_handler = Update::filter_callback_query()
+        .filter_map(|q: CallbackQuery| {
+            // Filter for settings callbacks
+            q.data
+                .as_ref()
+                .filter(|data| data.starts_with(SETTINGS_CALLBACK_PREFIX))
+                .cloned()
+        })
+        .endpoint(wrap_settings_callback);
+
     // Chat migration handler - handles group to supergroup upgrades
     let migration_handler = dptree::filter(|msg: Message| {
         // Only process migration messages
@@ -151,12 +170,25 @@ fn build_handler_tree(
     })
     .endpoint(handle_chat_migration);
 
+    // Dialogue state handler for settings input - must be checked before commands
+    // This handler intercepts text messages from users in a waiting state
+    let settings_dialogue_handler = Message::filter_text().endpoint(handle_settings_dialogue);
+
+    // Cancel command handler for settings dialogue
+    let cancel_handler = Message::filter_text()
+        .chain(middleware::filter_hybrid_command::<Command, HandlerResult>())
+        .filter(|cmd: Command| matches!(cmd, Command::Cancel))
+        .endpoint(handle_cancel_command);
+
     dptree::entry()
         .branch(callback_handler)
         .branch(download_callback_handler)
+        .branch(settings_callback_handler)
         .branch(
             Update::filter_message()
                 .branch(migration_handler)
+                .branch(cancel_handler)
+                .branch(settings_dialogue_handler)
                 .branch(admin_chat_control_handler)
                 .branch(command_handler)
                 .branch(message_handler),
@@ -185,6 +217,43 @@ async fn handle_message(
 ) -> HandlerResult {
     handler.handle_message(bot, msg, &text, ctx).await?;
     Ok(())
+}
+
+/// Handle settings dialogue state (intercepts messages from users in waiting state)
+async fn handle_settings_dialogue(
+    bot: ThrottledBot,
+    msg: Message,
+    handler: BotHandler,
+    storage: SettingsStorage,
+) -> HandlerResult {
+    // Try to handle the message as settings input
+    // If handled, return Ok and stop further processing
+    // If not handled (user not in waiting state), continue to next handler
+    match handle_settings_input(bot, msg, handler, storage).await {
+        Ok(true) => Ok(()), // Message was handled
+        Ok(false) => {
+            // User not in waiting state, let the message continue to other handlers
+            // We return an error to signal dptree to try the next branch
+            Err("Not in settings dialogue state".into())
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Handle /cancel command
+async fn handle_cancel_command(
+    bot: ThrottledBot,
+    msg: Message,
+    storage: SettingsStorage,
+) -> HandlerResult {
+    match handle_settings_cancel(bot, msg, storage).await {
+        Ok(true) => Ok(()), // Cancellation was handled
+        Ok(false) => {
+            // No active state to cancel - just ignore
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// 处理列表分页回调
@@ -339,6 +408,17 @@ async fn handle_download_callback(
     }
 
     Ok(())
+}
+
+/// Wrapper for settings callback handler
+async fn wrap_settings_callback(
+    bot: ThrottledBot,
+    q: CallbackQuery,
+    callback_data: String,
+    handler: BotHandler,
+    storage: SettingsStorage,
+) -> HandlerResult {
+    handle_settings_callback(bot, q, callback_data, handler, storage).await
 }
 
 /// 处理聊天迁移（普通群组升级为超级群组）
