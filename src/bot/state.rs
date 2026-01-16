@@ -5,9 +5,13 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use teloxide::prelude::*;
 use teloxide::types::MessageId;
 use tokio::sync::RwLock;
+
+/// Timeout duration for settings dialogue (5 minutes)
+pub const DIALOGUE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 /// State for the settings dialogue.
 ///
@@ -19,12 +23,41 @@ pub enum SettingsState {
     WaitingForSensitiveTags {
         /// The message ID of the settings panel to update after input
         settings_message_id: MessageId,
+        /// When this state was created
+        created_at: Instant,
     },
     /// Waiting for user to input excluded tags
     WaitingForExcludedTags {
         /// The message ID of the settings panel to update after input
         settings_message_id: MessageId,
+        /// When this state was created
+        created_at: Instant,
     },
+}
+
+impl SettingsState {
+    /// Check if this state has expired
+    pub fn is_expired(&self) -> bool {
+        let created_at = match self {
+            SettingsState::WaitingForSensitiveTags { created_at, .. } => created_at,
+            SettingsState::WaitingForExcludedTags { created_at, .. } => created_at,
+        };
+        created_at.elapsed() > DIALOGUE_TIMEOUT
+    }
+
+    /// Get the settings message ID
+    pub fn settings_message_id(&self) -> MessageId {
+        match self {
+            SettingsState::WaitingForSensitiveTags {
+                settings_message_id,
+                ..
+            } => *settings_message_id,
+            SettingsState::WaitingForExcludedTags {
+                settings_message_id,
+                ..
+            } => *settings_message_id,
+        }
+    }
 }
 
 /// Storage for dialogue states - thread-safe HashMap keyed by (ChatId, UserId)

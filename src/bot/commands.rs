@@ -50,7 +50,6 @@ impl Command {
             ),
             BotCommand::new("unsubthis", "回复消息取消对应订阅"),
             BotCommand::new("settings", "显示和管理聊天设置"),
-            BotCommand::new("cancel", "取消当前设置操作"),
             BotCommand::new("download", "下载作品原图 - /download <url|id> 或回复消息"),
             BotCommand::new("help", "显示帮助信息"),
         ]

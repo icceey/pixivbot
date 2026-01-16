@@ -3,6 +3,7 @@ use crate::bot::state::{SettingsState, SettingsStorage};
 use crate::bot::BotHandler;
 use crate::db::entities::chats;
 use crate::db::types::Tags;
+use std::time::Instant;
 use teloxide::prelude::*;
 use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup, MessageId, ParseMode};
 use teloxide::utils::markdown;
@@ -127,11 +128,11 @@ fn build_settings_panel(chat: &chats::Model) -> (String, InlineKeyboardMarkup) {
 
     // Row 2: Edit tags buttons
     let sensitive_tags_button = InlineKeyboardButton::callback(
-        "✏️ 编辑敏感标签",
+        "✏️ 敏感标签",
         format!("{}edit:sensitive", SETTINGS_CALLBACK_PREFIX),
     );
     let excluded_tags_button = InlineKeyboardButton::callback(
-        "✏️ 编辑排除标签",
+        "✏️ 排除标签",
         format!("{}edit:exclude", SETTINGS_CALLBACK_PREFIX),
     );
 
@@ -279,10 +280,12 @@ pub async fn handle_settings_callback(
             let state = if is_sensitive {
                 SettingsState::WaitingForSensitiveTags {
                     settings_message_id: message_id,
+                    created_at: Instant::now(),
                 }
             } else {
                 SettingsState::WaitingForExcludedTags {
                     settings_message_id: message_id,
+                    created_at: Instant::now(),
                 }
             };
 
@@ -306,7 +309,7 @@ pub async fn handle_settings_callback(
                 .unwrap_or_else(|| q.from.first_name.clone());
 
             let prompt = format!(
-                "{} 请回复此消息输入新的{}（用逗号分隔），或输入 `clear` 清除所有标签。\n\n发送 /cancel 取消操作。",
+                "{} 请在5分钟内发送新的{}（用逗号分隔），或发送 `clear` 清除所有标签。您发送的内容将直接覆盖原有配置\n\n发送 /cancel 取消操作。",
                 markdown::escape(&username),
                 tag_type
             );
@@ -356,13 +359,9 @@ pub async fn handle_settings_input(
         storage_guard.get(&(chat_id, user_id)).cloned()
     };
 
-    let (is_sensitive, settings_message_id) = match state {
-        Some(SettingsState::WaitingForSensitiveTags {
-            settings_message_id,
-        }) => (true, settings_message_id),
-        Some(SettingsState::WaitingForExcludedTags {
-            settings_message_id,
-        }) => (false, settings_message_id),
+    let (is_sensitive, settings_message_id) = match &state {
+        Some(s @ SettingsState::WaitingForSensitiveTags { .. }) => (true, s.settings_message_id()),
+        Some(s @ SettingsState::WaitingForExcludedTags { .. }) => (false, s.settings_message_id()),
         None => return Ok(false), // No active state, not handled
     };
 

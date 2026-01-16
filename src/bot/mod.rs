@@ -18,8 +18,8 @@ use handlers::{
 use notifier::ThrottledBot;
 use state::SettingsStorage;
 use std::sync::Arc;
-use teloxide::dispatching::{Dispatcher, UpdateFilterExt};
-use teloxide::dptree;
+use teloxide::dispatching::{Dispatcher, DpHandlerDescription, UpdateFilterExt};
+use teloxide::dptree::{self, Handler};
 use teloxide::prelude::*;
 use teloxide::types::BotCommandScope;
 use tracing::{error, info, warn};
@@ -173,9 +173,12 @@ fn build_handler_tree(
     // Dialogue state handler for settings input - must be checked before commands
     // This handler intercepts text messages from users in a waiting state
     // Uses middleware to ensure user/chat exist and chat is accessible
+    // The filter_in_settings_dialogue filter ensures we only enter this branch
+    // when the user has an active settings dialogue state
     let settings_dialogue_handler = Message::filter_text()
         .chain(middleware::filter_user_chat())
         .chain(middleware::filter_chat_accessible())
+        .chain(filter_in_settings_dialogue())
         .endpoint(handle_settings_dialogue);
 
     // Cancel command handler for settings dialogue
@@ -195,10 +198,10 @@ fn build_handler_tree(
         .branch(
             Update::filter_message()
                 .branch(migration_handler)
-                .branch(cancel_handler)
-                .branch(settings_dialogue_handler)
                 .branch(admin_chat_control_handler)
+                .branch(cancel_handler)
                 .branch(command_handler)
+                .branch(settings_dialogue_handler)
                 .branch(message_handler),
         )
 }
@@ -227,7 +230,50 @@ async fn handle_message(
     Ok(())
 }
 
+/// Filter to check if user is in a settings dialogue state.
+/// This filter checks the storage before entering the dialogue handler,
+/// preventing unnecessary processing and avoiding error logging when
+/// users are not in a dialogue state.
+///
+/// Also handles timeout: if the state has expired, it is automatically
+/// removed and the filter returns false.
+fn filter_in_settings_dialogue<Output>() -> Handler<'static, Output, DpHandlerDescription>
+where
+    Output: Send + Sync + 'static,
+{
+    dptree::filter_async(|msg: Message, storage: SettingsStorage| async move {
+        let chat_id = msg.chat.id;
+        let user_id = match msg.from.as_ref() {
+            Some(user) => user.id,
+            None => return false,
+        };
+
+        // Check if user has an active dialogue state
+        let state = {
+            let storage_guard = storage.read().await;
+            storage_guard.get(&(chat_id, user_id)).cloned()
+        };
+
+        match state {
+            Some(s) if s.is_expired() => {
+                // State has expired, remove it
+                let mut storage_guard = storage.write().await;
+                storage_guard.remove(&(chat_id, user_id));
+                info!(
+                    "Settings dialogue expired for user {} in chat {}",
+                    user_id, chat_id
+                );
+                false
+            }
+            Some(_) => true, // Valid active state
+            None => false,   // No state
+        }
+    })
+}
+
 /// Handle settings dialogue state (intercepts messages from users in waiting state)
+/// This handler is only called when the user has an active settings dialogue state,
+/// as verified by the filter_in_settings_dialogue filter.
 async fn handle_settings_dialogue(
     bot: ThrottledBot,
     msg: Message,
@@ -235,16 +281,10 @@ async fn handle_settings_dialogue(
     storage: SettingsStorage,
     _ctx: UserChatContext,
 ) -> HandlerResult {
-    // Try to handle the message as settings input
-    // If handled, return Ok and stop further processing
-    // If not handled (user not in waiting state), continue to next handler
+    // Handle the message as settings input
+    // The filter has already verified the user is in a dialogue state
     match handle_settings_input(bot, msg, handler, storage).await {
-        Ok(true) => Ok(()), // Message was handled
-        Ok(false) => {
-            // User not in waiting state, let the message continue to other handlers
-            // We return an error to signal dptree to try the next branch
-            Err("Not in settings dialogue state".into())
-        }
+        Ok(_) => Ok(()),
         Err(e) => Err(e),
     }
 }
