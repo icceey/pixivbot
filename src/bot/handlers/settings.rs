@@ -50,6 +50,10 @@ where
     pub async fn insert(&self, key: K, value: V) {
         self.map.lock().await.insert(key, value);
     }
+
+    pub async fn remove(&self, key: &K) -> Option<V> {
+        self.map.lock().await.remove(key)
+    }
 }
 
 pub type SettingsStorage = Arc<InMemStorage<(ChatId, UserId), SettingsState>>;
@@ -72,12 +76,24 @@ impl BotHandler {
         storage: SettingsStorage,
     ) -> ResponseResult<()> {
         let user_id = q.from.id;
-        let is_admin = match self.repo.get_user(user_id.0 as i64).await {
+        let user_result = self.repo.get_user(user_id.0 as i64).await;
+        let is_admin = match user_result {
             Ok(Some(user)) => user.role.is_admin(),
             Ok(None) => false,
             Err(e) => {
                 error!("Failed to get user {}: {:#}", user_id, e);
-                false
+                if let Err(cb_err) = bot
+                    .answer_callback_query(q.id.clone())
+                    .text("操作失败，请稍后重试")
+                    .show_alert(true)
+                    .await
+                {
+                    warn!(
+                        "Failed to answer callback query after user lookup error: {:#}",
+                        cb_err
+                    );
+                }
+                return Ok(());
             }
         };
 
@@ -93,10 +109,6 @@ impl BotHandler {
             return Ok(());
         }
 
-        if let Err(e) = bot.answer_callback_query(q.id.clone()).await {
-            warn!("Failed to answer callback query: {:#}", e);
-        }
-
         let Some(message) = q.message.as_ref() else {
             warn!("Settings callback missing message");
             return Ok(());
@@ -104,9 +116,13 @@ impl BotHandler {
 
         let chat_id = message.chat().id;
         let message_id = message.id();
+        let callback_id = q.id.clone();
 
         match callback_data.as_str() {
             SETTINGS_BLUR_TOGGLE => {
+                if let Err(e) = bot.answer_callback_query(callback_id.clone()).await {
+                    warn!("Failed to answer callback query: {:#}", e);
+                }
                 let current = match self.repo.get_chat(chat_id.0).await {
                     Ok(Some(chat)) => chat.blur_sensitive_tags,
                     Ok(None) => {
@@ -138,6 +154,9 @@ impl BotHandler {
                 }
             }
             SETTINGS_EDIT_SENSITIVE => {
+                if let Err(e) = bot.answer_callback_query(callback_id.clone()).await {
+                    warn!("Failed to answer callback query: {:#}", e);
+                }
                 storage
                     .insert((chat_id, user_id), SettingsState::WaitingForSensitiveTags)
                     .await;
@@ -154,6 +173,9 @@ impl BotHandler {
                     .await?;
             }
             SETTINGS_EDIT_EXCLUDE => {
+                if let Err(e) = bot.answer_callback_query(callback_id.clone()).await {
+                    warn!("Failed to answer callback query: {:#}", e);
+                }
                 storage
                     .insert((chat_id, user_id), SettingsState::WaitingForExcludedTags)
                     .await;
@@ -169,7 +191,11 @@ impl BotHandler {
                     .parse_mode(ParseMode::MarkdownV2)
                     .await?;
             }
-            _ => {}
+            _ => {
+                if let Err(e) = bot.answer_callback_query(callback_id).await {
+                    warn!("Failed to answer callback query: {:#}", e);
+                }
+            }
         }
 
         Ok(())
@@ -193,9 +219,7 @@ impl BotHandler {
         };
 
         if text.eq_ignore_ascii_case("/cancel") {
-            storage
-                .insert((chat_id, user_id), SettingsState::Idle)
-                .await;
+            storage.remove(&(chat_id, user_id)).await;
             bot.send_message(chat_id, "✅ 已取消").await?;
             return Ok(());
         }
@@ -211,9 +235,7 @@ impl BotHandler {
                 .collect();
             if tag_list.is_empty() {
                 bot.send_message(chat_id, "❌ 未提供有效的标签").await?;
-                storage
-                    .insert((chat_id, user_id), SettingsState::Idle)
-                    .await;
+                storage.remove(&(chat_id, user_id)).await;
                 return Ok(());
             }
             (Tags::from(tag_list), false)
@@ -244,9 +266,7 @@ impl BotHandler {
             }
         }
 
-        storage
-            .insert((chat_id, user_id), SettingsState::Idle)
-            .await;
+        storage.remove(&(chat_id, user_id)).await;
         Ok(())
     }
 
