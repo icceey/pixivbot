@@ -126,12 +126,7 @@
 - `/unsub <id,...>` - 取消訂閱畫師
 - `/unsubrank <mode>` - 取消訂閱排行榜
 - `/list` - 列出活躍的訂閱
-- `/settings` - 顯示目前聊天設定
-- `/blursensitive <on|off>` - 啟用/停用敏感內容的模糊處理
-- `/sensitivetags <tag,...>` - 設定自訂敏感標籤
-- `/clearsensitivetags` - 清除敏感標籤
-- `/excludetags <tag,...>` - 設定排除標籤（帶有這些標籤的圖片將不會被傳送）
-- `/clearexcludedtags` - 清除排除標籤
+- `/settings` - 顯示和管理聊天設定
 
 ### 管理員命令
 

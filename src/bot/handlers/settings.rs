@@ -30,6 +30,17 @@ pub struct InMemStorage<K, V> {
     map: Mutex<HashMap<K, V>>,
 }
 
+impl<K, V> Default for InMemStorage<K, V>
+where
+    K: Eq + Hash,
+{
+    fn default() -> Self {
+        Self {
+            map: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
 impl<K, V> InMemStorage<K, V>
 where
     K: Eq + Hash,
@@ -100,7 +111,7 @@ impl BotHandler {
         if !is_admin {
             if let Err(e) = bot
                 .answer_callback_query(q.id)
-                .text("Only admins can change settings")
+                .text("只有管理员可以更改设置")
                 .show_alert(true)
                 .await
             {
@@ -162,7 +173,7 @@ impl BotHandler {
                 let clear_hint = markdown::code_inline("clear");
                 let cancel_hint = markdown::code_inline("/cancel");
                 let message = format!(
-                    "{} 请回复敏感标签，用逗号分隔，或发送 {} 清除。发送 {} 取消。",
+                    "{} 请回复敏感标签，用逗号分隔，或发送 {} 清除。发送 {} 取消。注意：多人同时编辑可能覆盖。",
                     mention, clear_hint, cancel_hint
                 );
                 bot.send_message(chat_id, message)
@@ -178,7 +189,7 @@ impl BotHandler {
                 let clear_hint = markdown::code_inline("clear");
                 let cancel_hint = markdown::code_inline("/cancel");
                 let message = format!(
-                    "{} 请回复排除标签，用逗号分隔，或发送 {} 清除。发送 {} 取消。",
+                    "{} 请回复排除标签，用逗号分隔，或发送 {} 清除。发送 {} 取消。注意：多人同时编辑可能覆盖。",
                     mention, clear_hint, cancel_hint
                 );
                 bot.send_message(chat_id, message)
@@ -207,6 +218,23 @@ impl BotHandler {
             Some(text) => text.trim(),
             None => return Ok(()),
         };
+
+        let is_admin = match self.repo.get_user(user_id.0 as i64).await {
+            Ok(Some(user)) => user.role.is_admin(),
+            Ok(None) => false,
+            Err(e) => {
+                error!("Failed to get user {}: {:#}", user_id, e);
+                bot.send_message(chat_id, "❌ 更新设置失败").await?;
+                storage.remove(&(chat_id, user_id)).await;
+                return Ok(());
+            }
+        };
+
+        if !is_admin {
+            bot.send_message(chat_id, "只有管理员可以更改设置").await?;
+            storage.remove(&(chat_id, user_id)).await;
+            return Ok(());
+        }
 
         if text.eq_ignore_ascii_case("/cancel") {
             storage.remove(&(chat_id, user_id)).await;
@@ -299,22 +327,34 @@ impl BotHandler {
     }
 }
 
+fn format_tag_summary(tags: &Tags, max_tags: usize) -> String {
+    if tags.is_empty() {
+        return "无".to_string();
+    }
+
+    let total = tags.len();
+    let shown = std::cmp::min(max_tags, total);
+    let parts: Vec<String> = tags
+        .iter()
+        .take(shown)
+        .map(|tag| markdown::code_inline(tag))
+        .collect();
+
+    if total > shown {
+        format!("{}… 等 {} 个", parts.join(", "), total)
+    } else {
+        parts.join(", ")
+    }
+}
+
 fn settings_panel(chat: &crate::db::entities::chats::Model) -> (String, InlineKeyboardMarkup) {
     let blur_status = if chat.blur_sensitive_tags {
         "已启用"
     } else {
         "已禁用"
     };
-    let sensitive_status = if chat.sensitive_tags.is_empty() {
-        "无"
-    } else {
-        "有标签"
-    };
-    let excluded_status = if chat.excluded_tags.is_empty() {
-        "无"
-    } else {
-        "有标签"
-    };
+    let sensitive_status = format_tag_summary(&chat.sensitive_tags, 3);
+    let excluded_status = format_tag_summary(&chat.excluded_tags, 3);
 
     let message = format!(
         "⚙️ *聊天设置*\n\n🔒 敏感内容模糊: {}\n🏷 敏感标签: {}\n🚫 排除标签: {}",

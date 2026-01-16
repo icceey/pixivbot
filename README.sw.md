@@ -126,12 +126,7 @@ Chaguo za usanidi zinazosaidiwa katika `config.toml` au kupitia Vigeuzi vya Mazi
 - `/unsub <id,...>` - Ondoa usajili kutoka kwa msanii
 - `/unsubrank <mode>` - Ondoa usajili kutoka kwa orodha
 - `/list` - Orodhesha usajili unaofanya kazi
-- `/settings` - Onyesha mipangilio ya mazungumzo ya sasa
-- `/blursensitive <on|off>` - Washa/zima kubana kwa maudhui nyeti
-- `/sensitivetags <tag,...>` - Weka lebo nyeti za kibinafsi
-- `/clearsensitivetags` - Futa lebo nyeti
-- `/excludetags <tag,...>` - Weka lebo zilizotengwa (picha zenye lebo hizi hazitatolewa)
-- `/clearexcludedtags` - Futa lebo zilizotengwa
+- `/settings` - Onyesha na dhibiti mipangilio ya mazungumzo
 
 ### Amri za Msimamizi
 
