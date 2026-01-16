@@ -25,6 +25,8 @@ pub enum SettingsState {
     WaitingForExcludedTags,
 }
 
+/// Simple in-memory dialogue storage keyed by (ChatId, UserId) to keep per-user
+/// state isolated in group chats, instead of using the default per-chat storage.
 #[derive(Debug)]
 pub struct InMemStorage<K, V> {
     map: Mutex<HashMap<K, V>>,
@@ -171,9 +173,12 @@ impl BotHandler {
                 let mention = format_user_mention(&q.from);
                 let clear_hint = format_code_inline("clear");
                 let cancel_hint = format_code_inline("/cancel");
+                let prompt_prefix = markdown::escape(" 请回复敏感标签，用逗号分隔，或发送 ");
+                let prompt_middle = markdown::escape(" 清除。发送 ");
+                let prompt_suffix = markdown::escape(" 取消。注意：多人同时编辑可能覆盖。");
                 let message = format!(
-                    "{} 请回复敏感标签，用逗号分隔，或发送 {} 清除。发送 {} 取消。注意：多人同时编辑可能覆盖。",
-                    mention, clear_hint, cancel_hint
+                    "{}{}{}{}{}{}",
+                    mention, prompt_prefix, clear_hint, prompt_middle, cancel_hint, prompt_suffix
                 );
                 bot.send_message(chat_id, message)
                     .parse_mode(ParseMode::MarkdownV2)
@@ -186,9 +191,12 @@ impl BotHandler {
                 let mention = format_user_mention(&q.from);
                 let clear_hint = format_code_inline("clear");
                 let cancel_hint = format_code_inline("/cancel");
+                let prompt_prefix = markdown::escape(" 请回复排除标签，用逗号分隔，或发送 ");
+                let prompt_middle = markdown::escape(" 清除。发送 ");
+                let prompt_suffix = markdown::escape(" 取消。注意：多人同时编辑可能覆盖。");
                 let message = format!(
-                    "{} 请回复排除标签，用逗号分隔，或发送 {} 清除。发送 {} 取消。注意：多人同时编辑可能覆盖。",
-                    mention, clear_hint, cancel_hint
+                    "{}{}{}{}{}{}",
+                    mention, prompt_prefix, clear_hint, prompt_middle, cancel_hint, prompt_suffix
                 );
                 bot.send_message(chat_id, message)
                     .parse_mode(ParseMode::MarkdownV2)
@@ -327,7 +335,7 @@ impl BotHandler {
 
 fn format_tag_summary(tags: &Tags, max_tags: usize) -> String {
     if tags.is_empty() {
-        return "无".to_string();
+        return markdown::escape("无");
     }
 
     let total = tags.len();
@@ -339,7 +347,8 @@ fn format_tag_summary(tags: &Tags, max_tags: usize) -> String {
         .collect();
 
     if total > shown {
-        format!("{}… 等 {} 个", parts.join(", "), total)
+        let suffix = markdown::escape(&format!("… 等 {} 个", total));
+        format!("{}{}", parts.join(", "), suffix)
     } else {
         parts.join(", ")
     }
@@ -347,7 +356,9 @@ fn format_tag_summary(tags: &Tags, max_tags: usize) -> String {
 
 fn format_user_mention(user: &User) -> String {
     let escaped = markdown::escape(&user.full_name());
-    format!("[{}](tg://user?id={})", escaped, user.id.0)
+    let url = format!("tg://user?id={}", user.id.0);
+    let escaped_url = markdown::escape_link_url(&url);
+    format!("[{}]({})", escaped, escaped_url)
 }
 
 fn format_code_inline(text: &str) -> String {
@@ -356,17 +367,29 @@ fn format_code_inline(text: &str) -> String {
 }
 
 fn settings_panel(chat: &crate::db::entities::chats::Model) -> (String, InlineKeyboardMarkup) {
-    let blur_status = if chat.blur_sensitive_tags {
+    let blur_status_raw = if chat.blur_sensitive_tags {
         "已启用"
     } else {
         "已禁用"
     };
+    let blur_status = markdown::escape(blur_status_raw);
     let sensitive_status = format_tag_summary(&chat.sensitive_tags, 3);
     let excluded_status = format_tag_summary(&chat.excluded_tags, 3);
 
+    let title = markdown::escape("聊天设置");
+    let label_blur = markdown::escape("敏感内容模糊");
+    let label_sensitive = markdown::escape("敏感标签");
+    let label_excluded = markdown::escape("排除标签");
+
     let message = format!(
-        "⚙️ *聊天设置*\n\n🔒 敏感内容模糊: {}\n🏷 敏感标签: {}\n🚫 排除标签: {}",
-        blur_status, sensitive_status, excluded_status
+        "⚙️ *{}*\n\n🔒 {}: {}\n🏷 {}: {}\n🚫 {}: {}",
+        title,
+        label_blur,
+        blur_status,
+        label_sensitive,
+        sensitive_status,
+        label_excluded,
+        excluded_status
     );
 
     let blur_button = if chat.blur_sensitive_tags {
