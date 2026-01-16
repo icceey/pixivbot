@@ -132,17 +132,18 @@ fn build_handler_tree(
         .chain(middleware::filter_chat_accessible())
         .filter_map_async(|msg: Message, storage: SettingsStorage| async move {
             let user_id = msg.from.as_ref().map(|user| user.id)?;
+            let key = (msg.chat.id, user_id);
             if let Some(text) = msg.text() {
                 let trimmed = text.trim();
                 if trimmed.starts_with('/') && !trimmed.eq_ignore_ascii_case("/cancel") {
-                    storage.remove(&(msg.chat.id, user_id)).await;
+                    let state = storage.get(&key).await.unwrap_or_default();
+                    if !matches!(state, SettingsState::Idle) {
+                        storage.remove(&key).await;
+                    }
                     return None;
                 }
             }
-            let state = storage
-                .get(&(msg.chat.id, user_id))
-                .await
-                .unwrap_or_default();
+            let state = storage.get(&key).await.unwrap_or_default();
             (!matches!(state, SettingsState::Idle)).then_some(state)
         })
         .endpoint(handle_settings_input);
