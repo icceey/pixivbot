@@ -47,10 +47,6 @@ impl<K, V> InMemStorage<K, V>
 where
     K: Eq + Hash,
 {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     pub async fn get(&self, key: &K) -> Option<V>
     where
         V: Clone,
