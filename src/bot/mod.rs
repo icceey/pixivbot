@@ -107,6 +107,7 @@ fn build_handler_tree(
     // 管理员启用/禁用聊天命令 - 只检查用户权限，不检查聊天是否启用
     // 这允许管理员在禁用的聊天中使用 /enablechat 命令
     // 注意：此处的 is_admin() 检查与 handler 中 dispatch_command 的 pattern guard 是有意重复的（纵深防御）
+    // 注意：admin_chat_control_handler 不使用 filter_mention_requirement，因为管理员命令总是需要能够执行
     let admin_chat_control_handler = Message::filter_text()
         .chain(middleware::filter_hybrid_command::<Command, HandlerResult>())
         .chain(middleware::filter_user_chat())
@@ -117,16 +118,23 @@ fn build_handler_tree(
         })
         .endpoint(handle_command);
 
-    // 常规命令 - 保持原有的聊天可访问性检查
+    // 常规命令 - 保持原有的聊天可访问性检查，并添加 @mention 要求检查
     let command_handler = Message::filter_text()
         .chain(middleware::filter_hybrid_command::<Command, HandlerResult>())
         .chain(middleware::filter_user_chat())
+        .chain(middleware::filter_mention_requirement::<
+            Command,
+            HandlerResult,
+        >())
         .chain(middleware::filter_chat_accessible())
         .endpoint(handle_command);
 
     let message_handler = Message::filter_text()
         .chain(middleware::filter_relevant_message::<HandlerResult>())
         .chain(middleware::filter_user_chat())
+        .chain(middleware::filter_message_mention_requirement::<
+            HandlerResult,
+        >())
         .chain(middleware::filter_chat_accessible())
         .endpoint(handle_message);
 
@@ -184,10 +192,15 @@ fn build_handler_tree(
     // Cancel command handler for settings dialogue
     // Uses middleware to ensure user/chat exist and chat is accessible
     // Middleware is applied before command parsing to avoid unnecessary parsing for inaccessible chats
+    // 注意：cancel_handler 也需要检查 @mention 要求
     let cancel_handler = Message::filter_text()
         .chain(middleware::filter_user_chat())
         .chain(middleware::filter_chat_accessible())
         .chain(middleware::filter_hybrid_command::<Command, HandlerResult>())
+        .chain(middleware::filter_mention_requirement::<
+            Command,
+            HandlerResult,
+        >())
         .filter(|cmd: Command, _ctx: UserChatContext| matches!(cmd, Command::Cancel))
         .endpoint(handle_cancel_command);
 

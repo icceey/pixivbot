@@ -86,6 +86,12 @@ fn build_settings_panel(chat: &chats::Model) -> (String, InlineKeyboardMarkup) {
         "*已禁用*"
     };
 
+    let mention_status = if chat.allow_without_mention {
+        "*无需@响应*"
+    } else {
+        "*需要@响应*"
+    };
+
     let sensitive_tags = if chat.sensitive_tags.is_empty() {
         "无".to_string()
     } else {
@@ -106,40 +112,76 @@ fn build_settings_panel(chat: &chats::Model) -> (String, InlineKeyboardMarkup) {
             .join(", ")
     };
 
-    let message = format!(
-        "⚙️ *聊天设置*\n\n\
-         🔒 敏感内容模糊: {}\n\
-         🏷 敏感标签: {}\n\
-         🚫 排除标签: {}",
-        blur_status, sensitive_tags, excluded_tags
-    );
+    // 私聊时不显示群组命令响应设置（该设置只对群组有意义）
+    let is_private = chat.r#type == "private";
+
+    let message = if is_private {
+        format!(
+            "⚙️ *聊天设置*\n\n\
+             🔒 敏感内容模糊: {}\n\
+             🏷 敏感标签: {}\n\
+             🚫 排除标签: {}",
+            blur_status, sensitive_tags, excluded_tags
+        )
+    } else {
+        format!(
+            "⚙️ *聊天设置*\n\n\
+             🔒 敏感内容模糊: {}\n\
+             📢 群组命令响应: {}\n\
+             🏷 敏感标签: {}\n\
+             🚫 排除标签: {}",
+            blur_status, mention_status, sensitive_tags, excluded_tags
+        )
+    };
 
     // Build inline keyboard
     // Row 1: Toggle blur button
     let blur_button_text = if chat.blur_sensitive_tags {
-        "🔓 关闭模糊"
+        "🔓关闭模糊"
     } else {
-        "🔒 开启模糊"
+        "🔒开启模糊"
     };
     let blur_button = InlineKeyboardButton::callback(
         blur_button_text,
         format!("{}blur:toggle", SETTINGS_CALLBACK_PREFIX),
     );
 
-    // Row 2: Edit tags buttons
+    // Row 2: Toggle mention requirement button (only meaningful for groups)
+    let mention_button_text = if chat.allow_without_mention {
+        // Currently allows commands without @; pressing will turn on @ requirement
+        "📢开启@要求"
+    } else {
+        // Currently requires @; pressing will turn off the @ requirement (allow without @)
+        "📢关闭@要求"
+    };
+    let mention_button = InlineKeyboardButton::callback(
+        mention_button_text,
+        format!("{}mention:toggle", SETTINGS_CALLBACK_PREFIX),
+    );
+
+    // Row 3: Edit tags buttons
     let sensitive_tags_button = InlineKeyboardButton::callback(
-        "✏️ 敏感标签",
+        "✏️敏感标签",
         format!("{}edit:sensitive", SETTINGS_CALLBACK_PREFIX),
     );
     let excluded_tags_button = InlineKeyboardButton::callback(
-        "✏️ 排除标签",
+        "✏️排除标签",
         format!("{}edit:exclude", SETTINGS_CALLBACK_PREFIX),
     );
 
-    let keyboard = InlineKeyboardMarkup::new(vec![
-        vec![blur_button],
-        vec![sensitive_tags_button, excluded_tags_button],
-    ]);
+    // 私聊时不显示 mention 按钮（该设置只对群组有意义）
+    let keyboard = if is_private {
+        InlineKeyboardMarkup::new(vec![
+            vec![blur_button],
+            vec![sensitive_tags_button, excluded_tags_button],
+        ])
+    } else {
+        InlineKeyboardMarkup::new(vec![
+            vec![blur_button],
+            vec![mention_button],
+            vec![sensitive_tags_button, excluded_tags_button],
+        ])
+    };
 
     (message, keyboard)
 }
@@ -265,6 +307,60 @@ pub async fn handle_settings_callback(
                 Err(e) => {
                     error!(
                         "Failed to fetch chat {} for blur toggle by user {}: {:#}",
+                        chat_id, user_id, e
+                    );
+                    bot.answer_callback_query(q.id)
+                        .text("获取聊天信息失败")
+                        .show_alert(true)
+                        .await?;
+                }
+            }
+        }
+        "mention:toggle" => {
+            // Toggle allow_without_mention setting
+            match handler.repo.get_chat(chat_id.0).await {
+                Ok(Some(chat)) => {
+                    let new_allow = !chat.allow_without_mention;
+                    match handler
+                        .repo
+                        .set_allow_without_mention(chat_id.0, new_allow)
+                        .await
+                    {
+                        Ok(_) => {
+                            info!(
+                                "Chat {} allow_without_mention toggled to {} by user {}",
+                                chat_id, new_allow, user_id
+                            );
+
+                            // Refresh the settings panel
+                            handler
+                                .refresh_settings_panel(bot.clone(), chat_id, message_id)
+                                .await?;
+
+                            bot.answer_callback_query(q.id).await?;
+                        }
+                        Err(e) => {
+                            error!("Failed to toggle mention setting: {:#}", e);
+                            bot.answer_callback_query(q.id)
+                                .text("更新设置失败")
+                                .show_alert(true)
+                                .await?;
+                        }
+                    }
+                }
+                Ok(None) => {
+                    warn!(
+                        "Chat {} not found when toggling allow_without_mention by user {}",
+                        chat_id, user_id
+                    );
+                    bot.answer_callback_query(q.id)
+                        .text("获取聊天信息失败")
+                        .show_alert(true)
+                        .await?;
+                }
+                Err(e) => {
+                    error!(
+                        "Failed to fetch chat {} for mention toggle by user {}: {:#}",
                         chat_id, user_id, e
                     );
                     bot.answer_callback_query(q.id)

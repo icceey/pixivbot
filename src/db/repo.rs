@@ -192,10 +192,11 @@ impl Repo {
             excluded_tags: Set(Tags::default()),
             sensitive_tags: Set(default_sensitive_tags),
             created_at: Set(now),
+            allow_without_mention: Set(false), // Default to disabled
         };
 
         // INSERT ... ON CONFLICT(id) DO UPDATE SET type = excluded.type, title = excluded.title
-        // This preserves enabled, blur_sensitive_tags, excluded_tags, sensitive_tags when updating
+        // This preserves enabled, blur_sensitive_tags, excluded_tags, sensitive_tags, allow_without_mention when updating
         chats::Entity::insert(new_chat)
             .on_conflict(
                 OnConflict::column(chats::Column::Id)
@@ -227,6 +228,7 @@ impl Repo {
             excluded_tags: Set(Tags::default()),
             sensitive_tags: Set(Tags::default()),
             created_at: Set(now),
+            allow_without_mention: Set(false), // Default to disabled
         };
 
         // INSERT ... ON CONFLICT(id) DO UPDATE SET enabled = excluded.enabled
@@ -246,6 +248,26 @@ impl Repo {
             .await
             .context("Failed to fetch chat")?
             .ok_or_else(|| anyhow::anyhow!("Chat {} not found after upsert", chat_id))
+    }
+
+    /// Set allow_without_mention for a chat
+    pub async fn set_allow_without_mention(
+        &self,
+        chat_id: i64,
+        allow: bool,
+    ) -> Result<chats::Model> {
+        let chat = chats::Entity::find_by_id(chat_id)
+            .one(&self.db)
+            .await
+            .context("Failed to query chat")?
+            .ok_or_else(|| anyhow::anyhow!("Chat {} not found", chat_id))?;
+
+        let mut active: chats::ActiveModel = chat.into_active_model();
+        active.allow_without_mention = Set(allow);
+        active
+            .update(&self.db)
+            .await
+            .context("Failed to update allow_without_mention")
     }
 
     /// Set blur_sensitive_tags for a chat
@@ -347,6 +369,7 @@ impl Repo {
             excluded_tags: Set(old_chat.excluded_tags),
             sensitive_tags: Set(old_chat.sensitive_tags),
             created_at: Set(old_chat.created_at),
+            allow_without_mention: Set(old_chat.allow_without_mention),
         };
 
         // Insert new chat (or update if it already exists)
@@ -360,6 +383,7 @@ impl Repo {
                         chats::Column::BlurSensitiveTags,
                         chats::Column::ExcludedTags,
                         chats::Column::SensitiveTags,
+                        chats::Column::AllowWithoutMention,
                     ])
                     .to_owned(),
             )
@@ -824,7 +848,8 @@ mod tests {
                 blur_sensitive_tags BOOLEAN NOT NULL DEFAULT 1,
                 excluded_tags TEXT NOT NULL DEFAULT '[]',
                 sensitive_tags TEXT NOT NULL DEFAULT '[]',
-                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                allow_without_mention BOOLEAN NOT NULL DEFAULT 0
             )
             "#,
         ))

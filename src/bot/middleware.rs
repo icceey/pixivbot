@@ -180,6 +180,90 @@ fn is_chat_accessible(chat_id: ChatId, ctx: &UserChatContext) -> bool {
 }
 
 // ============================================================================
+// 可测试的辅助函数
+// ============================================================================
+
+/// 判断命令是否应该被接受（基于 @mention 要求）
+///
+/// 此函数封装了 mention 过滤的核心逻辑，便于单元测试。
+///
+/// # 参数
+/// - `is_private`: 是否为私聊
+/// - `require_mention_in_group`: 全局配置是否要求群组中 @bot
+/// - `allow_without_mention`: chat 级别设置是否允许不带 @bot
+/// - `is_bare_command`: 命令是否为裸命令（不带 @bot）
+///
+/// # 返回
+/// - `true`: 命令应该被接受
+/// - `false`: 命令应该被过滤
+#[inline]
+fn should_accept_command(
+    is_private: bool,
+    require_mention_in_group: bool,
+    allow_without_mention: bool,
+    is_bare_command: bool,
+) -> bool {
+    // 私聊：总是接受
+    if is_private {
+        return true;
+    }
+
+    // 群组：全局配置不需要 @bot，接受所有格式
+    if !require_mention_in_group {
+        return true;
+    }
+
+    // 全局配置需要 @bot，检查 chat 级别设置
+    if allow_without_mention {
+        // chat 允许不带 @bot
+        return true;
+    }
+
+    // 需要 @bot：只接受带 @bot 的命令
+    !is_bare_command
+}
+
+/// 判断消息是否应该被处理（基于 @mention 要求）
+///
+/// 此函数封装了消息 mention 过滤的核心逻辑，便于单元测试。
+///
+/// # 参数
+/// - `is_private`: 是否为私聊
+/// - `require_mention_in_group`: 全局配置是否要求群组中 @bot
+/// - `allow_without_mention`: chat 级别设置是否允许不带 @bot
+/// - `is_reply_to_bot`: 消息是否为回复 bot 的消息
+///
+/// # 返回
+/// - `true`: 消息应该被处理
+/// - `false`: 消息应该被忽略
+#[inline]
+fn should_process_message(
+    is_private: bool,
+    require_mention_in_group: bool,
+    allow_without_mention: bool,
+    is_reply_to_bot: bool,
+) -> bool {
+    // 私聊：总是处理
+    if is_private {
+        return true;
+    }
+
+    // 群组：全局配置不需要 @bot，处理所有消息
+    if !require_mention_in_group {
+        return true;
+    }
+
+    // 全局配置需要 @bot，检查 chat 级别设置
+    if allow_without_mention {
+        // chat 允许不带 @bot
+        return true;
+    }
+
+    // 需要 @bot：只处理回复 bot 的消息
+    is_reply_to_bot
+}
+
+// ============================================================================
 // 消息过滤器
 // ============================================================================
 
@@ -188,8 +272,8 @@ fn is_chat_accessible(chat_id: ChatId, ctx: &UserChatContext) -> bool {
 /// 根据聊天类型应用不同的命令解析策略：
 /// - **私聊**: 接受 `/cmd` 和 `/cmd@bot` (宽松)
 /// - **群组**:
-///   - 如果 `require_mention_in_group` 为 true: 只接受 `/cmd@bot` (严格)
-///   - 如果 `require_mention_in_group` 为 false: 接受 `/cmd` 和 `/cmd@bot` (宽松)
+///   - 如果全局 `require_mention_in_group` 为 false: 接受 `/cmd` 和 `/cmd@bot` (宽松)
+///   - 如果全局 `require_mention_in_group` 为 true: 先宽松解析，由后续过滤器根据 chat 设置决定
 ///
 /// **依赖要求:**
 /// - `Message` - 当前消息
@@ -217,16 +301,59 @@ where
                 return Some(cmd);
             }
 
-            // 群组：根据配置决定是否需要 @bot
+            // 群组：根据全局配置决定
             if !handler.require_mention_in_group {
-                // 不需要 @bot，接受所有格式
+                // 全局配置不需要 @bot，接受所有格式
                 return Some(cmd);
             }
 
-            // 需要 @bot：只接受带 @bot 的命令
-            // 技巧：用空字符串解析，如果成功说明是裸命令（如 /start），失败说明带点名（如 /start@bot）
+            // 全局配置需要 @bot，但需要考虑 chat 级别设置
+            // 这里先宽松解析，由后续 filter_mention_requirement 根据 chat 设置过滤
+            Some(cmd)
+        },
+    )
+}
+
+/// 检查命令的 @mention 要求
+///
+/// 此过滤器在 `filter_user_chat` 之后执行，可以访问 chat 设置。
+/// 根据全局 `require_mention_in_group` 和 chat 级别的 `allow_without_mention` 设置决定是否过滤裸命令。
+///
+/// **依赖要求:**
+/// - `UserChatContext` - 用户和聊天上下文
+/// - `C` - 解析后的命令
+/// - `Message` - 当前消息
+/// - `Me` - Bot 信息
+/// - `BotHandler` - Bot 处理器（获取配置）
+///
+/// **注入依赖:**
+/// - `C` - 解析后的命令类型（过滤后）
+#[must_use]
+pub fn filter_mention_requirement<C, Output>() -> Handler<'static, Output, DpHandlerDescription>
+where
+    C: BotCommands + Send + Sync + Clone + 'static,
+    Output: Send + Sync + 'static,
+{
+    dptree::filter_map(
+        move |ctx: UserChatContext,
+              cmd: C,
+              message: Message,
+              text: String,
+              handler: super::BotHandler| {
+            // 判断是否为裸命令（不带 @bot）
+            // 用空字符串作为 bot_name 解析：
+            // - 裸命令 "/start" 解析成功 → is_bare_command = true
+            // - 带 @bot 的命令 "/start@mybot" 解析失败 → is_bare_command = false
             let is_bare_command = C::parse(&text, "").is_ok();
-            (!is_bare_command).then_some(cmd)
+
+            let should_accept = should_accept_command(
+                message.chat.is_private(),
+                handler.require_mention_in_group,
+                ctx.chat.allow_without_mention,
+                is_bare_command,
+            );
+
+            should_accept.then_some(cmd)
         },
     )
 }
@@ -236,8 +363,8 @@ where
 /// 根据聊天类型判断消息是否需要处理：
 /// - **私聊**: 总是相关
 /// - **群组**:
-///   - 如果 `require_mention_in_group` 为 true: 只有回复 Bot 的消息才相关
-///   - 如果 `require_mention_in_group` 为 false: 所有消息都相关
+///   - 如果全局 `require_mention_in_group` 为 false: 所有消息都相关
+///   - 如果全局 `require_mention_in_group` 为 true: 先宽松检查，由后续过滤器根据 chat 设置决定
 ///
 /// **依赖要求:**
 /// - `Message` - 当前消息
@@ -248,27 +375,137 @@ pub fn filter_relevant_message<Output>() -> Handler<'static, Output, DpHandlerDe
 where
     Output: Send + Sync + 'static,
 {
+    dptree::filter_map(move |message: Message, handler: super::BotHandler| {
+        // 私聊总是处理
+        if message.chat.is_private() {
+            return Some(message);
+        }
+
+        // 群组：根据全局配置决定
+        if !handler.require_mention_in_group {
+            // 不需要 @bot，处理所有消息
+            return Some(message);
+        }
+
+        // 全局配置需要 @bot，但需要考虑 chat 级别设置
+        // 这里先宽松检查，由后续 filter_message_mention_requirement 根据 chat 设置过滤
+        Some(message)
+    })
+}
+
+/// 检查消息的 @mention 要求
+///
+/// 此过滤器在 `filter_user_chat` 之后执行，可以访问 chat 设置。
+/// 根据全局 `require_mention_in_group` 和 chat 级别的 `allow_without_mention` 设置决定是否过滤消息。
+///
+/// **依赖要求:**
+/// - `UserChatContext` - 用户和聊天上下文
+/// - `Message` - 当前消息
+/// - `Me` - Bot 信息
+/// - `BotHandler` - Bot 处理器（获取配置）
+///
+/// **注入依赖:**
+/// - `String` - 消息文本（用于后续处理）
+#[must_use]
+pub fn filter_message_mention_requirement<Output>() -> Handler<'static, Output, DpHandlerDescription>
+where
+    Output: Send + Sync + 'static,
+{
     dptree::filter_map(
-        move |message: Message, me: Me, handler: super::BotHandler| {
-            // 私聊总是处理
-            if message.chat.is_private() {
-                return Some(message);
-            }
-
-            // 群组：根据配置决定是否需要回复 Bot
-            if !handler.require_mention_in_group {
-                // 不需要 @bot，处理所有消息
-                return Some(message);
-            }
-
-            // 需要 @bot：检查是否回复 Bot
+        move |ctx: UserChatContext, message: Message, me: Me, handler: super::BotHandler| {
+            // 检查是否回复 Bot
             let is_reply_to_bot = message
                 .reply_to_message()
                 .and_then(|reply| reply.from.as_ref())
                 .map(|user| user.id == me.user.id)
                 .unwrap_or(false);
 
-            is_reply_to_bot.then_some(message)
+            let should_process = should_process_message(
+                message.chat.is_private(),
+                handler.require_mention_in_group,
+                ctx.chat.allow_without_mention,
+                is_reply_to_bot,
+            );
+
+            if should_process {
+                message.text().map(|t| t.to_string())
+            } else {
+                None
+            }
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ========================================================================
+    // should_accept_command 测试
+    // ========================================================================
+
+    #[test]
+    fn test_command_private_chat_always_accepted() {
+        // 私聊中，无论什么配置，命令都应该被接受
+        assert!(should_accept_command(true, true, false, true)); // 裸命令
+        assert!(should_accept_command(true, true, false, false)); // 带 @bot
+        assert!(should_accept_command(true, false, false, true));
+        assert!(should_accept_command(true, false, true, true));
+    }
+
+    #[test]
+    fn test_command_group_global_not_required() {
+        // 全局配置不需要 @bot 时，群组中所有命令都被接受
+        assert!(should_accept_command(false, false, false, true)); // 裸命令
+        assert!(should_accept_command(false, false, false, false)); // 带 @bot
+        assert!(should_accept_command(false, false, true, true)); // chat 设置被忽略
+    }
+
+    #[test]
+    fn test_command_group_global_required_chat_allows() {
+        // 全局要求 @bot，但 chat 允许不带 @bot
+        assert!(should_accept_command(false, true, true, true)); // 裸命令被接受
+        assert!(should_accept_command(false, true, true, false)); // 带 @bot 也被接受
+    }
+
+    #[test]
+    fn test_command_group_global_required_chat_not_allows() {
+        // 全局要求 @bot，chat 也不允许不带 @bot
+        assert!(!should_accept_command(false, true, false, true)); // 裸命令被过滤
+        assert!(should_accept_command(false, true, false, false)); // 带 @bot 被接受
+    }
+
+    // ========================================================================
+    // should_process_message 测试
+    // ========================================================================
+
+    #[test]
+    fn test_message_private_chat_always_processed() {
+        // 私聊中，消息都应该被处理
+        assert!(should_process_message(true, true, false, false));
+        assert!(should_process_message(true, true, false, true));
+        assert!(should_process_message(true, false, false, false));
+    }
+
+    #[test]
+    fn test_message_group_global_not_required() {
+        // 全局配置不需要 @bot 时，群组中所有消息都被处理
+        assert!(should_process_message(false, false, false, false));
+        assert!(should_process_message(false, false, false, true));
+        assert!(should_process_message(false, false, true, false));
+    }
+
+    #[test]
+    fn test_message_group_global_required_chat_allows() {
+        // 全局要求 @bot，但 chat 允许不带 @bot
+        assert!(should_process_message(false, true, true, false)); // 普通消息被处理
+        assert!(should_process_message(false, true, true, true)); // 回复消息也被处理
+    }
+
+    #[test]
+    fn test_message_group_global_required_chat_not_allows() {
+        // 全局要求 @bot，chat 也不允许不带 @bot
+        assert!(!should_process_message(false, true, false, false)); // 普通消息被忽略
+        assert!(should_process_message(false, true, false, true)); // 回复 bot 的消息被处理
+    }
 }
