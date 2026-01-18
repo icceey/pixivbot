@@ -15,6 +15,8 @@ pub struct Model {
     pub excluded_tags: Tags,
     pub sensitive_tags: Tags,
     pub created_at: DateTime,
+    /// 是否允许在群组中不 @bot 也能响应命令
+    pub allow_without_mention: bool,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

@@ -10,6 +10,8 @@ bot_mode = "private"  # Bot mode: "private" (chats disabled by default) or "publ
 # api_url = "https://api.telegram.org"  # Optional: Custom Telegram API URL (e.g., for local bot API server)
 # require_mention_in_group = true  # Whether bot requires @mention to respond in groups (default: true)
                                    # Set to false to allow bot to respond without @mention in groups
+                                   # Note: Each chat can override this via /settings → "群组命令响应"
+                                   # When enabled globally, individual chats can still allow responses without @mention
 
 [pixiv]
 refresh_token = "YOUR_PIXIV_REFRESH_TOKEN"
