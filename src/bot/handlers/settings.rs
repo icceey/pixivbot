@@ -148,9 +148,11 @@ fn build_settings_panel(chat: &chats::Model) -> (String, InlineKeyboardMarkup) {
 
     // Row 2: Toggle mention requirement button (only meaningful for groups)
     let mention_button_text = if chat.allow_without_mention {
-        "📢启用@响应"
+        // Currently allows commands without @; pressing will enable @ requirement
+        "📢启用@要求"
     } else {
-        "📢关闭@响应"
+        // Currently requires @; pressing will disable the @ requirement (allow without @)
+        "📢关闭@要求"
     };
     let mention_button = InlineKeyboardButton::callback(
         mention_button_text,

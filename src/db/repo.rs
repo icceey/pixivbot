@@ -383,6 +383,7 @@ impl Repo {
                         chats::Column::BlurSensitiveTags,
                         chats::Column::ExcludedTags,
                         chats::Column::SensitiveTags,
+                        chats::Column::AllowWithoutMention,
                     ])
                     .to_owned(),
             )
