@@ -126,7 +126,7 @@ jobs:
           fi
 
       - name: Upload Artifact
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: ${{ env.BINARY_NAME }}-${{ matrix.target }}
           path: ${{ steps.prepare_archive.outputs.archive || format('{0}-{1}-{2}.{3}', env.BINARY_NAME, needs.validate.outputs.version, matrix.target, matrix.archive) }}
