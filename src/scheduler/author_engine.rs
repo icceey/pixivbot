@@ -8,7 +8,7 @@ use crate::scheduler::helpers::{
 use anyhow::{Context, Result};
 use chrono::Local;
 use pixiv_client::Illust;
-use rand::Rng;
+use rand::RngExt;
 use std::sync::Arc;
 use teloxide::prelude::*;
 use tokio::time::{sleep, Duration};
