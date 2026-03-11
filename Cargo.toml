@@ -16,7 +16,7 @@ license.workspace = true
 
 [dependencies]
 anyhow = "1.0.102"
-chrono = { version = "0.4.43", features = ["serde"] }
+chrono = { version = "0.4.44", features = ["serde"] }
 config = { version = "0.15.19", features = ["toml"], default-features = false }
 md5 = "0.8.0"
 migration = { path = "migration" }
