@@ -173,3 +173,30 @@ pub struct Ranking {
 pub struct UserDetail {
     pub user: User,
 }
+
+/// Ugoira 动图帧信息
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct UgoiraFrame {
+    pub file: String,
+    /// 帧显示时长（毫秒）
+    pub delay: u32,
+}
+
+/// Ugoira Zip 下载 URL
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct UgoiraZipUrls {
+    pub medium: String,
+}
+
+/// Ugoira 动图元数据
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct UgoiraMetadata {
+    pub zip_urls: UgoiraZipUrls,
+    pub frames: Vec<UgoiraFrame>,
+}
+
+/// Ugoira 元数据 API 响应
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct UgoiraMetadataResponse {
+    pub ugoira_metadata: UgoiraMetadata,
+}

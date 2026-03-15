@@ -3,10 +3,10 @@ use crate::db::repo::Repo;
 use crate::db::types::RankingState;
 use crate::utils::{sensitive, tag};
 use anyhow::{Context, Result};
-use pixiv_client::Illust;
+use pixiv_client::{Illust, UgoiraMetadata};
 use teloxide::prelude::*;
 use teloxide::utils::markdown;
-use tracing::info;
+use tracing::{info, warn};
 
 /// Result of processing a single illust push
 #[derive(Debug)]
@@ -67,15 +67,85 @@ pub async fn get_chat_if_should_notify(
     }
 }
 
-/// Generic push executor: Send specific illust pages (excluding already sent pages)
+/// Generic push executor: Send specific illust pages (excluding already sent pages).
+///
+/// For ugoira works, `ugoira_meta` must be `Some(...)` containing the animation
+/// metadata fetched from the Pixiv API.  For all other work types it is ignored.
 pub async fn process_illust_push(
     notifier: &Notifier,
     ctx: &AuthorContext<'_>,
     illust: &Illust,
+    ugoira_meta: Option<&UgoiraMetadata>,
     already_sent_pages: &[usize],
     image_size: pixiv_client::ImageSize,
 ) -> Result<PushResult> {
     let chat_id = ChatId(ctx.subscription.chat_id);
+
+    // --- Ugoira (animated GIF) path ---
+    if illust.illust_type == "ugoira" {
+        // For ugoira the whole animation is a single logical "page".
+        // If already sent (page 0 present), report success immediately.
+        if already_sent_pages.contains(&0) {
+            return Ok(PushResult::Success {
+                illust_id: illust.id,
+                first_message_id: None,
+            });
+        }
+
+        // total_pages is 1 for ugoira (the single animation counts as one page).
+        // already_sent_pages is empty at this point (early return above handles non-empty),
+        // so build_illust_caption will always generate the full first-send caption.
+        let caption = build_illust_caption(illust, already_sent_pages, 1);
+        let sensitive_tags = sensitive::get_chat_sensitive_tags(&ctx.chat);
+        let has_spoiler = ctx.chat.blur_sensitive_tags
+            && sensitive::contains_sensitive_tags(illust, sensitive_tags);
+        let is_channel = ctx.chat.r#type == "channel";
+        let download_config = if is_channel {
+            DownloadButtonConfig::new(illust.id).for_channel()
+        } else {
+            DownloadButtonConfig::new(illust.id)
+        };
+
+        let meta = ugoira_meta.context("Ugoira metadata is required for ugoira works")?;
+
+        // Download zip and encode as animated GIF
+        let gif_path = notifier
+            .get_downloader()
+            .download_ugoira_gif(&meta.zip_urls.medium, &meta.frames)
+            .await
+            .context("Failed to create ugoira GIF")?;
+
+        let send_result = notifier
+            .notify_with_animation_and_button(
+                chat_id,
+                &gif_path,
+                Some(&caption),
+                has_spoiler,
+                &download_config,
+            )
+            .await;
+
+        return Ok(match send_result {
+            Ok(msg_id) => {
+                info!("✅ Sent ugoira GIF {} to chat {}", illust.id, chat_id);
+                PushResult::Success {
+                    illust_id: illust.id,
+                    first_message_id: Some(msg_id),
+                }
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to send ugoira GIF {} to chat {}: {:#}",
+                    illust.id, chat_id, e
+                );
+                PushResult::Failure {
+                    illust_id: illust.id,
+                }
+            }
+        });
+    }
+
+    // --- Regular image (illust / manga) path ---
     let all_urls = illust.get_all_image_urls_with_size(image_size);
     let total_pages = all_urls.len();
 
@@ -97,43 +167,7 @@ pub async fn process_illust_push(
         .collect();
 
     // Prepare caption
-    let caption = if already_sent_pages.is_empty() {
-        // First time sending this illust
-        let page_info = if illust.is_multi_page() {
-            format!(" \\({} photos\\)", illust.page_count)
-        } else {
-            String::new()
-        };
-        let tags = tag::format_tags_escaped(illust);
-        format!(
-            "🎨 {}{}\nby *{}* \\(ID: `{}`\\)\n\n👀 {} \\| ❤️ {} \\| 🔗 [来源](https://pixiv\\.net/artworks/{}){}", 
-            markdown::escape(&illust.title),
-            page_info,
-            markdown::escape(&illust.user.name),
-            illust.user.id,
-            illust.total_view,
-            illust.total_bookmarks,
-            illust.id,
-            tags
-        )
-    } else {
-        // Continuing from previous attempt - calculate batch numbers like normal send
-        // Normal batch size is 10 (MAX_PER_GROUP in notifier)
-        const MAX_PER_GROUP: usize = 10;
-        let total_batches = total_pages.div_ceil(MAX_PER_GROUP);
-        let current_batch = (already_sent_pages.len() / MAX_PER_GROUP) + 1;
-        let tags = tag::format_tags_escaped(illust);
-
-        format!(
-            "🎨 {} \\(continued {}/{}\\)\nby *{}*\n\n🔗 [来源](https://pixiv\\.net/artworks/{}){}",
-            markdown::escape(&illust.title),
-            current_batch,
-            total_batches,
-            markdown::escape(&illust.user.name),
-            illust.id,
-            tags
-        )
-    };
+    let caption = build_illust_caption(illust, already_sent_pages, total_pages);
 
     // Check spoiler setting
     let sensitive_tags = sensitive::get_chat_sensitive_tags(&ctx.chat);
@@ -222,5 +256,50 @@ fn map_send_result_to_push_result(
             total_pages,
             first_message_id,
         }
+    }
+}
+
+/// Build a caption string for an illust push.
+///
+/// - `already_sent_pages` empty  → full first-page caption with stats and tags
+/// - `already_sent_pages` non-empty → continuation caption (batch N/M)
+/// - `total_pages` is the total number of pages/frames in the work (1 for ugoira/single)
+fn build_illust_caption(
+    illust: &Illust,
+    already_sent_pages: &[usize],
+    total_pages: usize,
+) -> String {
+    if already_sent_pages.is_empty() {
+        let page_info = if illust.is_multi_page() {
+            format!(" \\({} photos\\)", illust.page_count)
+        } else {
+            String::new()
+        };
+        let tags = tag::format_tags_escaped(illust);
+        format!(
+            "🎨 {}{}\nby *{}* \\(ID: `{}`\\)\n\n👀 {} \\| ❤️ {} \\| 🔗 [来源](https://pixiv\\.net/artworks/{}){}", 
+            markdown::escape(&illust.title),
+            page_info,
+            markdown::escape(&illust.user.name),
+            illust.user.id,
+            illust.total_view,
+            illust.total_bookmarks,
+            illust.id,
+            tags
+        )
+    } else {
+        const MAX_PER_GROUP: usize = 10;
+        let total_batches = total_pages.div_ceil(MAX_PER_GROUP);
+        let current_batch = (already_sent_pages.len() / MAX_PER_GROUP) + 1;
+        let tags = tag::format_tags_escaped(illust);
+        format!(
+            "🎨 {} \\(continued {}/{}\\)\nby *{}*\n\n🔗 [来源](https://pixiv\\.net/artworks/{}){}",
+            markdown::escape(&illust.title),
+            current_batch,
+            total_batches,
+            markdown::escape(&illust.user.name),
+            illust.id,
+            tags
+        )
     }
 }

@@ -18,6 +18,7 @@ license.workspace = true
 anyhow = "1.0.102"
 chrono = { version = "0.4.44", features = ["serde"] }
 config = { version = "0.15.19", features = ["toml"], default-features = false }
+image = { version = "0.25.10", features = ["gif", "jpeg", "png"] }
 md5 = "0.8.0"
 migration = { path = "migration" }
 pixiv_client = { path = "pixiv_client" }

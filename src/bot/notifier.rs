@@ -192,6 +192,39 @@ impl Notifier {
         .await
     }
 
+    /// 发送 GIF 动画并带有下载按钮（用于 ugoira 类型作品）
+    pub async fn notify_with_animation_and_button(
+        &self,
+        chat_id: ChatId,
+        gif_path: &Path,
+        caption: Option<&str>,
+        has_spoiler: bool,
+        download_config: &DownloadButtonConfig,
+    ) -> Result<i32> {
+        let keyboard = download_config.build_keyboard();
+
+        if let Err(e) = self
+            .bot
+            .send_chat_action(chat_id, ChatAction::UploadVideo)
+            .await
+        {
+            warn!("Failed to set chat action for chat {}: {:#}", chat_id, e);
+        }
+
+        let mut req = self.bot.send_animation(chat_id, InputFile::file(gif_path));
+        if let Some(c) = caption {
+            req = req.caption(c).parse_mode(ParseMode::MarkdownV2);
+        }
+        if has_spoiler {
+            req = req.has_spoiler(true);
+        }
+        if let Some(kb) = keyboard {
+            req = req.reply_markup(kb);
+        }
+        let message = req.await.context("Send animation failed")?;
+        Ok(message.id.0)
+    }
+
     // ==================== 私有通用逻辑 ====================
 
     /// 核心逻辑：下载 -> 分批 -> 发送

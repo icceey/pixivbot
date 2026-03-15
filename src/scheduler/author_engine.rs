@@ -214,6 +214,25 @@ impl AuthorEngine {
         Ok(())
     }
 
+    /// Fetch ugoira metadata for a ugoira-type illust, or return `None` for other types.
+    ///
+    /// The read lock on `pixiv_client` is held only for the duration of the API call,
+    /// so callers do not hold it during the slow GIF creation / Telegram upload phase.
+    async fn fetch_ugoira_meta_if_needed(
+        &self,
+        illust: &pixiv_client::Illust,
+    ) -> Result<Option<pixiv_client::UgoiraMetadata>> {
+        if illust.illust_type != "ugoira" {
+            return Ok(None);
+        }
+        let pixiv = self.pixiv_client.read().await;
+        let meta = pixiv
+            .get_ugoira_metadata(illust.id)
+            .await
+            .context("Failed to fetch ugoira metadata")?;
+        Ok(Some(meta))
+    }
+
     // ==================== Dispatcher ====================
 
     /// Dispatcher: Decide between pending retry or new illust processing
@@ -314,10 +333,12 @@ impl AuthorEngine {
         }
 
         // Send remaining pages
+        let ugoira_meta = self.fetch_ugoira_meta_if_needed(illust).await?;
         let push_result = process_illust_push(
             &self.notifier,
             ctx,
             illust,
+            ugoira_meta.as_ref(),
             &pending.sent_pages,
             self.image_size,
         )
@@ -476,8 +497,16 @@ impl AuthorEngine {
             .expect("filtered_illusts is not empty");
 
         // Push this single illust
-        let push_result =
-            process_illust_push(&self.notifier, ctx, illust, &[], self.image_size).await?;
+        let ugoira_meta = self.fetch_ugoira_meta_if_needed(illust).await?;
+        let push_result = process_illust_push(
+            &self.notifier,
+            ctx,
+            illust,
+            ugoira_meta.as_ref(),
+            &[],
+            self.image_size,
+        )
+        .await?;
 
         // Calculate new state based on result
         let new_state = match push_result {

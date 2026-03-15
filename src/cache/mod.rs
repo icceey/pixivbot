@@ -80,6 +80,35 @@ impl FileCacheManager {
         Ok(path)
     }
 
+    /// Save data to cache with an explicit file extension.
+    ///
+    /// Use this when the URL does not reflect the true file extension
+    /// (e.g., saving a GIF created from a `.zip` source).
+    pub async fn save_as(&self, key: &str, data: &[u8], ext: &str) -> Result<PathBuf> {
+        let path = self.resolve_path_with_ext(key, ext);
+
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .context("Failed to create cache directory")?;
+        }
+
+        let mut file = tokio::fs::File::create(&path)
+            .await
+            .context("Failed to create cache file")?;
+        file.write_all(data)
+            .await
+            .context("Failed to write cache data")?;
+
+        Ok(path)
+    }
+
+    /// Check if a key is cached under a specific extension.
+    pub async fn get_as(&self, key: &str, ext: &str) -> Option<PathBuf> {
+        let path = self.resolve_path_with_ext(key, ext);
+        tokio::fs::metadata(&path).await.ok().map(|_| path)
+    }
+
     /// Start background cleanup task.
     fn start_background_cleanup(root_dir: PathBuf, retention_days: u64) {
         tokio::spawn(async move {
@@ -182,10 +211,15 @@ impl FileCacheManager {
     /// Directory structure: `{root_dir}/{prefix}/{hash}_{slug}.{ext}`
     /// - `prefix`: First 2 characters of hash (00-ff)
     fn resolve_path(&self, url: &str) -> PathBuf {
+        let ext = self.extract_extension(url);
+        self.resolve_path_with_ext(url, ext)
+    }
+
+    /// Resolve full path for a URL with an explicit extension.
+    fn resolve_path_with_ext(&self, url: &str, ext: &str) -> PathBuf {
         let key = self.generate_key(url);
         let prefix = &key[..2];
         let slug = self.safe_url_slug(url);
-        let ext = self.extract_extension(url);
 
         let filename = format!("{}_{}.{}", key, slug, ext);
         self.root_dir.join(prefix).join(filename)
