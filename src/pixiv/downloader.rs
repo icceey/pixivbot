@@ -138,10 +138,6 @@ fn encode_ugoira_gif(zip_data: &[u8], frames: &[UgoiraFrame]) -> Result<Vec<u8>>
     let cursor = Cursor::new(zip_data);
     let mut archive = zip::ZipArchive::new(cursor).context("Failed to open ugoira ZIP")?;
 
-    // Build a map from filename → delay for quick lookup
-    let frame_delays: std::collections::HashMap<&str, u32> =
-        frames.iter().map(|f| (f.file.as_str(), f.delay)).collect();
-
     // Collect decoded frames in order
     let mut decoded_frames: Vec<(RgbaImage, u32)> = Vec::with_capacity(frames.len());
 
@@ -157,12 +153,7 @@ fn encode_ugoira_gif(zip_data: &[u8], frames: &[UgoiraFrame]) -> Result<Vec<u8>>
         let img = image::load_from_memory(&frame_data)
             .with_context(|| format!("Failed to decode frame '{}'", frame_info.file))?;
 
-        let delay = frame_delays
-            .get(frame_info.file.as_str())
-            .copied()
-            .unwrap_or(frame_info.delay);
-
-        decoded_frames.push((img.to_rgba8(), delay));
+        decoded_frames.push((img.to_rgba8(), frame_info.delay));
     }
 
     if decoded_frames.is_empty() {
