@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Context, Result};
 use image::codecs::gif::{GifEncoder, Repeat};
-use image::{Frame, RgbaImage};
+use image::Frame;
 use pixiv_client::UgoiraFrame;
 use reqwest::Client;
 use std::io::Cursor;
@@ -133,45 +133,42 @@ impl Downloader {
     }
 }
 
-/// Extract frames from a ZIP archive and encode them as an animated GIF
+/// Extract frames from a ZIP archive and encode them as an animated GIF.
+///
+/// Streams frames one at a time: each frame is decoded from the ZIP and
+/// immediately encoded into the GIF output, avoiding buffering all decoded
+/// frames in memory simultaneously.
 fn encode_ugoira_gif(zip_data: &[u8], frames: &[UgoiraFrame]) -> Result<Vec<u8>> {
     let cursor = Cursor::new(zip_data);
     let mut archive = zip::ZipArchive::new(cursor).context("Failed to open ugoira ZIP")?;
 
-    // Collect decoded frames in order
-    let mut decoded_frames: Vec<(RgbaImage, u32)> = Vec::with_capacity(frames.len());
-
-    for frame_info in frames {
-        let mut zip_file = archive
-            .by_name(&frame_info.file)
-            .with_context(|| format!("Frame '{}' not found in ZIP", frame_info.file))?;
-
-        let mut frame_data = Vec::new();
-        std::io::Read::read_to_end(&mut zip_file, &mut frame_data)
-            .with_context(|| format!("Failed to read frame '{}'", frame_info.file))?;
-
-        let img = image::load_from_memory(&frame_data)
-            .with_context(|| format!("Failed to decode frame '{}'", frame_info.file))?;
-
-        decoded_frames.push((img.to_rgba8(), frame_info.delay));
-    }
-
-    if decoded_frames.is_empty() {
+    if frames.is_empty() {
         return Err(anyhow!("No frames found in ugoira ZIP"));
     }
 
-    // Encode as animated GIF
+    // Stream: decode each frame and immediately encode it into the GIF
     let mut gif_buf = Vec::new();
+    let frame_count = frames.len();
     {
         let mut encoder = GifEncoder::new_with_speed(&mut gif_buf, 10);
         encoder
             .set_repeat(Repeat::Infinite)
             .context("Failed to set GIF repeat")?;
 
-        for (rgba_image, delay_ms) in &decoded_frames {
-            // Convert delay from milliseconds to the `image` crate's Delay type
-            let delay = image::Delay::from_numer_denom_ms(*delay_ms, 1);
-            let frame = Frame::from_parts(rgba_image.clone(), 0, 0, delay);
+        for frame_info in frames {
+            let mut zip_file = archive
+                .by_name(&frame_info.file)
+                .with_context(|| format!("Frame '{}' not found in ZIP", frame_info.file))?;
+
+            let mut frame_data = Vec::new();
+            std::io::Read::read_to_end(&mut zip_file, &mut frame_data)
+                .with_context(|| format!("Failed to read frame '{}'", frame_info.file))?;
+
+            let img = image::load_from_memory(&frame_data)
+                .with_context(|| format!("Failed to decode frame '{}'", frame_info.file))?;
+
+            let delay = image::Delay::from_numer_denom_ms(frame_info.delay, 1);
+            let frame = Frame::from_parts(img.into_rgba8(), 0, 0, delay);
             encoder
                 .encode_frame(frame)
                 .context("Failed to encode GIF frame")?;
@@ -180,7 +177,7 @@ fn encode_ugoira_gif(zip_data: &[u8], frames: &[UgoiraFrame]) -> Result<Vec<u8>>
 
     info!(
         "Encoded ugoira GIF: {} frames, {:.1} KB",
-        decoded_frames.len(),
+        frame_count,
         gif_buf.len() as f64 / 1024.0
     );
 
@@ -190,7 +187,7 @@ fn encode_ugoira_gif(zip_data: &[u8], frames: &[UgoiraFrame]) -> Result<Vec<u8>>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use image::ImageFormat;
+    use image::{ImageFormat, RgbaImage};
     use std::io::Write;
 
     /// Create a minimal PNG image in memory (2x2 pixels with given color)
