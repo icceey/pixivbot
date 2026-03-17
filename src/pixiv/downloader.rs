@@ -124,7 +124,7 @@ impl Downloader {
         let gif_data =
             tokio::task::spawn_blocking(move || encode_ugoira_gif(&zip_data, &frames_clone))
                 .await
-                .context("GIF encoding task panicked")??;
+                .context("GIF encoding task failed")??;
 
         // Save to cache
         let path = self.cache.save(&gif_cache_key, &gif_data).await?;
