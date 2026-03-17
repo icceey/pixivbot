@@ -1,6 +1,7 @@
 use crate::bot::handlers::DOWNLOAD_CALLBACK_PREFIX;
 use crate::pixiv::downloader::Downloader;
 use anyhow::{Context, Result};
+use pixiv_client::UgoiraFrame;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use teloxide::adaptors::Throttle;
@@ -190,6 +191,65 @@ impl Notifier {
             download_config,
         )
         .await
+    }
+
+    // ==================== Ugoira (动图) 支持 ====================
+
+    /// 发送 Ugoira (动图) 作品为 GIF 动画
+    ///
+    /// 1. 下载 ZIP 并编码为 GIF
+    /// 2. 以 Telegram animation 发送
+    pub async fn notify_ugoira(
+        &self,
+        chat_id: ChatId,
+        zip_url: &str,
+        frames: &[UgoiraFrame],
+        caption: Option<&str>,
+        has_spoiler: bool,
+        download_config: &DownloadButtonConfig,
+    ) -> BatchSendResult {
+        // Build keyboard from config
+        let keyboard = download_config.build_keyboard();
+
+        // Set bot status to uploading video (animation)
+        if let Err(e) = self
+            .bot
+            .send_chat_action(chat_id, ChatAction::UploadVideo)
+            .await
+        {
+            warn!("Failed to set chat action for chat {}: {:#}", chat_id, e);
+        }
+
+        // Download and convert to GIF
+        let gif_path = match self.downloader.download_ugoira_gif(zip_url, frames).await {
+            Ok(path) => path,
+            Err(e) => {
+                error!(
+                    "Failed to download/convert ugoira for chat {}: {:#}",
+                    chat_id, e
+                );
+                return BatchSendResult::all_failed(1);
+            }
+        };
+
+        // Send as animation
+        match self
+            .send_animation_file(chat_id, &gif_path, caption, has_spoiler, keyboard)
+            .await
+        {
+            Ok(msg_id) => BatchSendResult {
+                succeeded_indices: vec![0],
+                failed_indices: Vec::new(),
+                first_message_id: Some(msg_id),
+            },
+            Err(e) => {
+                error!(
+                    "Failed to send ugoira animation to chat {}: {:#}",
+                    chat_id, e
+                );
+                BatchSendResult::all_failed(1)
+            }
+        }
     }
 
     // ==================== 私有通用逻辑 ====================
@@ -463,6 +523,29 @@ impl Notifier {
             req = req.reply_markup(kb);
         }
         let message = req.await.context("Send photo failed")?;
+        Ok(message.id.0)
+    }
+
+    /// 发送动画 (GIF) 文件并返回消息ID
+    async fn send_animation_file(
+        &self,
+        chat_id: ChatId,
+        path: &Path,
+        caption: Option<&str>,
+        has_spoiler: bool,
+        keyboard: Option<InlineKeyboardMarkup>,
+    ) -> Result<i32> {
+        let mut req = self.bot.send_animation(chat_id, InputFile::file(path));
+        if let Some(c) = caption {
+            req = req.caption(c).parse_mode(ParseMode::MarkdownV2);
+        }
+        if has_spoiler {
+            req = req.has_spoiler(true);
+        }
+        if let Some(kb) = keyboard {
+            req = req.reply_markup(kb);
+        }
+        let message = req.await.context("Send animation failed")?;
         Ok(message.id.0)
     }
 }

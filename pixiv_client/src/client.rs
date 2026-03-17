@@ -221,4 +221,16 @@ impl PixivClient {
         ];
         self.get("/v1/user/detail", &params).await
     }
+
+    /// 获取 Ugoira (动图) 元数据
+    ///
+    /// # 参数
+    /// - `illust_id`: 作品 ID (必须是 ugoira 类型)
+    ///
+    /// # 返回
+    /// 包含 ZIP 下载 URL 和每帧延迟信息
+    pub async fn ugoira_metadata(&self, illust_id: u64) -> Result<UgoiraMetadata> {
+        let params = vec![("illust_id", illust_id.to_string())];
+        self.get("/v1/ugoira/metadata", &params).await
+    }
 }

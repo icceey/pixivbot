@@ -316,6 +316,7 @@ impl AuthorEngine {
         // Send remaining pages
         let push_result = process_illust_push(
             &self.notifier,
+            &self.pixiv_client,
             ctx,
             illust,
             &pending.sent_pages,
@@ -476,8 +477,15 @@ impl AuthorEngine {
             .expect("filtered_illusts is not empty");
 
         // Push this single illust
-        let push_result =
-            process_illust_push(&self.notifier, ctx, illust, &[], self.image_size).await?;
+        let push_result = process_illust_push(
+            &self.notifier,
+            &self.pixiv_client,
+            ctx,
+            illust,
+            &[],
+            self.image_size,
+        )
+        .await?;
 
         // Calculate new state based on result
         let new_state = match push_result {

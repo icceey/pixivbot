@@ -91,6 +91,11 @@ pub enum ImageSize {
 }
 
 impl Illust {
+    /// 是否为动图 (ugoira) 作品
+    pub fn is_ugoira(&self) -> bool {
+        self.illust_type == "ugoira"
+    }
+
     /// 是否为多图作品
     pub fn is_multi_page(&self) -> bool {
         self.page_count > 1
@@ -172,4 +177,125 @@ pub struct Ranking {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct UserDetail {
     pub user: User,
+}
+
+/// Ugoira 帧信息
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct UgoiraFrame {
+    /// 帧文件名 (e.g., "000000.jpg")
+    pub file: String,
+    /// 帧延迟时间 (毫秒)
+    pub delay: u32,
+}
+
+/// Ugoira ZIP URL 信息
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct UgoiraZipUrls {
+    /// 中等尺寸 ZIP URL
+    pub medium: String,
+}
+
+/// Ugoira 元数据
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct UgoiraMetadataInfo {
+    /// ZIP 下载 URL
+    pub zip_urls: UgoiraZipUrls,
+    /// 每帧的延迟信息
+    pub frames: Vec<UgoiraFrame>,
+}
+
+/// Ugoira 元数据 API 响应
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct UgoiraMetadata {
+    pub ugoira_metadata: UgoiraMetadataInfo,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_illust(illust_type: &str, page_count: u32) -> Illust {
+        Illust {
+            id: 12345,
+            title: "Test".to_string(),
+            illust_type: illust_type.to_string(),
+            image_urls: ImageUrls {
+                square_medium: "https://example.com/sq.jpg".to_string(),
+                medium: "https://example.com/med.jpg".to_string(),
+                large: "https://example.com/large.jpg".to_string(),
+                original: Some("https://example.com/orig.jpg".to_string()),
+            },
+            caption: String::new(),
+            restrict: 0,
+            user: User {
+                id: 1,
+                name: "Artist".to_string(),
+                account: "artist".to_string(),
+                is_followed: None,
+            },
+            tags: vec![],
+            create_date: "2024-01-01".to_string(),
+            page_count,
+            width: 100,
+            height: 100,
+            sanity_level: 2,
+            x_restrict: 0,
+            series: None,
+            meta_single_page: MetaSinglePage {
+                original_image_url: Some("https://example.com/orig.jpg".to_string()),
+            },
+            meta_pages: vec![],
+            total_view: 100,
+            total_bookmarks: 50,
+            is_bookmarked: false,
+            visible: true,
+            is_muted: false,
+            total_comments: None,
+        }
+    }
+
+    #[test]
+    fn test_is_ugoira_true() {
+        let illust = make_illust("ugoira", 1);
+        assert!(illust.is_ugoira());
+    }
+
+    #[test]
+    fn test_is_ugoira_false_for_illust() {
+        let illust = make_illust("illust", 1);
+        assert!(!illust.is_ugoira());
+    }
+
+    #[test]
+    fn test_is_ugoira_false_for_manga() {
+        let illust = make_illust("manga", 1);
+        assert!(!illust.is_ugoira());
+    }
+
+    #[test]
+    fn test_ugoira_metadata_deserialization() {
+        let json = r#"{
+            "ugoira_metadata": {
+                "zip_urls": {
+                    "medium": "https://i.pximg.net/img-zip-ugoira/img/2024/01/01/00/00/00/12345_ugoira600x600.zip"
+                },
+                "frames": [
+                    {"file": "000000.jpg", "delay": 100},
+                    {"file": "000001.jpg", "delay": 100},
+                    {"file": "000002.jpg", "delay": 200}
+                ]
+            }
+        }"#;
+
+        let metadata: UgoiraMetadata = serde_json::from_str(json).unwrap();
+        assert_eq!(metadata.ugoira_metadata.frames.len(), 3);
+        assert_eq!(metadata.ugoira_metadata.frames[0].file, "000000.jpg");
+        assert_eq!(metadata.ugoira_metadata.frames[0].delay, 100);
+        assert_eq!(metadata.ugoira_metadata.frames[2].delay, 200);
+        assert!(metadata
+            .ugoira_metadata
+            .zip_urls
+            .medium
+            .contains("ugoira600x600.zip"));
+    }
 }

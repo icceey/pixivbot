@@ -1,5 +1,9 @@
 use anyhow::{anyhow, Context, Result};
+use image::codecs::gif::{GifEncoder, Repeat};
+use image::{Frame, RgbaImage};
+use pixiv_client::UgoiraFrame;
 use reqwest::Client;
+use std::io::Cursor;
 use std::path::PathBuf;
 use tracing::{info, warn};
 
@@ -74,5 +78,234 @@ impl Downloader {
             urls.len()
         );
         Ok(paths)
+    }
+
+    /// 下载 Ugoira (动图) 并转换为 GIF 文件
+    ///
+    /// 1. 下载 ZIP 文件 (包含各帧图片)
+    /// 2. 从 ZIP 中提取帧
+    /// 3. 根据帧延迟信息编码为动画 GIF
+    ///
+    /// 使用 ZIP URL 作为缓存键 (后缀改为 .gif)
+    pub async fn download_ugoira_gif(
+        &self,
+        zip_url: &str,
+        frames: &[UgoiraFrame],
+    ) -> Result<PathBuf> {
+        // Use a cache key derived from the ZIP URL but with .gif extension
+        let gif_cache_key = format!("{}.gif", zip_url);
+
+        // Check cache hit
+        if let Some(path) = self.cache.get(&gif_cache_key).await {
+            info!("Cache hit for ugoira GIF: {}", zip_url);
+            return Ok(path);
+        }
+
+        info!("Downloading ugoira ZIP: {}", zip_url);
+
+        // Download the ZIP file
+        let zip_bytes = self
+            .http_client
+            .get(zip_url)
+            .header("Referer", "https://app-api.pixiv.net/")
+            .send()
+            .await
+            .context("Failed to download ugoira ZIP")?
+            .error_for_status()
+            .context("Ugoira ZIP download returned error status")?
+            .bytes()
+            .await
+            .context("Failed to read ugoira ZIP bytes")?;
+
+        // Convert ZIP frames to GIF in a blocking task (CPU-intensive)
+        let frames_clone = frames.to_vec();
+        let zip_data = zip_bytes.to_vec();
+
+        let gif_data =
+            tokio::task::spawn_blocking(move || encode_ugoira_gif(&zip_data, &frames_clone))
+                .await
+                .context("GIF encoding task panicked")??;
+
+        // Save to cache
+        let path = self.cache.save(&gif_cache_key, &gif_data).await?;
+        info!("Ugoira GIF saved to: {:?}", path);
+        Ok(path)
+    }
+}
+
+/// Extract frames from a ZIP archive and encode them as an animated GIF
+fn encode_ugoira_gif(zip_data: &[u8], frames: &[UgoiraFrame]) -> Result<Vec<u8>> {
+    let cursor = Cursor::new(zip_data);
+    let mut archive = zip::ZipArchive::new(cursor).context("Failed to open ugoira ZIP")?;
+
+    // Build a map from filename → delay for quick lookup
+    let frame_delays: std::collections::HashMap<&str, u32> =
+        frames.iter().map(|f| (f.file.as_str(), f.delay)).collect();
+
+    // Collect decoded frames in order
+    let mut decoded_frames: Vec<(RgbaImage, u32)> = Vec::with_capacity(frames.len());
+
+    for frame_info in frames {
+        let mut zip_file = archive
+            .by_name(&frame_info.file)
+            .with_context(|| format!("Frame '{}' not found in ZIP", frame_info.file))?;
+
+        let mut frame_data = Vec::new();
+        std::io::Read::read_to_end(&mut zip_file, &mut frame_data)
+            .with_context(|| format!("Failed to read frame '{}'", frame_info.file))?;
+
+        let img = image::load_from_memory(&frame_data)
+            .with_context(|| format!("Failed to decode frame '{}'", frame_info.file))?;
+
+        let delay = frame_delays
+            .get(frame_info.file.as_str())
+            .copied()
+            .unwrap_or(frame_info.delay);
+
+        decoded_frames.push((img.to_rgba8(), delay));
+    }
+
+    if decoded_frames.is_empty() {
+        return Err(anyhow!("No frames found in ugoira ZIP"));
+    }
+
+    // Encode as animated GIF
+    let mut gif_buf = Vec::new();
+    {
+        let mut encoder = GifEncoder::new_with_speed(&mut gif_buf, 10);
+        encoder
+            .set_repeat(Repeat::Infinite)
+            .context("Failed to set GIF repeat")?;
+
+        for (rgba_image, delay_ms) in &decoded_frames {
+            // Convert delay from milliseconds to the `image` crate's Delay type
+            let delay = image::Delay::from_numer_denom_ms(*delay_ms, 1);
+            let frame = Frame::from_parts(rgba_image.clone(), 0, 0, delay);
+            encoder
+                .encode_frame(frame)
+                .context("Failed to encode GIF frame")?;
+        }
+    }
+
+    info!(
+        "Encoded ugoira GIF: {} frames, {:.1} KB",
+        decoded_frames.len(),
+        gif_buf.len() as f64 / 1024.0
+    );
+
+    Ok(gif_buf)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use image::ImageFormat;
+    use std::io::Write;
+
+    /// Create a minimal PNG image in memory (2x2 pixels with given color)
+    fn create_test_png(r: u8, g: u8, b: u8) -> Vec<u8> {
+        let img = RgbaImage::from_pixel(2, 2, image::Rgba([r, g, b, 255]));
+        let mut buf = Vec::new();
+        let mut cursor = Cursor::new(&mut buf);
+        img.write_to(&mut cursor, ImageFormat::Png).unwrap();
+        buf
+    }
+
+    /// Create a ZIP archive in memory containing the given named files
+    fn create_test_zip(files: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        {
+            let mut zip = zip::ZipWriter::new(Cursor::new(&mut buf));
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            for (name, data) in files {
+                zip.start_file(name.to_string(), options).unwrap();
+                zip.write_all(data).unwrap();
+            }
+            zip.finish().unwrap();
+        }
+        buf
+    }
+
+    #[test]
+    fn test_encode_ugoira_gif_basic() {
+        let frame0 = create_test_png(255, 0, 0); // Red
+        let frame1 = create_test_png(0, 255, 0); // Green
+        let frame2 = create_test_png(0, 0, 255); // Blue
+
+        let zip_data = create_test_zip(&[
+            ("000000.png", &frame0),
+            ("000001.png", &frame1),
+            ("000002.png", &frame2),
+        ]);
+
+        let frames = vec![
+            UgoiraFrame {
+                file: "000000.png".to_string(),
+                delay: 100,
+            },
+            UgoiraFrame {
+                file: "000001.png".to_string(),
+                delay: 100,
+            },
+            UgoiraFrame {
+                file: "000002.png".to_string(),
+                delay: 200,
+            },
+        ];
+
+        let gif_data = encode_ugoira_gif(&zip_data, &frames).unwrap();
+
+        // Verify it's a valid GIF (starts with "GIF89a" magic bytes)
+        assert!(gif_data.len() > 6);
+        assert_eq!(&gif_data[0..3], b"GIF");
+    }
+
+    #[test]
+    fn test_encode_ugoira_gif_single_frame() {
+        let frame0 = create_test_png(128, 128, 128);
+        let zip_data = create_test_zip(&[("000000.png", &frame0)]);
+
+        let frames = vec![UgoiraFrame {
+            file: "000000.png".to_string(),
+            delay: 50,
+        }];
+
+        let gif_data = encode_ugoira_gif(&zip_data, &frames).unwrap();
+        assert!(gif_data.len() > 6);
+        assert_eq!(&gif_data[0..3], b"GIF");
+    }
+
+    #[test]
+    fn test_encode_ugoira_gif_missing_frame() {
+        let frame0 = create_test_png(255, 0, 0);
+        let zip_data = create_test_zip(&[("000000.png", &frame0)]);
+
+        let frames = vec![
+            UgoiraFrame {
+                file: "000000.png".to_string(),
+                delay: 100,
+            },
+            UgoiraFrame {
+                file: "missing.png".to_string(),
+                delay: 100,
+            },
+        ];
+
+        let result = encode_ugoira_gif(&zip_data, &frames);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("missing.png"));
+    }
+
+    #[test]
+    fn test_encode_ugoira_gif_empty_frames() {
+        let frame0 = create_test_png(255, 0, 0);
+        let zip_data = create_test_zip(&[("000000.png", &frame0)]);
+
+        let frames: Vec<UgoiraFrame> = vec![];
+
+        let result = encode_ugoira_gif(&zip_data, &frames);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("No frames"));
     }
 }

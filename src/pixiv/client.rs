@@ -65,4 +65,14 @@ impl PixivClient {
         );
         Ok(response.user)
     }
+
+    /// 获取 Ugoira (动图) 元数据
+    pub async fn get_ugoira_metadata(
+        &self,
+        illust_id: u64,
+    ) -> Result<pixiv_client::UgoiraMetadataInfo> {
+        let response = self.client.ugoira_metadata(illust_id).await?;
+        info!("Fetched ugoira metadata for illust {}", illust_id);
+        Ok(response.ugoira_metadata)
+    }
 }
