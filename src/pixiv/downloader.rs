@@ -90,7 +90,7 @@ impl Downloader {
     pub async fn download_ugoira_gif(
         &self,
         zip_url: &str,
-        frames: &[UgoiraFrame],
+        frames: Vec<UgoiraFrame>,
     ) -> Result<PathBuf> {
         // Use a cache key derived from the ZIP URL but with .gif extension
         let gif_cache_key = format!("{}.gif", zip_url);
@@ -118,13 +118,11 @@ impl Downloader {
             .context("Failed to read ugoira ZIP bytes")?;
 
         // Convert ZIP frames to GIF in a blocking task (CPU-intensive)
-        let frames_clone = frames.to_vec();
         let zip_data = zip_bytes.to_vec();
 
-        let gif_data =
-            tokio::task::spawn_blocking(move || encode_ugoira_gif(&zip_data, &frames_clone))
-                .await
-                .context("GIF encoding task failed")??;
+        let gif_data = tokio::task::spawn_blocking(move || encode_ugoira_gif(&zip_data, &frames))
+            .await
+            .context("GIF encoding task failed")??;
 
         // Save to cache
         let path = self.cache.save(&gif_cache_key, &gif_data).await?;

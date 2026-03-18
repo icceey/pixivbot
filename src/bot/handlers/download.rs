@@ -251,10 +251,10 @@ impl BotHandler {
 
             let title = illust.title.clone();
             let artist = illust.user.name.clone();
-            let downloader = &self.notifier.get_downloader();
+            let downloader = self.notifier.get_downloader();
 
             let gif_path = downloader
-                .download_ugoira_gif(&metadata.zip_urls.medium, &metadata.frames)
+                .download_ugoira_gif(&metadata.zip_urls.medium, metadata.frames)
                 .await
                 .context("Failed to download ugoira GIF")?;
 

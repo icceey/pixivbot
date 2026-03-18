@@ -203,7 +203,7 @@ impl Notifier {
         &self,
         chat_id: ChatId,
         zip_url: &str,
-        frames: &[UgoiraFrame],
+        frames: Vec<UgoiraFrame>,
         caption: Option<&str>,
         has_spoiler: bool,
         download_config: &DownloadButtonConfig,

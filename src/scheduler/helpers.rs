@@ -73,7 +73,7 @@ pub async fn get_chat_if_should_notify(
 /// Generic push executor: Send specific illust pages (excluding already sent pages)
 pub async fn process_illust_push(
     notifier: &Notifier,
-    pixiv_client: &Arc<RwLock<PixivClient>>,
+    pixiv: &Arc<RwLock<PixivClient>>,
     ctx: &AuthorContext<'_>,
     illust: &Illust,
     already_sent_pages: &[usize],
@@ -81,7 +81,7 @@ pub async fn process_illust_push(
 ) -> Result<PushResult> {
     // For ugoira works, delegate to the specialized handler
     if illust.is_ugoira() {
-        return process_ugoira_push(notifier, pixiv_client, ctx, illust).await;
+        return process_ugoira_push(notifier, pixiv, ctx, illust).await;
     }
 
     let chat_id = ChatId(ctx.subscription.chat_id);
@@ -237,19 +237,19 @@ fn map_send_result_to_push_result(
 /// Push a ugoira (animated) illust as a GIF animation
 async fn process_ugoira_push(
     notifier: &Notifier,
-    pixiv_client: &Arc<RwLock<PixivClient>>,
+    pixiv: &Arc<RwLock<PixivClient>>,
     ctx: &AuthorContext<'_>,
     illust: &Illust,
 ) -> Result<PushResult> {
     let chat_id = ChatId(ctx.subscription.chat_id);
 
     // Fetch ugoira metadata (ZIP URL + frame delays)
-    let pixiv = pixiv_client.read().await;
-    let metadata = pixiv
+    let pixiv_guard = pixiv.read().await;
+    let metadata = pixiv_guard
         .get_ugoira_metadata(illust.id)
         .await
         .context("Failed to fetch ugoira metadata")?;
-    drop(pixiv);
+    drop(pixiv_guard);
 
     // Prepare caption (same format as regular illusts, with 🎞️ indicator)
     let tags = tag::format_tags_escaped(illust);
@@ -282,7 +282,7 @@ async fn process_ugoira_push(
         .notify_ugoira(
             chat_id,
             &metadata.zip_urls.medium,
-            &metadata.frames,
+            metadata.frames,
             Some(&caption),
             has_spoiler,
             &download_config,
