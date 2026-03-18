@@ -1,6 +1,4 @@
 use anyhow::{anyhow, Context, Result};
-use image::codecs::gif::{GifEncoder, Repeat};
-use image::Frame;
 use pixiv_client::UgoiraFrame;
 use reqwest::Client;
 use std::io::Cursor;
@@ -80,24 +78,24 @@ impl Downloader {
         Ok(paths)
     }
 
-    /// 下载 Ugoira (动图) 并转换为 GIF 文件
+    /// 下载 Ugoira (动图) 并转换为 MP4 文件
     ///
     /// 1. 下载 ZIP 文件 (包含各帧图片)
-    /// 2. 从 ZIP 中提取帧
-    /// 3. 根据帧延迟信息编码为动画 GIF
+    /// 2. 从 ZIP 中提取帧到临时目录
+    /// 3. 使用 ffmpeg 编码为无音频轨道的 MP4 (H.264 High profile, 画质优化)
     ///
-    /// 使用 ZIP URL 作为缓存键 (后缀改为 .gif)
-    pub async fn download_ugoira_gif(
+    /// 使用 ZIP URL 作为缓存键 (后缀改为 .mp4)
+    pub async fn download_ugoira_mp4(
         &self,
         zip_url: &str,
         frames: Vec<UgoiraFrame>,
     ) -> Result<PathBuf> {
-        // Use a cache key derived from the ZIP URL but with .gif extension
-        let gif_cache_key = format!("{}.gif", zip_url);
+        // Use a cache key derived from the ZIP URL but with .mp4 extension
+        let mp4_cache_key = format!("{}.mp4", zip_url);
 
         // Check cache hit
-        if let Some(path) = self.cache.get(&gif_cache_key).await {
-            info!("Cache hit for ugoira GIF: {}", zip_url);
+        if let Some(path) = self.cache.get(&mp4_cache_key).await {
+            info!("Cache hit for ugoira MP4: {}", zip_url);
             return Ok(path);
         }
 
@@ -117,26 +115,26 @@ impl Downloader {
             .await
             .context("Failed to read ugoira ZIP bytes")?;
 
-        // Convert ZIP frames to GIF in a blocking task (CPU-intensive)
+        // Convert ZIP frames to MP4 in a blocking task (CPU-intensive)
         let zip_data = zip_bytes.to_vec();
 
-        let gif_data = tokio::task::spawn_blocking(move || encode_ugoira_gif(&zip_data, &frames))
+        let mp4_data = tokio::task::spawn_blocking(move || encode_ugoira_mp4(&zip_data, &frames))
             .await
-            .context("GIF encoding task failed")??;
+            .context("MP4 encoding task failed")??;
 
         // Save to cache
-        let path = self.cache.save(&gif_cache_key, &gif_data).await?;
-        info!("Ugoira GIF saved to: {:?}", path);
+        let path = self.cache.save(&mp4_cache_key, &mp4_data).await?;
+        info!("Ugoira MP4 saved to: {:?}", path);
         Ok(path)
     }
 }
 
-/// Extract frames from a ZIP archive and encode them as an animated GIF.
+/// Extract frames from a ZIP archive and encode them as an MP4 video using ffmpeg.
 ///
-/// Streams frames one at a time: each frame is decoded from the ZIP and
-/// immediately encoded into the GIF output, avoiding buffering all decoded
-/// frames in memory simultaneously.
-fn encode_ugoira_gif(zip_data: &[u8], frames: &[UgoiraFrame]) -> Result<Vec<u8>> {
+/// Uses H.264 High profile with quality-optimized settings (CRF 18, slow preset)
+/// and no audio track. Frames are extracted to a temporary directory and assembled
+/// via ffmpeg's concat demuxer to preserve per-frame timing.
+fn encode_ugoira_mp4(zip_data: &[u8], frames: &[UgoiraFrame]) -> Result<Vec<u8>> {
     let cursor = Cursor::new(zip_data);
     let mut archive = zip::ZipArchive::new(cursor).context("Failed to open ugoira ZIP")?;
 
@@ -144,42 +142,92 @@ fn encode_ugoira_gif(zip_data: &[u8], frames: &[UgoiraFrame]) -> Result<Vec<u8>>
         return Err(anyhow!("No frames found in ugoira ZIP"));
     }
 
-    // Stream: decode each frame and immediately encode it into the GIF
-    let mut gif_buf = Vec::new();
-    let frame_count = frames.len();
-    {
-        let mut encoder = GifEncoder::new_with_speed(&mut gif_buf, 10);
-        encoder
-            .set_repeat(Repeat::Infinite)
-            .context("Failed to set GIF repeat")?;
+    // Create a temporary directory for frame extraction
+    let tmp_dir = tempfile::tempdir().context("Failed to create temp directory")?;
+    let tmp_path = tmp_dir.path();
 
-        for frame_info in frames {
-            let mut zip_file = archive
-                .by_name(&frame_info.file)
-                .with_context(|| format!("Frame '{}' not found in ZIP", frame_info.file))?;
+    // Extract each frame from the ZIP to the temp directory
+    for frame_info in frames {
+        let mut zip_file = archive
+            .by_name(&frame_info.file)
+            .with_context(|| format!("Frame '{}' not found in ZIP", frame_info.file))?;
 
-            let mut frame_data = Vec::new();
-            std::io::Read::read_to_end(&mut zip_file, &mut frame_data)
-                .with_context(|| format!("Failed to read frame '{}'", frame_info.file))?;
-
-            let img = image::load_from_memory(&frame_data)
-                .with_context(|| format!("Failed to decode frame '{}'", frame_info.file))?;
-
-            let delay = image::Delay::from_numer_denom_ms(frame_info.delay, 1);
-            let frame = Frame::from_parts(img.into_rgba8(), 0, 0, delay);
-            encoder
-                .encode_frame(frame)
-                .context("Failed to encode GIF frame")?;
-        }
+        let frame_path = tmp_path.join(&frame_info.file);
+        let mut out_file = std::fs::File::create(&frame_path)
+            .with_context(|| format!("Failed to create temp frame '{}'", frame_info.file))?;
+        std::io::copy(&mut zip_file, &mut out_file)
+            .with_context(|| format!("Failed to write temp frame '{}'", frame_info.file))?;
     }
 
+    // Build the ffmpeg concat demuxer input file
+    let concat_path = tmp_path.join("concat.txt");
+    let mut concat_content = String::new();
+    for frame_info in frames {
+        let frame_path = tmp_path.join(&frame_info.file);
+        // Use forward slashes and escape single quotes for ffmpeg
+        let path_str = frame_path.to_string_lossy().replace('\'', "'\\''");
+        let duration_sec = frame_info.delay as f64 / 1000.0;
+        concat_content.push_str(&format!(
+            "file '{}'\nduration {:.6}\n",
+            path_str, duration_sec
+        ));
+    }
+    // Repeat last frame entry to ensure its duration is applied
+    if let Some(last) = frames.last() {
+        let frame_path = tmp_path.join(&last.file);
+        let path_str = frame_path.to_string_lossy().replace('\'', "'\\''");
+        concat_content.push_str(&format!("file '{}'\n", path_str));
+    }
+    std::fs::write(&concat_path, &concat_content).context("Failed to write concat file")?;
+
+    // Output MP4 path
+    let output_path = tmp_path.join("output.mp4");
+
+    // Run ffmpeg: H.264 High profile, quality-optimized, no audio
+    let output = std::process::Command::new("ffmpeg")
+        .args([
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            &concat_path.to_string_lossy(),
+            "-c:v",
+            "libx264",
+            "-profile:v",
+            "high",
+            "-preset",
+            "slow",
+            "-crf",
+            "18",
+            "-pix_fmt",
+            "yuv420p",
+            "-an",
+            "-movflags",
+            "+faststart",
+            "-y",
+            &output_path.to_string_lossy(),
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .context("Failed to run ffmpeg (is ffmpeg installed?)")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!("ffmpeg encoding failed: {}", stderr));
+    }
+
+    let mp4_data = std::fs::read(&output_path).context("Failed to read encoded MP4")?;
+
+    let frame_count = frames.len();
     info!(
-        "Encoded ugoira GIF: {} frames, {:.1} KB",
+        "Encoded ugoira MP4: {} frames, {:.1} KB",
         frame_count,
-        gif_buf.len() as f64 / 1024.0
+        mp4_data.len() as f64 / 1024.0
     );
 
-    Ok(gif_buf)
+    Ok(mp4_data)
 }
 
 #[cfg(test)]
@@ -214,7 +262,7 @@ mod tests {
     }
 
     #[test]
-    fn test_encode_ugoira_gif_basic() {
+    fn test_encode_ugoira_mp4_basic() {
         let frame0 = create_test_png(255, 0, 0); // Red
         let frame1 = create_test_png(0, 255, 0); // Green
         let frame2 = create_test_png(0, 0, 255); // Blue
@@ -240,15 +288,17 @@ mod tests {
             },
         ];
 
-        let gif_data = encode_ugoira_gif(&zip_data, &frames).unwrap();
+        let mp4_data = encode_ugoira_mp4(&zip_data, &frames).unwrap();
 
-        // Verify it's a valid GIF (starts with "GIF89a" magic bytes)
-        assert!(gif_data.len() > 6);
-        assert_eq!(&gif_data[0..3], b"GIF");
+        // Verify it's a valid MP4 (check for ftyp box near the start)
+        assert!(mp4_data.len() > 8);
+        // MP4 files contain "ftyp" box marker in the first 12 bytes
+        let has_ftyp = mp4_data.windows(4).take(12).any(|w| w == b"ftyp");
+        assert!(has_ftyp, "Output should be a valid MP4 file");
     }
 
     #[test]
-    fn test_encode_ugoira_gif_single_frame() {
+    fn test_encode_ugoira_mp4_single_frame() {
         let frame0 = create_test_png(128, 128, 128);
         let zip_data = create_test_zip(&[("000000.png", &frame0)]);
 
@@ -257,13 +307,14 @@ mod tests {
             delay: 50,
         }];
 
-        let gif_data = encode_ugoira_gif(&zip_data, &frames).unwrap();
-        assert!(gif_data.len() > 6);
-        assert_eq!(&gif_data[0..3], b"GIF");
+        let mp4_data = encode_ugoira_mp4(&zip_data, &frames).unwrap();
+        assert!(mp4_data.len() > 8);
+        let has_ftyp = mp4_data.windows(4).take(12).any(|w| w == b"ftyp");
+        assert!(has_ftyp, "Output should be a valid MP4 file");
     }
 
     #[test]
-    fn test_encode_ugoira_gif_missing_frame() {
+    fn test_encode_ugoira_mp4_missing_frame() {
         let frame0 = create_test_png(255, 0, 0);
         let zip_data = create_test_zip(&[("000000.png", &frame0)]);
 
@@ -278,19 +329,19 @@ mod tests {
             },
         ];
 
-        let result = encode_ugoira_gif(&zip_data, &frames);
+        let result = encode_ugoira_mp4(&zip_data, &frames);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("missing.png"));
     }
 
     #[test]
-    fn test_encode_ugoira_gif_empty_frames() {
+    fn test_encode_ugoira_mp4_empty_frames() {
         let frame0 = create_test_png(255, 0, 0);
         let zip_data = create_test_zip(&[("000000.png", &frame0)]);
 
         let frames: Vec<UgoiraFrame> = vec![];
 
-        let result = encode_ugoira_gif(&zip_data, &frames);
+        let result = encode_ugoira_mp4(&zip_data, &frames);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("No frames"));
     }

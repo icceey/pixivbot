@@ -234,7 +234,7 @@ fn map_send_result_to_push_result(
     }
 }
 
-/// Push a ugoira (animated) illust as a GIF animation
+/// Push a ugoira (animated) illust as an MP4 animation
 async fn process_ugoira_push(
     notifier: &Notifier,
     pixiv: &Arc<RwLock<PixivClient>>,
@@ -277,7 +277,7 @@ async fn process_ugoira_push(
         DownloadButtonConfig::new(illust.id)
     };
 
-    // Send ugoira as animated GIF
+    // Send ugoira as MP4 animation
     let send_result = notifier
         .notify_ugoira(
             chat_id,

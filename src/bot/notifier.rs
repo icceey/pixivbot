@@ -195,9 +195,9 @@ impl Notifier {
 
     // ==================== Ugoira (动图) 支持 ====================
 
-    /// 发送 Ugoira (动图) 作品为 GIF 动画
+    /// 发送 Ugoira (动图) 作品为 MP4 动画
     ///
-    /// 1. 下载 ZIP 并编码为 GIF
+    /// 1. 下载 ZIP 并编码为 MP4
     /// 2. 以 Telegram animation 发送
     pub async fn notify_ugoira(
         &self,
@@ -220,8 +220,8 @@ impl Notifier {
             warn!("Failed to set chat action for chat {}: {:#}", chat_id, e);
         }
 
-        // Download and convert to GIF
-        let gif_path = match self.downloader.download_ugoira_gif(zip_url, frames).await {
+        // Download and convert to MP4
+        let mp4_path = match self.downloader.download_ugoira_mp4(zip_url, frames).await {
             Ok(path) => path,
             Err(e) => {
                 error!(
@@ -234,7 +234,7 @@ impl Notifier {
 
         // Send as animation
         match self
-            .send_animation_file(chat_id, &gif_path, caption, has_spoiler, keyboard)
+            .send_animation_file(chat_id, &mp4_path, caption, has_spoiler, keyboard)
             .await
         {
             Ok(msg_id) => BatchSendResult {
@@ -526,7 +526,7 @@ impl Notifier {
         Ok(message.id.0)
     }
 
-    /// 发送动画 (GIF) 文件并返回消息ID
+    /// 发送动画 (MP4/GIF) 文件并返回消息ID
     async fn send_animation_file(
         &self,
         chat_id: ChatId,

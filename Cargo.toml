@@ -18,7 +18,6 @@ license.workspace = true
 anyhow = "1.0.102"
 chrono = { version = "0.4.44", features = ["serde"] }
 config = { version = "0.15.19", features = ["toml"], default-features = false }
-image = { version = "0.25.10", default-features = false, features = ["jpeg", "gif", "png"] }
 md5 = "0.8.0"
 migration = { path = "migration" }
 pixiv_client = { path = "pixiv_client" }
@@ -30,6 +29,7 @@ sea-orm-migration = { version = "1.1.19", features = ["runtime-tokio-rustls", "s
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 teloxide = { version = "0.17.0", features = ["macros", "ctrlc_handler", "rustls", "throttle"], default-features = false}
+tempfile = "3.27.0"
 tokio = { version = "1.49.0", features = ["macros", "rt", "time"] }
 tokio-cron-scheduler = "0.15.1"
 tracing = "0.1.44"
@@ -37,4 +37,7 @@ tracing-appender = "0.2.4"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter", "chrono"] }
 url = "2.5.8"
 zip = "7.2.0"
+
+[dev-dependencies]
+image = { version = "0.25.10", default-features = false, features = ["png"] }
 

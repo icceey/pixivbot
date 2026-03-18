@@ -241,7 +241,7 @@ impl BotHandler {
             .await
             .context("Failed to fetch illust details")?;
 
-        // For ugoira works, download as GIF instead of static images
+        // For ugoira works, download as MP4 instead of static images
         if illust.is_ugoira() {
             let metadata = pixiv
                 .get_ugoira_metadata(illust_id)
@@ -253,15 +253,15 @@ impl BotHandler {
             let artist = illust.user.name.clone();
             let downloader = self.notifier.get_downloader();
 
-            let gif_path = downloader
-                .download_ugoira_gif(&metadata.zip_urls.medium, metadata.frames)
+            let mp4_path = downloader
+                .download_ugoira_mp4(&metadata.zip_urls.medium, metadata.frames)
                 .await
-                .context("Failed to download ugoira GIF")?;
+                .context("Failed to download ugoira MP4")?;
 
             let sanitized_title = sanitize_filename(&title);
-            let filename = format!("{}_{}.gif", sanitized_title, illust_id);
+            let filename = format!("{}_{}.mp4", sanitized_title, illust_id);
 
-            return Ok((vec![(gif_path, filename)], title, artist));
+            return Ok((vec![(mp4_path, filename)], title, artist));
         }
 
         drop(pixiv);
