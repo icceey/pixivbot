@@ -147,12 +147,11 @@ fn read_zip_entry(archive: &mut zip::ZipArchive<Cursor<&[u8]>>, name: &str) -> R
 /// and no audio track. Frames are decoded from PNG in memory, scaled to YUV420P,
 /// and encoded with per-frame timing from ugoira metadata.
 fn encode_ugoira_mp4(zip_data: &[u8], frames: &[UgoiraFrame]) -> Result<Vec<u8>> {
-    extern crate ffmpeg_next as ffmpeg;
-    use ffmpeg::format::Pixel;
-    use ffmpeg::software::scaling;
-    use ffmpeg::{codec, encoder, format, frame, Dictionary, Packet, Rational};
+    use ffmpeg_next::format::Pixel;
+    use ffmpeg_next::software::scaling;
+    use ffmpeg_next::{codec, encoder, format, frame, Dictionary, Packet, Rational};
 
-    ffmpeg::init().map_err(|e| anyhow!("Failed to initialize ffmpeg: {}", e))?;
+    ffmpeg_next::init().map_err(|e| anyhow!("Failed to initialize ffmpeg: {}", e))?;
 
     let cursor = Cursor::new(zip_data);
     let mut archive = zip::ZipArchive::new(cursor).context("Failed to open ugoira ZIP")?;
@@ -230,31 +229,39 @@ fn encode_ugoira_mp4(zip_data: &[u8], frames: &[UgoiraFrame]) -> Result<Vec<u8>>
     let ost_time_base = octx.stream(0).unwrap().time_base();
     let encoder_time_base = Rational(1, 1000);
 
+    // Pre-allocate reusable buffers for encoding loop
+    let mut packet = Packet::empty();
+    let mut rgba_frame = frame::Video::new(Pixel::RGBA, width, height);
+    let mut yuv_frame = frame::Video::empty();
+    let stride = rgba_frame.stride(0);
+    let src_row_bytes = width as usize * 4;
+
     // Helper: receive encoded packets and write to output
-    let receive_packets =
-        |encoder: &mut encoder::Video, octx: &mut format::context::Output| -> Result<()> {
-            let mut packet = Packet::empty();
-            while encoder.receive_packet(&mut packet).is_ok() {
-                packet.set_stream(0);
-                packet.rescale_ts(encoder_time_base, ost_time_base);
-                packet
-                    .write_interleaved(octx)
-                    .map_err(|e| anyhow!("Failed to write packet: {}", e))?;
-            }
-            Ok(())
-        };
+    let receive_packets = |encoder: &mut encoder::Video,
+                           packet: &mut Packet,
+                           octx: &mut format::context::Output|
+     -> Result<()> {
+        while encoder.receive_packet(packet).is_ok() {
+            packet.set_stream(0);
+            packet.rescale_ts(encoder_time_base, ost_time_base);
+            packet
+                .write_interleaved(octx)
+                .map_err(|e| anyhow!("Failed to write packet: {}", e))?;
+        }
+        Ok(())
+    };
 
     // Helper: encode a single RGBA image as a video frame at the given PTS
     let encode_rgba_frame = |img: &image::RgbaImage,
                              pts_ms: i64,
+                             rgba_frame: &mut frame::Video,
+                             yuv_frame: &mut frame::Video,
                              scaler: &mut scaling::Context,
                              encoder: &mut encoder::Video,
+                             packet: &mut Packet,
                              octx: &mut format::context::Output|
      -> Result<()> {
-        // Create RGBA video frame and copy pixel data (respecting stride)
-        let mut rgba_frame = frame::Video::new(Pixel::RGBA, width, height);
-        let stride = rgba_frame.stride(0);
-        let src_row_bytes = width as usize * 4;
+        // Copy RGBA pixel data into reusable frame (respecting stride)
         let src_data = img.as_raw();
         let dst_data = rgba_frame.data_mut(0);
         for y in 0..height as usize {
@@ -265,22 +272,30 @@ fn encode_ugoira_mp4(zip_data: &[u8], frames: &[UgoiraFrame]) -> Result<Vec<u8>>
         }
 
         // Scale RGBA → YUV420P
-        let mut yuv_frame = frame::Video::empty();
         scaler
-            .run(&rgba_frame, &mut yuv_frame)
+            .run(rgba_frame, yuv_frame)
             .map_err(|e| anyhow!("Failed to scale frame: {}", e))?;
         yuv_frame.set_pts(Some(pts_ms));
 
         // Encode
         encoder
-            .send_frame(&yuv_frame)
+            .send_frame(yuv_frame)
             .map_err(|e| anyhow!("Failed to send frame to encoder: {}", e))?;
-        receive_packets(encoder, octx)
+        receive_packets(encoder, packet, octx)
     };
 
     // Encode first frame (already decoded)
     let mut pts_ms: i64 = 0;
-    encode_rgba_frame(&first_img, pts_ms, &mut scaler, &mut encoder, &mut octx)?;
+    encode_rgba_frame(
+        &first_img,
+        pts_ms,
+        &mut rgba_frame,
+        &mut yuv_frame,
+        &mut scaler,
+        &mut encoder,
+        &mut packet,
+        &mut octx,
+    )?;
     pts_ms += frames[0].delay as i64;
 
     // Encode remaining frames
@@ -289,7 +304,16 @@ fn encode_ugoira_mp4(zip_data: &[u8], frames: &[UgoiraFrame]) -> Result<Vec<u8>>
         let img = image::load_from_memory(&frame_bytes)
             .with_context(|| format!("Failed to decode frame '{}'", frame_info.file))?
             .to_rgba8();
-        encode_rgba_frame(&img, pts_ms, &mut scaler, &mut encoder, &mut octx)?;
+        encode_rgba_frame(
+            &img,
+            pts_ms,
+            &mut rgba_frame,
+            &mut yuv_frame,
+            &mut scaler,
+            &mut encoder,
+            &mut packet,
+            &mut octx,
+        )?;
         pts_ms += frame_info.delay as i64;
     }
 
@@ -297,7 +321,7 @@ fn encode_ugoira_mp4(zip_data: &[u8], frames: &[UgoiraFrame]) -> Result<Vec<u8>>
     encoder
         .send_eof()
         .map_err(|e| anyhow!("Failed to flush encoder: {}", e))?;
-    receive_packets(&mut encoder, &mut octx)?;
+    receive_packets(&mut encoder, &mut packet, &mut octx)?;
 
     // Write MP4 trailer
     octx.write_trailer()
