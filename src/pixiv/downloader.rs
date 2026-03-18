@@ -164,8 +164,11 @@ fn encode_ugoira_mp4(zip_data: &[u8], frames: &[UgoiraFrame]) -> Result<Vec<u8>>
     let mut concat_content = String::new();
     for frame_info in frames {
         let frame_path = tmp_path.join(&frame_info.file);
-        // Use forward slashes and escape single quotes for ffmpeg
-        let path_str = frame_path.to_string_lossy().replace('\'', "'\\''");
+        // Escape for ffmpeg concat demuxer: \ → \\, ' → \'
+        let path_str = frame_path
+            .to_string_lossy()
+            .replace('\\', "\\\\")
+            .replace('\'', "\\'");
         let duration_sec = frame_info.delay as f64 / 1000.0;
         concat_content.push_str(&format!(
             "file '{}'\nduration {:.6}\n",
@@ -175,7 +178,10 @@ fn encode_ugoira_mp4(zip_data: &[u8], frames: &[UgoiraFrame]) -> Result<Vec<u8>>
     // Repeat last frame entry to ensure its duration is applied
     if let Some(last) = frames.last() {
         let frame_path = tmp_path.join(&last.file);
-        let path_str = frame_path.to_string_lossy().replace('\'', "'\\''");
+        let path_str = frame_path
+            .to_string_lossy()
+            .replace('\\', "\\\\")
+            .replace('\'', "\\'");
         concat_content.push_str(&format!("file '{}'\n", path_str));
     }
     std::fs::write(&concat_path, &concat_content).context("Failed to write concat file")?;
@@ -211,11 +217,15 @@ fn encode_ugoira_mp4(zip_data: &[u8], frames: &[UgoiraFrame]) -> Result<Vec<u8>>
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .output()
-        .context("Failed to run ffmpeg (is ffmpeg installed?)")?;
+        .context("Failed to execute ffmpeg command")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(anyhow!("ffmpeg encoding failed: {}", stderr));
+        warn!("ffmpeg stderr: {}", stderr);
+        return Err(anyhow!(
+            "ffmpeg encoding failed (exit code: {:?})",
+            output.status.code()
+        ));
     }
 
     let mp4_data = std::fs::read(&output_path).context("Failed to read encoded MP4")?;
@@ -290,11 +300,13 @@ mod tests {
 
         let mp4_data = encode_ugoira_mp4(&zip_data, &frames).unwrap();
 
-        // Verify it's a valid MP4 (check for ftyp box near the start)
+        // Verify it's a valid MP4: ftyp box type at offset 4 (after 4-byte size field)
         assert!(mp4_data.len() > 8);
-        // MP4 files contain "ftyp" box marker in the first 12 bytes
-        let has_ftyp = mp4_data.windows(4).take(12).any(|w| w == b"ftyp");
-        assert!(has_ftyp, "Output should be a valid MP4 file");
+        assert_eq!(
+            &mp4_data[4..8],
+            b"ftyp",
+            "Output should be a valid MP4 file"
+        );
     }
 
     #[test]
@@ -309,8 +321,11 @@ mod tests {
 
         let mp4_data = encode_ugoira_mp4(&zip_data, &frames).unwrap();
         assert!(mp4_data.len() > 8);
-        let has_ftyp = mp4_data.windows(4).take(12).any(|w| w == b"ftyp");
-        assert!(has_ftyp, "Output should be a valid MP4 file");
+        assert_eq!(
+            &mp4_data[4..8],
+            b"ftyp",
+            "Output should be a valid MP4 file"
+        );
     }
 
     #[test]
