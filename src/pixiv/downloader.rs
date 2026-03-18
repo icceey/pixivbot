@@ -271,8 +271,23 @@ mod tests {
         buf
     }
 
+    /// Check if ffmpeg is available on the system
+    fn ffmpeg_available() -> bool {
+        std::process::Command::new("ffmpeg")
+            .arg("-version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok()
+    }
+
     #[test]
     fn test_encode_ugoira_mp4_basic() {
+        if !ffmpeg_available() {
+            eprintln!("Skipping test: ffmpeg not found");
+            return;
+        }
+
         let frame0 = create_test_png(255, 0, 0); // Red
         let frame1 = create_test_png(0, 255, 0); // Green
         let frame2 = create_test_png(0, 0, 255); // Blue
@@ -311,6 +326,11 @@ mod tests {
 
     #[test]
     fn test_encode_ugoira_mp4_single_frame() {
+        if !ffmpeg_available() {
+            eprintln!("Skipping test: ffmpeg not found");
+            return;
+        }
+
         let frame0 = create_test_png(128, 128, 128);
         let zip_data = create_test_zip(&[("000000.png", &frame0)]);
 
