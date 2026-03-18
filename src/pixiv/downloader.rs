@@ -271,20 +271,23 @@ mod tests {
         buf
     }
 
-    /// Check if ffmpeg is available on the system
+    /// Check if ffmpeg is available on the system (cached)
     fn ffmpeg_available() -> bool {
-        std::process::Command::new("ffmpeg")
-            .arg("-version")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok()
+        use std::sync::LazyLock;
+        static FFMPEG_AVAILABLE: LazyLock<bool> = LazyLock::new(|| {
+            std::process::Command::new("ffmpeg")
+                .arg("-version")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok()
+        });
+        *FFMPEG_AVAILABLE
     }
 
     #[test]
     fn test_encode_ugoira_mp4_basic() {
         if !ffmpeg_available() {
-            eprintln!("Skipping test: ffmpeg not found");
             return;
         }
 
@@ -327,7 +330,6 @@ mod tests {
     #[test]
     fn test_encode_ugoira_mp4_single_frame() {
         if !ffmpeg_available() {
-            eprintln!("Skipping test: ffmpeg not found");
             return;
         }
 
