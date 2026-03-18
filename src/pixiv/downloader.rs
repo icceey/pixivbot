@@ -84,14 +84,19 @@ impl Downloader {
     /// 2. 从 ZIP 中解码各帧 PNG 图片
     /// 3. 使用 ffmpeg-next 库编码为无音频轨道的 MP4 (H.264 High profile, 画质优化)
     ///
-    /// 使用 ZIP URL 作为缓存键 (后缀改为 .mp4)
+    /// 使用 ZIP URL 的 MD5 哈希 + 时间戳作为缓存键
     pub async fn download_ugoira_mp4(
         &self,
         zip_url: &str,
         frames: Vec<UgoiraFrame>,
     ) -> Result<PathBuf> {
-        // Use a cache key derived from the ZIP URL but with .mp4 extension
-        let mp4_cache_key = format!("{}.mp4", zip_url);
+        // Use a hashed cache key derived from the ZIP URL with a timestamp
+        let url_hash = format!("{:x}", md5::compute(zip_url));
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let mp4_cache_key = format!("ugoira_{}_{}.mp4", url_hash, ts);
 
         // Check cache hit
         if let Some(path) = self.cache.get(&mp4_cache_key).await {
@@ -143,7 +148,7 @@ fn read_zip_entry(archive: &mut zip::ZipArchive<Cursor<&[u8]>>, name: &str) -> R
 
 /// Extract frames from a ZIP archive and encode them as an MP4 video using ffmpeg-next.
 ///
-/// Uses H.264 High profile with quality-optimized settings (CRF 18, slow preset)
+/// Uses H.264 High profile with quality-optimized settings (CRF 18, fast preset)
 /// and no audio track. Frames are decoded from PNG in memory, scaled to YUV420P,
 /// and encoded with per-frame timing from ugoira metadata.
 fn encode_ugoira_mp4(zip_data: &[u8], frames: &[UgoiraFrame]) -> Result<Vec<u8>> {
@@ -200,9 +205,9 @@ fn encode_ugoira_mp4(zip_data: &[u8], frames: &[UgoiraFrame]) -> Result<Vec<u8>>
         encoder_ctx.set_flags(codec::Flags::GLOBAL_HEADER);
     }
 
-    // H.264 quality options: High profile, CRF 18, slow preset
+    // H.264 quality options: High profile, CRF 18, fast preset
     let mut x264_opts = Dictionary::new();
-    x264_opts.set("preset", "slow");
+    x264_opts.set("preset", "fast");
     x264_opts.set("crf", "18");
     x264_opts.set("profile", "high");
 
