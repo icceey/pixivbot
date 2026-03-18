@@ -18,6 +18,8 @@ license.workspace = true
 anyhow = "1.0.102"
 chrono = { version = "0.4.44", features = ["serde"] }
 config = { version = "0.15.19", features = ["toml"], default-features = false }
+ffmpeg-next = { version = "8.1.0", default-features = false, features = ["codec", "format", "software-scaling"] }
+image = { version = "0.25.10", default-features = false, features = ["png"] }
 md5 = "0.8.0"
 migration = { path = "migration" }
 pixiv_client = { path = "pixiv_client" }
@@ -38,6 +40,5 @@ tracing-subscriber = { version = "0.3.22", features = ["env-filter", "chrono"] }
 url = "2.5.8"
 zip = "7.2.0"
 
-[dev-dependencies]
-image = { version = "0.25.10", default-features = false, features = ["png"] }
+
 

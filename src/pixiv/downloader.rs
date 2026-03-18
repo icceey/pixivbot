@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use pixiv_client::UgoiraFrame;
 use reqwest::Client;
-use std::io::Cursor;
+use std::io::{Cursor, Read};
 use std::path::PathBuf;
 use tracing::{info, warn};
 
@@ -81,8 +81,8 @@ impl Downloader {
     /// 下载 Ugoira (动图) 并转换为 MP4 文件
     ///
     /// 1. 下载 ZIP 文件 (包含各帧图片)
-    /// 2. 从 ZIP 中提取帧到临时目录
-    /// 3. 使用 ffmpeg 编码为无音频轨道的 MP4 (H.264 High profile, 画质优化)
+    /// 2. 从 ZIP 中解码各帧 PNG 图片
+    /// 3. 使用 ffmpeg-next 库编码为无音频轨道的 MP4 (H.264 High profile, 画质优化)
     ///
     /// 使用 ZIP URL 作为缓存键 (后缀改为 .mp4)
     pub async fn download_ugoira_mp4(
@@ -129,12 +129,31 @@ impl Downloader {
     }
 }
 
-/// Extract frames from a ZIP archive and encode them as an MP4 video using ffmpeg.
+/// Read a named entry from a ZIP archive into a byte vector.
+fn read_zip_entry(archive: &mut zip::ZipArchive<Cursor<&[u8]>>, name: &str) -> Result<Vec<u8>> {
+    let mut entry = archive
+        .by_name(name)
+        .with_context(|| format!("Frame '{}' not found in ZIP", name))?;
+    let mut buf = Vec::with_capacity(entry.size() as usize);
+    entry
+        .read_to_end(&mut buf)
+        .with_context(|| format!("Failed to read frame '{}' from ZIP", name))?;
+    Ok(buf)
+}
+
+/// Extract frames from a ZIP archive and encode them as an MP4 video using ffmpeg-next.
 ///
 /// Uses H.264 High profile with quality-optimized settings (CRF 18, slow preset)
-/// and no audio track. Frames are extracted to a temporary directory and assembled
-/// via ffmpeg's concat demuxer to preserve per-frame timing.
+/// and no audio track. Frames are decoded from PNG in memory, scaled to YUV420P,
+/// and encoded with per-frame timing from ugoira metadata.
 fn encode_ugoira_mp4(zip_data: &[u8], frames: &[UgoiraFrame]) -> Result<Vec<u8>> {
+    extern crate ffmpeg_next as ffmpeg;
+    use ffmpeg::format::Pixel;
+    use ffmpeg::software::scaling;
+    use ffmpeg::{codec, encoder, format, frame, Dictionary, Packet, Rational};
+
+    ffmpeg::init().map_err(|e| anyhow!("Failed to initialize ffmpeg: {}", e))?;
+
     let cursor = Cursor::new(zip_data);
     let mut archive = zip::ZipArchive::new(cursor).context("Failed to open ugoira ZIP")?;
 
@@ -142,98 +161,154 @@ fn encode_ugoira_mp4(zip_data: &[u8], frames: &[UgoiraFrame]) -> Result<Vec<u8>>
         return Err(anyhow!("No frames found in ugoira ZIP"));
     }
 
-    // Create a temporary directory for frame extraction
+    // Decode first frame to determine dimensions
+    let first_bytes = read_zip_entry(&mut archive, &frames[0].file)?;
+    let first_img = image::load_from_memory(&first_bytes)
+        .context("Failed to decode first frame")?
+        .to_rgba8();
+    let width = first_img.width();
+    let height = first_img.height();
+
+    // Create temp file for output MP4 (ffmpeg format::output requires a path)
     let tmp_dir = tempfile::tempdir().context("Failed to create temp directory")?;
-    let tmp_path = tmp_dir.path();
+    let output_path = tmp_dir.path().join("output.mp4");
 
-    // Extract each frame from the ZIP to the temp directory
-    for frame_info in frames {
-        let mut zip_file = archive
-            .by_name(&frame_info.file)
-            .with_context(|| format!("Frame '{}' not found in ZIP", frame_info.file))?;
+    // Create output context for MP4
+    let mut octx = format::output(&output_path)
+        .map_err(|e| anyhow!("Failed to create output context: {}", e))?;
 
-        let frame_path = tmp_path.join(&frame_info.file);
-        let mut out_file = std::fs::File::create(&frame_path)
-            .with_context(|| format!("Failed to create temp frame '{}'", frame_info.file))?;
-        std::io::copy(&mut zip_file, &mut out_file)
-            .with_context(|| format!("Failed to write temp frame '{}'", frame_info.file))?;
+    // Find H.264 codec and add video stream
+    let codec = encoder::find(codec::Id::H264).ok_or_else(|| anyhow!("H.264 encoder not found"))?;
+
+    let global_header = octx.format().flags().contains(format::Flags::GLOBAL_HEADER);
+
+    let mut ost = octx
+        .add_stream(codec)
+        .map_err(|e| anyhow!("Failed to add output stream: {}", e))?;
+
+    // Create and configure encoder
+    let mut encoder_ctx = codec::context::Context::new_with_codec(codec)
+        .encoder()
+        .video()
+        .map_err(|e| anyhow!("Failed to create encoder context: {}", e))?;
+
+    encoder_ctx.set_width(width);
+    encoder_ctx.set_height(height);
+    encoder_ctx.set_format(Pixel::YUV420P);
+    encoder_ctx.set_time_base(Rational(1, 1000)); // millisecond timebase
+
+    if global_header {
+        encoder_ctx.set_flags(codec::Flags::GLOBAL_HEADER);
     }
 
-    // Build the ffmpeg concat demuxer input file
-    let concat_path = tmp_path.join("concat.txt");
-    let mut concat_content = String::new();
-    for frame_info in frames {
-        let frame_path = tmp_path.join(&frame_info.file);
-        // Escape for ffmpeg concat demuxer: \ → \\, ' → \'
-        let path_str = frame_path
-            .to_string_lossy()
-            .replace('\\', "\\\\")
-            .replace('\'', "\\'");
-        let duration_sec = frame_info.delay as f64 / 1000.0;
-        concat_content.push_str(&format!(
-            "file '{}'\nduration {:.6}\n",
-            path_str, duration_sec
-        ));
+    // H.264 quality options: High profile, CRF 18, slow preset
+    let mut x264_opts = Dictionary::new();
+    x264_opts.set("preset", "slow");
+    x264_opts.set("crf", "18");
+    x264_opts.set("profile", "high");
+
+    let mut encoder = encoder_ctx
+        .open_with(x264_opts)
+        .map_err(|e| anyhow!("Failed to open H.264 encoder: {}", e))?;
+    ost.set_parameters(&encoder);
+
+    // Create RGBA → YUV420P pixel format scaler
+    let mut scaler = scaling::Context::get(
+        Pixel::RGBA,
+        width,
+        height,
+        Pixel::YUV420P,
+        width,
+        height,
+        scaling::Flags::BILINEAR,
+    )
+    .map_err(|e| anyhow!("Failed to create pixel format scaler: {}", e))?;
+
+    // Write MP4 container header
+    octx.write_header()
+        .map_err(|e| anyhow!("Failed to write MP4 header: {}", e))?;
+    let ost_time_base = octx.stream(0).unwrap().time_base();
+    let encoder_time_base = Rational(1, 1000);
+
+    // Helper: receive encoded packets and write to output
+    let receive_packets =
+        |encoder: &mut encoder::Video, octx: &mut format::context::Output| -> Result<()> {
+            let mut packet = Packet::empty();
+            while encoder.receive_packet(&mut packet).is_ok() {
+                packet.set_stream(0);
+                packet.rescale_ts(encoder_time_base, ost_time_base);
+                packet
+                    .write_interleaved(octx)
+                    .map_err(|e| anyhow!("Failed to write packet: {}", e))?;
+            }
+            Ok(())
+        };
+
+    // Helper: encode a single RGBA image as a video frame at the given PTS
+    let encode_rgba_frame = |img: &image::RgbaImage,
+                             pts_ms: i64,
+                             scaler: &mut scaling::Context,
+                             encoder: &mut encoder::Video,
+                             octx: &mut format::context::Output|
+     -> Result<()> {
+        // Create RGBA video frame and copy pixel data (respecting stride)
+        let mut rgba_frame = frame::Video::new(Pixel::RGBA, width, height);
+        let stride = rgba_frame.stride(0);
+        let src_row_bytes = width as usize * 4;
+        let src_data = img.as_raw();
+        let dst_data = rgba_frame.data_mut(0);
+        for y in 0..height as usize {
+            let dst_offset = y * stride;
+            let src_offset = y * src_row_bytes;
+            dst_data[dst_offset..dst_offset + src_row_bytes]
+                .copy_from_slice(&src_data[src_offset..src_offset + src_row_bytes]);
+        }
+
+        // Scale RGBA → YUV420P
+        let mut yuv_frame = frame::Video::empty();
+        scaler
+            .run(&rgba_frame, &mut yuv_frame)
+            .map_err(|e| anyhow!("Failed to scale frame: {}", e))?;
+        yuv_frame.set_pts(Some(pts_ms));
+
+        // Encode
+        encoder
+            .send_frame(&yuv_frame)
+            .map_err(|e| anyhow!("Failed to send frame to encoder: {}", e))?;
+        receive_packets(encoder, octx)
+    };
+
+    // Encode first frame (already decoded)
+    let mut pts_ms: i64 = 0;
+    encode_rgba_frame(&first_img, pts_ms, &mut scaler, &mut encoder, &mut octx)?;
+    pts_ms += frames[0].delay as i64;
+
+    // Encode remaining frames
+    for frame_info in &frames[1..] {
+        let frame_bytes = read_zip_entry(&mut archive, &frame_info.file)?;
+        let img = image::load_from_memory(&frame_bytes)
+            .with_context(|| format!("Failed to decode frame '{}'", frame_info.file))?
+            .to_rgba8();
+        encode_rgba_frame(&img, pts_ms, &mut scaler, &mut encoder, &mut octx)?;
+        pts_ms += frame_info.delay as i64;
     }
-    // Repeat last frame entry to ensure its duration is applied
-    if let Some(last) = frames.last() {
-        let frame_path = tmp_path.join(&last.file);
-        let path_str = frame_path
-            .to_string_lossy()
-            .replace('\\', "\\\\")
-            .replace('\'', "\\'");
-        concat_content.push_str(&format!("file '{}'\n", path_str));
-    }
-    std::fs::write(&concat_path, &concat_content).context("Failed to write concat file")?;
 
-    // Output MP4 path
-    let output_path = tmp_path.join("output.mp4");
+    // Flush encoder
+    encoder
+        .send_eof()
+        .map_err(|e| anyhow!("Failed to flush encoder: {}", e))?;
+    receive_packets(&mut encoder, &mut octx)?;
 
-    // Run ffmpeg: H.264 High profile, quality-optimized, no audio
-    let output = std::process::Command::new("ffmpeg")
-        .args([
-            "-f",
-            "concat",
-            "-safe",
-            "0",
-            "-i",
-            &concat_path.to_string_lossy(),
-            "-c:v",
-            "libx264",
-            "-profile:v",
-            "high",
-            "-preset",
-            "slow",
-            "-crf",
-            "18",
-            "-pix_fmt",
-            "yuv420p",
-            "-an",
-            "-movflags",
-            "+faststart",
-            "-y",
-            &output_path.to_string_lossy(),
-        ])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .context("Failed to execute ffmpeg command")?;
+    // Write MP4 trailer
+    octx.write_trailer()
+        .map_err(|e| anyhow!("Failed to write MP4 trailer: {}", e))?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        warn!("ffmpeg stderr: {}", stderr);
-        return Err(anyhow!(
-            "ffmpeg encoding failed (exit code: {:?})",
-            output.status.code()
-        ));
-    }
-
+    // Read the output MP4
     let mp4_data = std::fs::read(&output_path).context("Failed to read encoded MP4")?;
 
-    let frame_count = frames.len();
     info!(
         "Encoded ugoira MP4: {} frames, {:.1} KB",
-        frame_count,
+        frames.len(),
         mp4_data.len() as f64 / 1024.0
     );
 
@@ -271,26 +346,8 @@ mod tests {
         buf
     }
 
-    /// Check if ffmpeg is available on the system (cached)
-    fn ffmpeg_available() -> bool {
-        use std::sync::LazyLock;
-        static FFMPEG_AVAILABLE: LazyLock<bool> = LazyLock::new(|| {
-            std::process::Command::new("ffmpeg")
-                .arg("-version")
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .is_ok()
-        });
-        *FFMPEG_AVAILABLE
-    }
-
     #[test]
     fn test_encode_ugoira_mp4_basic() {
-        if !ffmpeg_available() {
-            return;
-        }
-
         let frame0 = create_test_png(255, 0, 0); // Red
         let frame1 = create_test_png(0, 255, 0); // Green
         let frame2 = create_test_png(0, 0, 255); // Blue
@@ -329,10 +386,6 @@ mod tests {
 
     #[test]
     fn test_encode_ugoira_mp4_single_frame() {
-        if !ffmpeg_available() {
-            return;
-        }
-
         let frame0 = create_test_png(128, 128, 128);
         let zip_data = create_test_zip(&[("000000.png", &frame0)]);
 
