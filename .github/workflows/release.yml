@@ -89,6 +89,23 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - name: Install FFmpeg development libraries (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libavcodec-dev libavformat-dev libavutil-dev libswscale-dev libswresample-dev pkg-config
+
+      - name: Install FFmpeg development libraries (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ffmpeg pkg-config
+
+      - name: Install FFmpeg development libraries (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          vcpkg install ffmpeg:x64-windows
+          echo "VCPKG_ROOT=$VCPKG_INSTALLATION_ROOT" >> $GITHUB_ENV
+
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
         with:

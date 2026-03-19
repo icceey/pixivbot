@@ -19,7 +19,7 @@ anyhow = "1.0.102"
 chrono = { version = "0.4.44", features = ["serde"] }
 config = { version = "0.15.19", features = ["toml"], default-features = false }
 ffmpeg-next = { version = "8.1.0", default-features = false, features = ["codec", "format", "software-scaling"] }
-image = { version = "0.25.10", default-features = false, features = ["png"] }
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
 md5 = "0.8.0"
 migration = { path = "migration" }
 pixiv_client = { path = "pixiv_client" }
