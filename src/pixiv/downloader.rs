@@ -3,7 +3,7 @@ use pixiv_client::UgoiraFrame;
 use reqwest::Client;
 use std::io::{Cursor, Read};
 use std::path::PathBuf;
-use std::sync::Once;
+use std::sync::OnceLock;
 use tracing::{info, warn};
 
 use crate::cache::FileCacheManager;
@@ -144,7 +144,7 @@ fn read_zip_entry(archive: &mut zip::ZipArchive<Cursor<&[u8]>>, name: &str) -> R
 }
 
 /// Global FFmpeg initialization guard (runs only once per process).
-static FFMPEG_INIT: Once = Once::new();
+static FFMPEG_INIT: OnceLock<Result<(), ffmpeg_next::Error>> = OnceLock::new();
 
 /// Extract frames from a ZIP archive and encode them as an MP4 video using ffmpeg-next.
 ///
@@ -158,13 +158,8 @@ fn encode_ugoira_mp4(zip_data: &[u8], frames: &[UgoiraFrame]) -> Result<Vec<u8>>
     use ffmpeg_next::{codec, encoder, format, frame, Dictionary, Packet, Rational};
 
     // Initialize FFmpeg library only once per process
-    let mut init_err: Option<ffmpeg_next::Error> = None;
-    FFMPEG_INIT.call_once(|| {
-        if let Err(e) = ffmpeg_next::init() {
-            init_err = Some(e);
-        }
-    });
-    if let Some(e) = init_err {
+    let init_result = FFMPEG_INIT.get_or_init(ffmpeg_next::init);
+    if let Err(e) = init_result {
         return Err(anyhow!("Failed to initialize ffmpeg: {}", e));
     }
 
@@ -358,6 +353,9 @@ fn encode_ugoira_mp4(zip_data: &[u8], frames: &[UgoiraFrame]) -> Result<Vec<u8>>
     // Write MP4 trailer
     octx.write_trailer()
         .map_err(|e| anyhow!("Failed to write MP4 trailer: {}", e))?;
+
+    // Ensure output context is dropped so the file is fully flushed/unlocked
+    drop(octx);
 
     // Read the output MP4
     let mp4_data = std::fs::read(&output_path).context("Failed to read encoded MP4")?;
