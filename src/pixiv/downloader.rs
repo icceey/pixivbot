@@ -3,6 +3,7 @@ use pixiv_client::UgoiraFrame;
 use reqwest::Client;
 use std::io::{Cursor, Read};
 use std::path::PathBuf;
+use std::sync::Once;
 use tracing::{info, warn};
 
 use crate::cache::FileCacheManager;
@@ -84,19 +85,15 @@ impl Downloader {
     /// 2. 从 ZIP 中解码各帧 PNG 图片
     /// 3. 使用 ffmpeg-next 库编码为无音频轨道的 MP4 (H.264 High profile, 画质优化)
     ///
-    /// 使用 ZIP URL 的 MD5 哈希 + 时间戳作为缓存键
+    /// 使用 ZIP URL 的 MD5 哈希作为缓存键
     pub async fn download_ugoira_mp4(
         &self,
         zip_url: &str,
         frames: Vec<UgoiraFrame>,
     ) -> Result<PathBuf> {
-        // Use a hashed cache key derived from the ZIP URL with a timestamp
+        // Use a deterministic cache key derived from the ZIP URL (without timestamp)
         let url_hash = format!("{:x}", md5::compute(zip_url));
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let mp4_cache_key = format!("ugoira_{}_{}.mp4", url_hash, ts);
+        let mp4_cache_key = format!("ugoira_{}.mp4", url_hash);
 
         // Check cache hit
         if let Some(path) = self.cache.get(&mp4_cache_key).await {
@@ -146,6 +143,9 @@ fn read_zip_entry(archive: &mut zip::ZipArchive<Cursor<&[u8]>>, name: &str) -> R
     Ok(buf)
 }
 
+/// Global FFmpeg initialization guard (runs only once per process).
+static FFMPEG_INIT: Once = Once::new();
+
 /// Extract frames from a ZIP archive and encode them as an MP4 video using ffmpeg-next.
 ///
 /// Uses H.264 High profile with quality-optimized settings (CRF 18, fast preset)
@@ -154,9 +154,19 @@ fn read_zip_entry(archive: &mut zip::ZipArchive<Cursor<&[u8]>>, name: &str) -> R
 fn encode_ugoira_mp4(zip_data: &[u8], frames: &[UgoiraFrame]) -> Result<Vec<u8>> {
     use ffmpeg_next::format::Pixel;
     use ffmpeg_next::software::scaling;
+    use ffmpeg_next::util::error::{Error as FfmpegError, EAGAIN};
     use ffmpeg_next::{codec, encoder, format, frame, Dictionary, Packet, Rational};
 
-    ffmpeg_next::init().map_err(|e| anyhow!("Failed to initialize ffmpeg: {}", e))?;
+    // Initialize FFmpeg library only once per process
+    let mut init_err: Option<ffmpeg_next::Error> = None;
+    FFMPEG_INIT.call_once(|| {
+        if let Err(e) = ffmpeg_next::init() {
+            init_err = Some(e);
+        }
+    });
+    if let Some(e) = init_err {
+        return Err(anyhow!("Failed to initialize ffmpeg: {}", e));
+    }
 
     let cursor = Cursor::new(zip_data);
     let mut archive = zip::ZipArchive::new(cursor).context("Failed to open ugoira ZIP")?;
@@ -246,12 +256,19 @@ fn encode_ugoira_mp4(zip_data: &[u8], frames: &[UgoiraFrame]) -> Result<Vec<u8>>
                            packet: &mut Packet,
                            octx: &mut format::context::Output|
      -> Result<()> {
-        while encoder.receive_packet(packet).is_ok() {
-            packet.set_stream(0);
-            packet.rescale_ts(encoder_time_base, ost_time_base);
-            packet
-                .write_interleaved(octx)
-                .map_err(|e| anyhow!("Failed to write packet: {}", e))?;
+        loop {
+            match encoder.receive_packet(packet) {
+                Ok(()) => {
+                    packet.set_stream(0);
+                    packet.rescale_ts(encoder_time_base, ost_time_base);
+                    packet
+                        .write_interleaved(octx)
+                        .map_err(|e| anyhow!("Failed to write packet: {}", e))?;
+                }
+                Err(FfmpegError::Other { errno }) if errno == EAGAIN => break,
+                Err(FfmpegError::Eof) => break,
+                Err(e) => return Err(anyhow!("Failed to receive packet from encoder: {}", e)),
+            }
         }
         Ok(())
     };
@@ -309,6 +326,16 @@ fn encode_ugoira_mp4(zip_data: &[u8], frames: &[UgoiraFrame]) -> Result<Vec<u8>>
         let img = image::load_from_memory(&frame_bytes)
             .with_context(|| format!("Failed to decode frame '{}'", frame_info.file))?
             .to_rgba8();
+        if img.width() != width || img.height() != height {
+            return Err(anyhow!(
+                "Frame '{}' has dimensions {}x{}, expected {}x{}",
+                frame_info.file,
+                img.width(),
+                img.height(),
+                width,
+                height
+            ));
+        }
         encode_rgba_frame(
             &img,
             pts_ms,
