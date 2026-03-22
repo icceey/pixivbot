@@ -9,7 +9,10 @@
       "installZsh": true,
       "configureZshAsDefaultShell": true,
       "installOhMyZsh": true,
-      "upgradePackages": true
+      "upgradePackages": true,
+      "username": "vscode",
+      "userUid": "1000",
+      "userGid": "1000"
     },
     "ghcr.io/devcontainers/features/git:1": {
       "version": "latest",
@@ -21,12 +24,10 @@
       "extensions": [
         "rust-lang.rust-analyzer",
         "tamasfe.even-better-toml",
-        "serayuzgur.crates",
         "vadimcn.vscode-lldb",
         "fill-labs.dependi",
         "usernamehw.errorlens",
         "eamodio.gitlens",
-        "streetsidesoftware.code-spell-checker",
         "oai2lmapi.oai2lmapi@prerelease"
       ],
       "settings": {
@@ -46,8 +47,7 @@
     }
   },
   "mounts": [
-    "source=${localWorkspaceFolderBasename}-cargo-cache,target=/usr/local/cargo/registry,type=volume",
-    "source=${localWorkspaceFolderBasename}-target-cache,target=${containerWorkspaceFolder}/target,type=volume"
+    "source=${localWorkspaceFolderBasename}-cargo-cache,target=/usr/local/cargo/registry,type=volume"
   ],
   "postCreateCommand": "cargo fetch",
   "postStartCommand": "git config --global --add safe.directory ${containerWorkspaceFolder}",

@@ -226,26 +226,38 @@ impl BotHandler {
         };
         drop(pixiv);
 
-        // 构建消息
-        let page_info = if illust.is_multi_page() {
-            format!(" \\({} photos\\)", illust.page_count)
-        } else {
-            String::new()
-        };
-
         let tags = tag::format_tags_escaped(&illust);
 
-        let caption = format!(
-            "🎨 {}{}\nby *{}* \\(ID: `{}`\\)\n\n👀 {} \\| ❤️ {} \\| 🔗 [来源](https://pixiv\\.net/artworks/{}){}", 
-            markdown::escape(&illust.title),
-            page_info,
-            markdown::escape(&illust.user.name),
-            illust.user.id,
-            illust.total_view,
-            illust.total_bookmarks,
-            illust.id,
-            tags
-        );
+        let caption = if illust.is_ugoira() {
+            format!(
+                "🎞️ {}\nby *{}* \\(ID: `{}`\\)\n\n👀 {} \\| ❤️ {} \\| 🔗 [来源](https://pixiv\\.net/artworks/{}){}",
+                markdown::escape(&illust.title),
+                markdown::escape(&illust.user.name),
+                illust.user.id,
+                illust.total_view,
+                illust.total_bookmarks,
+                illust.id,
+                tags
+            )
+        } else {
+            let page_info = if illust.is_multi_page() {
+                format!(" \\({} photos\\)", illust.page_count)
+            } else {
+                String::new()
+            };
+
+            format!(
+                "🎨 {}{}\nby *{}* \\(ID: `{}`\\)\n\n👀 {} \\| ❤️ {} \\| 🔗 [来源](https://pixiv\\.net/artworks/{}){}",
+                markdown::escape(&illust.title),
+                page_info,
+                markdown::escape(&illust.user.name),
+                illust.user.id,
+                illust.total_view,
+                illust.total_bookmarks,
+                illust.id,
+                tags
+            )
+        };
 
         // 检查是否有敏感标签 (使用 chat-level 设置)
         use crate::utils::sensitive;
@@ -258,9 +270,6 @@ impl BotHandler {
         let has_spoiler =
             blur_sensitive && sensitive::contains_sensitive_tags(&illust, sensitive_tags);
 
-        // 获取所有图片 URL (使用配置的尺寸)
-        let image_urls = illust.get_all_image_urls_with_size(self.image_size);
-
         // Build download button config
         // For one-off pushes via link, check chat type to skip channels
         let is_channel = chat_settings.is_some_and(|c| c.r#type == "channel");
@@ -269,6 +278,41 @@ impl BotHandler {
         } else {
             DownloadButtonConfig::new(illust.id)
         };
+
+        if illust.is_ugoira() {
+            let pixiv = self.pixiv_client.read().await;
+            let metadata_result = pixiv.get_ugoira_metadata(illust.id).await;
+            drop(pixiv);
+
+            let metadata = match metadata_result {
+                Ok(metadata) => metadata,
+                Err(e) => {
+                    error!(
+                        "Failed to get ugoira metadata for illust {}: {:#}",
+                        illust.id, e
+                    );
+                    bot.send_message(chat_id, "❌ 获取动图信息失败").await?;
+                    return Ok(());
+                }
+            };
+
+            let _ = self
+                .notifier
+                .notify_ugoira(
+                    chat_id,
+                    &metadata.zip_urls.medium,
+                    metadata.frames,
+                    Some(&caption),
+                    has_spoiler,
+                    &download_config,
+                )
+                .await;
+
+            return Ok(());
+        }
+
+        // 获取所有图片 URL (使用配置的尺寸)
+        let image_urls = illust.get_all_image_urls_with_size(self.image_size);
 
         // 发送图片
         let _ = self

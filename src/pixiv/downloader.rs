@@ -146,6 +146,14 @@ fn read_zip_entry(archive: &mut zip::ZipArchive<Cursor<&[u8]>>, name: &str) -> R
 /// Global FFmpeg initialization guard (runs only once per process).
 static FFMPEG_INIT: OnceLock<Result<(), ffmpeg_next::Error>> = OnceLock::new();
 
+fn h264_compatible_dimension(value: u32) -> u32 {
+    if value.is_multiple_of(2) {
+        value
+    } else {
+        value + 1
+    }
+}
+
 /// Extract frames from a ZIP archive and encode them as an MP4 video using ffmpeg-next.
 ///
 /// Uses H.264 High profile with quality-optimized settings (CRF 18, fast preset)
@@ -175,8 +183,17 @@ fn encode_ugoira_mp4(zip_data: &[u8], frames: &[UgoiraFrame]) -> Result<Vec<u8>>
     let first_img = image::load_from_memory(&first_bytes)
         .context("Failed to decode first frame")?
         .to_rgba8();
-    let width = first_img.width();
-    let height = first_img.height();
+    let source_width = first_img.width();
+    let source_height = first_img.height();
+    let encoded_width = h264_compatible_dimension(source_width);
+    let encoded_height = h264_compatible_dimension(source_height);
+
+    if encoded_width != source_width || encoded_height != source_height {
+        info!(
+            "Adjusting ugoira frame size from {}x{} to {}x{} for H.264 compatibility",
+            source_width, source_height, encoded_width, encoded_height
+        );
+    }
 
     // Create temp file for output MP4 (ffmpeg format::output requires a path)
     let tmp_dir = tempfile::tempdir().context("Failed to create temp directory")?;
@@ -201,8 +218,8 @@ fn encode_ugoira_mp4(zip_data: &[u8], frames: &[UgoiraFrame]) -> Result<Vec<u8>>
         .video()
         .map_err(|e| anyhow!("Failed to create encoder context: {}", e))?;
 
-    encoder_ctx.set_width(width);
-    encoder_ctx.set_height(height);
+    encoder_ctx.set_width(encoded_width);
+    encoder_ctx.set_height(encoded_height);
     encoder_ctx.set_format(Pixel::YUV420P);
     encoder_ctx.set_time_base(Rational(1, 1000)); // millisecond timebase
 
@@ -224,11 +241,11 @@ fn encode_ugoira_mp4(zip_data: &[u8], frames: &[UgoiraFrame]) -> Result<Vec<u8>>
     // Create RGBA → YUV420P pixel format scaler
     let mut scaler = scaling::Context::get(
         Pixel::RGBA,
-        width,
-        height,
+        source_width,
+        source_height,
         Pixel::YUV420P,
-        width,
-        height,
+        encoded_width,
+        encoded_height,
         scaling::Flags::BILINEAR,
     )
     .map_err(|e| anyhow!("Failed to create pixel format scaler: {}", e))?;
@@ -241,10 +258,10 @@ fn encode_ugoira_mp4(zip_data: &[u8], frames: &[UgoiraFrame]) -> Result<Vec<u8>>
 
     // Pre-allocate reusable buffers for encoding loop
     let mut packet = Packet::empty();
-    let mut rgba_frame = frame::Video::new(Pixel::RGBA, width, height);
+    let mut rgba_frame = frame::Video::new(Pixel::RGBA, source_width, source_height);
     let mut yuv_frame = frame::Video::empty();
     let stride = rgba_frame.stride(0);
-    let src_row_bytes = width as usize * 4;
+    let src_row_bytes = source_width as usize * 4;
 
     // Helper: receive encoded packets and write to output
     let receive_packets = |encoder: &mut encoder::Video,
@@ -281,7 +298,7 @@ fn encode_ugoira_mp4(zip_data: &[u8], frames: &[UgoiraFrame]) -> Result<Vec<u8>>
         // Copy RGBA pixel data into reusable frame (respecting stride)
         let src_data = img.as_raw();
         let dst_data = rgba_frame.data_mut(0);
-        for y in 0..height as usize {
+        for y in 0..source_height as usize {
             let dst_offset = y * stride;
             let src_offset = y * src_row_bytes;
             dst_data[dst_offset..dst_offset + src_row_bytes]
@@ -321,14 +338,14 @@ fn encode_ugoira_mp4(zip_data: &[u8], frames: &[UgoiraFrame]) -> Result<Vec<u8>>
         let img = image::load_from_memory(&frame_bytes)
             .with_context(|| format!("Failed to decode frame '{}'", frame_info.file))?
             .to_rgba8();
-        if img.width() != width || img.height() != height {
+        if img.width() != source_width || img.height() != source_height {
             return Err(anyhow!(
                 "Frame '{}' has dimensions {}x{}, expected {}x{}",
                 frame_info.file,
                 img.width(),
                 img.height(),
-                width,
-                height
+                source_width,
+                source_height
             ));
         }
         encode_rgba_frame(
@@ -377,7 +394,11 @@ mod tests {
 
     /// Create a minimal PNG image in memory (2x2 pixels with given color)
     fn create_test_png(r: u8, g: u8, b: u8) -> Vec<u8> {
-        let img = RgbaImage::from_pixel(2, 2, image::Rgba([r, g, b, 255]));
+        create_test_png_with_size(2, 2, r, g, b)
+    }
+
+    fn create_test_png_with_size(width: u32, height: u32, r: u8, g: u8, b: u8) -> Vec<u8> {
+        let img = RgbaImage::from_pixel(width, height, image::Rgba([r, g, b, 255]));
         let mut buf = Vec::new();
         let mut cursor = Cursor::new(&mut buf);
         img.write_to(&mut cursor, ImageFormat::Png).unwrap();
@@ -454,6 +475,32 @@ mod tests {
             &mp4_data[4..8],
             b"ftyp",
             "Output should be a valid MP4 file"
+        );
+    }
+
+    #[test]
+    fn test_encode_ugoira_mp4_odd_dimensions() {
+        let frame0 = create_test_png_with_size(3, 5, 255, 0, 0);
+        let frame1 = create_test_png_with_size(3, 5, 0, 255, 0);
+        let zip_data = create_test_zip(&[("000000.png", &frame0), ("000001.png", &frame1)]);
+
+        let frames = vec![
+            UgoiraFrame {
+                file: "000000.png".to_string(),
+                delay: 100,
+            },
+            UgoiraFrame {
+                file: "000001.png".to_string(),
+                delay: 100,
+            },
+        ];
+
+        let mp4_data = encode_ugoira_mp4(&zip_data, &frames).unwrap();
+        assert!(mp4_data.len() > 8);
+        assert_eq!(
+            &mp4_data[4..8],
+            b"ftyp",
+            "Output should remain a valid MP4 file for odd-sized frames"
         );
     }
 
