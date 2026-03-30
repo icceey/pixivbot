@@ -6,6 +6,7 @@ RUN cargo chef prepare --recipe-path recipe.json
 FROM lukemathwalker/cargo-chef:latest-rust-1.91-slim-bookworm AS builder
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libavcodec-dev libavformat-dev libavutil-dev libswscale-dev libswresample-dev pkg-config \
+    clang libclang-dev \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY --from=planner /app/recipe.json recipe.json
