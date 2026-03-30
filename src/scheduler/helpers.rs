@@ -1,11 +1,14 @@
 use crate::bot::notifier::{BatchSendResult, DownloadButtonConfig, Notifier};
 use crate::db::repo::Repo;
 use crate::db::types::RankingState;
+use crate::pixiv::client::PixivClient;
 use crate::utils::{sensitive, tag};
 use anyhow::{Context, Result};
 use pixiv_client::Illust;
+use std::sync::Arc;
 use teloxide::prelude::*;
 use teloxide::utils::markdown;
+use tokio::sync::RwLock;
 use tracing::info;
 
 /// Result of processing a single illust push
@@ -70,11 +73,17 @@ pub async fn get_chat_if_should_notify(
 /// Generic push executor: Send specific illust pages (excluding already sent pages)
 pub async fn process_illust_push(
     notifier: &Notifier,
+    pixiv: &Arc<RwLock<PixivClient>>,
     ctx: &AuthorContext<'_>,
     illust: &Illust,
     already_sent_pages: &[usize],
     image_size: pixiv_client::ImageSize,
 ) -> Result<PushResult> {
+    // For ugoira works, delegate to the specialized handler
+    if illust.is_ugoira() {
+        return process_ugoira_push(notifier, pixiv, ctx, illust).await;
+    }
+
     let chat_id = ChatId(ctx.subscription.chat_id);
     let all_urls = illust.get_all_image_urls_with_size(image_size);
     let total_pages = all_urls.len();
@@ -222,5 +231,73 @@ fn map_send_result_to_push_result(
             total_pages,
             first_message_id,
         }
+    }
+}
+
+/// Push a ugoira (animated) illust as an MP4 animation
+async fn process_ugoira_push(
+    notifier: &Notifier,
+    pixiv: &Arc<RwLock<PixivClient>>,
+    ctx: &AuthorContext<'_>,
+    illust: &Illust,
+) -> Result<PushResult> {
+    let chat_id = ChatId(ctx.subscription.chat_id);
+
+    // Fetch ugoira metadata (ZIP URL + frame delays)
+    let pixiv_guard = pixiv.read().await;
+    let metadata = pixiv_guard
+        .get_ugoira_metadata(illust.id)
+        .await
+        .context("Failed to fetch ugoira metadata")?;
+    drop(pixiv_guard);
+
+    // Prepare caption (same format as regular illusts, with 🎞️ indicator)
+    let tags = tag::format_tags_escaped(illust);
+    let caption = format!(
+        "🎞️ {}\nby *{}* \\(ID: `{}`\\)\n\n👀 {} \\| ❤️ {} \\| 🔗 [来源](https://pixiv\\.net/artworks/{}){}", 
+        markdown::escape(&illust.title),
+        markdown::escape(&illust.user.name),
+        illust.user.id,
+        illust.total_view,
+        illust.total_bookmarks,
+        illust.id,
+        tags
+    );
+
+    // Check spoiler setting
+    let sensitive_tags = sensitive::get_chat_sensitive_tags(&ctx.chat);
+    let has_spoiler =
+        ctx.chat.blur_sensitive_tags && sensitive::contains_sensitive_tags(illust, sensitive_tags);
+
+    // Build download button config
+    let is_channel = ctx.chat.r#type == "channel";
+    let download_config = if is_channel {
+        DownloadButtonConfig::new(illust.id).for_channel()
+    } else {
+        DownloadButtonConfig::new(illust.id)
+    };
+
+    // Send ugoira as MP4 animation
+    let send_result = notifier
+        .notify_ugoira(
+            chat_id,
+            &metadata.zip_urls.medium,
+            metadata.frames,
+            Some(&caption),
+            has_spoiler,
+            &download_config,
+        )
+        .await;
+
+    // Ugoira is a single item, so treat it simply
+    if send_result.is_complete_failure() {
+        Ok(PushResult::Failure {
+            illust_id: illust.id,
+        })
+    } else {
+        Ok(PushResult::Success {
+            illust_id: illust.id,
+            first_message_id: send_result.first_message_id,
+        })
     }
 }

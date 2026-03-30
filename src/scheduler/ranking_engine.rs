@@ -1,4 +1,4 @@
-use crate::bot::notifier::Notifier;
+use crate::bot::notifier::{BatchSendResult, DownloadButtonConfig, Notifier};
 use crate::db::repo::Repo;
 use crate::db::types::{SubscriptionState, TaskType};
 use crate::pixiv::client::PixivClient;
@@ -272,61 +272,14 @@ impl RankingEngine {
             chat_id
         );
 
-        // Build title for the batch
-        let title = format!(
-            "📊 *{} Ranking* \\- {} new\\!\n\n",
-            teloxide::utils::markdown::escape(&mode.replace('_', " ").to_uppercase()),
-            filtered_illusts.len()
-        );
-
-        // Collect all illusts data for batch sending
-        let mut image_urls = Vec::new();
-        let mut captions = Vec::new();
         let mut illust_ids = Vec::new();
-
-        for (index, illust) in filtered_illusts.iter().enumerate() {
-            // Get image URL (single image per ranking item)
-            let image_url = illust
-                .get_all_image_urls_with_size(self.image_size)
-                .first()
-                .cloned()
-                .unwrap_or_else(|| illust.image_urls.large.clone());
-            image_urls.push(image_url);
+        for illust in &filtered_illusts {
             illust_ids.push(illust.id);
-
-            // Build caption
-            let tags = crate::utils::tag::format_tags_escaped(illust);
-            let base_caption = format!(
-                "{}\nby *{}* \\(ID: `{}`\\)\n\n❤️ {} \\| 🔗 [来源](https://pixiv\\.net/artworks/{}){}",
-                teloxide::utils::markdown::escape(&illust.title),
-                teloxide::utils::markdown::escape(&illust.user.name),
-                illust.user.id,
-                illust.total_bookmarks,
-                illust.id,
-                tags
-            );
-
-            // Prepend title to first caption
-            let caption = if index == 0 {
-                format!("{}{}", title, base_caption)
-            } else {
-                base_caption
-            };
-            captions.push(caption);
         }
 
-        // Check spoiler setting
-        let sensitive_tags = crate::utils::sensitive::get_chat_sensitive_tags(&ctx.chat);
-        let has_spoiler = ctx.chat.blur_sensitive_tags
-            && filtered_illusts.iter().any(|illust| {
-                crate::utils::sensitive::contains_sensitive_tags(illust, sensitive_tags)
-            });
-
-        // Send as media group with individual captions
         let send_result = self
-            .notifier
-            .notify_with_individual_captions(chat_id, &image_urls, &captions, has_spoiler)
-            .await;
+            .send_ranking_illusts(chat_id, mode, &ctx.chat, &filtered_illusts)
+            .await?;
 
         // Collect successfully sent illust IDs
         let successfully_sent_ids: Vec<u64> = send_result
@@ -380,6 +333,144 @@ impl RankingEngine {
         Ok(())
     }
 
+    async fn send_ranking_illusts(
+        &self,
+        chat_id: ChatId,
+        mode: &str,
+        chat: &crate::db::entities::chats::Model,
+        illusts: &[&Illust],
+    ) -> Result<BatchSendResult> {
+        if ranking_requires_individual_send(illusts) {
+            info!(
+                "Ranking push for chat {} contains ugoira, sending items individually",
+                chat_id
+            );
+            return self
+                .send_ranking_illusts_individually(chat_id, mode, chat, illusts)
+                .await;
+        }
+
+        Ok(self
+            .send_ranking_illusts_as_batch(chat_id, mode, chat, illusts)
+            .await)
+    }
+
+    async fn send_ranking_illusts_as_batch(
+        &self,
+        chat_id: ChatId,
+        mode: &str,
+        chat: &crate::db::entities::chats::Model,
+        illusts: &[&Illust],
+    ) -> BatchSendResult {
+        let title = build_ranking_title(mode, illusts.len());
+
+        let mut image_urls = Vec::new();
+        let mut captions = Vec::new();
+
+        for (index, illust) in illusts.iter().enumerate() {
+            let image_url = illust
+                .get_all_image_urls_with_size(self.image_size)
+                .first()
+                .cloned()
+                .unwrap_or_else(|| illust.image_urls.large.clone());
+            image_urls.push(image_url);
+            captions.push(build_ranking_caption(&title, index, illust));
+        }
+
+        let sensitive_tags = crate::utils::sensitive::get_chat_sensitive_tags(chat);
+        let has_spoiler = chat.blur_sensitive_tags
+            && illusts.iter().any(|illust| {
+                crate::utils::sensitive::contains_sensitive_tags(illust, sensitive_tags)
+            });
+
+        self.notifier
+            .notify_with_individual_captions(chat_id, &image_urls, &captions, has_spoiler)
+            .await
+    }
+
+    async fn send_ranking_illusts_individually(
+        &self,
+        chat_id: ChatId,
+        mode: &str,
+        chat: &crate::db::entities::chats::Model,
+        illusts: &[&Illust],
+    ) -> Result<BatchSendResult> {
+        let title = build_ranking_title(mode, illusts.len());
+        let sensitive_tags = crate::utils::sensitive::get_chat_sensitive_tags(chat);
+        let mut succeeded_indices = Vec::new();
+        let mut failed_indices = Vec::new();
+        let mut first_message_id = None;
+
+        for (index, illust) in illusts.iter().enumerate() {
+            let caption = build_ranking_caption(&title, index, illust);
+            let has_spoiler = chat.blur_sensitive_tags
+                && crate::utils::sensitive::contains_sensitive_tags(illust, sensitive_tags);
+
+            let send_result = if illust.is_ugoira() {
+                let pixiv = self.pixiv_client.read().await;
+                let metadata_result = pixiv.get_ugoira_metadata(illust.id).await;
+                drop(pixiv);
+
+                match metadata_result {
+                    Ok(metadata) => {
+                        self.notifier
+                            .notify_ugoira(
+                                chat_id,
+                                &metadata.zip_urls.medium,
+                                metadata.frames,
+                                Some(&caption),
+                                has_spoiler,
+                                &DownloadButtonConfig::default(),
+                            )
+                            .await
+                    }
+                    Err(e) => {
+                        error!(
+                            "Failed to fetch ugoira metadata for ranking illust {}: {:#}",
+                            illust.id, e
+                        );
+                        BatchSendResult {
+                            succeeded_indices: Vec::new(),
+                            failed_indices: vec![0],
+                            first_message_id: None,
+                        }
+                    }
+                }
+            } else {
+                let image_url = illust
+                    .get_all_image_urls_with_size(self.image_size)
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| illust.image_urls.large.clone());
+
+                self.notifier
+                    .notify_with_images(
+                        chat_id,
+                        std::slice::from_ref(&image_url),
+                        Some(&caption),
+                        has_spoiler,
+                    )
+                    .await
+            };
+
+            if send_result.is_complete_failure() {
+                failed_indices.push(index);
+                continue;
+            }
+
+            succeeded_indices.push(index);
+            if first_message_id.is_none() {
+                first_message_id = send_result.first_message_id;
+            }
+        }
+
+        Ok(BatchSendResult {
+            succeeded_indices,
+            failed_indices,
+            first_message_id,
+        })
+    }
+
     /// Helper: Trim pushed_ids to last 200 and update state
     async fn trim_and_update_pushed_ids(
         &self,
@@ -425,5 +516,111 @@ impl RankingEngine {
         pushed_ids.extend(new_ids);
         self.trim_and_update_pushed_ids(subscription_id, pushed_ids)
             .await
+    }
+}
+
+fn ranking_requires_individual_send(illusts: &[&Illust]) -> bool {
+    illusts.iter().any(|illust| illust.is_ugoira())
+}
+
+fn build_ranking_title(mode: &str, count: usize) -> String {
+    format!(
+        "📊 *{} Ranking* \\- {} new\\!\n\n",
+        teloxide::utils::markdown::escape(&mode.replace('_', " ").to_uppercase()),
+        count
+    )
+}
+
+fn build_ranking_caption(title: &str, index: usize, illust: &Illust) -> String {
+    let tags = crate::utils::tag::format_tags_escaped(illust);
+    let title_line = if illust.is_ugoira() {
+        format!("🎞️ {}", teloxide::utils::markdown::escape(&illust.title))
+    } else {
+        teloxide::utils::markdown::escape(&illust.title)
+    };
+
+    let base_caption = format!(
+        "{}\nby *{}* \\(ID: `{}`\\)\n\n❤️ {} \\| 🔗 [来源](https://pixiv\\.net/artworks/{}){}",
+        title_line,
+        teloxide::utils::markdown::escape(&illust.user.name),
+        illust.user.id,
+        illust.total_bookmarks,
+        illust.id,
+        tags
+    );
+
+    if index == 0 {
+        format!("{}{}", title, base_caption)
+    } else {
+        base_caption
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn make_illust(illust_type: &str, title: &str) -> Illust {
+        serde_json::from_value(json!({
+            "id": 12345,
+            "title": title,
+            "type": illust_type,
+            "image_urls": {
+                "square_medium": "square",
+                "medium": "medium",
+                "large": "large",
+                "original": "original"
+            },
+            "caption": "",
+            "restrict": 0,
+            "user": {
+                "id": 67890,
+                "name": "Author",
+                "account": "author"
+            },
+            "tags": [],
+            "create_date": "2026-01-01T00:00:00+00:00",
+            "page_count": 1,
+            "width": 100,
+            "height": 100,
+            "sanity_level": 2,
+            "x_restrict": 0,
+            "series": null,
+            "meta_single_page": {
+                "original_image_url": "original"
+            },
+            "meta_pages": [],
+            "total_view": 1,
+            "total_bookmarks": 2,
+            "is_bookmarked": false,
+            "visible": true,
+            "is_muted": false,
+            "total_comments": 0
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn ranking_requires_individual_send_when_ugoira_present() {
+        let still = make_illust("illust", "Still");
+        let ugoira = make_illust("ugoira", "Animated");
+        assert!(ranking_requires_individual_send(&[&still, &ugoira]));
+        assert!(!ranking_requires_individual_send(&[&still]));
+    }
+
+    #[test]
+    fn build_ranking_caption_marks_ugoira_and_prepends_title_once() {
+        let title = build_ranking_title("day", 2);
+        let ugoira = make_illust("ugoira", "Animated");
+        let still = make_illust("illust", "Still");
+
+        let first_caption = build_ranking_caption(&title, 0, &ugoira);
+        let second_caption = build_ranking_caption(&title, 1, &still);
+
+        assert!(first_caption.starts_with(&title));
+        assert!(first_caption.contains("🎞️ Animated"));
+        assert!(!second_caption.starts_with(&title));
+        assert!(!second_caption.contains("🎞️ Still"));
     }
 }
