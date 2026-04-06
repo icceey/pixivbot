@@ -32,23 +32,24 @@ pub fn parse_pixiv_links(text: &str) -> Vec<PixivLink> {
 
     // 解析作品链接
     for caps in ILLUST_REGEX.captures_iter(text) {
-        if let Some(id_str) = caps.get(1) {
+        if let (Some(full_match), Some(id_str)) = (caps.get(0), caps.get(1)) {
             if let Ok(id) = id_str.as_str().parse::<u64>() {
-                links.push(PixivLink::Illust(id));
+                links.push((full_match.start(), PixivLink::Illust(id)));
             }
         }
     }
 
     // 解析用户链接
     for caps in USER_REGEX.captures_iter(text) {
-        if let Some(id_str) = caps.get(1) {
+        if let (Some(full_match), Some(id_str)) = (caps.get(0), caps.get(1)) {
             if let Ok(id) = id_str.as_str().parse::<u64>() {
-                links.push(PixivLink::User(id));
+                links.push((full_match.start(), PixivLink::User(id)));
             }
         }
     }
 
-    links
+    links.sort_by_key(|(start, _)| *start);
+    links.into_iter().map(|(_, link)| link).collect()
 }
 
 #[cfg(test)]
@@ -82,6 +83,29 @@ mod tests {
         let text = "作品: https://www.pixiv.net/artworks/123 作者: https://www.pixiv.net/users/456";
         let links = parse_pixiv_links(text);
         assert_eq!(links.len(), 2);
+    }
+
+    #[test]
+    fn test_parse_mixed_links_preserves_appearance_order() {
+        let text = "作者: https://www.pixiv.net/users/456 作品: https://www.pixiv.net/artworks/123 作者: https://www.pixiv.net/users/789";
+        let links = parse_pixiv_links(text);
+
+        assert_eq!(links.len(), 3);
+
+        match &links[0] {
+            PixivLink::User(id) => assert_eq!(*id, 456),
+            _ => panic!("Expected first link to be User"),
+        }
+
+        match &links[1] {
+            PixivLink::Illust(id) => assert_eq!(*id, 123),
+            _ => panic!("Expected second link to be Illust"),
+        }
+
+        match &links[2] {
+            PixivLink::User(id) => assert_eq!(*id, 789),
+            _ => panic!("Expected third link to be User"),
+        }
     }
 
     #[test]
