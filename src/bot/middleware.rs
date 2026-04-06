@@ -6,7 +6,7 @@ use std::sync::Arc;
 use teloxide::dispatching::DpHandlerDescription;
 use teloxide::dptree::{self, Handler};
 use teloxide::prelude::*;
-use teloxide::types::Me;
+use teloxide::types::{Me, MessageEntity, MessageEntityKind, MessageEntityRef, UserId};
 use teloxide::utils::command::BotCommands;
 use tracing::{error, info};
 
@@ -232,6 +232,7 @@ fn should_accept_command(
 /// - `require_mention_in_group`: 全局配置是否要求群组中 @bot
 /// - `allow_without_mention`: chat 级别设置是否允许不带 @bot
 /// - `is_reply_to_bot`: 消息是否为回复 bot 的消息
+/// - `is_mentioned`: 消息是否显式 @ 了 bot
 ///
 /// # 返回
 /// - `true`: 消息应该被处理
@@ -242,6 +243,7 @@ fn should_process_message(
     require_mention_in_group: bool,
     allow_without_mention: bool,
     is_reply_to_bot: bool,
+    is_mentioned: bool,
 ) -> bool {
     // 私聊：总是处理
     if is_private {
@@ -259,8 +261,40 @@ fn should_process_message(
         return true;
     }
 
-    // 需要 @bot：只处理回复 bot 的消息
-    is_reply_to_bot
+    // 需要 @bot：处理回复 bot 或显式 @bot 的消息
+    is_reply_to_bot || is_mentioned
+}
+
+#[inline]
+fn message_mentions_bot(message: &Message, me: &Me) -> bool {
+    let Some(text) = message.text() else {
+        return false;
+    };
+    let Some(entities) = message.entities() else {
+        return false;
+    };
+
+    entities_mention_bot(text, entities, me.user.username.as_deref(), me.user.id)
+}
+
+#[inline]
+fn entities_mention_bot(
+    text: &str,
+    entities: &[MessageEntity],
+    bot_username: Option<&str>,
+    bot_id: UserId,
+) -> bool {
+    let bot_mention = bot_username.map(|username| format!("@{username}"));
+
+    MessageEntityRef::parse(text, entities)
+        .into_iter()
+        .any(|entity| match entity.kind() {
+            MessageEntityKind::Mention => bot_mention
+                .as_ref()
+                .is_some_and(|mention| entity.text().eq_ignore_ascii_case(mention)),
+            MessageEntityKind::TextMention { user } => user.id == bot_id,
+            _ => false,
+        })
 }
 
 // ============================================================================
@@ -420,11 +454,14 @@ where
                 .map(|user| user.id == me.user.id)
                 .unwrap_or(false);
 
+            let is_mentioned = message_mentions_bot(&message, &me);
+
             let should_process = should_process_message(
                 message.chat.is_private(),
                 handler.require_mention_in_group,
                 ctx.chat.allow_without_mention,
                 is_reply_to_bot,
+                is_mentioned,
             );
 
             if should_process {
@@ -439,6 +476,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use teloxide::types::User;
 
     // ========================================================================
     // should_accept_command 测试
@@ -482,30 +520,85 @@ mod tests {
     #[test]
     fn test_message_private_chat_always_processed() {
         // 私聊中，消息都应该被处理
-        assert!(should_process_message(true, true, false, false));
-        assert!(should_process_message(true, true, false, true));
-        assert!(should_process_message(true, false, false, false));
+        assert!(should_process_message(true, true, false, false, false));
+        assert!(should_process_message(true, true, false, true, false));
+        assert!(should_process_message(true, false, false, false, true));
     }
 
     #[test]
     fn test_message_group_global_not_required() {
         // 全局配置不需要 @bot 时，群组中所有消息都被处理
-        assert!(should_process_message(false, false, false, false));
-        assert!(should_process_message(false, false, false, true));
-        assert!(should_process_message(false, false, true, false));
+        assert!(should_process_message(false, false, false, false, false));
+        assert!(should_process_message(false, false, false, true, false));
+        assert!(should_process_message(false, false, true, false, true));
     }
 
     #[test]
     fn test_message_group_global_required_chat_allows() {
         // 全局要求 @bot，但 chat 允许不带 @bot
-        assert!(should_process_message(false, true, true, false)); // 普通消息被处理
-        assert!(should_process_message(false, true, true, true)); // 回复消息也被处理
+        assert!(should_process_message(false, true, true, false, false)); // 普通消息被处理
+        assert!(should_process_message(false, true, true, true, false)); // 回复消息也被处理
     }
 
     #[test]
     fn test_message_group_global_required_chat_not_allows() {
         // 全局要求 @bot，chat 也不允许不带 @bot
-        assert!(!should_process_message(false, true, false, false)); // 普通消息被忽略
-        assert!(should_process_message(false, true, false, true)); // 回复 bot 的消息被处理
+        assert!(!should_process_message(false, true, false, false, false)); // 普通消息被忽略
+        assert!(should_process_message(false, true, false, true, false)); // 回复 bot 的消息被处理
+        assert!(should_process_message(false, true, false, false, true)); // @bot 的消息被处理
+    }
+
+    #[test]
+    fn test_entities_mention_bot_matches_username_mention() {
+        let text = "@PixivBot 看看这个链接";
+        let entities = vec![MessageEntity::new(MessageEntityKind::Mention, 0, 9)];
+
+        assert!(entities_mention_bot(
+            text,
+            &entities,
+            Some("pixivbot"),
+            UserId(42)
+        ));
+    }
+
+    #[test]
+    fn test_entities_mention_bot_ignores_other_mentions() {
+        let text = "@someone 看看这个链接";
+        let entities = vec![MessageEntity::new(MessageEntityKind::Mention, 0, 8)];
+
+        assert!(!entities_mention_bot(
+            text,
+            &entities,
+            Some("pixivbot"),
+            UserId(42)
+        ));
+    }
+
+    #[test]
+    fn test_entities_mention_bot_matches_text_mention() {
+        let text = "点我";
+        let entities = vec![MessageEntity::new(
+            MessageEntityKind::TextMention {
+                user: User {
+                    id: UserId(42),
+                    is_bot: true,
+                    first_name: "PixivBot".to_string(),
+                    last_name: None,
+                    username: Some("pixivbot".to_string()),
+                    language_code: None,
+                    is_premium: false,
+                    added_to_attachment_menu: false,
+                },
+            },
+            0,
+            2,
+        )];
+
+        assert!(entities_mention_bot(
+            text,
+            &entities,
+            Some("pixivbot"),
+            UserId(42)
+        ));
     }
 }
