@@ -13,7 +13,7 @@ pub use settings::{
 
 // Subscription related handlers
 mod subscription;
-pub use subscription::LIST_CALLBACK_PREFIX;
+pub use subscription::{parse_list_callback_data, ListPaginationAction, LIST_CALLBACK_PREFIX};
 
 // Download handler
 mod download;

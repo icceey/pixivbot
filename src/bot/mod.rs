@@ -13,7 +13,8 @@ use crate::pixiv::client::PixivClient;
 use anyhow::Result;
 use handlers::{
     handle_settings_callback, handle_settings_cancel, handle_settings_input,
-    DOWNLOAD_CALLBACK_PREFIX, LIST_CALLBACK_PREFIX, SETTINGS_CALLBACK_PREFIX,
+    parse_list_callback_data, ListPaginationAction, DOWNLOAD_CALLBACK_PREFIX, LIST_CALLBACK_PREFIX,
+    SETTINGS_CALLBACK_PREFIX,
 };
 use notifier::ThrottledBot;
 use state::SettingsStorage;
@@ -331,30 +332,42 @@ async fn handle_list_callback(
         warn!("Failed to answer callback query: {:#}", e);
     }
 
-    // Parse page number from callback data (format: "list:N" or "list:noop")
-    let page_str = callback_data
-        .strip_prefix(LIST_CALLBACK_PREFIX)
-        .unwrap_or("0");
+    let action = match parse_list_callback_data(&callback_data) {
+        Some(action) => action,
+        None => {
+            warn!("Invalid list callback data: {}", callback_data);
+            return Ok(());
+        }
+    };
 
-    // Handle noop (page indicator button)
-    if page_str == "noop" {
+    if matches!(action, ListPaginationAction::Noop) {
         return Ok(());
     }
-
-    let page: usize = page_str.parse().unwrap_or_else(|_| {
-        warn!("Invalid page number in callback data: {}", page_str);
-        0
-    });
 
     // Get message and chat info from the callback query
     if let Some(msg) = q.message {
         let chat_id = msg.chat().id;
         let message_id = msg.id();
 
+        let (page, target_chat_id, is_channel) = match action {
+            ListPaginationAction::Noop => return Ok(()),
+            ListPaginationAction::Page {
+                page,
+                target_chat_id,
+                is_channel,
+            } => (page, target_chat_id.unwrap_or(chat_id), is_channel),
+        };
+
         // Update the subscription list message
-        // For pagination callback, use same chat_id for reply and target (no channel support in pagination)
         handler
-            .send_subscription_list(bot, chat_id, chat_id, page, Some(message_id), false)
+            .send_subscription_list(
+                bot,
+                chat_id,
+                target_chat_id,
+                page,
+                Some(message_id),
+                is_channel,
+            )
             .await?;
     }
 

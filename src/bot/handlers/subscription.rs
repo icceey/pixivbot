@@ -15,6 +15,16 @@ use tracing::{error, info, warn};
 /// Maximum number of subscriptions per page
 pub const PAGE_SIZE: usize = 50;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListPaginationAction {
+    Noop,
+    Page {
+        page: usize,
+        target_chat_id: Option<ChatId>,
+        is_channel: bool,
+    },
+}
+
 // ============================================================================
 // Helper Types
 // ============================================================================
@@ -844,7 +854,12 @@ impl BotHandler {
 
                 // Build pagination keyboard if needed
                 let keyboard = if total_pages > 1 {
-                    Some(build_pagination_keyboard(page, total_pages))
+                    Some(build_pagination_keyboard(
+                        page,
+                        total_pages,
+                        target_chat_id,
+                        is_channel,
+                    ))
                 } else {
                     None
                 };
@@ -976,15 +991,58 @@ impl BotHandler {
 /// Callback data prefix for list pagination
 pub const LIST_CALLBACK_PREFIX: &str = "list:";
 
+fn build_list_callback_data(page: usize, target_chat_id: ChatId, is_channel: bool) -> String {
+    format!(
+        "{}{page}:{}:{}",
+        LIST_CALLBACK_PREFIX,
+        target_chat_id.0,
+        if is_channel { 1 } else { 0 }
+    )
+}
+
+pub fn parse_list_callback_data(callback_data: &str) -> Option<ListPaginationAction> {
+    let payload = callback_data.strip_prefix(LIST_CALLBACK_PREFIX)?;
+
+    if payload == "noop" {
+        return Some(ListPaginationAction::Noop);
+    }
+
+    let parts: Vec<_> = payload.split(':').collect();
+    let page = parts.first()?.parse().ok()?;
+
+    match parts.as_slice() {
+        [_page] => Some(ListPaginationAction::Page {
+            page,
+            target_chat_id: None,
+            is_channel: false,
+        }),
+        [_page, target_chat_id, is_channel] => Some(ListPaginationAction::Page {
+            page,
+            target_chat_id: Some(ChatId(target_chat_id.parse().ok()?)),
+            is_channel: match *is_channel {
+                "0" => false,
+                "1" => true,
+                _ => return None,
+            },
+        }),
+        _ => None,
+    }
+}
+
 /// Build inline keyboard for pagination
-fn build_pagination_keyboard(current_page: usize, total_pages: usize) -> InlineKeyboardMarkup {
+fn build_pagination_keyboard(
+    current_page: usize,
+    total_pages: usize,
+    target_chat_id: ChatId,
+    is_channel: bool,
+) -> InlineKeyboardMarkup {
     let mut buttons = Vec::new();
 
     // Previous button
     if current_page > 0 {
         buttons.push(InlineKeyboardButton::callback(
             "⬅️ 上一页",
-            format!("{}{}", LIST_CALLBACK_PREFIX, current_page - 1),
+            build_list_callback_data(current_page - 1, target_chat_id, is_channel),
         ));
     }
 
@@ -998,9 +1056,54 @@ fn build_pagination_keyboard(current_page: usize, total_pages: usize) -> InlineK
     if current_page + 1 < total_pages {
         buttons.push(InlineKeyboardButton::callback(
             "下一页 ➡️",
-            format!("{}{}", LIST_CALLBACK_PREFIX, current_page + 1),
+            build_list_callback_data(current_page + 1, target_chat_id, is_channel),
         ));
     }
 
     InlineKeyboardMarkup::new(vec![buttons])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_list_callback_data_legacy_format() {
+        assert_eq!(
+            parse_list_callback_data("list:3"),
+            Some(ListPaginationAction::Page {
+                page: 3,
+                target_chat_id: None,
+                is_channel: false,
+            })
+        );
+    }
+
+    #[test]
+    fn test_parse_list_callback_data_channel_format() {
+        assert_eq!(
+            parse_list_callback_data("list:2:-1001234567890:1"),
+            Some(ListPaginationAction::Page {
+                page: 2,
+                target_chat_id: Some(ChatId(-1001234567890)),
+                is_channel: true,
+            })
+        );
+    }
+
+    #[test]
+    fn test_parse_list_callback_data_noop() {
+        assert_eq!(
+            parse_list_callback_data("list:noop"),
+            Some(ListPaginationAction::Noop)
+        );
+    }
+
+    #[test]
+    fn test_build_list_callback_data_encodes_context() {
+        assert_eq!(
+            build_list_callback_data(4, ChatId(-1001234567890), true),
+            "list:4:-1001234567890:1"
+        );
+    }
 }
