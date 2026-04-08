@@ -139,39 +139,6 @@ fn build_handler_tree(
         .chain(middleware::filter_chat_accessible())
         .endpoint(handle_message);
 
-    // Callback query handler for pagination
-    let callback_handler = Update::filter_callback_query()
-        .filter_map(|q: CallbackQuery| {
-            // Filter for list pagination callbacks
-            q.data
-                .as_ref()
-                .filter(|data| data.starts_with(LIST_CALLBACK_PREFIX))
-                .cloned()
-        })
-        .endpoint(handle_list_callback);
-
-    // Callback query handler for download button
-    let download_callback_handler = Update::filter_callback_query()
-        .filter_map(|q: CallbackQuery| {
-            // Filter for download callbacks
-            q.data
-                .as_ref()
-                .filter(|data| data.starts_with(DOWNLOAD_CALLBACK_PREFIX))
-                .cloned()
-        })
-        .endpoint(handle_download_callback);
-
-    // Callback query handler for settings buttons
-    let settings_callback_handler = Update::filter_callback_query()
-        .filter_map(|q: CallbackQuery| {
-            // Filter for settings callbacks
-            q.data
-                .as_ref()
-                .filter(|data| data.starts_with(SETTINGS_CALLBACK_PREFIX))
-                .cloned()
-        })
-        .endpoint(wrap_settings_callback);
-
     // Chat migration handler - handles group to supergroup upgrades
     let migration_handler = dptree::filter(|msg: Message| {
         // Only process migration messages
@@ -205,19 +172,50 @@ fn build_handler_tree(
         .filter(|cmd: Command, _ctx: UserChatContext| matches!(cmd, Command::Cancel))
         .endpoint(handle_cancel_command);
 
+    dptree::entry().branch(build_callback_handlers()).branch(
+        Update::filter_message()
+            .branch(migration_handler)
+            .branch(admin_chat_control_handler)
+            .branch(cancel_handler)
+            .branch(command_handler)
+            .branch(settings_dialogue_handler)
+            .branch(message_handler),
+    )
+}
+
+fn build_callback_handlers(
+) -> teloxide::dispatching::UpdateHandler<Box<dyn std::error::Error + Send + Sync + 'static>> {
+    let callback_handler = Update::filter_callback_query()
+        .filter_map(|q: CallbackQuery| {
+            q.data
+                .as_ref()
+                .filter(|data| data.starts_with(LIST_CALLBACK_PREFIX))
+                .cloned()
+        })
+        .endpoint(handle_list_callback);
+
+    let download_callback_handler = Update::filter_callback_query()
+        .filter_map(|q: CallbackQuery| {
+            q.data
+                .as_ref()
+                .filter(|data| data.starts_with(DOWNLOAD_CALLBACK_PREFIX))
+                .cloned()
+        })
+        .endpoint(handle_download_callback);
+
+    let settings_callback_handler = Update::filter_callback_query()
+        .filter_map(|q: CallbackQuery| {
+            q.data
+                .as_ref()
+                .filter(|data| data.starts_with(SETTINGS_CALLBACK_PREFIX))
+                .cloned()
+        })
+        .endpoint(wrap_settings_callback);
+
     dptree::entry()
         .branch(callback_handler)
         .branch(download_callback_handler)
         .branch(settings_callback_handler)
-        .branch(
-            Update::filter_message()
-                .branch(migration_handler)
-                .branch(admin_chat_control_handler)
-                .branch(cancel_handler)
-                .branch(command_handler)
-                .branch(settings_dialogue_handler)
-                .branch(message_handler),
-        )
 }
 
 /// 处理命令
