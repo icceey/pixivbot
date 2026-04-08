@@ -1,16 +1,18 @@
-use crate::bot::handlers::DOWNLOAD_CALLBACK_PREFIX;
 use crate::pixiv::downloader::Downloader;
-use anyhow::{Context, Result};
+use crate::utils::caption::MAX_PER_GROUP;
 use pixiv_client::UgoiraFrame;
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use teloxide::adaptors::Throttle;
 use teloxide::prelude::*;
-use teloxide::types::{
-    ChatAction, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, InputMedia, InputMediaPhoto,
-    ParseMode,
-};
-use tracing::{error, info, warn};
+use tracing::warn;
+
+mod batch;
+mod button;
+mod caption;
+mod media;
+mod numbering;
+mod result;
+mod ugoira;
 
 /// Button label for download button
 const DOWNLOAD_BUTTON_LABEL: &str = "📥 下载";
@@ -18,82 +20,11 @@ const DOWNLOAD_BUTTON_LABEL: &str = "📥 下载";
 /// Type alias for the throttled bot
 pub type ThrottledBot = Throttle<Bot>;
 
-#[derive(Debug, Clone)]
-pub struct BatchSendResult {
-    pub succeeded_indices: Vec<usize>,
-    pub failed_indices: Vec<usize>,
-    /// The first message ID from the batch (for tracking/reply purposes)
-    pub first_message_id: Option<i32>,
-}
+pub use button::DownloadButtonConfig;
+pub use numbering::ContinuationNumbering;
+pub use result::BatchSendResult;
 
-impl BatchSendResult {
-    fn all_failed(total: usize) -> Self {
-        Self {
-            succeeded_indices: Vec::new(),
-            failed_indices: (0..total).collect(),
-            first_message_id: None,
-        }
-    }
-    pub fn is_complete_success(&self) -> bool {
-        self.failed_indices.is_empty()
-    }
-    pub fn is_complete_failure(&self) -> bool {
-        self.succeeded_indices.is_empty()
-    }
-}
-
-/// 文案策略：区分“共享文案”和“独立文案”
-enum CaptionStrategy<'a> {
-    /// 所有图片共享一个 Caption (仅第一张显示)
-    Shared(Option<&'a str>),
-    /// 每张图片有独立的 Caption
-    Individual(&'a [String]),
-}
-
-/// Configuration for download button
-/// Only applicable to non-channel chats (private and group chats)
-#[derive(Clone, Debug, Default)]
-pub struct DownloadButtonConfig {
-    /// The illust ID to download when button is clicked
-    pub illust_id: Option<u64>,
-    /// Whether the target chat is a channel (channels don't support inline buttons)
-    pub is_channel: bool,
-}
-
-impl DownloadButtonConfig {
-    /// Create a new config with the given illust ID
-    /// By default, assumes it's NOT a channel (button will be shown)
-    pub fn new(illust_id: u64) -> Self {
-        Self {
-            illust_id: Some(illust_id),
-            is_channel: false,
-        }
-    }
-
-    /// Mark the target as a channel (button will NOT be shown)
-    pub fn for_channel(mut self) -> Self {
-        self.is_channel = true;
-        self
-    }
-
-    /// Returns true if the download button should be shown
-    fn should_show_button(&self) -> bool {
-        self.illust_id.is_some() && !self.is_channel
-    }
-
-    /// Build the inline keyboard with download button
-    fn build_keyboard(&self) -> Option<InlineKeyboardMarkup> {
-        if !self.should_show_button() {
-            return None;
-        }
-
-        // unwrap() is safe here because should_show_button() already validated illust_id.is_some()
-        let illust_id = self.illust_id.unwrap();
-        let callback_data = format!("{}{}", DOWNLOAD_CALLBACK_PREFIX, illust_id);
-        let button = InlineKeyboardButton::callback(DOWNLOAD_BUTTON_LABEL, callback_data);
-        Some(InlineKeyboardMarkup::new(vec![vec![button]]))
-    }
-}
+use caption::CaptionStrategy;
 
 #[derive(Clone)]
 pub struct Notifier {
@@ -145,6 +76,27 @@ impl Notifier {
             CaptionStrategy::Shared(caption),
             has_spoiler,
             download_config,
+            None,
+        )
+        .await
+    }
+
+    pub async fn notify_with_images_and_button_and_continuation(
+        &self,
+        chat_id: ChatId,
+        image_urls: &[String],
+        caption: Option<&str>,
+        has_spoiler: bool,
+        download_config: &DownloadButtonConfig,
+        continuation_numbering: ContinuationNumbering,
+    ) -> BatchSendResult {
+        self.process_batch_send(
+            chat_id,
+            image_urls,
+            CaptionStrategy::Shared(caption),
+            has_spoiler,
+            download_config,
+            Some(continuation_numbering),
         )
         .await
     }
@@ -189,363 +141,127 @@ impl Notifier {
             CaptionStrategy::Individual(captions),
             has_spoiler,
             download_config,
+            None,
         )
         .await
     }
+}
 
-    // ==================== Ugoira (动图) 支持 ====================
+#[cfg(test)]
+mod tests {
+    use super::caption::{individual_batch_caption, shared_batch_caption};
+    use super::{BatchSendResult, ContinuationNumbering, DownloadButtonConfig};
+    use crate::db::types::Tags;
 
-    /// 发送 Ugoira (动图) 作品为 MP4 动画
-    ///
-    /// 1. 下载 ZIP 并编码为 MP4
-    /// 2. 以 Telegram animation 发送
-    pub async fn notify_ugoira(
-        &self,
-        chat_id: ChatId,
-        zip_url: &str,
-        frames: Vec<UgoiraFrame>,
-        caption: Option<&str>,
-        has_spoiler: bool,
-        download_config: &DownloadButtonConfig,
-    ) -> BatchSendResult {
-        // Build keyboard from config
-        let keyboard = download_config.build_keyboard();
-
-        // Set bot status to uploading video (animation)
-        if let Err(e) = self
-            .bot
-            .send_chat_action(chat_id, ChatAction::UploadVideo)
-            .await
-        {
-            warn!("Failed to set chat action for chat {}: {:#}", chat_id, e);
-        }
-
-        // Download and convert to MP4
-        let mp4_path = match self.downloader.download_ugoira_mp4(zip_url, frames).await {
-            Ok(path) => path,
-            Err(e) => {
-                error!(
-                    "Failed to download/convert ugoira for chat {}: {:#}",
-                    chat_id, e
-                );
-                return BatchSendResult::all_failed(1);
-            }
-        };
-
-        // Send as animation
-        match self
-            .send_animation_file(chat_id, &mp4_path, caption, has_spoiler, keyboard)
-            .await
-        {
-            Ok(msg_id) => BatchSendResult {
-                succeeded_indices: vec![0],
-                failed_indices: Vec::new(),
-                first_message_id: Some(msg_id),
-            },
-            Err(e) => {
-                error!(
-                    "Failed to send ugoira animation to chat {}: {:#}",
-                    chat_id, e
-                );
-                BatchSendResult::all_failed(1)
-            }
+    fn make_chat(chat_type: &str) -> crate::db::entities::chats::Model {
+        crate::db::entities::chats::Model {
+            id: 1,
+            r#type: chat_type.to_string(),
+            title: Some("test".to_string()),
+            enabled: true,
+            blur_sensitive_tags: false,
+            excluded_tags: Tags::default(),
+            sensitive_tags: Tags::default(),
+            created_at: chrono::Utc::now().naive_utc(),
+            allow_without_mention: false,
         }
     }
 
-    // ==================== 私有通用逻辑 ====================
+    #[test]
+    fn shared_batch_caption_uses_global_numbering_for_resumed_multi_batch_send() {
+        let numbering = ContinuationNumbering::new(2, 3);
 
-    /// 核心逻辑：下载 -> 分批 -> 发送
-    async fn process_batch_send(
-        &self,
-        chat_id: ChatId,
-        image_urls: &[String],
-        caption_strategy: CaptionStrategy<'_>,
-        has_spoiler: bool,
-        download_config: &DownloadButtonConfig,
-    ) -> BatchSendResult {
-        let total = image_urls.len();
-        if total == 0 {
-            return BatchSendResult::all_failed(0);
-        }
-
-        // Build keyboard from config
-        let keyboard = download_config.build_keyboard();
-
-        // 1. 优化：单图特例处理
-        if total == 1 {
-            let cap = match &caption_strategy {
-                CaptionStrategy::Shared(c) => *c,
-                CaptionStrategy::Individual(cs) => Some(cs[0].as_str()),
-            };
-
-            match self
-                .send_single_image(chat_id, &image_urls[0], cap, has_spoiler, keyboard)
-                .await
-            {
-                Ok(msg_id) => {
-                    return BatchSendResult {
-                        succeeded_indices: vec![0],
-                        failed_indices: Vec::new(),
-                        first_message_id: Some(msg_id),
-                    };
-                }
-                Err(e) => {
-                    error!("Single image send failed for chat {}: {:#}", chat_id, e);
-                    return BatchSendResult::all_failed(1);
-                }
-            }
-        }
-
-        info!("Batch processing {} images for chat {}", total, chat_id);
-
-        // Set bot status to uploading photo before downloading
-        if let Err(e) = self
-            .bot
-            .send_chat_action(chat_id, ChatAction::UploadPhoto)
-            .await
-        {
-            warn!("Failed to set chat action for chat {}: {:#}", chat_id, e);
-        }
-
-        // 2. 批量下载
-        let local_paths = match self.downloader.download_all(image_urls).await {
-            Ok(paths) => paths,
-            Err(e) => {
-                error!("Batch download failed for chat {}: {:#}", chat_id, e);
-                return BatchSendResult::all_failed(total);
-            }
-        };
-
-        // 3. 分批处理
-        const MAX_PER_GROUP: usize = 10;
-        let chunks: Vec<_> = local_paths.chunks(MAX_PER_GROUP).collect();
-        let total_batches = chunks.len();
-
-        let mut succeeded = Vec::new();
-        let mut failed = Vec::new();
-        let mut current_idx = 0;
-        let mut first_message_id: Option<i32> = None;
-
-        for (batch_idx, path_chunk) in chunks.into_iter().enumerate() {
-            let batch_size = path_chunk.len();
-            let batch_end_idx = current_idx + batch_size;
-
-            let batch_captions_slice = match &caption_strategy {
-                CaptionStrategy::Individual(all_captions) => {
-                    Some(&all_captions[current_idx..batch_end_idx])
-                }
-                CaptionStrategy::Shared(_) => None,
-            };
-
-            let silent = batch_idx > 0;
-
-            match self
-                .send_media_batch(
-                    chat_id,
-                    path_chunk,
-                    &caption_strategy,
-                    batch_captions_slice,
-                    has_spoiler,
-                    batch_idx,
-                    total_batches,
-                    silent,
-                )
-                .await
-            {
-                Ok(msg_id) => {
-                    succeeded.extend(current_idx..batch_end_idx);
-                    // Capture the first message ID from the first successful batch
-                    if first_message_id.is_none() {
-                        first_message_id = msg_id;
-                    }
-                }
-                Err(e) => {
-                    warn!(
-                        "Batch {}/{} failed for chat {}: {:#}",
-                        batch_idx + 1,
-                        total_batches,
-                        chat_id,
-                        e
-                    );
-                    failed.extend(current_idx..batch_end_idx);
-                }
-            }
-
-            current_idx += batch_size;
-            // Rate limiting is now handled by the Throttle adaptor
-        }
-
-        // Note: For multi-image batches (media groups), download button is NOT shown
-        // because Telegram's sendMediaGroup API doesn't support reply_markup
-
-        if !failed.is_empty() {
-            error!(
-                "❌ Sent {}/{} images to chat {}",
-                succeeded.len(),
-                total,
-                chat_id
-            );
-        } else {
-            info!("✅ All {} images sent to chat {}", total, chat_id);
-        }
-
-        BatchSendResult {
-            succeeded_indices: succeeded,
-            failed_indices: failed,
-            first_message_id,
-        }
-    }
-
-    /// 发送单张图片并返回消息ID
-    async fn send_single_image(
-        &self,
-        chat_id: ChatId,
-        image_url: &str,
-        caption: Option<&str>,
-        has_spoiler: bool,
-        keyboard: Option<InlineKeyboardMarkup>,
-    ) -> Result<i32> {
-        info!(
-            "Downloading and sending image to chat {}: {}",
-            chat_id, image_url
+        assert_eq!(
+            shared_batch_caption(Some("base"), 0, 0, numbering),
+            Some("\\(continued 2/3\\)".to_string())
         );
-        // Set bot status to uploading photo
-        if let Err(e) = self
-            .bot
-            .send_chat_action(chat_id, ChatAction::UploadPhoto)
-            .await
-        {
-            warn!("Failed to set chat action for chat {}: {:#}", chat_id, e);
-        }
-        let local_path = self.downloader.download(image_url).await?;
-        self.send_photo_file_with_id(chat_id, &local_path, caption, has_spoiler, keyboard)
-            .await
+        assert_eq!(
+            shared_batch_caption(Some("base"), 0, 1, numbering),
+            Some("\\(continued 3/3\\)".to_string())
+        );
+        assert_eq!(shared_batch_caption(Some("base"), 1, 1, numbering), None);
     }
 
-    /// 底层发送：构建 InputMedia 并调用 API，返回第一条消息的ID
-    #[allow(clippy::too_many_arguments)]
-    async fn send_media_batch(
-        &self,
-        chat_id: ChatId,
-        paths: &[PathBuf], // 接收切片
-        strategy: &CaptionStrategy<'_>,
-        batch_captions: Option<&[String]>, // 仅当 Individual 时有值
-        has_spoiler: bool,
-        batch_idx: usize,
-        total_batches: usize,
-        silent: bool,
-    ) -> Result<Option<i32>> {
-        let media_group: Vec<InputMedia> = paths
-            .iter()
-            .enumerate()
-            .map(|(i, path)| {
-                let mut photo = InputMediaPhoto::new(InputFile::file(path));
+    #[test]
+    fn individual_batch_caption_uses_global_numbering_for_later_batches() {
+        let numbering = ContinuationNumbering::new(2, 3);
 
-                // 文案逻辑
-                let caption_text = match strategy {
-                    // 1. 共享文案：只有第一批的第一张图有文案
-                    CaptionStrategy::Shared(base_cap) => {
-                        if i == 0 {
-                            if batch_idx == 0 {
-                                // 首批首图：原始文案
-                                base_cap.map(|s| s.to_string())
-                            } else if total_batches > 1 {
-                                // 后续批次首图：添加页码标记
-                                Some(format!(
-                                    "\\(continued {}/{}\\)",
-                                    batch_idx + 1,
-                                    total_batches
-                                ))
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
-                        }
-                    }
-                    // 2. 独立文案：每张图都有，且需处理批次标记
-                    CaptionStrategy::Individual(_) => {
-                        if let Some(caps) = batch_captions {
-                            let raw_cap = &caps[i];
-                            if batch_idx > 0 && i == 0 {
-                                // 后续批次首图：添加页码标记 + 原始文案
-                                Some(format!(
-                                    "\\(continued {}/{}\\)\n\n{}",
-                                    batch_idx + 1,
-                                    total_batches,
-                                    raw_cap
-                                ))
-                            } else {
-                                Some(raw_cap.clone())
-                            }
-                        } else {
-                            None
-                        }
-                    }
-                };
-
-                if let Some(c) = caption_text {
-                    photo = photo.caption(c).parse_mode(ParseMode::MarkdownV2);
-                }
-                if has_spoiler {
-                    photo = photo.spoiler();
-                }
-                InputMedia::Photo(photo)
-            })
-            .collect();
-
-        let mut req = self.bot.send_media_group(chat_id, media_group);
-        if silent {
-            req = req.disable_notification(true);
-        }
-        let messages = req.await.context("Send media group failed")?;
-        // Return the first message ID from the group
-        let first_msg_id = messages.first().map(|m| m.id.0);
-        Ok(first_msg_id)
+        assert_eq!(
+            individual_batch_caption("ranking caption", 0, 0, numbering),
+            Some("\\(continued 2/3\\)\n\nranking caption".to_string())
+        );
+        assert_eq!(
+            individual_batch_caption("ranking caption", 0, 1, numbering),
+            Some("\\(continued 3/3\\)\n\nranking caption".to_string())
+        );
+        assert_eq!(
+            individual_batch_caption("ranking caption", 1, 1, numbering),
+            Some("ranking caption".to_string())
+        );
     }
 
-    async fn send_photo_file_with_id(
-        &self,
-        chat_id: ChatId,
-        path: &Path,
-        caption: Option<&str>,
-        has_spoiler: bool,
-        keyboard: Option<InlineKeyboardMarkup>,
-    ) -> Result<i32> {
-        let mut req = self.bot.send_photo(chat_id, InputFile::file(path));
-        if let Some(c) = caption {
-            req = req.caption(c).parse_mode(ParseMode::MarkdownV2);
-        }
-        if has_spoiler {
-            req = req.has_spoiler(true);
-        }
-        if let Some(kb) = keyboard {
-            req = req.reply_markup(kb);
-        }
-        let message = req.await.context("Send photo failed")?;
-        Ok(message.id.0)
+    #[test]
+    fn download_button_config_for_chat_marks_channels_only() {
+        let private_chat = make_chat("private");
+        let channel_chat = make_chat("channel");
+
+        assert!(!DownloadButtonConfig::for_chat(123, &private_chat).is_channel);
+        assert!(DownloadButtonConfig::for_chat(123, &channel_chat).is_channel);
     }
 
-    /// 发送动画 (MP4/GIF) 文件并返回消息ID
-    async fn send_animation_file(
-        &self,
-        chat_id: ChatId,
-        path: &Path,
-        caption: Option<&str>,
-        has_spoiler: bool,
-        keyboard: Option<InlineKeyboardMarkup>,
-    ) -> Result<i32> {
-        let mut req = self.bot.send_animation(chat_id, InputFile::file(path));
-        if let Some(c) = caption {
-            req = req.caption(c).parse_mode(ParseMode::MarkdownV2);
-        }
-        if has_spoiler {
-            req = req.has_spoiler(true);
-        }
-        if let Some(kb) = keyboard {
-            req = req.reply_markup(kb);
-        }
-        let message = req.await.context("Send animation failed")?;
-        Ok(message.id.0)
+    #[test]
+    fn batch_send_result_all_failed_marks_every_index_failed() {
+        let result = BatchSendResult::all_failed(3);
+
+        assert_eq!(result.succeeded_indices, Vec::<usize>::new());
+        assert_eq!(result.failed_indices, vec![0, 1, 2]);
+        assert_eq!(result.first_message_id, None);
+        assert!(result.is_complete_failure());
+        assert!(!result.is_complete_success());
+    }
+
+    #[test]
+    fn batch_send_result_success_and_partial_flags_match_contents() {
+        let success = BatchSendResult {
+            succeeded_indices: vec![0, 1],
+            failed_indices: Vec::new(),
+            first_message_id: Some(42),
+        };
+        let partial = BatchSendResult {
+            succeeded_indices: vec![0],
+            failed_indices: vec![1],
+            first_message_id: Some(7),
+        };
+
+        assert!(success.is_complete_success());
+        assert!(!success.is_complete_failure());
+
+        assert!(!partial.is_complete_success());
+        assert!(!partial.is_complete_failure());
+    }
+
+    #[test]
+    fn continuation_numbering_for_item_count_uses_shared_batch_limit() {
+        let numbering = ContinuationNumbering::for_item_count(23);
+
+        assert_eq!(numbering.first_batch_number, 1);
+        assert_eq!(numbering.total_batches, 3);
+        assert_eq!(numbering.display_batch_number(0), 1);
+        assert_eq!(numbering.display_batch_number(2), 3);
+    }
+
+    #[test]
+    fn download_button_config_hides_button_without_illust_or_for_channels() {
+        let without_illust = DownloadButtonConfig::default();
+        let for_channel = DownloadButtonConfig::new(123).for_channel();
+        let normal = DownloadButtonConfig::new(123);
+
+        assert!(!without_illust.should_show_button());
+        assert!(!for_channel.should_show_button());
+        assert!(normal.should_show_button());
+
+        assert!(without_illust.build_keyboard().is_none());
+        assert!(for_channel.build_keyboard().is_none());
+        assert!(normal.build_keyboard().is_some());
     }
 }
