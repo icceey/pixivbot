@@ -1,8 +1,12 @@
 use crate::bot::notifier::{BatchSendResult, DownloadButtonConfig, Notifier};
 use crate::db::repo::Repo;
-use crate::db::types::{SubscriptionState, TaskType};
+use crate::db::types::TaskType;
 use crate::pixiv::client::PixivClient;
-use crate::scheduler::helpers::{get_chat_if_should_notify, RankingContext};
+use crate::scheduler::helpers::{
+    apply_subscription_tag_filter, get_chat_if_should_notify, ranking_subscription_state,
+    save_first_message_record, RankingContext, INTER_SUBSCRIPTION_DELAY_MS,
+};
+use crate::utils::caption::{build_ranking_caption, build_ranking_title};
 use anyhow::{Context, Result};
 use chrono::{Local, NaiveTime, TimeZone, Timelike};
 use pixiv_client::Illust;
@@ -172,10 +176,7 @@ impl RankingEngine {
                 }
             };
 
-            let subscription_state = match &subscription.latest_data {
-                Some(SubscriptionState::Ranking(state)) => Some(state.clone()),
-                _ => None,
-            };
+            let subscription_state = ranking_subscription_state(&subscription);
 
             let ctx = RankingContext {
                 subscription: &subscription,
@@ -196,7 +197,7 @@ impl RankingEngine {
             }
 
             // Small delay between subscriptions
-            sleep(Duration::from_millis(2000)).await;
+            sleep(Duration::from_millis(INTER_SUBSCRIPTION_DELAY_MS)).await;
         }
 
         // Schedule next poll (next day at execution time)
@@ -249,10 +250,8 @@ impl RankingEngine {
         );
 
         // Apply tag filters
-        let chat_filter = crate::db::types::TagFilter::from_excluded_tags(&ctx.chat.excluded_tags);
-        let combined_filter = ctx.subscription.filter_tags.merged(&chat_filter);
-        let filtered_illusts: Vec<&pixiv_client::Illust> =
-            combined_filter.filter(new_illusts.iter().copied());
+        let filtered_illusts =
+            apply_subscription_tag_filter(ctx.subscription, &ctx.chat, new_illusts.iter().copied());
 
         // Collect all new IDs for tracking
         let all_new_ids: Vec<u64> = new_illusts.iter().map(|i| i.id).collect();
@@ -298,16 +297,14 @@ impl RankingEngine {
         }
 
         // Save message record for reply-based unsubscribe (use first illust_id)
-        if let Some(msg_id) = send_result.first_message_id {
-            let first_illust_id = illust_ids.first().map(|&id| id as i64);
-            if let Err(e) = self
-                .repo
-                .save_message(chat_id.0, msg_id, ctx.subscription.id, first_illust_id)
-                .await
-            {
-                warn!("Failed to save message record: {:#}", e);
-            }
-        }
+        save_first_message_record(
+            &self.repo,
+            chat_id,
+            ctx.subscription.id,
+            send_result.first_message_id,
+            illust_ids.first().map(|&id| id as i64),
+        )
+        .await;
 
         // Update pushed_ids with successfully sent illusts
         let mut new_pushed_ids = pushed_ids.clone();
@@ -521,39 +518,6 @@ impl RankingEngine {
 
 fn ranking_requires_individual_send(illusts: &[&Illust]) -> bool {
     illusts.iter().any(|illust| illust.is_ugoira())
-}
-
-fn build_ranking_title(mode: &str, count: usize) -> String {
-    format!(
-        "📊 *{} Ranking* \\- {} new\\!\n\n",
-        teloxide::utils::markdown::escape(&mode.replace('_', " ").to_uppercase()),
-        count
-    )
-}
-
-fn build_ranking_caption(title: &str, index: usize, illust: &Illust) -> String {
-    let tags = crate::utils::tag::format_tags_escaped(illust);
-    let title_line = if illust.is_ugoira() {
-        format!("🎞️ {}", teloxide::utils::markdown::escape(&illust.title))
-    } else {
-        teloxide::utils::markdown::escape(&illust.title)
-    };
-
-    let base_caption = format!(
-        "{}\nby *{}* \\(ID: `{}`\\)\n\n❤️ {} \\| 🔗 [来源](https://pixiv\\.net/artworks/{}){}",
-        title_line,
-        teloxide::utils::markdown::escape(&illust.user.name),
-        illust.user.id,
-        illust.total_bookmarks,
-        illust.id,
-        tags
-    );
-
-    if index == 0 {
-        format!("{}{}", title, base_caption)
-    } else {
-        base_caption
-    }
 }
 
 #[cfg(test)]
