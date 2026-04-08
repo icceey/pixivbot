@@ -3,7 +3,9 @@ use crate::db::repo::Repo;
 use crate::db::types::{AuthorState, PendingIllust, SubscriptionState, TagFilter, TaskType};
 use crate::pixiv::client::PixivClient;
 use crate::scheduler::helpers::{
-    get_chat_if_should_notify, process_illust_push, AuthorContext, PushResult,
+    apply_subscription_tag_filter, author_subscription_state, get_chat_if_should_notify,
+    process_illust_push, save_first_message_record, AuthorContext, PushResult,
+    INTER_SUBSCRIPTION_DELAY_MS,
 };
 use anyhow::{Context, Result};
 use chrono::Local;
@@ -139,10 +141,7 @@ impl AuthorEngine {
                 }
             };
 
-            let subscription_state = match &subscription.latest_data {
-                Some(SubscriptionState::Author(state)) => Some(state.clone()),
-                _ => None,
-            };
+            let subscription_state = author_subscription_state(&subscription);
 
             let ctx = AuthorContext {
                 subscription: &subscription,
@@ -179,7 +178,7 @@ impl AuthorEngine {
             }
 
             // Small delay between subscriptions
-            sleep(Duration::from_millis(2000)).await;
+            sleep(Duration::from_millis(INTER_SUBSCRIPTION_DELAY_MS)).await;
         }
 
         // Schedule next poll
@@ -212,6 +211,68 @@ impl AuthorEngine {
             )
             .await?;
         Ok(())
+    }
+
+    fn author_state(latest_illust_id: u64, pending_illust: Option<PendingIllust>) -> AuthorState {
+        AuthorState {
+            latest_illust_id,
+            pending_illust,
+        }
+    }
+
+    fn clear_pending_state(latest_illust_id: u64) -> AuthorState {
+        Self::author_state(latest_illust_id, None)
+    }
+
+    async fn save_push_message_record(
+        &self,
+        chat_id: ChatId,
+        subscription_id: i32,
+        illust_id: u64,
+        first_message_id: Option<i32>,
+    ) {
+        save_first_message_record(
+            &self.repo,
+            chat_id,
+            subscription_id,
+            first_message_id,
+            Some(illust_id as i64),
+        )
+        .await;
+    }
+
+    fn pending_retry_state(
+        latest_illust_id: u64,
+        pending: &PendingIllust,
+        retry_count: u8,
+    ) -> AuthorState {
+        Self::author_state(
+            latest_illust_id,
+            Some(PendingIllust {
+                illust_id: pending.illust_id,
+                sent_pages: pending.sent_pages.clone(),
+                total_pages: pending.total_pages,
+                retry_count,
+            }),
+        )
+    }
+
+    fn partial_push_state(
+        latest_illust_id: u64,
+        illust_id: u64,
+        sent_pages: Vec<usize>,
+        total_pages: usize,
+        retry_count: u8,
+    ) -> AuthorState {
+        Self::author_state(
+            latest_illust_id,
+            Some(PendingIllust {
+                illust_id,
+                sent_pages,
+                total_pages,
+                retry_count,
+            }),
+        )
     }
 
     // ==================== Dispatcher ====================
@@ -258,10 +319,7 @@ impl AuthorEngine {
                 "Retry disabled (max_retry_count={}), abandoning pending illust {} for chat {}",
                 self.max_retry_count, pending.illust_id, chat_id
             );
-            return Ok(Some(AuthorState {
-                latest_illust_id: state.latest_illust_id,
-                pending_illust: None,
-            }));
+            return Ok(Some(Self::clear_pending_state(state.latest_illust_id)));
         }
 
         // Compare retry_count (u8) with max_retry_count (i32) safely
@@ -271,10 +329,7 @@ impl AuthorEngine {
                 "Max retry count reached ({}/{}), abandoning pending illust {} for chat {}",
                 pending.retry_count, self.max_retry_count, pending.illust_id, chat_id
             );
-            return Ok(Some(AuthorState {
-                latest_illust_id: state.latest_illust_id,
-                pending_illust: None,
-            }));
+            return Ok(Some(Self::clear_pending_state(state.latest_illust_id)));
         }
 
         // Find the illust in API response
@@ -284,10 +339,7 @@ impl AuthorEngine {
                 "Pending illust {} not found in API response, abandoning",
                 pending.illust_id
             );
-            return Ok(Some(AuthorState {
-                latest_illust_id: state.latest_illust_id,
-                pending_illust: None,
-            }));
+            return Ok(Some(Self::clear_pending_state(state.latest_illust_id)));
         };
 
         info!(
@@ -307,10 +359,7 @@ impl AuthorEngine {
 
         if remaining_pages.is_empty() {
             // All pages already sent, mark as complete
-            return Ok(Some(AuthorState {
-                latest_illust_id: pending.illust_id,
-                pending_illust: None,
-            }));
+            return Ok(Some(Self::clear_pending_state(pending.illust_id)));
         }
 
         // Send remaining pages
@@ -334,25 +383,14 @@ impl AuthorEngine {
                     "✅ Completed pending illust {} for chat {}",
                     illust_id, chat_id
                 );
-                // Save message record for reply-based unsubscribe
-                if let Some(msg_id) = first_message_id {
-                    if let Err(e) = self
-                        .repo
-                        .save_message(
-                            chat_id.0,
-                            msg_id,
-                            ctx.subscription.id,
-                            Some(illust_id as i64),
-                        )
-                        .await
-                    {
-                        warn!("Failed to save message record: {:#}", e);
-                    }
-                }
-                AuthorState {
-                    latest_illust_id: illust_id,
-                    pending_illust: None,
-                }
+                self.save_push_message_record(
+                    chat_id,
+                    ctx.subscription.id,
+                    illust_id,
+                    first_message_id,
+                )
+                .await;
+                Self::clear_pending_state(illust_id)
             }
             PushResult::Partial {
                 illust_id,
@@ -366,30 +404,20 @@ impl AuthorEngine {
                     sent_pages.len(),
                     total_pages
                 );
-                // Save message record even for partial success
-                if let Some(msg_id) = first_message_id {
-                    if let Err(e) = self
-                        .repo
-                        .save_message(
-                            chat_id.0,
-                            msg_id,
-                            ctx.subscription.id,
-                            Some(illust_id as i64),
-                        )
-                        .await
-                    {
-                        warn!("Failed to save message record: {:#}", e);
-                    }
-                }
-                AuthorState {
-                    latest_illust_id: state.latest_illust_id,
-                    pending_illust: Some(PendingIllust {
-                        illust_id,
-                        sent_pages,
-                        total_pages,
-                        retry_count: pending.retry_count.saturating_add(1),
-                    }),
-                }
+                self.save_push_message_record(
+                    chat_id,
+                    ctx.subscription.id,
+                    illust_id,
+                    first_message_id,
+                )
+                .await;
+                Self::partial_push_state(
+                    state.latest_illust_id,
+                    illust_id,
+                    sent_pages,
+                    total_pages,
+                    pending.retry_count.saturating_add(1),
+                )
             }
             PushResult::Failure { illust_id } => {
                 // Use saturating_add to prevent u8 overflow
@@ -400,25 +428,14 @@ impl AuthorEngine {
                         "❌ Failed to send pending illust {} to chat {}, max retries reached ({}/{}), abandoning",
                         illust_id, chat_id, new_retry_count, self.max_retry_count
                     );
-                    AuthorState {
-                        latest_illust_id: state.latest_illust_id,
-                        pending_illust: None,
-                    }
+                    Self::clear_pending_state(state.latest_illust_id)
                 } else {
                     error!(
                         "❌ Failed to send pending illust {} to chat {}, will retry (attempt {}/{})",
                         illust_id, chat_id, new_retry_count, self.max_retry_count
                     );
                     // Increment retry count and keep pending state
-                    AuthorState {
-                        latest_illust_id: state.latest_illust_id,
-                        pending_illust: Some(PendingIllust {
-                            illust_id: pending.illust_id,
-                            sent_pages: pending.sent_pages.clone(),
-                            total_pages: pending.total_pages,
-                            retry_count: new_retry_count,
-                        }),
-                    }
+                    Self::pending_retry_state(state.latest_illust_id, pending, new_retry_count)
                 }
             }
         };
@@ -459,16 +476,12 @@ impl AuthorEngine {
         let newest_illust_id = new_illusts.first().map(|i| i.id);
 
         // Apply tag filters
-        let chat_filter = TagFilter::from_excluded_tags(&ctx.chat.excluded_tags);
-        let combined_filter = ctx.subscription.filter_tags.merged(&chat_filter);
-        let filtered_illusts: Vec<&Illust> = combined_filter.filter(new_illusts.iter().copied());
+        let filtered_illusts =
+            apply_subscription_tag_filter(ctx.subscription, &ctx.chat, new_illusts.iter().copied());
 
         // If all filtered out, update cursor and return
         if filtered_illusts.is_empty() {
-            return Ok(newest_illust_id.map(|newest_id| AuthorState {
-                latest_illust_id: newest_id,
-                pending_illust: None,
-            }));
+            return Ok(newest_illust_id.map(Self::clear_pending_state));
         }
 
         // *** KEY CHANGE: Only process the OLDEST new illust (last in the filtered list) ***
@@ -482,7 +495,7 @@ impl AuthorEngine {
             &self.pixiv_client,
             ctx,
             illust,
-            &[],
+            &Vec::new(),
             self.image_size,
         )
         .await?;
@@ -497,25 +510,14 @@ impl AuthorEngine {
                     "✅ Successfully sent illust {} to chat {}",
                     illust_id, chat_id
                 );
-                // Save message record for reply-based unsubscribe
-                if let Some(msg_id) = first_message_id {
-                    if let Err(e) = self
-                        .repo
-                        .save_message(
-                            chat_id.0,
-                            msg_id,
-                            ctx.subscription.id,
-                            Some(illust_id as i64),
-                        )
-                        .await
-                    {
-                        warn!("Failed to save message record: {:#}", e);
-                    }
-                }
-                AuthorState {
-                    latest_illust_id: illust_id,
-                    pending_illust: None,
-                }
+                self.save_push_message_record(
+                    chat_id,
+                    ctx.subscription.id,
+                    illust_id,
+                    first_message_id,
+                )
+                .await;
+                Self::clear_pending_state(illust_id)
             }
             PushResult::Partial {
                 illust_id,
@@ -529,30 +531,20 @@ impl AuthorEngine {
                     sent_pages.len(),
                     total_pages
                 );
-                // Save message record even for partial success
-                if let Some(msg_id) = first_message_id {
-                    if let Err(e) = self
-                        .repo
-                        .save_message(
-                            chat_id.0,
-                            msg_id,
-                            ctx.subscription.id,
-                            Some(illust_id as i64),
-                        )
-                        .await
-                    {
-                        warn!("Failed to save message record: {:#}", e);
-                    }
-                }
-                AuthorState {
-                    latest_illust_id: last_illust_id.unwrap_or(0),
-                    pending_illust: Some(PendingIllust {
-                        illust_id,
-                        sent_pages,
-                        total_pages,
-                        retry_count: 0,
-                    }),
-                }
+                self.save_push_message_record(
+                    chat_id,
+                    ctx.subscription.id,
+                    illust_id,
+                    first_message_id,
+                )
+                .await;
+                Self::partial_push_state(
+                    last_illust_id.unwrap_or(0),
+                    illust_id,
+                    sent_pages,
+                    total_pages,
+                    0,
+                )
             }
             PushResult::Failure { illust_id } => {
                 error!(
@@ -565,5 +557,88 @@ impl AuthorEngine {
         };
 
         Ok(Some(new_state))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AuthorEngine;
+    use crate::db::types::{AuthorState, PendingIllust};
+
+    #[test]
+    fn author_state_keeps_latest_id_and_pending_payload() {
+        let pending = PendingIllust {
+            illust_id: 123,
+            sent_pages: vec![0, 2],
+            total_pages: 4,
+            retry_count: 1,
+        };
+
+        let state = AuthorEngine::author_state(999, Some(pending.clone()));
+
+        assert_eq!(
+            state,
+            AuthorState {
+                latest_illust_id: 999,
+                pending_illust: Some(pending),
+            }
+        );
+    }
+
+    #[test]
+    fn clear_pending_state_removes_pending_illust() {
+        let state = AuthorEngine::clear_pending_state(456);
+
+        assert_eq!(
+            state,
+            AuthorState {
+                latest_illust_id: 456,
+                pending_illust: None,
+            }
+        );
+    }
+
+    #[test]
+    fn pending_retry_state_preserves_progress_and_updates_retry_count() {
+        let pending = PendingIllust {
+            illust_id: 321,
+            sent_pages: vec![0, 1],
+            total_pages: 5,
+            retry_count: 0,
+        };
+
+        let state = AuthorEngine::pending_retry_state(654, &pending, 2);
+
+        assert_eq!(
+            state,
+            AuthorState {
+                latest_illust_id: 654,
+                pending_illust: Some(PendingIllust {
+                    illust_id: 321,
+                    sent_pages: vec![0, 1],
+                    total_pages: 5,
+                    retry_count: 2,
+                }),
+            }
+        );
+        assert_eq!(pending.retry_count, 0);
+    }
+
+    #[test]
+    fn partial_push_state_starts_new_pending_retry_from_partial_send() {
+        let state = AuthorEngine::partial_push_state(777, 888, vec![0, 3], 6, 0);
+
+        assert_eq!(
+            state,
+            AuthorState {
+                latest_illust_id: 777,
+                pending_illust: Some(PendingIllust {
+                    illust_id: 888,
+                    sent_pages: vec![0, 3],
+                    total_pages: 6,
+                    retry_count: 0,
+                }),
+            }
+        );
     }
 }
