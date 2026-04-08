@@ -117,145 +117,6 @@ pub async fn get_chat_if_should_notify(
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{
-        apply_subscription_tag_filter, author_subscription_state, ranking_subscription_state,
-        INTER_SUBSCRIPTION_DELAY_MS,
-    };
-    use crate::db::entities::{chats, subscriptions};
-    use crate::db::types::{AuthorState, RankingState, SubscriptionState, TagFilter, Tags};
-    use pixiv_client::Illust;
-    use serde_json::json;
-
-    fn make_chat(excluded_tags: &[&str]) -> chats::Model {
-        chats::Model {
-            id: 1,
-            r#type: "private".to_string(),
-            title: Some("chat".to_string()),
-            enabled: true,
-            blur_sensitive_tags: false,
-            excluded_tags: Tags(excluded_tags.iter().map(|t| t.to_string()).collect()),
-            sensitive_tags: Tags::default(),
-            created_at: chrono::Utc::now().naive_utc(),
-            allow_without_mention: false,
-        }
-    }
-
-    fn make_subscription(
-        latest_data: Option<SubscriptionState>,
-        filter_tags: TagFilter,
-    ) -> subscriptions::Model {
-        subscriptions::Model {
-            id: 1,
-            chat_id: 1,
-            task_id: 1,
-            filter_tags,
-            latest_data,
-            created_at: chrono::Utc::now().naive_utc(),
-        }
-    }
-
-    fn make_illust(id: u64, tags: &[&str]) -> Illust {
-        serde_json::from_value(json!({
-            "id": id,
-            "title": format!("illust-{id}"),
-            "type": "illust",
-            "image_urls": {
-                "square_medium": "square",
-                "medium": "medium",
-                "large": "large",
-                "original": "original"
-            },
-            "caption": "",
-            "restrict": 0,
-            "user": {
-                "id": 67890,
-                "name": "Author",
-                "account": "author"
-            },
-            "tags": tags.iter().map(|name| json!({ "name": name, "translated_name": null })).collect::<Vec<_>>(),
-            "create_date": "2026-01-01T00:00:00+00:00",
-            "page_count": 1,
-            "width": 100,
-            "height": 100,
-            "sanity_level": 2,
-            "x_restrict": 0,
-            "series": null,
-            "meta_single_page": { "original_image_url": "original" },
-            "meta_pages": [],
-            "total_view": 1,
-            "total_bookmarks": 2,
-            "is_bookmarked": false,
-            "visible": true,
-            "is_muted": false,
-            "total_comments": 0
-        }))
-        .unwrap()
-    }
-
-    #[test]
-    fn author_subscription_state_extracts_only_author_state() {
-        let author = AuthorState {
-            latest_illust_id: 42,
-            pending_illust: None,
-        };
-        let subscription = make_subscription(
-            Some(SubscriptionState::Author(author.clone())),
-            TagFilter::default(),
-        );
-
-        assert_eq!(author_subscription_state(&subscription), Some(author));
-        assert_eq!(
-            ranking_subscription_state(&subscription),
-            None,
-            "author state must not be exposed as ranking state"
-        );
-    }
-
-    #[test]
-    fn ranking_subscription_state_extracts_only_ranking_state() {
-        let ranking = RankingState {
-            pushed_ids: vec![1, 2, 3],
-            pending_illust: None,
-        };
-        let subscription = make_subscription(
-            Some(SubscriptionState::Ranking(ranking.clone())),
-            TagFilter::default(),
-        );
-
-        assert_eq!(ranking_subscription_state(&subscription), Some(ranking));
-        assert_eq!(
-            author_subscription_state(&subscription),
-            None,
-            "ranking state must not be exposed as author state"
-        );
-    }
-
-    #[test]
-    fn apply_subscription_tag_filter_merges_subscription_and_chat_rules() {
-        let subscription = make_subscription(None, TagFilter::parse_from_args(&["+cat"]));
-        let chat = make_chat(&["R-18"]);
-        let keep = make_illust(1, &["cat"]);
-        let drop_by_chat = make_illust(2, &["cat", "R-18"]);
-        let drop_by_subscription = make_illust(3, &["dog"]);
-
-        let filtered = apply_subscription_tag_filter(
-            &subscription,
-            &chat,
-            [&keep, &drop_by_chat, &drop_by_subscription],
-        );
-
-        assert_eq!(filtered.len(), 1);
-        assert_eq!(filtered[0].id, keep.id);
-    }
-
-    #[test]
-    fn inter_subscription_delay_constant_stays_two_seconds() {
-        assert_eq!(INTER_SUBSCRIPTION_DELAY_MS, 2000);
-    }
-}
-
 /// Generic push executor: Send specific illust pages (excluding already sent pages)
 pub async fn process_illust_push(
     notifier: &Notifier,
@@ -439,5 +300,144 @@ async fn process_ugoira_push(
             illust_id: illust.id,
             first_message_id: send_result.first_message_id,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        apply_subscription_tag_filter, author_subscription_state, ranking_subscription_state,
+        INTER_SUBSCRIPTION_DELAY_MS,
+    };
+    use crate::db::entities::{chats, subscriptions};
+    use crate::db::types::{AuthorState, RankingState, SubscriptionState, TagFilter, Tags};
+    use pixiv_client::Illust;
+    use serde_json::json;
+
+    fn make_chat(excluded_tags: &[&str]) -> chats::Model {
+        chats::Model {
+            id: 1,
+            r#type: "private".to_string(),
+            title: Some("chat".to_string()),
+            enabled: true,
+            blur_sensitive_tags: false,
+            excluded_tags: Tags(excluded_tags.iter().map(|t| t.to_string()).collect()),
+            sensitive_tags: Tags::default(),
+            created_at: chrono::Utc::now().naive_utc(),
+            allow_without_mention: false,
+        }
+    }
+
+    fn make_subscription(
+        latest_data: Option<SubscriptionState>,
+        filter_tags: TagFilter,
+    ) -> subscriptions::Model {
+        subscriptions::Model {
+            id: 1,
+            chat_id: 1,
+            task_id: 1,
+            filter_tags,
+            latest_data,
+            created_at: chrono::Utc::now().naive_utc(),
+        }
+    }
+
+    fn make_illust(id: u64, tags: &[&str]) -> Illust {
+        serde_json::from_value(json!({
+            "id": id,
+            "title": format!("illust-{id}"),
+            "type": "illust",
+            "image_urls": {
+                "square_medium": "square",
+                "medium": "medium",
+                "large": "large",
+                "original": "original"
+            },
+            "caption": "",
+            "restrict": 0,
+            "user": {
+                "id": 67890,
+                "name": "Author",
+                "account": "author"
+            },
+            "tags": tags.iter().map(|name| json!({ "name": name, "translated_name": null })).collect::<Vec<_>>(),
+            "create_date": "2026-01-01T00:00:00+00:00",
+            "page_count": 1,
+            "width": 100,
+            "height": 100,
+            "sanity_level": 2,
+            "x_restrict": 0,
+            "series": null,
+            "meta_single_page": { "original_image_url": "original" },
+            "meta_pages": [],
+            "total_view": 1,
+            "total_bookmarks": 2,
+            "is_bookmarked": false,
+            "visible": true,
+            "is_muted": false,
+            "total_comments": 0
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn author_subscription_state_extracts_only_author_state() {
+        let author = AuthorState {
+            latest_illust_id: 42,
+            pending_illust: None,
+        };
+        let subscription = make_subscription(
+            Some(SubscriptionState::Author(author.clone())),
+            TagFilter::default(),
+        );
+
+        assert_eq!(author_subscription_state(&subscription), Some(author));
+        assert_eq!(
+            ranking_subscription_state(&subscription),
+            None,
+            "author state must not be exposed as ranking state"
+        );
+    }
+
+    #[test]
+    fn ranking_subscription_state_extracts_only_ranking_state() {
+        let ranking = RankingState {
+            pushed_ids: vec![1, 2, 3],
+            pending_illust: None,
+        };
+        let subscription = make_subscription(
+            Some(SubscriptionState::Ranking(ranking.clone())),
+            TagFilter::default(),
+        );
+
+        assert_eq!(ranking_subscription_state(&subscription), Some(ranking));
+        assert_eq!(
+            author_subscription_state(&subscription),
+            None,
+            "ranking state must not be exposed as author state"
+        );
+    }
+
+    #[test]
+    fn apply_subscription_tag_filter_merges_subscription_and_chat_rules() {
+        let subscription = make_subscription(None, TagFilter::parse_from_args(&["+cat"]));
+        let chat = make_chat(&["R-18"]);
+        let keep = make_illust(1, &["cat"]);
+        let drop_by_chat = make_illust(2, &["cat", "R-18"]);
+        let drop_by_subscription = make_illust(3, &["dog"]);
+
+        let filtered = apply_subscription_tag_filter(
+            &subscription,
+            &chat,
+            [&keep, &drop_by_chat, &drop_by_subscription],
+        );
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].id, keep.id);
+    }
+
+    #[test]
+    fn inter_subscription_delay_constant_stays_two_seconds() {
+        assert_eq!(INTER_SUBSCRIPTION_DELAY_MS, 2000);
     }
 }
