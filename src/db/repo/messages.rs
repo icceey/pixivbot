@@ -2,7 +2,7 @@ use super::Repo;
 use crate::db::entities::{messages, subscriptions, tasks};
 use anyhow::{Context, Result};
 use chrono::Local;
-use sea_orm::{ActiveModelTrait, EntityTrait, QueryFilter, Set};
+use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
 
 impl Repo {
     pub async fn save_message(

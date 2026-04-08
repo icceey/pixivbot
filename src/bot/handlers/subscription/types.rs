@@ -1,7 +1,7 @@
 use teloxide::types::ChatId;
 
 /// Maximum number of subscriptions per page
-pub(super) const PAGE_SIZE: usize = 50;
+pub(crate) const PAGE_SIZE: usize = 50;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ListPaginationAction {
@@ -14,38 +14,38 @@ pub enum ListPaginationAction {
 }
 
 /// 批量操作结果收集器
-pub(super) struct BatchResult {
+pub(crate) struct BatchResult {
     success: Vec<String>,
     failed: Vec<String>,
 }
 
 impl BatchResult {
-    pub(super) fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             success: Vec::new(),
             failed: Vec::new(),
         }
     }
 
-    pub(super) fn add_success(&mut self, item: String) {
+    pub(crate) fn add_success(&mut self, item: String) {
         self.success.push(item);
     }
 
-    pub(super) fn add_failure(&mut self, item: String) {
+    pub(crate) fn add_failure(&mut self, item: String) {
         self.failed.push(item);
     }
 
-    pub(super) fn has_success(&self) -> bool {
+    pub(crate) fn has_success(&self) -> bool {
         !self.success.is_empty()
     }
 
     /// 构建成功/失败列表的响应消息
-    pub(super) fn build_response(&self, success_prefix: &str, failure_prefix: &str) -> String {
+    pub(crate) fn build_response(&self, success_prefix: &str, failure_prefix: &str) -> String {
         self.build_response_with_suffix(success_prefix, failure_prefix, None)
     }
 
     /// 构建成功/失败列表的响应消息，在成功列表后添加可选后缀
-    pub(super) fn build_response_with_suffix(
+    pub(crate) fn build_response_with_suffix(
         &self,
         success_prefix: &str,
         failure_prefix: &str,

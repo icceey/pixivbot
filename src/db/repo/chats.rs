@@ -1,11 +1,11 @@
 use super::Repo;
-use crate::db::entities::{chats, messages, subscriptions};
+use crate::db::entities::chats;
 use crate::db::types::Tags;
 use anyhow::{Context, Result};
 use chrono::Local;
 use sea_orm::{
-    sea_query::OnConflict, ActiveModelTrait, ConnectionTrait, EntityTrait, IntoActiveModel,
-    QueryFilter, Set, Statement,
+    sea_query::OnConflict, ActiveModelTrait, ConnectionTrait, EntityTrait, IntoActiveModel, Set,
+    Statement,
 };
 
 impl Repo {

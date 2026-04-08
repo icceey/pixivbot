@@ -1,6 +1,5 @@
 use crate::pixiv::downloader::Downloader;
 use crate::utils::caption::MAX_PER_GROUP;
-use pixiv_client::UgoiraFrame;
 use std::sync::Arc;
 use teloxide::adaptors::Throttle;
 use teloxide::prelude::*;

@@ -1,6 +1,6 @@
 use crate::bot::notifier::{BatchSendResult, DownloadButtonConfig, Notifier};
 use crate::db::repo::Repo;
-use crate::db::types::TaskType;
+use crate::db::types::{SubscriptionState, TaskType};
 use crate::pixiv::client::PixivClient;
 use crate::scheduler::helpers::{
     apply_subscription_tag_filter, get_chat_if_should_notify, ranking_subscription_state,
@@ -13,7 +13,7 @@ use pixiv_client::Illust;
 use std::sync::Arc;
 use teloxide::prelude::*;
 use tokio::time::{sleep, Duration};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
 pub struct RankingEngine {
     repo: Arc<Repo>,

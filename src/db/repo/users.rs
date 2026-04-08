@@ -4,8 +4,8 @@ use crate::db::types::UserRole;
 use anyhow::{Context, Result};
 use chrono::Local;
 use sea_orm::{
-    sea_query::OnConflict, ActiveModelTrait, EntityTrait, IntoActiveModel, PaginatorTrait,
-    QueryFilter, Set,
+    sea_query::OnConflict, ActiveModelTrait, ColumnTrait, EntityTrait, IntoActiveModel,
+    PaginatorTrait, QueryFilter, Set,
 };
 
 impl Repo {

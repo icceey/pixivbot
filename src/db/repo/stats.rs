@@ -3,7 +3,8 @@ use crate::db::entities::{subscriptions, tasks, users};
 use crate::db::types::UserRole;
 use anyhow::{Context, Result};
 use sea_orm::{
-    ConnectionTrait, EntityTrait, FromQueryResult, PaginatorTrait, QueryFilter, Statement,
+    ColumnTrait, ConnectionTrait, EntityTrait, FromQueryResult, PaginatorTrait, QueryFilter,
+    Statement,
 };
 
 impl Repo {

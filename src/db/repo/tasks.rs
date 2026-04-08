@@ -4,8 +4,8 @@ use crate::db::types::TaskType;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Local};
 use sea_orm::{
-    sea_query::OnConflict, ActiveModelTrait, EntityTrait, IntoActiveModel, QueryFilter, QueryOrder,
-    QuerySelect, Set,
+    sea_query::OnConflict, ActiveModelTrait, ColumnTrait, EntityTrait, IntoActiveModel,
+    QueryFilter, QueryOrder, QuerySelect, Set,
 };
 
 impl Repo {

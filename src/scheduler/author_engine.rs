@@ -1,6 +1,6 @@
 use crate::bot::notifier::Notifier;
 use crate::db::repo::Repo;
-use crate::db::types::{AuthorState, PendingIllust, SubscriptionState, TagFilter, TaskType};
+use crate::db::types::{AuthorState, PendingIllust, SubscriptionState, TaskType};
 use crate::pixiv::client::PixivClient;
 use crate::scheduler::helpers::{
     apply_subscription_tag_filter, author_subscription_state, get_chat_if_should_notify,

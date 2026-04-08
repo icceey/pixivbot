@@ -246,7 +246,8 @@ mod tests {
             [&keep, &drop_by_chat, &drop_by_subscription],
         );
 
-        assert_eq!(filtered, vec![&keep]);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].id, keep.id);
     }
 
     #[test]

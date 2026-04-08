@@ -32,6 +32,7 @@ pub fn should_blur(chat: &chats::Model, illust: &Illust) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{contains_sensitive_tags, should_blur};
+    use crate::db::entities::chats;
     use crate::db::types::Tags;
     use pixiv_client::Illust;
     use serde_json::json;
