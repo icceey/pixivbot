@@ -178,14 +178,3 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-  docker:
-    name: Build and Push Docker Image
-    needs: [validate, release]
-    uses: ./.github/workflows/docker.yml
-    with:
-      channel: stable
-      version: ${{ needs.validate.outputs.version }}
-      push_to_ghcr: true
-    permissions:
-      contents: read
-      packages: write

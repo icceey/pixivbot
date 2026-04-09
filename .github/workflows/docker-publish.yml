@@ -1,0 +1,31 @@
+name: Docker Publish
+
+on:
+  push:
+    branches: [master]
+  release:
+    types: [published]
+
+jobs:
+  beta:
+    name: Publish Beta Image
+    if: github.event_name == 'push'
+    uses: ./.github/workflows/docker.yml
+    with:
+      channel: beta
+      push_to_ghcr: true
+    permissions:
+      contents: read
+      packages: write
+
+  stable:
+    name: Publish Release Image
+    if: github.event_name == 'release'
+    uses: ./.github/workflows/docker.yml
+    with:
+      channel: stable
+      version: ${{ github.event.release.tag_name }}
+      push_to_ghcr: true
+    permissions:
+      contents: read
+      packages: write
