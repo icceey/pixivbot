@@ -26,13 +26,25 @@ impl Notifier {
         let keyboard = download_config.build_keyboard();
 
         if total == 1 {
-            let cap = match &caption_strategy {
-                CaptionStrategy::Shared(c) => *c,
-                CaptionStrategy::Individual(cs) => Some(cs[0].as_str()),
+            let numbering = continuation_numbering
+                .unwrap_or_else(|| ContinuationNumbering::for_item_count(total));
+            let effective_cap = match &caption_strategy {
+                CaptionStrategy::Shared(c) => {
+                    super::caption::shared_batch_caption(*c, 0, 0, numbering)
+                }
+                CaptionStrategy::Individual(cs) => {
+                    super::caption::individual_batch_caption(&cs[0], 0, 0, numbering)
+                }
             };
 
             match self
-                .send_single_image(chat_id, &image_urls[0], cap, has_spoiler, keyboard)
+                .send_single_image(
+                    chat_id,
+                    &image_urls[0],
+                    effective_cap.as_deref(),
+                    has_spoiler,
+                    keyboard,
+                )
                 .await
             {
                 Ok(msg_id) => {
