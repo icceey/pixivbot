@@ -1,15 +1,19 @@
-use crate::bot::notifier::{BatchSendResult, DownloadButtonConfig, Notifier};
+use crate::bot::notifier::{
+    BatchSendResult, ContinuationNumbering, DownloadButtonConfig, Notifier,
+};
+use crate::db::entities::{chats, subscriptions};
 use crate::db::repo::Repo;
-use crate::db::types::RankingState;
+use crate::db::types::{AuthorState, RankingState, SubscriptionState, TagFilter};
 use crate::pixiv::client::PixivClient;
-use crate::utils::{sensitive, tag};
+use crate::utils::{caption, sensitive};
 use anyhow::{Context, Result};
 use pixiv_client::Illust;
 use std::sync::Arc;
 use teloxide::prelude::*;
-use teloxide::utils::markdown;
 use tokio::sync::RwLock;
 use tracing::info;
+
+pub const INTER_SUBSCRIPTION_DELAY_MS: u64 = 2000;
 
 /// Result of processing a single illust push
 #[derive(Debug)]
@@ -42,6 +46,49 @@ pub struct RankingContext<'a> {
     pub subscription: &'a crate::db::entities::subscriptions::Model,
     pub chat: crate::db::entities::chats::Model,
     pub subscription_state: Option<RankingState>,
+}
+
+pub fn author_subscription_state(subscription: &subscriptions::Model) -> Option<AuthorState> {
+    match &subscription.latest_data {
+        Some(SubscriptionState::Author(state)) => Some(state.clone()),
+        _ => None,
+    }
+}
+
+pub fn ranking_subscription_state(subscription: &subscriptions::Model) -> Option<RankingState> {
+    match &subscription.latest_data {
+        Some(SubscriptionState::Ranking(state)) => Some(state.clone()),
+        _ => None,
+    }
+}
+
+pub fn apply_subscription_tag_filter<'a>(
+    subscription: &subscriptions::Model,
+    chat: &chats::Model,
+    illusts: impl IntoIterator<Item = &'a Illust>,
+) -> Vec<&'a Illust> {
+    let chat_filter = TagFilter::from_excluded_tags(&chat.excluded_tags);
+    let combined_filter = subscription.filter_tags.merged(&chat_filter);
+    combined_filter.filter(illusts)
+}
+
+pub async fn save_first_message_record(
+    repo: &Repo,
+    chat_id: ChatId,
+    subscription_id: i32,
+    first_message_id: Option<i32>,
+    illust_id: Option<i64>,
+) {
+    let Some(msg_id) = first_message_id else {
+        return;
+    };
+
+    if let Err(e) = repo
+        .save_message(chat_id.0, msg_id, subscription_id, illust_id)
+        .await
+    {
+        tracing::warn!("Failed to save message record: {:#}", e);
+    }
 }
 
 /// Get chat and check if should notify (enabled or admin)
@@ -107,65 +154,36 @@ pub async fn process_illust_push(
 
     // Prepare caption
     let caption = if already_sent_pages.is_empty() {
-        // First time sending this illust
-        let page_info = if illust.is_multi_page() {
-            format!(" \\({} photos\\)", illust.page_count)
-        } else {
-            String::new()
-        };
-        let tags = tag::format_tags_escaped(illust);
-        format!(
-            "🎨 {}{}\nby *{}* \\(ID: `{}`\\)\n\n👀 {} \\| ❤️ {} \\| 🔗 [来源](https://pixiv\\.net/artworks/{}){}", 
-            markdown::escape(&illust.title),
-            page_info,
-            markdown::escape(&illust.user.name),
-            illust.user.id,
-            illust.total_view,
-            illust.total_bookmarks,
-            illust.id,
-            tags
-        )
+        caption::build_illust_caption(illust)
     } else {
-        // Continuing from previous attempt - calculate batch numbers like normal send
-        // Normal batch size is 10 (MAX_PER_GROUP in notifier)
-        const MAX_PER_GROUP: usize = 10;
-        let total_batches = total_pages.div_ceil(MAX_PER_GROUP);
-        let current_batch = (already_sent_pages.len() / MAX_PER_GROUP) + 1;
-        let tags = tag::format_tags_escaped(illust);
-
-        format!(
-            "🎨 {} \\(continued {}/{}\\)\nby *{}*\n\n🔗 [来源](https://pixiv\\.net/artworks/{}){}",
-            markdown::escape(&illust.title),
-            current_batch,
-            total_batches,
-            markdown::escape(&illust.user.name),
-            illust.id,
-            tags
-        )
+        caption::build_continuation_caption(illust, already_sent_pages.len(), total_pages)
     };
 
     // Check spoiler setting
-    let sensitive_tags = sensitive::get_chat_sensitive_tags(&ctx.chat);
-    let has_spoiler =
-        ctx.chat.blur_sensitive_tags && sensitive::contains_sensitive_tags(illust, sensitive_tags);
+    let has_spoiler = sensitive::should_blur(&ctx.chat, illust);
 
     // Build download button config
     // Skip download button for channel chats (channels don't support inline buttons)
-    let is_channel = ctx.chat.r#type == "channel";
-    let download_config = if is_channel {
-        DownloadButtonConfig::new(illust.id).for_channel()
-    } else {
-        DownloadButtonConfig::new(illust.id)
-    };
+    let download_config = DownloadButtonConfig::for_chat(illust.id, &ctx.chat);
 
     // Send images with download button
+    let continuation_numbering = (!already_sent_pages.is_empty()).then(|| {
+        ContinuationNumbering::new(
+            (already_sent_pages.len() / caption::MAX_PER_GROUP) + 1,
+            total_pages.div_ceil(caption::MAX_PER_GROUP),
+        )
+    });
+
     let send_result = notifier
-        .notify_with_images_and_button(
+        .notify_with_images_and_button_and_continuation(
             chat_id,
             &urls_to_send,
             Some(&caption),
             has_spoiler,
             &download_config,
+            continuation_numbering.unwrap_or_else(|| {
+                ContinuationNumbering::new(1, total_pages.div_ceil(caption::MAX_PER_GROUP))
+            }),
         )
         .await;
 
@@ -252,30 +270,13 @@ async fn process_ugoira_push(
     drop(pixiv_guard);
 
     // Prepare caption (same format as regular illusts, with 🎞️ indicator)
-    let tags = tag::format_tags_escaped(illust);
-    let caption = format!(
-        "🎞️ {}\nby *{}* \\(ID: `{}`\\)\n\n👀 {} \\| ❤️ {} \\| 🔗 [来源](https://pixiv\\.net/artworks/{}){}", 
-        markdown::escape(&illust.title),
-        markdown::escape(&illust.user.name),
-        illust.user.id,
-        illust.total_view,
-        illust.total_bookmarks,
-        illust.id,
-        tags
-    );
+    let caption = caption::build_ugoira_caption(illust);
 
     // Check spoiler setting
-    let sensitive_tags = sensitive::get_chat_sensitive_tags(&ctx.chat);
-    let has_spoiler =
-        ctx.chat.blur_sensitive_tags && sensitive::contains_sensitive_tags(illust, sensitive_tags);
+    let has_spoiler = sensitive::should_blur(&ctx.chat, illust);
 
     // Build download button config
-    let is_channel = ctx.chat.r#type == "channel";
-    let download_config = if is_channel {
-        DownloadButtonConfig::new(illust.id).for_channel()
-    } else {
-        DownloadButtonConfig::new(illust.id)
-    };
+    let download_config = DownloadButtonConfig::for_chat(illust.id, &ctx.chat);
 
     // Send ugoira as MP4 animation
     let send_result = notifier
@@ -299,5 +300,144 @@ async fn process_ugoira_push(
             illust_id: illust.id,
             first_message_id: send_result.first_message_id,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        apply_subscription_tag_filter, author_subscription_state, ranking_subscription_state,
+        INTER_SUBSCRIPTION_DELAY_MS,
+    };
+    use crate::db::entities::{chats, subscriptions};
+    use crate::db::types::{AuthorState, RankingState, SubscriptionState, TagFilter, Tags};
+    use pixiv_client::Illust;
+    use serde_json::json;
+
+    fn make_chat(excluded_tags: &[&str]) -> chats::Model {
+        chats::Model {
+            id: 1,
+            r#type: "private".to_string(),
+            title: Some("chat".to_string()),
+            enabled: true,
+            blur_sensitive_tags: false,
+            excluded_tags: Tags(excluded_tags.iter().map(|t| t.to_string()).collect()),
+            sensitive_tags: Tags::default(),
+            created_at: chrono::Utc::now().naive_utc(),
+            allow_without_mention: false,
+        }
+    }
+
+    fn make_subscription(
+        latest_data: Option<SubscriptionState>,
+        filter_tags: TagFilter,
+    ) -> subscriptions::Model {
+        subscriptions::Model {
+            id: 1,
+            chat_id: 1,
+            task_id: 1,
+            filter_tags,
+            latest_data,
+            created_at: chrono::Utc::now().naive_utc(),
+        }
+    }
+
+    fn make_illust(id: u64, tags: &[&str]) -> Illust {
+        serde_json::from_value(json!({
+            "id": id,
+            "title": format!("illust-{id}"),
+            "type": "illust",
+            "image_urls": {
+                "square_medium": "square",
+                "medium": "medium",
+                "large": "large",
+                "original": "original"
+            },
+            "caption": "",
+            "restrict": 0,
+            "user": {
+                "id": 67890,
+                "name": "Author",
+                "account": "author"
+            },
+            "tags": tags.iter().map(|name| json!({ "name": name, "translated_name": null })).collect::<Vec<_>>(),
+            "create_date": "2026-01-01T00:00:00+00:00",
+            "page_count": 1,
+            "width": 100,
+            "height": 100,
+            "sanity_level": 2,
+            "x_restrict": 0,
+            "series": null,
+            "meta_single_page": { "original_image_url": "original" },
+            "meta_pages": [],
+            "total_view": 1,
+            "total_bookmarks": 2,
+            "is_bookmarked": false,
+            "visible": true,
+            "is_muted": false,
+            "total_comments": 0
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn author_subscription_state_extracts_only_author_state() {
+        let author = AuthorState {
+            latest_illust_id: 42,
+            pending_illust: None,
+        };
+        let subscription = make_subscription(
+            Some(SubscriptionState::Author(author.clone())),
+            TagFilter::default(),
+        );
+
+        assert_eq!(author_subscription_state(&subscription), Some(author));
+        assert_eq!(
+            ranking_subscription_state(&subscription),
+            None,
+            "author state must not be exposed as ranking state"
+        );
+    }
+
+    #[test]
+    fn ranking_subscription_state_extracts_only_ranking_state() {
+        let ranking = RankingState {
+            pushed_ids: vec![1, 2, 3],
+            pending_illust: None,
+        };
+        let subscription = make_subscription(
+            Some(SubscriptionState::Ranking(ranking.clone())),
+            TagFilter::default(),
+        );
+
+        assert_eq!(ranking_subscription_state(&subscription), Some(ranking));
+        assert_eq!(
+            author_subscription_state(&subscription),
+            None,
+            "ranking state must not be exposed as author state"
+        );
+    }
+
+    #[test]
+    fn apply_subscription_tag_filter_merges_subscription_and_chat_rules() {
+        let subscription = make_subscription(None, TagFilter::parse_from_args(&["+cat"]));
+        let chat = make_chat(&["R-18"]);
+        let keep = make_illust(1, &["cat"]);
+        let drop_by_chat = make_illust(2, &["cat", "R-18"]);
+        let drop_by_subscription = make_illust(3, &["dog"]);
+
+        let filtered = apply_subscription_tag_filter(
+            &subscription,
+            &chat,
+            [&keep, &drop_by_chat, &drop_by_subscription],
+        );
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].id, keep.id);
+    }
+
+    #[test]
+    fn inter_subscription_delay_constant_stays_two_seconds() {
+        assert_eq!(INTER_SUBSCRIPTION_DELAY_MS, 2000);
     }
 }

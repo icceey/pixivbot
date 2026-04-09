@@ -4,7 +4,7 @@ use crate::bot::Command;
 use crate::db::repo::Repo;
 use crate::db::types::{TagFilter, TaskType, UserRole};
 use crate::pixiv::client::PixivClient;
-use crate::utils::tag;
+use crate::utils::caption;
 use std::sync::Arc;
 use teloxide::prelude::*;
 use teloxide::types::ParseMode;
@@ -226,58 +226,21 @@ impl BotHandler {
         };
         drop(pixiv);
 
-        let tags = tag::format_tags_escaped(&illust);
-
         let caption = if illust.is_ugoira() {
-            format!(
-                "🎞️ {}\nby *{}* \\(ID: `{}`\\)\n\n👀 {} \\| ❤️ {} \\| 🔗 [来源](https://pixiv\\.net/artworks/{}){}",
-                markdown::escape(&illust.title),
-                markdown::escape(&illust.user.name),
-                illust.user.id,
-                illust.total_view,
-                illust.total_bookmarks,
-                illust.id,
-                tags
-            )
+            caption::build_ugoira_caption(&illust)
         } else {
-            let page_info = if illust.is_multi_page() {
-                format!(" \\({} photos\\)", illust.page_count)
-            } else {
-                String::new()
-            };
-
-            format!(
-                "🎨 {}{}\nby *{}* \\(ID: `{}`\\)\n\n👀 {} \\| ❤️ {} \\| 🔗 [来源](https://pixiv\\.net/artworks/{}){}",
-                markdown::escape(&illust.title),
-                page_info,
-                markdown::escape(&illust.user.name),
-                illust.user.id,
-                illust.total_view,
-                illust.total_bookmarks,
-                illust.id,
-                tags
-            )
+            caption::build_illust_caption(&illust)
         };
 
         // 检查是否有敏感标签 (使用 chat-level 设置)
-        use crate::utils::sensitive;
-        let blur_sensitive = chat_settings
-            .map(|c| c.blur_sensitive_tags)
-            .unwrap_or(false);
-        let sensitive_tags = chat_settings
-            .map(sensitive::get_chat_sensitive_tags)
-            .unwrap_or_default();
         let has_spoiler =
-            blur_sensitive && sensitive::contains_sensitive_tags(&illust, sensitive_tags);
+            chat_settings.is_some_and(|chat| crate::utils::sensitive::should_blur(chat, &illust));
 
         // Build download button config
         // For one-off pushes via link, check chat type to skip channels
-        let is_channel = chat_settings.is_some_and(|c| c.r#type == "channel");
-        let download_config = if is_channel {
-            DownloadButtonConfig::new(illust.id).for_channel()
-        } else {
-            DownloadButtonConfig::new(illust.id)
-        };
+        let download_config = chat_settings
+            .map(|chat| DownloadButtonConfig::for_chat(illust.id, chat))
+            .unwrap_or_else(|| DownloadButtonConfig::new(illust.id));
 
         if illust.is_ugoira() {
             let pixiv = self.pixiv_client.read().await;
