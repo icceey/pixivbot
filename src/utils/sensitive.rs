@@ -34,7 +34,7 @@ pub fn should_blur_booru_tags(chat: &chats::Model, tags: &str) -> bool {
         return false;
     }
     let sensitive_tags = get_chat_sensitive_tags(chat);
-    let post_tags: Vec<String> = tags.split_whitespace().map(|t| normalize_tag(t)).collect();
+    let post_tags: Vec<String> = tags.split_whitespace().map(normalize_tag).collect();
 
     sensitive_tags
         .iter()

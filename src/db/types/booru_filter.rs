@@ -2,7 +2,7 @@ use booru_client::BooruRating;
 use sea_orm::FromJsonQueryResult;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, FromJsonQueryResult)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, FromJsonQueryResult)]
 pub struct BooruFilter {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub score_min: Option<i32>,

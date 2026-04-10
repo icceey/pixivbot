@@ -133,7 +133,7 @@ impl BooruEngine {
 
         let posts = site_ctx
             .client
-            .get_posts(tags, site_ctx.config.page_limit as u32, 1)
+            .get_posts(tags, site_ctx.config.page_limit, 1)
             .await
             .context("Failed to fetch posts from booru")?;
 
