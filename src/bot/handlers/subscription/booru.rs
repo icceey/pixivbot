@@ -34,9 +34,10 @@ impl BotHandler {
         if parts.is_empty() {
             bot.send_message(
                 chat_id,
-                "❌ 用法: `/bsub [ch=<频道ID>] <站点名:标签> [score>N] [fav>N] [rating=s,q,e]`\n\n\
+                "❌ 用法: `/bsub [ch=<频道ID>] <站点名:标签 [标签2 ...]> [score>N] [fav>N] [rating=s,q,e]`\n\n\
                  示例:\n\
                  `/bsub konachan:landscape`\n\
+                 `/bsub konachan:blue_sky clouds`\n\
                  `/bsub konachan: score>50`\n\
                  `/bsub konachan:blue_sky rating=s`",
             )
@@ -46,7 +47,7 @@ impl BotHandler {
         }
 
         let site_tags_str = parts[0];
-        let (site_name, tags) = match site_tags_str.split_once(':') {
+        let (site_name, first_tag) = match site_tags_str.split_once(':') {
             Some((site, tags)) => (site, tags),
             None => {
                 bot.send_message(chat_id, "❌ 格式: `站点名:标签`，例如 `konachan:landscape`")
@@ -88,8 +89,27 @@ impl BotHandler {
             return Ok(());
         }
 
-        let filter_args = &parts[1..];
-        let (booru_filter, tag_filter) = parse_booru_filter_args(filter_args);
+        let mut booru_query_tags: Vec<&str> = Vec::new();
+        if !first_tag.is_empty() {
+            booru_query_tags.push(first_tag);
+        }
+        let mut filter_arg_parts: Vec<&str> = Vec::new();
+
+        for &part in &parts[1..] {
+            if part.starts_with("score>")
+                || part.starts_with("fav>")
+                || part.starts_with("rating=")
+                || part.starts_with('+')
+                || part.starts_with('-')
+            {
+                filter_arg_parts.push(part);
+            } else {
+                booru_query_tags.push(part);
+            }
+        }
+
+        let (booru_filter, tag_filter) = parse_booru_filter_args(&filter_arg_parts);
+        let tags = booru_query_tags.join(" ");
 
         let task_value = format!("{}:{}", site_name.to_lowercase(), tags);
         let display_name = if tags.is_empty() {
@@ -174,7 +194,7 @@ impl BotHandler {
         }
 
         let site_tags_str = parts[0];
-        let (site_name, tags) = match site_tags_str.split_once(':') {
+        let (site_name, first_tag) = match site_tags_str.split_once(':') {
             Some((site, tags)) => (site, tags),
             None => {
                 bot.send_message(chat_id, "❌ 格式: `站点名:标签`")
@@ -183,6 +203,15 @@ impl BotHandler {
                 return Ok(());
             }
         };
+
+        let mut booru_query_tags: Vec<&str> = Vec::new();
+        if !first_tag.is_empty() {
+            booru_query_tags.push(first_tag);
+        }
+        for &part in &parts[1..] {
+            booru_query_tags.push(part);
+        }
+        let tags = booru_query_tags.join(" ");
 
         let task_value = format!("{}:{}", site_name.to_lowercase(), tags);
 

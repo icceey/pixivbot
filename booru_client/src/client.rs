@@ -67,7 +67,7 @@ impl BooruClient {
         page: u32,
     ) -> Result<Vec<BooruPost>> {
         match self.engine_type {
-            BooruEngineType::Moebooru => self.get_pool_posts_moebooru(pool_id, page).await,
+            BooruEngineType::Moebooru => self.get_pool_posts_moebooru(pool_id, limit, page).await,
             BooruEngineType::Danbooru => {
                 let tags = format!("pool:{pool_id}");
                 self.get_posts_danbooru(&tags, limit, page).await
@@ -105,7 +105,12 @@ impl BooruClient {
         Ok(raw.into_pool_info())
     }
 
-    async fn get_pool_posts_moebooru(&self, pool_id: u64, page: u32) -> Result<Vec<BooruPost>> {
+    async fn get_pool_posts_moebooru(
+        &self,
+        pool_id: u64,
+        limit: u32,
+        page: u32,
+    ) -> Result<Vec<BooruPost>> {
         let url = format!("{}/pool/show.json", self.base_url);
         let raw: MoebooruRawPool = self
             .request(
@@ -113,7 +118,12 @@ impl BooruClient {
                 &[("id", &pool_id.to_string()), ("page", &page.to_string())],
             )
             .await?;
-        Ok(raw.posts.into_iter().map(|r| r.into_booru_post()).collect())
+        Ok(raw
+            .posts
+            .into_iter()
+            .take(limit as usize)
+            .map(|r| r.into_booru_post())
+            .collect())
     }
 
     async fn get_posts_danbooru(
@@ -173,14 +183,36 @@ impl BooruClient {
         url: &str,
         params: &[(&str, &str)],
     ) -> Result<T> {
+        let mut query_params: Vec<(&str, &str)> = params.to_vec();
+
+        let username_str;
+        let api_key_str;
+        if let (Some(user), Some(key)) = (&self.username, &self.api_key) {
+            username_str = user.clone();
+            api_key_str = key.clone();
+            match self.engine_type {
+                BooruEngineType::Moebooru => {
+                    query_params.push(("login", &username_str));
+                    query_params.push(("api_key", &api_key_str));
+                }
+                BooruEngineType::Gelbooru => {
+                    query_params.push(("user_id", &username_str));
+                    query_params.push(("api_key", &api_key_str));
+                }
+                BooruEngineType::Danbooru => {}
+            }
+        }
+
         let mut req = self
             .client
             .get(url)
             .header(reqwest::header::USER_AGENT, DEFAULT_USER_AGENT)
-            .query(params);
+            .query(&query_params);
 
         if let (Some(user), Some(key)) = (&self.username, &self.api_key) {
-            req = req.basic_auth(user, Some(key));
+            if self.engine_type == BooruEngineType::Danbooru {
+                req = req.basic_auth(user, Some(key));
+            }
         }
 
         let response = req.send().await?;

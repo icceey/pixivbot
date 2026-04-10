@@ -17,6 +17,8 @@ use teloxide::prelude::*;
 use tokio::time::{sleep, Duration};
 use tracing::{debug, error, info, warn};
 
+const DRAIN_POLL_INTERVAL_SEC: u64 = 10;
+
 pub struct BooruEngine {
     repo: Arc<Repo>,
     notifier: Notifier,
@@ -155,6 +157,8 @@ impl BooruEngine {
             return Ok(());
         }
 
+        let mut has_pending_queue = false;
+
         for subscription in &subscriptions {
             let chat = match get_chat_if_should_notify(&self.repo, subscription.chat_id).await {
                 Ok(Some(chat)) => chat,
@@ -176,11 +180,13 @@ impl BooruEngine {
                     site_name,
                     &site_ctx.config.base_url,
                     site_ctx.config.engine_type,
-                    tags.is_empty(),
                 )
                 .await
             {
                 Ok(Some(new_state)) => {
+                    if !new_state.pending_queue.is_empty() {
+                        has_pending_queue = true;
+                    }
                     if let Err(e) = self
                         .repo
                         .update_subscription_latest_data(
@@ -207,7 +213,11 @@ impl BooruEngine {
             sleep(Duration::from_millis(INTER_SUBSCRIPTION_DELAY_MS)).await;
         }
 
-        self.schedule_next_poll(task.id, &site_ctx.config).await?;
+        if has_pending_queue {
+            self.schedule_drain_poll(task.id).await?;
+        } else {
+            self.schedule_next_poll(task.id, &site_ctx.config).await?;
+        }
         Ok(())
     }
 
@@ -221,7 +231,6 @@ impl BooruEngine {
         site_name: &str,
         base_url: &str,
         engine_type: booru_client::BooruEngineType,
-        is_empty_tag: bool,
     ) -> Result<Option<BooruTagState>> {
         let chat_id = ChatId(subscription.chat_id);
 
@@ -264,45 +273,16 @@ impl BooruEngine {
             }));
         }
 
-        if is_empty_tag && filtered.len() > 1 {
-            let queue: Vec<QueuedBooruPost> = filtered
-                .iter()
-                .skip(1)
-                .map(|p| Self::post_to_queued(p))
-                .collect();
+        // Queue remaining posts for later delivery (applies to all modes)
+        let queue: Vec<QueuedBooruPost> =
+            filtered.iter().skip(1).map(Self::post_to_queued).collect();
 
-            let first = filtered.first().unwrap();
-            let send_ok = self
-                .push_single_post(
-                    chat_id,
-                    subscription.id,
-                    first,
-                    chat,
-                    site_name,
-                    base_url,
-                    engine_type,
-                )
-                .await;
-
-            return Ok(Some(BooruTagState {
-                latest_post_id: newest_id,
-                pending_queue: if send_ok {
-                    queue
-                } else {
-                    let mut full_queue = vec![Self::post_to_queued(first)];
-                    full_queue.extend(queue);
-                    full_queue
-                },
-                retry_count: if send_ok { 0 } else { 1 },
-            }));
-        }
-
-        let oldest = filtered.last().unwrap();
+        let first = filtered.first().unwrap();
         let send_ok = self
             .push_single_post(
                 chat_id,
                 subscription.id,
-                oldest,
+                first,
                 chat,
                 site_name,
                 base_url,
@@ -310,15 +290,18 @@ impl BooruEngine {
             )
             .await;
 
-        if send_ok {
-            Ok(Some(BooruTagState {
-                latest_post_id: newest_id,
-                pending_queue: Vec::new(),
-                retry_count: 0,
-            }))
-        } else {
-            Ok(None)
-        }
+        Ok(Some(BooruTagState {
+            latest_post_id: newest_id,
+            pending_queue: if send_ok {
+                queue
+            } else {
+                // Failed: put the unsent post back at the front of the queue
+                let mut full_queue = vec![Self::post_to_queued(first)];
+                full_queue.extend(queue);
+                full_queue
+            },
+            retry_count: if send_ok { 0 } else { 1 },
+        }))
     }
 
     async fn drain_pending_queue(
@@ -362,15 +345,15 @@ impl BooruEngine {
         };
 
         let caption_text = caption::build_booru_caption(
-            &self.queued_to_booru_post(first),
+            &Self::queued_to_booru_post(first),
             site_name,
             base_url,
             engine_type,
         );
 
         let queued_rating = booru_client::BooruRating::from_short_str(&first.rating);
-        let has_spoiler =
-            sensitive::should_blur_booru_tags(chat, &first.tags) || queued_rating.is_nsfw();
+        let has_spoiler = sensitive::should_blur_booru_tags(chat, &first.tags)
+            || (chat.blur_sensitive_tags && queued_rating.is_nsfw());
 
         let send_result = self
             .notifier
@@ -431,8 +414,8 @@ impl BooruEngine {
         };
 
         let caption_text = caption::build_booru_caption(post, site_name, base_url, engine_type);
-        let has_spoiler =
-            sensitive::should_blur_booru_tags(chat, &post.tags) || post.rating.is_nsfw();
+        let has_spoiler = sensitive::should_blur_booru_tags(chat, &post.tags)
+            || (chat.blur_sensitive_tags && post.rating.is_nsfw());
 
         let send_result = self
             .notifier
@@ -516,7 +499,7 @@ impl BooruEngine {
         }
     }
 
-    fn queued_to_booru_post(&self, queued: &QueuedBooruPost) -> booru_client::BooruPost {
+    fn queued_to_booru_post(queued: &QueuedBooruPost) -> booru_client::BooruPost {
         booru_client::BooruPost {
             id: queued.id,
             tags: queued.tags.clone(),
@@ -542,6 +525,12 @@ impl BooruEngine {
         let max = site_config.max_interval_sec.max(min);
         let random_interval_sec = rand::rng().random_range(min..=max);
         let next_poll = Local::now() + chrono::Duration::seconds(random_interval_sec as i64);
+        self.repo.update_task_after_poll(task_id, next_poll).await?;
+        Ok(())
+    }
+
+    async fn schedule_drain_poll(&self, task_id: i32) -> Result<()> {
+        let next_poll = Local::now() + chrono::Duration::seconds(DRAIN_POLL_INTERVAL_SEC as i64);
         self.repo.update_task_after_poll(task_id, next_poll).await?;
         Ok(())
     }
