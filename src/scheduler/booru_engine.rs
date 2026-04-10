@@ -149,7 +149,7 @@ impl BooruEngine {
         }
 
         let any_pending = subscriptions.iter().any(|sub| {
-            booru_tag_subscription_state(sub).map_or(false, |s| !s.pending_queue.is_empty())
+            booru_tag_subscription_state(sub).is_some_and(|s| !s.pending_queue.is_empty())
         });
 
         let posts = if any_pending {
@@ -178,7 +178,7 @@ impl BooruEngine {
             if posts.is_empty()
                 && sub_state
                     .as_ref()
-                    .map_or(true, |s| s.pending_queue.is_empty())
+                    .is_none_or(|s| s.pending_queue.is_empty())
             {
                 continue;
             }
@@ -336,8 +336,11 @@ impl BooruEngine {
         }
 
         // Queue remaining posts for later delivery (applies to all modes)
-        let queue: Vec<QueuedBooruPost> =
-            filtered.iter().skip(1).map(Self::post_to_queued).collect();
+        let queue: Vec<QueuedBooruPost> = filtered
+            .iter()
+            .skip(1)
+            .map(|p| Self::post_to_queued(p))
+            .collect();
 
         let first = filtered.first().unwrap();
         let send_ok = self
@@ -454,6 +457,7 @@ impl BooruEngine {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn push_single_post(
         &self,
         chat_id: ChatId,
