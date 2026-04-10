@@ -6,7 +6,7 @@ pub mod middleware;
 pub mod notifier;
 pub mod state;
 
-use crate::config::TelegramConfig;
+use crate::config::{BooruConfig, TelegramConfig};
 use crate::db::repo::Repo;
 use crate::db::types::UserRole;
 use crate::pixiv::client::PixivClient;
@@ -44,6 +44,7 @@ pub async fn run(
     download_original_threshold: u8,
     cache_dir: String,
     log_dir: String,
+    booru_config: BooruConfig,
 ) -> Result<()> {
     info!("Starting Telegram Bot...");
 
@@ -77,6 +78,7 @@ pub async fn run(
         config.require_mention_in_group,
         cache_dir,
         log_dir,
+        booru_config,
     );
 
     info!("✅ Bot initialized, starting command handler");

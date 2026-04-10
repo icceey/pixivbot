@@ -71,6 +71,45 @@ pub fn build_ranking_caption(title: &str, index: usize, illust: &Illust) -> Stri
     }
 }
 
+/// Build caption for a booru post (MarkdownV2 format)
+pub fn build_booru_caption(
+    post: &booru_client::BooruPost,
+    site_name: &str,
+    base_url: &str,
+) -> String {
+    let rating_emoji = match post.rating {
+        booru_client::BooruRating::Safe | booru_client::BooruRating::General => "🟢",
+        booru_client::BooruRating::Questionable => "🟡",
+        booru_client::BooruRating::Explicit => "🔴",
+    };
+
+    let clean_base = base_url.trim_end_matches('/');
+    let post_url = format!("{}/post/show/{}", clean_base, post.id);
+
+    let tag_list: Vec<&str> = post.tags.split_whitespace().take(5).collect();
+    let tags_display = if tag_list.is_empty() {
+        String::new()
+    } else {
+        let formatted: Vec<String> = tag_list
+            .iter()
+            .map(|t| format!("\\#{}", markdown::escape(&t.replace('-', "_"))))
+            .collect();
+        format!("\n\n{}", formatted.join("  "))
+    };
+
+    format!(
+        "🏷 *{}* \\| {}\n\n⭐ {} \\| ❤️ {} \\| {} {}\n🔗 [来源]({}){}\n",
+        markdown::escape(site_name),
+        markdown::escape(&format!("#{}", post.id)),
+        post.score,
+        post.fav_count,
+        rating_emoji,
+        markdown::escape(post.rating.as_short_str()),
+        markdown::escape(&post_url),
+        tags_display
+    )
+}
+
 fn build_standard_caption(prefix: &str, illust: &Illust, title_suffix: &str) -> String {
     let tags = tag::format_tags_escaped(illust);
 

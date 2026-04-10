@@ -117,6 +117,8 @@ impl BotHandler {
                     let type_emoji = match task.r#type {
                         TaskType::Author => "🎨",
                         TaskType::Ranking => "📊",
+                        TaskType::BooruTag => "🏷",
+                        TaskType::BooruPool => "📦",
                     };
 
                     let display_info = if task.r#type == TaskType::Author {
@@ -142,6 +144,23 @@ impl BotHandler {
                                 )
                             }
                         }
+                    } else if task.r#type == TaskType::BooruTag
+                        || task.r#type == TaskType::BooruPool
+                    {
+                        let label = if task.r#type == TaskType::BooruPool {
+                            "Pool"
+                        } else {
+                            "标签"
+                        };
+                        if let Some(ref name) = task.author_name {
+                            format!(
+                                "{} \\| `{}`",
+                                markdown::escape(name),
+                                markdown::escape(&task.value)
+                            )
+                        } else {
+                            format!("{}: `{}`", label, markdown::escape(&task.value))
+                        }
                     } else {
                         task.value.replace('_', "\\_")
                     };
@@ -152,7 +171,20 @@ impl BotHandler {
                         String::new()
                     };
 
-                    message.push_str(&format!("{} {}{}\n", type_emoji, display_info, filter_info));
+                    let booru_filter_info = if let Some(ref bf) = sub.booru_filter {
+                        if !bf.is_empty() {
+                            format!("\n  🔍 {}", markdown::escape(&bf.format_for_display()))
+                        } else {
+                            String::new()
+                        }
+                    } else {
+                        String::new()
+                    };
+
+                    message.push_str(&format!(
+                        "{} {}{}{}\n",
+                        type_emoji, display_info, filter_info, booru_filter_info
+                    ));
                 }
 
                 if is_channel {

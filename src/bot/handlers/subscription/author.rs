@@ -294,6 +294,12 @@ impl BotHandler {
                 Some(mode) => mode.display_name().to_string(),
                 None => format!("排行榜 `{}`", markdown::escape(&task_value)),
             },
+            TaskType::BooruTag => {
+                format!("Booru标签 `{}`", markdown::escape(&task_value))
+            }
+            TaskType::BooruPool => {
+                format!("Booru Pool `{}`", markdown::escape(&task_value))
+            }
         };
 
         bot.send_message(chat_id, format!("✅ 成功取消订阅 {}", display_name))

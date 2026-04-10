@@ -1,6 +1,7 @@
 use crate::bot::link_handler::{parse_pixiv_links, PixivLink};
 use crate::bot::notifier::{DownloadButtonConfig, Notifier, ThrottledBot};
 use crate::bot::Command;
+use crate::config::BooruConfig;
 use crate::db::repo::Repo;
 use crate::db::types::{TagFilter, TaskType, UserRole};
 use crate::pixiv::client::PixivClient;
@@ -32,6 +33,7 @@ pub struct BotHandler {
     pub(crate) cache_dir: String,
     /// 日志目录路径 (用于管理员查看磁盘占用)
     pub(crate) log_dir: String,
+    pub(crate) booru_config: BooruConfig,
 }
 
 impl BotHandler {
@@ -52,6 +54,7 @@ impl BotHandler {
         require_mention_in_group: bool,
         cache_dir: String,
         log_dir: String,
+        booru_config: BooruConfig,
     ) -> Self {
         Self {
             repo,
@@ -65,6 +68,7 @@ impl BotHandler {
             require_mention_in_group,
             cache_dir,
             log_dir,
+            booru_config,
         }
     }
 
@@ -131,6 +135,10 @@ impl BotHandler {
 
             // Download command (defined in handlers/download.rs)
             Command::Download(args) => self.handle_download(bot.clone(), msg, chat_id, args).await,
+
+            // Booru subscription commands (defined in handlers/subscription/booru.rs)
+            Command::BSub(args) => self.handle_bsub(bot, chat_id, user_id, args).await,
+            Command::BUnsub(args) => self.handle_bunsub(bot, chat_id, user_id, args).await,
 
             // Admin commands (require admin or owner role, defined in handlers/admin.rs)
             Command::EnableChat(args) if user_role.is_admin() => {

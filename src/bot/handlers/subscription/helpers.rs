@@ -1,5 +1,5 @@
 use crate::bot::BotHandler;
-use crate::db::types::{TagFilter, TaskType};
+use crate::db::types::{BooruFilter, TagFilter, TaskType};
 use anyhow::{Context, Result};
 use tracing::{error, info};
 
@@ -26,6 +26,39 @@ impl BotHandler {
             .upsert_subscription(chat_id, task.id, filter_tags)
             .await
             .context("Failed to upsert subscription")?;
+
+        Ok(())
+    }
+
+    pub(crate) async fn create_booru_subscription(
+        &self,
+        chat_id: i64,
+        task_type: TaskType,
+        task_value: &str,
+        display_name: Option<&str>,
+        filter_tags: TagFilter,
+        booru_filter: BooruFilter,
+    ) -> Result<()> {
+        let task = self
+            .repo
+            .get_or_create_task(
+                task_type,
+                task_value.to_string(),
+                display_name.map(|s| s.to_string()),
+            )
+            .await
+            .context("Failed to create task")?;
+
+        let booru_filter_opt = if booru_filter.is_empty() {
+            None
+        } else {
+            Some(booru_filter)
+        };
+
+        self.repo
+            .upsert_booru_subscription(chat_id, task.id, filter_tags, booru_filter_opt)
+            .await
+            .context("Failed to upsert booru subscription")?;
 
         Ok(())
     }

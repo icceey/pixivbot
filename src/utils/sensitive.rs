@@ -29,6 +29,18 @@ pub fn should_blur(chat: &chats::Model, illust: &Illust) -> bool {
     chat.blur_sensitive_tags && contains_sensitive_tags(illust, get_chat_sensitive_tags(chat))
 }
 
+pub fn should_blur_booru_tags(chat: &chats::Model, tags: &str) -> bool {
+    if !chat.blur_sensitive_tags {
+        return false;
+    }
+    let sensitive_tags = get_chat_sensitive_tags(chat);
+    let post_tags: Vec<String> = tags.split_whitespace().map(|t| normalize_tag(t)).collect();
+
+    sensitive_tags
+        .iter()
+        .any(|st| post_tags.iter().any(|pt| pt == &normalize_tag(st)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{contains_sensitive_tags, should_blur};

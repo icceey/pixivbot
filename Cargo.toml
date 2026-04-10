@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "migration", "pixiv_client"]
+members = [".", "migration", "pixiv_client", "booru_client"]
 
 [workspace.package]
 version = "0.2.0"
@@ -22,6 +22,7 @@ ffmpeg-next = { version = "8.1.0", default-features = false, features = ["codec"
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
 md5 = "0.8.0"
 migration = { path = "migration" }
+booru_client = { path = "booru_client" }
 pixiv_client = { path = "pixiv_client" }
 rand = "0.10.0"
 regex = "1.12.3"

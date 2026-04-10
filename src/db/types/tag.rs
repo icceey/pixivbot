@@ -156,19 +156,33 @@ impl TagFilter {
             .map(|t| tag::normalize_tag(&t.name))
             .collect();
 
-        // Check exclude tags first (must not contain any)
+        self.matches_normalized_tags(&illust_tags)
+    }
+
+    /// Check if a list of already-normalized tag strings matches this filter.
+    ///
+    /// Used for booru posts where tags are space-separated strings.
+    pub fn matches_tag_strings(&self, tags: &[String]) -> bool {
+        if self.is_empty() {
+            return true;
+        }
+
+        let normalized: Vec<String> = tags.iter().map(|t| tag::normalize_tag(t)).collect();
+        self.matches_normalized_tags(&normalized)
+    }
+
+    fn matches_normalized_tags(&self, normalized_tags: &[String]) -> bool {
         for exclude_tag in &self.exclude {
             let normalized = tag::normalize_tag(exclude_tag);
-            if illust_tags.iter().any(|t| t == &normalized) {
+            if normalized_tags.iter().any(|t| t == &normalized) {
                 return false;
             }
         }
 
-        // Check include tags (must contain at least one if specified)
         if !self.include.is_empty() {
             for include_tag in &self.include {
                 let normalized = tag::normalize_tag(include_tag);
-                if illust_tags.iter().any(|t| t == &normalized) {
+                if normalized_tags.iter().any(|t| t == &normalized) {
                     return true;
                 }
             }

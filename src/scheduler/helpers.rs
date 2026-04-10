@@ -3,7 +3,7 @@ use crate::bot::notifier::{
 };
 use crate::db::entities::{chats, subscriptions};
 use crate::db::repo::Repo;
-use crate::db::types::{AuthorState, RankingState, SubscriptionState, TagFilter};
+use crate::db::types::{AuthorState, BooruTagState, RankingState, SubscriptionState, TagFilter};
 use crate::pixiv::client::PixivClient;
 use crate::utils::{caption, sensitive};
 use anyhow::{Context, Result};
@@ -58,6 +58,13 @@ pub fn author_subscription_state(subscription: &subscriptions::Model) -> Option<
 pub fn ranking_subscription_state(subscription: &subscriptions::Model) -> Option<RankingState> {
     match &subscription.latest_data {
         Some(SubscriptionState::Ranking(state)) => Some(state.clone()),
+        _ => None,
+    }
+}
+
+pub fn booru_tag_subscription_state(subscription: &subscriptions::Model) -> Option<BooruTagState> {
+    match &subscription.latest_data {
+        Some(SubscriptionState::BooruTag(state)) => Some(state.clone()),
         _ => None,
     }
 }
@@ -337,6 +344,7 @@ mod tests {
             chat_id: 1,
             task_id: 1,
             filter_tags,
+            booru_filter: None,
             latest_data,
             created_at: chrono::Utc::now().naive_utc(),
         }

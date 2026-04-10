@@ -1,4 +1,5 @@
 mod author;
+mod booru;
 mod channel;
 mod helpers;
 mod list;
