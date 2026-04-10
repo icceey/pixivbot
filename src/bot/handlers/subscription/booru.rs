@@ -34,11 +34,11 @@ impl BotHandler {
         if parts.is_empty() {
             bot.send_message(
                 chat_id,
-                "❌ 用法: `/bsub [ch=<频道ID>] <站点名:标签 [标签2 ...]> [score>N] [fav>N] [rating=s,q,e]`\n\n\
+                "❌ 用法: `/bsub [ch=<频道ID>] <站点名:标签 [标签2 ...]> [score>=N] [fav>=N] [rating=s,q,e]`\n\n\
                  示例:\n\
                  `/bsub konachan:landscape`\n\
                  `/bsub konachan:blue_sky clouds`\n\
-                 `/bsub konachan: score>50`\n\
+                 `/bsub konachan: score>=50`\n\
                  `/bsub konachan:blue_sky rating=s`",
             )
             .parse_mode(ParseMode::MarkdownV2)
@@ -249,13 +249,19 @@ fn parse_booru_filter_args(args: &[&str]) -> (BooruFilter, TagFilter) {
     let mut tag_parts = Vec::new();
 
     for &arg in args {
-        if let Some(val) = arg.strip_prefix("score>") {
+        if let Some(val) = arg
+            .strip_prefix("score>=")
+            .or_else(|| arg.strip_prefix("score>"))
+        {
             if let Ok(n) = val.parse::<i32>() {
                 score_min = Some(n);
                 continue;
             }
         }
-        if let Some(val) = arg.strip_prefix("fav>") {
+        if let Some(val) = arg
+            .strip_prefix("fav>=")
+            .or_else(|| arg.strip_prefix("fav>"))
+        {
             if let Ok(n) = val.parse::<i32>() {
                 fav_count_min = Some(n);
                 continue;

@@ -91,9 +91,10 @@ pub fn build_booru_caption(
     let tags_display = if tag_list.is_empty() {
         String::new()
     } else {
-        let formatted: Vec<String> = tag_list
+        let sanitized = tag::format_tags(&tag_list);
+        let formatted: Vec<String> = sanitized
             .iter()
-            .map(|t| format!("\\#{}", markdown::escape(&t.replace('-', "_"))))
+            .map(|t| format!("\\#{}", markdown::escape(t)))
             .collect();
         format!("\n\n{}", formatted.join("  "))
     };
@@ -379,7 +380,7 @@ mod tests {
             "https://example.com",
             booru_client::BooruEngineType::Moebooru,
         );
-        assert!(caption.contains("\\#tag\\_with\\_dash"));
+        assert!(caption.contains("\\#tagwithdash"));
         assert!(caption.contains("\\#tag\\_underscore"));
         assert!(caption.contains("test\\_site"));
     }
