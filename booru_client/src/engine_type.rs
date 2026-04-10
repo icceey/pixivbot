@@ -15,6 +15,19 @@ pub enum BooruEngineType {
     Gelbooru,
 }
 
+impl BooruEngineType {
+    /// Returns the post URL path for a given post ID, relative to the base URL.
+    pub fn post_path(&self, post_id: u64) -> String {
+        match self {
+            BooruEngineType::Moebooru => format!("/post/show/{}", post_id),
+            BooruEngineType::Danbooru => format!("/posts/{}", post_id),
+            BooruEngineType::Gelbooru => {
+                format!("/index.php?page=post&s=view&id={}", post_id)
+            }
+        }
+    }
+}
+
 impl fmt::Display for BooruEngineType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

@@ -196,7 +196,12 @@ impl BooruClient {
 
         serde_json::from_str(&text).map_err(|e| {
             tracing::debug!("Failed to parse response from {}: {}", url, e);
-            tracing::debug!("Response body: {}", &text[..text.len().min(500)]);
+            let preview = text
+                .char_indices()
+                .nth(500)
+                .map(|(i, _)| &text[..i])
+                .unwrap_or(&text);
+            tracing::debug!("Response body: {}", preview);
             e.into()
         })
     }

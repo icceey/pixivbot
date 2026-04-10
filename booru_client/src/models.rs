@@ -92,6 +92,10 @@ impl BooruRating {
             _ => BooruRating::Safe,
         }
     }
+
+    pub fn is_nsfw(&self) -> bool {
+        matches!(self, BooruRating::Questionable | BooruRating::Explicit)
+    }
 }
 
 impl fmt::Display for BooruRating {

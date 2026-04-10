@@ -106,6 +106,13 @@ impl BooruEngine {
             error!("Booru tag task execution failed: {:#}", e);
             if let Some(site_ctx) = self.site_for_task_value(&task.value) {
                 self.schedule_next_poll(task.id, &site_ctx.config).await?;
+            } else {
+                warn!(
+                    "Task [{}] refers to unknown site '{}', scheduling backoff",
+                    task.id, task.value
+                );
+                let backoff = Local::now() + chrono::Duration::hours(1);
+                self.repo.update_task_after_poll(task.id, backoff).await?;
             }
         }
 
@@ -168,6 +175,7 @@ impl BooruEngine {
                     &posts,
                     site_name,
                     &site_ctx.config.base_url,
+                    site_ctx.config.engine_type,
                     tags.is_empty(),
                 )
                 .await
@@ -212,6 +220,7 @@ impl BooruEngine {
         posts: &[booru_client::BooruPost],
         site_name: &str,
         base_url: &str,
+        engine_type: booru_client::BooruEngineType,
         is_empty_tag: bool,
     ) -> Result<Option<BooruTagState>> {
         let chat_id = ChatId(subscription.chat_id);
@@ -219,7 +228,14 @@ impl BooruEngine {
         if let Some(ref state) = sub_state {
             if !state.pending_queue.is_empty() {
                 return self
-                    .drain_pending_queue(subscription, chat, state, site_name, base_url)
+                    .drain_pending_queue(
+                        subscription,
+                        chat,
+                        state,
+                        site_name,
+                        base_url,
+                        engine_type,
+                    )
                     .await;
             }
         }
@@ -257,7 +273,15 @@ impl BooruEngine {
 
             let first = filtered.first().unwrap();
             let send_ok = self
-                .push_single_post(chat_id, subscription.id, first, chat, site_name, base_url)
+                .push_single_post(
+                    chat_id,
+                    subscription.id,
+                    first,
+                    chat,
+                    site_name,
+                    base_url,
+                    engine_type,
+                )
                 .await;
 
             return Ok(Some(BooruTagState {
@@ -275,7 +299,15 @@ impl BooruEngine {
 
         let oldest = filtered.last().unwrap();
         let send_ok = self
-            .push_single_post(chat_id, subscription.id, oldest, chat, site_name, base_url)
+            .push_single_post(
+                chat_id,
+                subscription.id,
+                oldest,
+                chat,
+                site_name,
+                base_url,
+                engine_type,
+            )
             .await;
 
         if send_ok {
@@ -296,6 +328,7 @@ impl BooruEngine {
         state: &BooruTagState,
         site_name: &str,
         base_url: &str,
+        engine_type: booru_client::BooruEngineType,
     ) -> Result<Option<BooruTagState>> {
         let chat_id = ChatId(subscription.chat_id);
 
@@ -328,10 +361,16 @@ impl BooruEngine {
             }));
         };
 
-        let caption_text =
-            caption::build_booru_caption(&self.queued_to_booru_post(first), site_name, base_url);
+        let caption_text = caption::build_booru_caption(
+            &self.queued_to_booru_post(first),
+            site_name,
+            base_url,
+            engine_type,
+        );
 
-        let has_spoiler = sensitive::should_blur_booru_tags(chat, &first.tags);
+        let queued_rating = booru_client::BooruRating::from_short_str(&first.rating);
+        let has_spoiler =
+            sensitive::should_blur_booru_tags(chat, &first.tags) || queued_rating.is_nsfw();
 
         let send_result = self
             .notifier
@@ -378,6 +417,7 @@ impl BooruEngine {
         chat: &crate::db::entities::chats::Model,
         site_name: &str,
         base_url: &str,
+        engine_type: booru_client::BooruEngineType,
     ) -> bool {
         let image_url = post
             .sample_url
@@ -390,8 +430,9 @@ impl BooruEngine {
             return false;
         };
 
-        let caption_text = caption::build_booru_caption(post, site_name, base_url);
-        let has_spoiler = sensitive::should_blur_booru_tags(chat, &post.tags);
+        let caption_text = caption::build_booru_caption(post, site_name, base_url, engine_type);
+        let has_spoiler =
+            sensitive::should_blur_booru_tags(chat, &post.tags) || post.rating.is_nsfw();
 
         let send_result = self
             .notifier
@@ -497,8 +538,9 @@ impl BooruEngine {
     }
 
     async fn schedule_next_poll(&self, task_id: i32, site_config: &BooruSiteConfig) -> Result<()> {
-        let random_interval_sec =
-            rand::rng().random_range(site_config.min_interval_sec..=site_config.max_interval_sec);
+        let min = site_config.min_interval_sec;
+        let max = site_config.max_interval_sec.max(min);
+        let random_interval_sec = rand::rng().random_range(min..=max);
         let next_poll = Local::now() + chrono::Duration::seconds(random_interval_sec as i64);
         self.repo.update_task_after_poll(task_id, next_poll).await?;
         Ok(())

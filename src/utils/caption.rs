@@ -76,6 +76,7 @@ pub fn build_booru_caption(
     post: &booru_client::BooruPost,
     site_name: &str,
     base_url: &str,
+    engine_type: booru_client::BooruEngineType,
 ) -> String {
     let rating_emoji = match post.rating {
         booru_client::BooruRating::Safe | booru_client::BooruRating::General => "🟢",
@@ -84,7 +85,7 @@ pub fn build_booru_caption(
     };
 
     let clean_base = base_url.trim_end_matches('/');
-    let post_url = format!("{}/post/show/{}", clean_base, post.id);
+    let post_url = format!("{}{}", clean_base, engine_type.post_path(post.id));
 
     let tag_list: Vec<&str> = post.tags.split_whitespace().take(5).collect();
     let tags_display = if tag_list.is_empty() {

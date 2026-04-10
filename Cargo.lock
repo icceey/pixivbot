@@ -277,7 +277,6 @@ dependencies = [
 name = "booru_client"
 version = "0.2.0"
 dependencies = [
- "anyhow",
  "chrono",
  "reqwest",
  "serde",
