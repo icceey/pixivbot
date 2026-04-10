@@ -18,6 +18,8 @@ use tokio::time::{sleep, Duration};
 use tracing::{debug, error, info, warn};
 
 const DRAIN_POLL_INTERVAL_SEC: u64 = 10;
+/// Maximum number of pages to fetch when catching up on missed posts.
+const MAX_FETCH_PAGES: u32 = 5;
 
 pub struct BooruEngine {
     repo: Arc<Repo>,
@@ -140,19 +142,30 @@ impl BooruEngine {
             .site_for_task_value(&task.value)
             .ok_or_else(|| anyhow::anyhow!("Unknown booru site: {}", site_name))?;
 
-        let posts = site_ctx
-            .client
-            .get_posts(tags, site_ctx.config.page_limit, 1)
-            .await
-            .context("Failed to fetch posts from booru")?;
-
-        if posts.is_empty() {
+        let subscriptions = self.repo.list_subscriptions_by_task(task.id).await?;
+        if subscriptions.is_empty() {
             self.schedule_next_poll(task.id, &site_ctx.config).await?;
             return Ok(());
         }
 
-        let subscriptions = self.repo.list_subscriptions_by_task(task.id).await?;
-        if subscriptions.is_empty() {
+        let any_pending = subscriptions.iter().any(|sub| {
+            booru_tag_subscription_state(sub).map_or(false, |s| !s.pending_queue.is_empty())
+        });
+
+        let posts = if any_pending {
+            debug!("Task [{}] has pending queues, skipping API fetch", task.id);
+            Vec::new()
+        } else {
+            let oldest_latest_id = subscriptions
+                .iter()
+                .filter_map(|sub| booru_tag_subscription_state(sub).map(|s| s.latest_post_id))
+                .min();
+
+            self.fetch_posts_since(site_ctx, tags, oldest_latest_id)
+                .await?
+        };
+
+        if posts.is_empty() && !any_pending {
             self.schedule_next_poll(task.id, &site_ctx.config).await?;
             return Ok(());
         }
@@ -160,6 +173,16 @@ impl BooruEngine {
         let mut has_pending_queue = false;
 
         for subscription in &subscriptions {
+            let sub_state = booru_tag_subscription_state(subscription);
+
+            if posts.is_empty()
+                && sub_state
+                    .as_ref()
+                    .map_or(true, |s| s.pending_queue.is_empty())
+            {
+                continue;
+            }
+
             let chat = match get_chat_if_should_notify(&self.repo, subscription.chat_id).await {
                 Ok(Some(chat)) => chat,
                 Ok(None) => continue,
@@ -168,8 +191,6 @@ impl BooruEngine {
                     continue;
                 }
             };
-
-            let sub_state = booru_tag_subscription_state(subscription);
 
             match self
                 .process_booru_tag_sub(
@@ -219,6 +240,47 @@ impl BooruEngine {
             self.schedule_next_poll(task.id, &site_ctx.config).await?;
         }
         Ok(())
+    }
+
+    async fn fetch_posts_since(
+        &self,
+        site_ctx: &SiteContext,
+        tags: &str,
+        oldest_latest_id: Option<u64>,
+    ) -> Result<Vec<booru_client::BooruPost>> {
+        let mut all_posts = Vec::new();
+        let limit = site_ctx.config.page_limit;
+
+        for page in 1..=MAX_FETCH_PAGES {
+            let posts = site_ctx
+                .client
+                .get_posts(tags, limit, page)
+                .await
+                .context("Failed to fetch posts from booru")?;
+
+            if posts.is_empty() {
+                break;
+            }
+
+            let reached_old = match oldest_latest_id {
+                Some(last_id) => posts.iter().any(|p| p.id <= last_id),
+                None => true,
+            };
+
+            all_posts.extend(posts);
+
+            if reached_old {
+                break;
+            }
+
+            debug!(
+                "All posts on page {} are new, fetching page {}",
+                page,
+                page + 1
+            );
+        }
+
+        Ok(all_posts)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -533,5 +595,90 @@ impl BooruEngine {
         let next_poll = Local::now() + chrono::Duration::seconds(DRAIN_POLL_INTERVAL_SEC as i64);
         self.repo.update_task_after_poll(task_id, next_poll).await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use booru_client::{BooruPost, BooruRating};
+
+    fn make_post(id: u64, tags: &str, score: i32, rating: BooruRating) -> BooruPost {
+        BooruPost {
+            id,
+            tags: tags.to_string(),
+            score,
+            fav_count: 0,
+            file_url: Some(format!("https://example.com/{}.jpg", id)),
+            sample_url: Some(format!("https://example.com/sample/{}.jpg", id)),
+            preview_url: None,
+            rating,
+            width: 800,
+            height: 600,
+            md5: None,
+            source: Some("https://source.example".to_string()),
+            created_at: None,
+            file_size: None,
+            file_ext: None,
+            status: None,
+        }
+    }
+
+    #[test]
+    fn test_parse_task_value_with_tags() {
+        let (site, tags) = BooruEngine::parse_task_value("konachan:landscape sky");
+        assert_eq!(site, "konachan");
+        assert_eq!(tags, "landscape sky");
+    }
+
+    #[test]
+    fn test_parse_task_value_empty_tags() {
+        let (site, tags) = BooruEngine::parse_task_value("konachan:");
+        assert_eq!(site, "konachan");
+        assert_eq!(tags, "");
+    }
+
+    #[test]
+    fn test_parse_task_value_no_colon() {
+        let (site, tags) = BooruEngine::parse_task_value("konachan");
+        assert_eq!(site, "konachan");
+        assert_eq!(tags, "");
+    }
+
+    #[test]
+    fn test_post_to_queued_roundtrip() {
+        let post = make_post(42, "landscape sky", 100, BooruRating::Safe);
+        let queued = BooruEngine::post_to_queued(&post);
+        let recovered = BooruEngine::queued_to_booru_post(&queued);
+
+        assert_eq!(recovered.id, post.id);
+        assert_eq!(recovered.tags, post.tags);
+        assert_eq!(recovered.score, post.score);
+        assert_eq!(recovered.fav_count, post.fav_count);
+        assert_eq!(recovered.file_url, post.file_url);
+        assert_eq!(recovered.sample_url, post.sample_url);
+        assert_eq!(recovered.rating, post.rating);
+        assert_eq!(recovered.width, post.width);
+        assert_eq!(recovered.height, post.height);
+        assert_eq!(recovered.source, post.source);
+    }
+
+    #[test]
+    fn test_queued_rating_roundtrip() {
+        for rating in [
+            BooruRating::Safe,
+            BooruRating::General,
+            BooruRating::Questionable,
+            BooruRating::Explicit,
+        ] {
+            let post = make_post(1, "", 0, rating);
+            let queued = BooruEngine::post_to_queued(&post);
+            let recovered = BooruEngine::queued_to_booru_post(&queued);
+            assert_eq!(
+                recovered.rating, rating,
+                "Rating roundtrip failed for {:?}",
+                rating
+            );
+        }
     }
 }
