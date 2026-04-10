@@ -162,16 +162,6 @@ async fn main() -> Result<()> {
 
     info!("✅ Author, Ranking, and Name Update engines initialized");
 
-    let booru_engine = scheduler::BooruEngine::new(
-        repo.clone(),
-        notifier.clone(),
-        scheduler_config.tick_interval_sec,
-        scheduler_config.max_retry_count,
-        config.booru.sites.clone(),
-    );
-
-    info!("✅ Booru engine initialized");
-
     // Spawn all engines in background
     let author_engine_handle = tokio::spawn(async move {
         author_engine.run().await;
@@ -185,9 +175,25 @@ async fn main() -> Result<()> {
         name_update_engine.run().await;
     });
 
-    let booru_engine_handle = tokio::spawn(async move {
-        booru_engine.run().await;
-    });
+    let booru_engine_handle = if !config.booru.sites.is_empty() {
+        let booru_engine = scheduler::BooruEngine::new(
+            repo.clone(),
+            notifier.clone(),
+            scheduler_config.tick_interval_sec,
+            scheduler_config.max_retry_count,
+            config.booru.sites.clone(),
+        );
+        info!(
+            "✅ Booru engine initialized with {} site(s)",
+            config.booru.sites.len()
+        );
+        Some(tokio::spawn(async move {
+            booru_engine.run().await;
+        }))
+    } else {
+        info!("No booru sites configured, skipping booru engine");
+        None
+    };
 
     info!("🤖 Starting Telegram Bot...");
 
@@ -237,7 +243,9 @@ async fn main() -> Result<()> {
     author_engine_handle.abort();
     ranking_engine_handle.abort();
     name_update_engine_handle.abort();
-    booru_engine_handle.abort();
+    if let Some(handle) = booru_engine_handle {
+        handle.abort();
+    }
 
     info!("✅ Shutdown complete");
     Ok(())

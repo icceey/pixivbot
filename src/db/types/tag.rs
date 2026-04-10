@@ -159,10 +159,11 @@ impl TagFilter {
         self.matches_normalized_tags(&illust_tags)
     }
 
-    /// Check if a list of already-normalized tag strings matches this filter.
+    /// Check if a list of raw tag strings matches this filter.
     ///
+    /// Tags are normalized internally for case-insensitive comparison.
     /// Used for booru posts where tags are space-separated strings.
-    pub fn matches_tag_strings(&self, tags: &[String]) -> bool {
+    pub fn matches_tag_strings(&self, tags: &[&str]) -> bool {
         if self.is_empty() {
             return true;
         }

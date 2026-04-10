@@ -10,7 +10,7 @@ impl MigrationTrait for Migration {
             .alter_table(
                 Table::alter()
                     .table(Subscriptions::Table)
-                    .add_column(ColumnDef::new(Subscriptions::BooruFilter).text().null())
+                    .add_column(ColumnDef::new(Subscriptions::BooruFilter).json().null())
                     .to_owned(),
             )
             .await

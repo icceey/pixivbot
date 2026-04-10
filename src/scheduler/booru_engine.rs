@@ -1,7 +1,7 @@
 use crate::bot::notifier::{DownloadButtonConfig, Notifier};
 use crate::config::BooruSiteConfig;
 use crate::db::repo::Repo;
-use crate::db::types::{BooruTagState, QueuedBooruPost, SubscriptionState, TaskType};
+use crate::db::types::{BooruFilter, BooruTagState, QueuedBooruPost, SubscriptionState, TaskType};
 use crate::scheduler::helpers::{
     booru_tag_subscription_state, get_chat_if_should_notify, save_first_message_record,
     INTER_SUBSCRIPTION_DELAY_MS,
@@ -56,7 +56,7 @@ impl BooruEngine {
                 _ => client,
             };
             sites.insert(
-                cfg.name.clone(),
+                cfg.name.to_lowercase(),
                 SiteContext {
                     client,
                     config: cfg,
@@ -152,16 +152,41 @@ impl BooruEngine {
             booru_tag_subscription_state(sub).is_some_and(|s| !s.pending_queue.is_empty())
         });
 
-        let posts = if any_pending {
-            debug!("Task [{}] has pending queues, skipping API fetch", task.id);
+        let all_pending = any_pending
+            && subscriptions.iter().all(|sub| {
+                booru_tag_subscription_state(sub).is_some_and(|s| !s.pending_queue.is_empty())
+            });
+
+        let posts = if all_pending {
+            debug!(
+                "Task [{}]: all subscriptions have pending queues, skipping API fetch",
+                task.id
+            );
             Vec::new()
         } else {
             let oldest_latest_id = subscriptions
                 .iter()
-                .filter_map(|sub| booru_tag_subscription_state(sub).map(|s| s.latest_post_id))
+                .filter_map(|sub| {
+                    let state = booru_tag_subscription_state(sub)?;
+                    if state.pending_queue.is_empty() {
+                        Some(state.latest_post_id)
+                    } else {
+                        None
+                    }
+                })
                 .min();
 
-            self.fetch_posts_since(site_ctx, tags, oldest_latest_id)
+            let booru_filters: Vec<Option<&BooruFilter>> = subscriptions
+                .iter()
+                .filter(|sub| {
+                    booru_tag_subscription_state(sub).is_none_or(|s| s.pending_queue.is_empty())
+                })
+                .map(|sub| sub.booru_filter.as_ref())
+                .collect();
+            let aggregate = BooruFilter::aggregate(&booru_filters);
+            let api_tags = aggregate.to_api_tags(site_ctx.config.engine_type);
+
+            self.fetch_posts_since(site_ctx, tags, oldest_latest_id, &api_tags)
                 .await?
         };
 
@@ -247,22 +272,31 @@ impl BooruEngine {
         site_ctx: &SiteContext,
         tags: &str,
         oldest_latest_id: Option<u64>,
+        api_filter_tags: &[String],
     ) -> Result<Vec<booru_client::BooruPost>> {
         let mut all_posts = Vec::new();
         let limit = site_ctx.config.page_limit;
+        let mut reached_old = false;
+
+        let query_tags = if api_filter_tags.is_empty() {
+            tags.to_string()
+        } else {
+            format!("{} {}", tags, api_filter_tags.join(" "))
+        };
 
         for page in 1..=MAX_FETCH_PAGES {
             let posts = site_ctx
                 .client
-                .get_posts(tags, limit, page)
+                .get_posts(&query_tags, limit, page)
                 .await
                 .context("Failed to fetch posts from booru")?;
 
             if posts.is_empty() {
+                reached_old = true;
                 break;
             }
 
-            let reached_old = match oldest_latest_id {
+            reached_old = match oldest_latest_id {
                 Some(last_id) => posts.iter().any(|p| p.id <= last_id),
                 None => true,
             };
@@ -277,6 +311,13 @@ impl BooruEngine {
                 "All posts on page {} are new, fetching page {}",
                 page,
                 page + 1
+            );
+        }
+
+        if !reached_old {
+            warn!(
+                "Reached MAX_FETCH_PAGES ({}) without catching up to last known post (id: {:?}). Some posts may be skipped.",
+                MAX_FETCH_PAGES, oldest_latest_id
             );
         }
 
@@ -526,13 +567,9 @@ impl BooruEngine {
         posts
             .iter()
             .filter(|post| {
-                let tag_vec: Vec<String> = post
-                    .tags
-                    .split_whitespace()
-                    .map(|s| s.to_string())
-                    .collect();
+                let tag_refs: Vec<&str> = post.tags.split_whitespace().collect();
                 if !combined_tag_filter.is_empty()
-                    && !combined_tag_filter.matches_tag_strings(&tag_vec)
+                    && !combined_tag_filter.matches_tag_strings(&tag_refs)
                 {
                     return false;
                 }

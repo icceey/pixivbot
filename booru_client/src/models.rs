@@ -83,6 +83,15 @@ impl BooruRating {
         }
     }
 
+    pub fn as_gelbooru_str(&self) -> &'static str {
+        match self {
+            BooruRating::General => "general",
+            BooruRating::Safe => "sensitive",
+            BooruRating::Questionable => "questionable",
+            BooruRating::Explicit => "explicit",
+        }
+    }
+
     pub fn from_short_str(s: &str) -> Self {
         match s {
             "g" => BooruRating::General,

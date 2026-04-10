@@ -359,8 +359,8 @@ mod tests {
             "https://gelbooru.com",
             booru_client::BooruEngineType::Gelbooru,
         );
-        assert!(caption.contains("page=post"));
-        assert!(caption.contains("id=42"));
+        assert!(caption.contains("page\\=post"));
+        assert!(caption.contains("id\\=42"));
         assert!(caption.contains("🔴"));
     }
 
