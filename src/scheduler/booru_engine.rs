@@ -92,6 +92,7 @@ impl BooruEngine {
     }
 
     async fn tick(&self) -> Result<()> {
+        // TODO: BooruPool task type support (currently only BooruTag is implemented)
         let tasks = self
             .repo
             .get_pending_tasks_by_type(TaskType::BooruTag, 1)
@@ -441,11 +442,9 @@ impl BooruEngine {
             .or(first.preview_url.as_deref());
 
         let Some(url) = image_url else {
-            let mut remaining = state.pending_queue.clone();
-            remaining.remove(0);
             return Ok(Some(BooruTagState {
                 latest_post_id: state.latest_post_id,
-                pending_queue: remaining,
+                pending_queue: state.pending_queue[1..].to_vec(),
                 retry_count: 0,
             }));
         };
@@ -482,11 +481,9 @@ impl BooruEngine {
             )
             .await;
 
-            let mut remaining = state.pending_queue.clone();
-            remaining.remove(0);
             Ok(Some(BooruTagState {
                 latest_post_id: state.latest_post_id,
-                pending_queue: remaining,
+                pending_queue: state.pending_queue[1..].to_vec(),
                 retry_count: 0,
             }))
         } else {

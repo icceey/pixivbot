@@ -1,6 +1,7 @@
 use super::tag::normalize_tag;
 use crate::db::entities::chats;
 use pixiv_client::Illust;
+use std::collections::HashSet;
 
 /// Get sensitive tags list from chat settings
 pub fn get_chat_sensitive_tags(chat: &chats::Model) -> &[String] {
@@ -36,9 +37,8 @@ pub fn should_blur_booru_tags(chat: &chats::Model, tags: &str) -> bool {
     let sensitive_tags = get_chat_sensitive_tags(chat);
     let post_tags: Vec<String> = tags.split_whitespace().map(normalize_tag).collect();
 
-    sensitive_tags
-        .iter()
-        .any(|st| post_tags.iter().any(|pt| pt == &normalize_tag(st)))
+    let sensitive_set: HashSet<String> = sensitive_tags.iter().map(|s| normalize_tag(s)).collect();
+    post_tags.iter().any(|pt| sensitive_set.contains(pt))
 }
 
 #[cfg(test)]

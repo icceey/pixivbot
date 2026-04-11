@@ -255,8 +255,9 @@ fn parse_booru_filter_args(args: &[&str]) -> (BooruFilter, TagFilter) {
         {
             if let Ok(n) = val.parse::<i32>() {
                 score_min = Some(n);
-                continue;
             }
+            // Always skip: if prefix matched, it's a filter arg (even if parse failed)
+            continue;
         }
         if let Some(val) = arg
             .strip_prefix("fav>=")
@@ -264,8 +265,8 @@ fn parse_booru_filter_args(args: &[&str]) -> (BooruFilter, TagFilter) {
         {
             if let Ok(n) = val.parse::<i32>() {
                 fav_count_min = Some(n);
-                continue;
             }
+            continue;
         }
         if let Some(val) = arg.strip_prefix("rating=") {
             for r in val.split(',') {
@@ -286,4 +287,53 @@ fn parse_booru_filter_args(args: &[&str]) -> (BooruFilter, TagFilter) {
     let tag_filter = TagFilter::parse_from_args(&tag_parts);
 
     (booru_filter, tag_filter)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_filters_and_tags_split() {
+        let args = vec!["+good", "score>=50", "fav>=10", "rating=s,q", "-bad"];
+        let (booru, tags) = parse_booru_filter_args(&args);
+        assert_eq!(booru.score_min, Some(50));
+        assert_eq!(booru.fav_count_min, Some(10));
+        assert_eq!(
+            booru.allowed_ratings,
+            vec![BooruRating::Safe, BooruRating::Questionable]
+        );
+        assert!(!tags.is_empty());
+    }
+
+    #[test]
+    fn invalid_numeric_is_ignored_not_tag() {
+        let args = vec!["score>=abc", "fav>=xyz"];
+        let (booru, tags) = parse_booru_filter_args(&args);
+        assert_eq!(booru.score_min, None);
+        assert_eq!(booru.fav_count_min, None);
+        assert!(tags.is_empty());
+    }
+
+    #[test]
+    fn multiple_ratings_parsed() {
+        let args = vec!["rating=s,q,e"];
+        let (booru, _) = parse_booru_filter_args(&args);
+        assert_eq!(
+            booru.allowed_ratings,
+            vec![
+                BooruRating::Safe,
+                BooruRating::Questionable,
+                BooruRating::Explicit
+            ]
+        );
+    }
+
+    #[test]
+    fn empty_args_returns_defaults() {
+        let args: Vec<&str> = vec![];
+        let (booru, tags) = parse_booru_filter_args(&args);
+        assert!(booru.is_empty());
+        assert!(tags.is_empty());
+    }
 }
