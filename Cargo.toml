@@ -26,8 +26,8 @@ pixiv_client = { path = "pixiv_client" }
 rand = "0.10.0"
 regex = "1.12.3"
 reqwest = { version = "0.12.28", default-features = false, features = ["json", "rustls-tls"] }
-sea-orm = { version = "1.1.19", features = ["sqlx-sqlite", "runtime-tokio-rustls", "macros", "sqlx-dep"] }
-sea-orm-migration = { version = "1.1.19", features = ["runtime-tokio-rustls", "sqlx-sqlite"] }
+sea-orm = { version = "1.1.20", features = ["sqlx-sqlite", "runtime-tokio-rustls", "macros", "sqlx-dep"] }
+sea-orm-migration = { version = "1.1.20", features = ["runtime-tokio-rustls", "sqlx-sqlite"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 teloxide = { version = "0.17.0", features = ["macros", "ctrlc_handler", "rustls", "throttle"], default-features = false}
@@ -38,5 +38,5 @@ tracing = "0.1.44"
 tracing-appender = "0.2.4"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "chrono"] }
 url = "2.5.8"
-zip = "8.3.0"
+zip = "8.4.0"
 
