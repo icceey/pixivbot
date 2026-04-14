@@ -104,11 +104,11 @@ pub fn build_booru_caption(
         "🏷 *{}* \\| {}\n\n⭐ {} \\| ❤️ {} \\| {} {}\n🔗 [来源]({}){}\n",
         markdown::escape(site_name),
         markdown::escape(&format!("#{}", post.id)),
-        post.score,
-        post.fav_count,
+        markdown::escape(&post.score.to_string()),
+        markdown::escape(&post.fav_count.to_string()),
         rating_emoji,
         markdown::escape(post.rating.as_short_str()),
-        markdown::escape(&post_url),
+        markdown::escape_link_url(&post_url),
         tags_display
     )
 }
@@ -361,8 +361,8 @@ mod tests {
             "https://gelbooru.com",
             booru_client::BooruEngineType::Gelbooru,
         );
-        assert!(caption.contains("page\\=post"));
-        assert!(caption.contains("id\\=42"));
+        assert!(caption.contains("page=post"));
+        assert!(caption.contains("id=42"));
         assert!(caption.contains("🔴"));
     }
 
@@ -384,5 +384,18 @@ mod tests {
         assert!(caption.contains("\\#tagwithdash"));
         assert!(caption.contains("\\#tag\\_underscore"));
         assert!(caption.contains("test\\_site"));
+    }
+
+    #[test]
+    fn build_booru_caption_escapes_negative_score() {
+        let post = make_booru_post(1, "test", -5, 0, booru_client::BooruRating::Safe);
+        let caption = build_booru_caption(
+            &post,
+            "danbooru",
+            "https://danbooru.donmai.us",
+            booru_client::BooruEngineType::Danbooru,
+        );
+        // The `-` in `-5` must be escaped for MarkdownV2
+        assert!(caption.contains("\\-5"));
     }
 }

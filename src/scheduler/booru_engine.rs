@@ -68,7 +68,9 @@ impl BooruEngine {
             repo,
             notifier,
             tick_interval_sec,
-            max_retry_count,
+            // Clamp to u8 range since retry_count in BooruTagState is u8.
+            // Values > 255 would cause the counter to saturate and retry forever.
+            max_retry_count: max_retry_count.min(255),
             sites,
         }
     }
@@ -158,22 +160,21 @@ impl BooruEngine {
                 booru_tag_subscription_state(sub).is_some_and(|s| !s.pending_queue.is_empty())
             });
 
-        let posts = if all_pending {
+        let (posts, reached_old) = if all_pending {
             debug!(
                 "Task [{}]: all subscriptions have pending queues, skipping API fetch",
                 task.id
             );
-            Vec::new()
+            (Vec::new(), true)
         } else {
+            // Use the oldest latest_post_id across ALL subscriptions (including
+            // those with pending queues) so that when a pending sub's queue drains,
+            // it can still process newly fetched posts from its cursor position.
             let oldest_latest_id = subscriptions
                 .iter()
                 .filter_map(|sub| {
                     let state = booru_tag_subscription_state(sub)?;
-                    if state.pending_queue.is_empty() {
-                        Some(state.latest_post_id)
-                    } else {
-                        None
-                    }
+                    Some(state.latest_post_id)
                 })
                 .min();
 
@@ -189,7 +190,6 @@ impl BooruEngine {
 
             self.fetch_posts_since(site_ctx, tags, oldest_latest_id, &api_tags)
                 .await?
-                .0
         };
 
         if posts.is_empty() && !any_pending {
@@ -225,6 +225,7 @@ impl BooruEngine {
                     &chat,
                     sub_state,
                     &posts,
+                    reached_old,
                     site_name,
                     &site_ctx.config.base_url,
                     site_ctx.config.engine_type,
@@ -273,6 +274,11 @@ impl BooruEngine {
     /// `reached_old` indicates whether we successfully fetched back to (or past)
     /// the `oldest_latest_id`. When `false`, some posts between the cursor and
     /// the oldest fetched post may have been missed due to the MAX_FETCH_PAGES limit.
+    ///
+    /// **Assumption**: The API returns posts sorted by ID descending (newest first).
+    /// This is the default behavior for Moebooru, Danbooru, and Gelbooru.
+    /// If a future engine returns differently-ordered results, the pagination
+    /// termination logic (checking `p.id <= last_id`) will malfunction.
     async fn fetch_posts_since(
         &self,
         site_ctx: &SiteContext,
@@ -339,6 +345,7 @@ impl BooruEngine {
         chat: &crate::db::entities::chats::Model,
         sub_state: Option<BooruTagState>,
         posts: &[booru_client::BooruPost],
+        reached_old: bool,
         site_name: &str,
         base_url: &str,
         engine_type: booru_client::BooruEngineType,
@@ -374,20 +381,57 @@ impl BooruEngine {
 
         let newest_id = new_posts.iter().map(|p| p.id).max().unwrap_or(0);
 
+        if !reached_old {
+            if let Some(last_id) = latest_id {
+                let oldest_fetched = new_posts.iter().map(|p| p.id).min().unwrap_or(0);
+                warn!(
+                    "Catch-up overflow for sub {} chat {}: advancing cursor from {} to {} \
+                     but posts in range {}..{} may have been missed (MAX_FETCH_PAGES exhausted)",
+                    subscription.id,
+                    ChatId(subscription.chat_id),
+                    last_id,
+                    newest_id,
+                    last_id + 1,
+                    oldest_fetched.saturating_sub(1),
+                );
+            }
+        }
+
         let filtered = self.apply_booru_filters(subscription, chat, &new_posts);
 
         if filtered.is_empty() {
             return Ok(Some(BooruTagState::cleared(newest_id)));
         }
 
-        // Queue remaining posts for later delivery (applies to all modes)
+        // Queue remaining posts for later delivery (applies to all modes).
+        // Filter out posts without any image URL at construction time to avoid
+        // tick-by-tick drain of permanently unsendable posts.
         let queue: Vec<QueuedBooruPost> = filtered
             .iter()
             .skip(1)
+            .filter(|p| p.sample_url.is_some() || p.file_url.is_some() || p.preview_url.is_some())
             .map(|p| Self::post_to_queued(p))
             .collect();
 
         let first = filtered.first().unwrap();
+
+        // Check if the first post has a sendable image URL. If not, skip it
+        // rather than queueing it for retry (it will never become sendable).
+        let has_image =
+            first.sample_url.is_some() || first.file_url.is_some() || first.preview_url.is_some();
+
+        if !has_image {
+            warn!(
+                "No image URL for booru post {} (sub {} chat {}), skipping",
+                first.id, subscription.id, chat_id
+            );
+            return Ok(Some(BooruTagState {
+                latest_post_id: newest_id,
+                pending_queue: queue,
+                retry_count: 0,
+            }));
+        }
+
         let send_ok = self
             .push_single_post(
                 chat_id,

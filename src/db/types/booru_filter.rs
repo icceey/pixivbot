@@ -120,13 +120,36 @@ impl BooruFilter {
 
         if self.allowed_ratings.len() == 1 {
             let rating = &self.allowed_ratings[0];
-            let tag = match engine_type {
-                BooruEngineType::Gelbooru => {
-                    format!("rating:{}", rating.as_gelbooru_str())
+            tags.push(format!("rating:{}", rating.as_api_str(engine_type)));
+        } else if !self.allowed_ratings.is_empty() {
+            // For multi-rating: send exclusion tags for ratings NOT in the allowed set.
+            // Compare by API string (not enum variant) since Safe and General may map to same value.
+            let all_ratings = [
+                BooruRating::General,
+                BooruRating::Safe,
+                BooruRating::Sensitive,
+                BooruRating::Questionable,
+                BooruRating::Explicit,
+            ];
+            let allowed_api_strs: Vec<&str> = self
+                .allowed_ratings
+                .iter()
+                .map(|r| r.as_api_str(engine_type))
+                .collect();
+            let mut excluded_api_strs: Vec<&str> = Vec::new();
+            for r in &all_ratings {
+                let api_str = r.as_api_str(engine_type);
+                if !allowed_api_strs.contains(&api_str) && !excluded_api_strs.contains(&api_str) {
+                    excluded_api_strs.push(api_str);
                 }
-                _ => format!("rating:{}", rating.as_short_str()),
-            };
-            tags.push(tag);
+            }
+            // Only send exclusions when there are few enough to be practical
+            // (avoids consuming too many tag slots on sites with tag limits)
+            if !excluded_api_strs.is_empty() && excluded_api_strs.len() <= 2 {
+                for api_str in excluded_api_strs {
+                    tags.push(format!("-rating:{}", api_str));
+                }
+            }
         }
 
         tags
@@ -226,7 +249,8 @@ mod tests {
         let tags = filter.to_api_tags(BooruEngineType::Danbooru);
         assert!(tags.contains(&"score:>=10".to_string()));
         assert!(tags.contains(&"favcount:>=5".to_string()));
-        assert!(tags.contains(&"rating:s".to_string()));
+        // Safe maps to "g" (general) on Danbooru, not "s" (which means sensitive)
+        assert!(tags.contains(&"rating:g".to_string()));
     }
 
     #[test]
@@ -246,13 +270,26 @@ mod tests {
     }
 
     #[test]
-    fn test_to_api_tags_multi_rating_skipped() {
+    fn test_to_api_tags_multi_rating_exclusion() {
+        // Safe + Questionable on Danbooru: Safe→"g", Questionable→"q"
+        // Excluded: Sensitive→"s", Explicit→"e" (2 exclusions, sent as -rating:)
         let filter = BooruFilter::new(
             None,
             None,
             vec![BooruRating::Safe, BooruRating::Questionable],
         );
         let tags = filter.to_api_tags(BooruEngineType::Danbooru);
-        assert!(!tags.iter().any(|t| t.starts_with("rating")));
+        assert!(tags.contains(&"-rating:s".to_string()));
+        assert!(tags.contains(&"-rating:e".to_string()));
+    }
+
+    #[test]
+    fn test_to_api_tags_multi_rating_too_many_exclusions_skipped() {
+        // Only Safe on Danbooru means excluded = [s, q, e] (3 exclusions, too many)
+        // But wait, Safe alone is len()==1, handled by the single-rating path.
+        // Test with General + Safe (both map to "g"), excluded = [s, q, e] = 3, skipped
+        let filter = BooruFilter::new(None, None, vec![BooruRating::General, BooruRating::Safe]);
+        let tags = filter.to_api_tags(BooruEngineType::Danbooru);
+        assert!(!tags.iter().any(|t| t.contains("rating")));
     }
 }

@@ -189,11 +189,11 @@ impl BotHandler {
 
                 if is_channel {
                     message.push_str(&format!(
-                        "\n💡 使用 `/unsub ch={} <id>` 或 `/unsubrank ch={} <mode>` 取消订阅",
-                        target_chat_id.0, target_chat_id.0
+                        "\n💡 使用 `/unsub ch={cid} <id>` `/unsubrank ch={cid} <mode>` `/bunsub ch={cid} <站点:标签>` 取消订阅",
+                        cid = target_chat_id.0
                     ));
                 } else {
-                    message.push_str("\n💡 使用 `/unsub <id>` 或 `/unsubrank <mode>` 取消订阅");
+                    message.push_str("\n💡 使用 `/unsub <id>` `/unsubrank <mode>` `/bunsub <站点:标签>` 取消订阅");
                 }
 
                 let keyboard = if total_pages > 1 {

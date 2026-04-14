@@ -39,15 +39,12 @@ impl Repo {
             ..Default::default()
         };
 
-        let conflict_handler = if author_name.is_some() {
-            OnConflict::columns([tasks::Column::Type, tasks::Column::Value])
-                .update_column(tasks::Column::AuthorName)
-                .to_owned()
-        } else {
-            OnConflict::columns([tasks::Column::Type, tasks::Column::Value])
-                .update_column(tasks::Column::Value)
-                .to_owned()
-        };
+        // On conflict (same type+value), do NOT overwrite author_name.
+        // The first subscriber's display_name should be preserved;
+        // otherwise later subscribers could overwrite it for all chats.
+        let conflict_handler = OnConflict::columns([tasks::Column::Type, tasks::Column::Value])
+            .update_column(tasks::Column::Value)
+            .to_owned();
 
         tasks::Entity::insert(new_task)
             .on_conflict(conflict_handler)

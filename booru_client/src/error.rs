@@ -10,8 +10,6 @@ pub enum Error {
     Json(serde_json::Error),
     /// API 返回的错误
     Api { message: String, status: u16 },
-    /// 其他错误
-    Other(String),
 }
 
 impl fmt::Display for Error {
@@ -22,7 +20,6 @@ impl fmt::Display for Error {
             Error::Api { message, status } => {
                 write!(f, "API error ({}): {}", status, message)
             }
-            Error::Other(msg) => write!(f, "{}", msg),
         }
     }
 }

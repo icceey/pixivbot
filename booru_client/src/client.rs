@@ -73,8 +73,15 @@ impl BooruClient {
                 self.get_posts_danbooru(&tags, limit, page).await
             }
             BooruEngineType::Gelbooru => {
-                let tags = format!("pool:{pool_id}");
-                self.get_posts_gelbooru(&tags, limit, page).await
+                // Gelbooru doesn't have a proper pool API (get_pool returns error),
+                // so reject pool post fetching too for consistency.
+                Err(Error::Api {
+                    message: format!(
+                        "Gelbooru does not support pool operations (pool ID: {})",
+                        pool_id
+                    ),
+                    status: 0,
+                })
             }
         }
     }
@@ -161,7 +168,7 @@ impl BooruClient {
         let url = format!("{}/index.php", self.base_url);
         // Gelbooru uses 0-indexed pid
         let pid = page.saturating_sub(1);
-        let resp: GelbooruPostsResponse = self
+        let resp: std::result::Result<GelbooruPostsResponse, _> = self
             .request(
                 &url,
                 &[
@@ -174,8 +181,15 @@ impl BooruClient {
                     ("pid", &pid.to_string()),
                 ],
             )
-            .await?;
-        Ok(resp.post.into_iter().map(|r| r.into_booru_post()).collect())
+            .await;
+        match resp {
+            Ok(r) => Ok(r.post.into_iter().map(|r| r.into_booru_post()).collect()),
+            Err(Error::Json(_)) => {
+                // Gelbooru returns empty/non-JSON body for zero-result queries
+                Ok(vec![])
+            }
+            Err(e) => Err(e),
+        }
     }
 
     async fn request<T: serde::de::DeserializeOwned>(

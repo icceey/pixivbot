@@ -115,6 +115,7 @@ impl BotHandler {
                 return Ok(());
             }
         };
+        booru_query_tags.sort_unstable();
         let tags = booru_query_tags.join(" ");
 
         let task_value = format!("{}:{}", site_name.to_lowercase(), tags);
@@ -214,9 +215,19 @@ impl BotHandler {
         if !first_tag.is_empty() {
             booru_query_tags.push(first_tag);
         }
+        // Strip filter-like args (same as bsub) so the task key matches
         for &part in &parts[1..] {
+            if part.starts_with("score>")
+                || part.starts_with("fav>")
+                || part.starts_with("rating=")
+                || part.starts_with('+')
+                || part.starts_with('-')
+            {
+                continue;
+            }
             booru_query_tags.push(part);
         }
+        booru_query_tags.sort_unstable();
         let tags = booru_query_tags.join(" ");
 
         let task_value = format!("{}:{}", site_name.to_lowercase(), tags);
@@ -255,24 +266,34 @@ fn parse_booru_filter_args(args: &[&str]) -> Result<(BooruFilter, TagFilter), St
     let mut tag_parts = Vec::new();
 
     for &arg in args {
-        if let Some(val) = arg
-            .strip_prefix("score>=")
-            .or_else(|| arg.strip_prefix("score>"))
-        {
+        // score>=N means "score >= N", score>N means "score > N" (stored as N+1)
+        if let Some(val) = arg.strip_prefix("score>=") {
             score_min =
                 Some(val.parse::<i32>().map_err(|_| {
                     format!("score 参数无效: `{}`，需要整数，例如 `score>=50`", arg)
                 })?);
             continue;
         }
-        if let Some(val) = arg
-            .strip_prefix("fav>=")
-            .or_else(|| arg.strip_prefix("fav>"))
-        {
+        if let Some(val) = arg.strip_prefix("score>") {
+            let v = val
+                .parse::<i32>()
+                .map_err(|_| format!("score 参数无效: `{}`，需要整数，例如 `score>=50`", arg))?;
+            score_min = Some(v.saturating_add(1));
+            continue;
+        }
+        // fav>=N means "fav >= N", fav>N means "fav > N" (stored as N+1)
+        if let Some(val) = arg.strip_prefix("fav>=") {
             fav_count_min = Some(
                 val.parse::<i32>()
                     .map_err(|_| format!("fav 参数无效: `{}`，需要整数，例如 `fav>=10`", arg))?,
             );
+            continue;
+        }
+        if let Some(val) = arg.strip_prefix("fav>") {
+            let v = val
+                .parse::<i32>()
+                .map_err(|_| format!("fav 参数无效: `{}`，需要整数，例如 `fav>=10`", arg))?;
+            fav_count_min = Some(v.saturating_add(1));
             continue;
         }
         if let Some(val) = arg.strip_prefix("rating=") {
@@ -371,5 +392,13 @@ mod tests {
         let (booru, tags) = parse_booru_filter_args(&args).unwrap();
         assert!(booru.is_empty());
         assert!(tags.is_empty());
+    }
+
+    #[test]
+    fn strict_greater_than_stored_as_plus_one() {
+        let args = vec!["score>49", "fav>9"];
+        let (booru, _) = parse_booru_filter_args(&args).unwrap();
+        assert_eq!(booru.score_min, Some(50));
+        assert_eq!(booru.fav_count_min, Some(10));
     }
 }

@@ -1,3 +1,4 @@
+use crate::engine_type::BooruEngineType;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -88,10 +89,35 @@ impl BooruRating {
 
     pub fn as_gelbooru_str(&self) -> &'static str {
         match self {
-            BooruRating::General => "general",
-            BooruRating::Safe | BooruRating::Sensitive => "sensitive",
+            BooruRating::General | BooruRating::Safe => "general",
+            BooruRating::Sensitive => "sensitive",
             BooruRating::Questionable => "questionable",
             BooruRating::Explicit => "explicit",
+        }
+    }
+
+    /// Returns the correct rating string for API queries on the given engine.
+    ///
+    /// Each booru engine uses different rating vocabularies:
+    /// - Moebooru: s (safe), q (questionable), e (explicit)
+    /// - Danbooru: g (general), s (sensitive), q (questionable), e (explicit)
+    /// - Gelbooru: general, sensitive, questionable, explicit
+    ///
+    /// `BooruRating::Safe` (a Moebooru concept) maps to the safest tier on each engine.
+    pub fn as_api_str(&self, engine_type: BooruEngineType) -> &'static str {
+        match engine_type {
+            BooruEngineType::Moebooru => match self {
+                BooruRating::General | BooruRating::Safe => "s",
+                BooruRating::Sensitive | BooruRating::Questionable => "q",
+                BooruRating::Explicit => "e",
+            },
+            BooruEngineType::Danbooru => match self {
+                BooruRating::General | BooruRating::Safe => "g",
+                BooruRating::Sensitive => "s",
+                BooruRating::Questionable => "q",
+                BooruRating::Explicit => "e",
+            },
+            BooruEngineType::Gelbooru => self.as_gelbooru_str(),
         }
     }
 
@@ -391,6 +417,11 @@ impl GelbooruRawPost {
                         .ok()
                         .map(|dt| dt.with_timezone(&Utc))
                 })
+                .or_else(|| {
+                    DateTime::parse_from_str(s, "%a %b %d %H:%M:%S %z %Y")
+                        .ok()
+                        .map(|dt| dt.with_timezone(&Utc))
+                })
         });
         BooruPost {
             id: self.id,
@@ -527,6 +558,72 @@ mod tests {
     }
 
     #[test]
+    fn test_rating_as_api_str_moebooru() {
+        assert_eq!(
+            BooruRating::General.as_api_str(BooruEngineType::Moebooru),
+            "s"
+        );
+        assert_eq!(BooruRating::Safe.as_api_str(BooruEngineType::Moebooru), "s");
+        assert_eq!(
+            BooruRating::Sensitive.as_api_str(BooruEngineType::Moebooru),
+            "q"
+        );
+        assert_eq!(
+            BooruRating::Questionable.as_api_str(BooruEngineType::Moebooru),
+            "q"
+        );
+        assert_eq!(
+            BooruRating::Explicit.as_api_str(BooruEngineType::Moebooru),
+            "e"
+        );
+    }
+
+    #[test]
+    fn test_rating_as_api_str_danbooru() {
+        assert_eq!(
+            BooruRating::General.as_api_str(BooruEngineType::Danbooru),
+            "g"
+        );
+        assert_eq!(BooruRating::Safe.as_api_str(BooruEngineType::Danbooru), "g");
+        assert_eq!(
+            BooruRating::Sensitive.as_api_str(BooruEngineType::Danbooru),
+            "s"
+        );
+        assert_eq!(
+            BooruRating::Questionable.as_api_str(BooruEngineType::Danbooru),
+            "q"
+        );
+        assert_eq!(
+            BooruRating::Explicit.as_api_str(BooruEngineType::Danbooru),
+            "e"
+        );
+    }
+
+    #[test]
+    fn test_rating_as_api_str_gelbooru() {
+        assert_eq!(
+            BooruRating::General.as_api_str(BooruEngineType::Gelbooru),
+            "general"
+        );
+        assert_eq!(
+            BooruRating::Safe.as_api_str(BooruEngineType::Gelbooru),
+            "general"
+        );
+        assert_eq!(
+            BooruRating::Sensitive.as_api_str(BooruEngineType::Gelbooru),
+            "sensitive"
+        );
+        assert_eq!(
+            BooruRating::Questionable.as_api_str(BooruEngineType::Gelbooru),
+            "questionable"
+        );
+        assert_eq!(
+            BooruRating::Explicit.as_api_str(BooruEngineType::Gelbooru),
+            "explicit"
+        );
+    }
+
+    #[test]
     fn test_danbooru_raw_post_deserialization() {
         let json = r#"{
             "id": 7654321,
@@ -585,6 +682,26 @@ mod tests {
         assert_eq!(post.md5.as_deref(), Some("aabbccdd"));
         assert!(post.created_at.is_some());
         assert_eq!(post.fav_count, 0); // Gelbooru fav_count is optional
+    }
+
+    #[test]
+    fn test_gelbooru_date_format_with_timezone() {
+        let json = r#"{
+            "id": 8888888,
+            "tags": "sky",
+            "score": 5,
+            "rating": "general",
+            "width": 100,
+            "height": 100,
+            "created_at": "Wed Jun 01 12:34:56 -0500 2022"
+        }"#;
+
+        let raw: GelbooruRawPost = serde_json::from_str(json).unwrap();
+        let post = raw.into_booru_post();
+        assert!(
+            post.created_at.is_some(),
+            "Should parse 'Wed Jun 01 12:34:56 -0500 2022' date format"
+        );
     }
 
     #[test]
