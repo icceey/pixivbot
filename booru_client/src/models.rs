@@ -41,6 +41,8 @@ pub struct BooruPost {
 pub enum BooruRating {
     General,
     Safe,
+    /// Gelbooru's "sensitive" rating — between safe and questionable.
+    Sensitive,
     Questionable,
     Explicit,
 }
@@ -57,7 +59,7 @@ impl BooruRating {
     pub fn from_danbooru(s: &str) -> Self {
         match s {
             "g" => BooruRating::General,
-            "s" => BooruRating::Safe,
+            "s" => BooruRating::Sensitive,
             "q" => BooruRating::Questionable,
             "e" => BooruRating::Explicit,
             _ => BooruRating::Safe,
@@ -67,7 +69,7 @@ impl BooruRating {
     pub fn from_gelbooru(s: &str) -> Self {
         match s {
             "general" => BooruRating::General,
-            "sensitive" => BooruRating::Safe,
+            "sensitive" => BooruRating::Sensitive,
             "questionable" => BooruRating::Questionable,
             "explicit" => BooruRating::Explicit,
             _ => BooruRating::Safe,
@@ -78,6 +80,7 @@ impl BooruRating {
         match self {
             BooruRating::General => "g",
             BooruRating::Safe => "s",
+            BooruRating::Sensitive => "se",
             BooruRating::Questionable => "q",
             BooruRating::Explicit => "e",
         }
@@ -86,7 +89,7 @@ impl BooruRating {
     pub fn as_gelbooru_str(&self) -> &'static str {
         match self {
             BooruRating::General => "general",
-            BooruRating::Safe => "sensitive",
+            BooruRating::Safe | BooruRating::Sensitive => "sensitive",
             BooruRating::Questionable => "questionable",
             BooruRating::Explicit => "explicit",
         }
@@ -96,6 +99,7 @@ impl BooruRating {
         match s {
             "g" => BooruRating::General,
             "s" => BooruRating::Safe,
+            "se" => BooruRating::Sensitive,
             "q" => BooruRating::Questionable,
             "e" => BooruRating::Explicit,
             _ => BooruRating::Safe,
@@ -103,7 +107,10 @@ impl BooruRating {
     }
 
     pub fn is_nsfw(&self) -> bool {
-        matches!(self, BooruRating::Questionable | BooruRating::Explicit)
+        matches!(
+            self,
+            BooruRating::Sensitive | BooruRating::Questionable | BooruRating::Explicit
+        )
     }
 }
 
@@ -112,6 +119,7 @@ impl fmt::Display for BooruRating {
         match self {
             BooruRating::General => write!(f, "General"),
             BooruRating::Safe => write!(f, "Safe"),
+            BooruRating::Sensitive => write!(f, "Sensitive"),
             BooruRating::Questionable => write!(f, "Questionable"),
             BooruRating::Explicit => write!(f, "Explicit"),
         }
@@ -485,7 +493,7 @@ mod tests {
     #[test]
     fn test_rating_from_danbooru() {
         assert_eq!(BooruRating::from_danbooru("g"), BooruRating::General);
-        assert_eq!(BooruRating::from_danbooru("s"), BooruRating::Safe);
+        assert_eq!(BooruRating::from_danbooru("s"), BooruRating::Sensitive);
         assert_eq!(BooruRating::from_danbooru("q"), BooruRating::Questionable);
         assert_eq!(BooruRating::from_danbooru("e"), BooruRating::Explicit);
         assert_eq!(BooruRating::from_danbooru("x"), BooruRating::Safe);
@@ -494,7 +502,10 @@ mod tests {
     #[test]
     fn test_rating_from_gelbooru() {
         assert_eq!(BooruRating::from_gelbooru("general"), BooruRating::General);
-        assert_eq!(BooruRating::from_gelbooru("sensitive"), BooruRating::Safe);
+        assert_eq!(
+            BooruRating::from_gelbooru("sensitive"),
+            BooruRating::Sensitive
+        );
         assert_eq!(
             BooruRating::from_gelbooru("questionable"),
             BooruRating::Questionable
@@ -510,6 +521,7 @@ mod tests {
     fn test_rating_short_str() {
         assert_eq!(BooruRating::General.as_short_str(), "g");
         assert_eq!(BooruRating::Safe.as_short_str(), "s");
+        assert_eq!(BooruRating::Sensitive.as_short_str(), "se");
         assert_eq!(BooruRating::Questionable.as_short_str(), "q");
         assert_eq!(BooruRating::Explicit.as_short_str(), "e");
     }

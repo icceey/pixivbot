@@ -189,6 +189,7 @@ impl BooruEngine {
 
             self.fetch_posts_since(site_ctx, tags, oldest_latest_id, &api_tags)
                 .await?
+                .0
         };
 
         if posts.is_empty() && !any_pending {
@@ -268,13 +269,17 @@ impl BooruEngine {
         Ok(())
     }
 
+    /// Fetch posts since the given ID. Returns `(posts, reached_old)` where
+    /// `reached_old` indicates whether we successfully fetched back to (or past)
+    /// the `oldest_latest_id`. When `false`, some posts between the cursor and
+    /// the oldest fetched post may have been missed due to the MAX_FETCH_PAGES limit.
     async fn fetch_posts_since(
         &self,
         site_ctx: &SiteContext,
         tags: &str,
         oldest_latest_id: Option<u64>,
         api_filter_tags: &[String],
-    ) -> Result<Vec<booru_client::BooruPost>> {
+    ) -> Result<(Vec<booru_client::BooruPost>, bool)> {
         let mut all_posts = Vec::new();
         let limit = site_ctx.config.page_limit;
         let mut reached_old = false;
@@ -316,13 +321,15 @@ impl BooruEngine {
         }
 
         if !reached_old {
-            warn!(
-                "Reached MAX_FETCH_PAGES ({}) without catching up to last known post (id: {:?}). Some posts may be skipped.",
-                MAX_FETCH_PAGES, oldest_latest_id
+            error!(
+                "Reached MAX_FETCH_PAGES ({}) for site '{}' tags '{}' without catching up to \
+                 last known post (id: {:?}). Posts between the cursor and the oldest fetched \
+                 post are permanently skipped.",
+                MAX_FETCH_PAGES, site_ctx.config.name, tags, oldest_latest_id
             );
         }
 
-        Ok(all_posts)
+        Ok((all_posts, reached_old))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -370,11 +377,7 @@ impl BooruEngine {
         let filtered = self.apply_booru_filters(subscription, chat, &new_posts);
 
         if filtered.is_empty() {
-            return Ok(Some(BooruTagState {
-                latest_post_id: newest_id,
-                pending_queue: Vec::new(),
-                retry_count: 0,
-            }));
+            return Ok(Some(BooruTagState::cleared(newest_id)));
         }
 
         // Queue remaining posts for later delivery (applies to all modes)
@@ -422,16 +425,20 @@ impl BooruEngine {
     ) -> Result<Option<BooruTagState>> {
         let chat_id = ChatId(subscription.chat_id);
 
-        if self.max_retry_count > 0 && (state.retry_count as i32) >= self.max_retry_count {
-            warn!(
-                "Max retry count reached for booru sub {} chat {}, clearing queue",
-                subscription.id, chat_id
-            );
-            return Ok(Some(BooruTagState {
-                latest_post_id: state.latest_post_id,
-                pending_queue: Vec::new(),
-                retry_count: 0,
-            }));
+        // Check retry limit: max_retry_count <= 0 means retry disabled
+        if state.should_abandon_queue(self.max_retry_count) {
+            if self.max_retry_count <= 0 {
+                warn!(
+                    "Retry disabled (max_retry_count={}), clearing pending queue for booru sub {} chat {}",
+                    self.max_retry_count, subscription.id, chat_id
+                );
+            } else {
+                warn!(
+                    "Max retry count reached for booru sub {} chat {}, clearing queue",
+                    subscription.id, chat_id
+                );
+            }
+            return Ok(Some(BooruTagState::cleared(state.latest_post_id)));
         }
 
         let first = &state.pending_queue[0];
@@ -442,11 +449,11 @@ impl BooruEngine {
             .or(first.preview_url.as_deref());
 
         let Some(url) = image_url else {
-            return Ok(Some(BooruTagState {
-                latest_post_id: state.latest_post_id,
-                pending_queue: state.pending_queue[1..].to_vec(),
-                retry_count: 0,
-            }));
+            warn!(
+                "No image URL for queued booru post {} (sub {} chat {}), removing from queue",
+                first.id, subscription.id, chat_id
+            );
+            return Ok(Some(state.popped_front()));
         };
 
         let caption_text = caption::build_booru_caption(
@@ -481,17 +488,9 @@ impl BooruEngine {
             )
             .await;
 
-            Ok(Some(BooruTagState {
-                latest_post_id: state.latest_post_id,
-                pending_queue: state.pending_queue[1..].to_vec(),
-                retry_count: 0,
-            }))
+            Ok(Some(state.popped_front()))
         } else {
-            Ok(Some(BooruTagState {
-                latest_post_id: state.latest_post_id,
-                pending_queue: state.pending_queue.clone(),
-                retry_count: state.retry_count.saturating_add(1),
-            }))
+            Ok(Some(state.with_retry_increment()))
         }
     }
 
@@ -706,6 +705,7 @@ mod tests {
         for rating in [
             BooruRating::Safe,
             BooruRating::General,
+            BooruRating::Sensitive,
             BooruRating::Questionable,
             BooruRating::Explicit,
         ] {

@@ -108,7 +108,13 @@ impl BotHandler {
             }
         }
 
-        let (booru_filter, tag_filter) = parse_booru_filter_args(&filter_arg_parts);
+        let (booru_filter, tag_filter) = match parse_booru_filter_args(&filter_arg_parts) {
+            Ok(result) => result,
+            Err(msg) => {
+                bot.send_message(chat_id, format!("❌ {}", msg)).await?;
+                return Ok(());
+            }
+        };
         let tags = booru_query_tags.join(" ");
 
         let task_value = format!("{}:{}", site_name.to_lowercase(), tags);
@@ -242,7 +248,7 @@ impl BotHandler {
     }
 }
 
-fn parse_booru_filter_args(args: &[&str]) -> (BooruFilter, TagFilter) {
+fn parse_booru_filter_args(args: &[&str]) -> Result<(BooruFilter, TagFilter), String> {
     let mut score_min = None;
     let mut fav_count_min = None;
     let mut allowed_ratings = Vec::new();
@@ -253,19 +259,20 @@ fn parse_booru_filter_args(args: &[&str]) -> (BooruFilter, TagFilter) {
             .strip_prefix("score>=")
             .or_else(|| arg.strip_prefix("score>"))
         {
-            if let Ok(n) = val.parse::<i32>() {
-                score_min = Some(n);
-            }
-            // Always skip: if prefix matched, it's a filter arg (even if parse failed)
+            score_min =
+                Some(val.parse::<i32>().map_err(|_| {
+                    format!("score 参数无效: `{}`，需要整数，例如 `score>=50`", arg)
+                })?);
             continue;
         }
         if let Some(val) = arg
             .strip_prefix("fav>=")
             .or_else(|| arg.strip_prefix("fav>"))
         {
-            if let Ok(n) = val.parse::<i32>() {
-                fav_count_min = Some(n);
-            }
+            fav_count_min = Some(
+                val.parse::<i32>()
+                    .map_err(|_| format!("fav 参数无效: `{}`，需要整数，例如 `fav>=10`", arg))?,
+            );
             continue;
         }
         if let Some(val) = arg.strip_prefix("rating=") {
@@ -273,9 +280,15 @@ fn parse_booru_filter_args(args: &[&str]) -> (BooruFilter, TagFilter) {
                 match r.trim() {
                     "s" | "safe" => allowed_ratings.push(BooruRating::Safe),
                     "g" | "general" => allowed_ratings.push(BooruRating::General),
+                    "se" | "sensitive" => allowed_ratings.push(BooruRating::Sensitive),
                     "q" | "questionable" => allowed_ratings.push(BooruRating::Questionable),
                     "e" | "explicit" => allowed_ratings.push(BooruRating::Explicit),
-                    _ => {}
+                    other => {
+                        return Err(format!(
+                            "rating 值无效: `{}`，可用值: s/safe, g/general, se/sensitive, q/questionable, e/explicit",
+                            other
+                        ));
+                    }
                 }
             }
             continue;
@@ -286,7 +299,7 @@ fn parse_booru_filter_args(args: &[&str]) -> (BooruFilter, TagFilter) {
     let booru_filter = BooruFilter::new(score_min, fav_count_min, allowed_ratings);
     let tag_filter = TagFilter::parse_from_args(&tag_parts);
 
-    (booru_filter, tag_filter)
+    Ok((booru_filter, tag_filter))
 }
 
 #[cfg(test)]
@@ -296,7 +309,7 @@ mod tests {
     #[test]
     fn parse_filters_and_tags_split() {
         let args = vec!["+good", "score>=50", "fav>=10", "rating=s,q", "-bad"];
-        let (booru, tags) = parse_booru_filter_args(&args);
+        let (booru, tags) = parse_booru_filter_args(&args).unwrap();
         assert_eq!(booru.score_min, Some(50));
         assert_eq!(booru.fav_count_min, Some(10));
         assert_eq!(
@@ -307,18 +320,30 @@ mod tests {
     }
 
     #[test]
-    fn invalid_numeric_is_ignored_not_tag() {
-        let args = vec!["score>=abc", "fav>=xyz"];
-        let (booru, tags) = parse_booru_filter_args(&args);
-        assert_eq!(booru.score_min, None);
-        assert_eq!(booru.fav_count_min, None);
-        assert!(tags.is_empty());
+    fn invalid_numeric_returns_error() {
+        let args = vec!["score>=abc"];
+        let result = parse_booru_filter_args(&args);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("score"));
+
+        let args = vec!["fav>=xyz"];
+        let result = parse_booru_filter_args(&args);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("fav"));
+    }
+
+    #[test]
+    fn invalid_rating_returns_error() {
+        let args = vec!["rating=bad"];
+        let result = parse_booru_filter_args(&args);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("rating"));
     }
 
     #[test]
     fn multiple_ratings_parsed() {
         let args = vec!["rating=s,q,e"];
-        let (booru, _) = parse_booru_filter_args(&args);
+        let (booru, _) = parse_booru_filter_args(&args).unwrap();
         assert_eq!(
             booru.allowed_ratings,
             vec![
@@ -330,9 +355,20 @@ mod tests {
     }
 
     #[test]
+    fn sensitive_rating_parsed() {
+        let args = vec!["rating=se"];
+        let (booru, _) = parse_booru_filter_args(&args).unwrap();
+        assert_eq!(booru.allowed_ratings, vec![BooruRating::Sensitive]);
+
+        let args = vec!["rating=sensitive"];
+        let (booru, _) = parse_booru_filter_args(&args).unwrap();
+        assert_eq!(booru.allowed_ratings, vec![BooruRating::Sensitive]);
+    }
+
+    #[test]
     fn empty_args_returns_defaults() {
         let args: Vec<&str> = vec![];
-        let (booru, tags) = parse_booru_filter_args(&args);
+        let (booru, tags) = parse_booru_filter_args(&args).unwrap();
         assert!(booru.is_empty());
         assert!(tags.is_empty());
     }

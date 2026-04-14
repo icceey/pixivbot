@@ -240,7 +240,7 @@ mod tests {
 
     #[test]
     fn test_to_api_tags_gelbooru_rating_name() {
-        let filter = BooruFilter::new(None, None, vec![BooruRating::Safe]);
+        let filter = BooruFilter::new(None, None, vec![BooruRating::Sensitive]);
         let tags = filter.to_api_tags(BooruEngineType::Gelbooru);
         assert_eq!(tags, vec!["rating:sensitive".to_string()]);
     }

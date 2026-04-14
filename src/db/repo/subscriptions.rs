@@ -88,12 +88,21 @@ impl Repo {
     }
 
     pub async fn delete_subscription_by_chat_task(&self, chat_id: i64, task_id: i32) -> Result<()> {
-        subscriptions::Entity::delete_many()
+        let result = subscriptions::Entity::delete_many()
             .filter(subscriptions::Column::ChatId.eq(chat_id))
             .filter(subscriptions::Column::TaskId.eq(task_id))
             .exec(&self.db)
             .await
             .context("Failed to delete subscription by chat and task")?;
+
+        if result.rows_affected == 0 {
+            anyhow::bail!(
+                "No subscription found for chat {} task {}",
+                chat_id,
+                task_id
+            );
+        }
+
         Ok(())
     }
 

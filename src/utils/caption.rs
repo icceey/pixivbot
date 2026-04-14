@@ -80,6 +80,7 @@ pub fn build_booru_caption(
 ) -> String {
     let rating_emoji = match post.rating {
         booru_client::BooruRating::Safe | booru_client::BooruRating::General => "🟢",
+        booru_client::BooruRating::Sensitive => "🟠",
         booru_client::BooruRating::Questionable => "🟡",
         booru_client::BooruRating::Explicit => "🔴",
     };
