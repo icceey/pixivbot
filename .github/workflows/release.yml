@@ -74,7 +74,7 @@ jobs:
             os: macos-latest
             archive: tar.gz
           - target: x86_64-apple-darwin
-            os: macos-latest
+            os: macos-26-intel
             archive: tar.gz
           - target: x86_64-pc-windows-msvc
             os: windows-latest
@@ -177,4 +177,3 @@ jobs:
           files: artifacts/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
