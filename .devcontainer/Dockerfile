@@ -1,5 +1,5 @@
 # Development container for PixivBot
-FROM rust:1.91-bookworm
+FROM rust:1.94-bookworm
 
 # Install development dependencies
 RUN apt-get update && export DEBIAN_FRONTEND=noninteractive \

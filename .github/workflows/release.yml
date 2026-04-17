@@ -84,9 +84,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
-      - name: Install Rust
+      - name: Install Rust 1.94
         uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: 1.94
           targets: ${{ matrix.target }}
 
       - name: Install FFmpeg development libraries (Linux)

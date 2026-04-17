@@ -13,6 +13,7 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
+rust-version = "1.94"
 
 [dependencies]
 anyhow = "1.0.102"
@@ -40,4 +41,3 @@ tracing-appender = "0.2.4"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "chrono"] }
 url = "2.5.8"
 zip = "8.4.0"
-

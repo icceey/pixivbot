@@ -75,8 +75,7 @@ impl BotHandler {
                     .into_iter()
                     .partition(|(_, task)| task.r#type == TaskType::Author);
 
-                let all_subscriptions: Vec<_> =
-                    rankings.into_iter().chain(authors.into_iter()).collect();
+                let all_subscriptions: Vec<_> = rankings.into_iter().chain(authors).collect();
 
                 let total = all_subscriptions.len();
                 let total_pages = total.div_ceil(PAGE_SIZE);
