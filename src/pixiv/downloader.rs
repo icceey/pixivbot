@@ -28,10 +28,12 @@ impl Downloader {
         }
 
         // Cache miss - download
-        let bytes = self
-            .http_client
-            .get(url)
-            .header("Referer", "https://app-api.pixiv.net/")
+        let mut request = self.http_client.get(url);
+        if let Some(referer) = download_referer(url) {
+            request = request.header("Referer", referer);
+        }
+
+        let bytes = request
             .send()
             .await
             .context("Failed to send download request")?
@@ -104,10 +106,12 @@ impl Downloader {
         info!("Downloading ugoira ZIP: {}", zip_url);
 
         // Download the ZIP file
-        let zip_bytes = self
-            .http_client
-            .get(zip_url)
-            .header("Referer", "https://app-api.pixiv.net/")
+        let mut request = self.http_client.get(zip_url);
+        if let Some(referer) = download_referer(zip_url) {
+            request = request.header("Referer", referer);
+        }
+
+        let zip_bytes = request
             .send()
             .await
             .context("Failed to download ugoira ZIP")?
@@ -128,6 +132,16 @@ impl Downloader {
         let path = self.cache.save(&mp4_cache_key, &mp4_data).await?;
         info!("Ugoira MP4 saved to: {:?}", path);
         Ok(path)
+    }
+}
+
+fn download_referer(url: &str) -> Option<&'static str> {
+    let host = url::Url::parse(url).ok()?.host_str()?.to_ascii_lowercase();
+
+    if host == "pximg.net" || host.ends_with(".pximg.net") {
+        Some("https://app-api.pixiv.net/")
+    } else {
+        None
     }
 }
 
@@ -391,6 +405,29 @@ mod tests {
     use super::*;
     use image::{ImageFormat, RgbaImage};
     use std::io::Write;
+
+    #[test]
+    fn pixiv_urls_keep_pixiv_referer() {
+        assert_eq!(
+            download_referer("https://i.pximg.net/img-original/img/2026/01/01/00/00/00/1_p0.jpg"),
+            Some("https://app-api.pixiv.net/")
+        );
+    }
+
+    #[test]
+    fn non_pixiv_urls_do_not_use_pixiv_referer() {
+        assert_eq!(
+            download_referer("https://files.yande.re/sample/example.jpg"),
+            None
+        );
+        assert_eq!(download_referer("https://example.com/image.jpg"), None);
+        assert_eq!(download_referer("https://evilpximg.net/image.jpg"), None);
+    }
+
+    #[test]
+    fn invalid_urls_do_not_use_pixiv_referer() {
+        assert_eq!(download_referer("not a url"), None);
+    }
 
     /// Create a minimal PNG image in memory (2x2 pixels with given color)
     fn create_test_png(r: u8, g: u8, b: u8) -> Vec<u8> {

@@ -75,8 +75,7 @@ impl BotHandler {
                     .into_iter()
                     .partition(|(_, task)| task.r#type == TaskType::Author);
 
-                let all_subscriptions: Vec<_> =
-                    rankings.into_iter().chain(authors.into_iter()).collect();
+                let all_subscriptions: Vec<_> = rankings.into_iter().chain(authors).collect();
 
                 let total = all_subscriptions.len();
                 let total_pages = total.div_ceil(PAGE_SIZE);
@@ -117,6 +116,8 @@ impl BotHandler {
                     let type_emoji = match task.r#type {
                         TaskType::Author => "🎨",
                         TaskType::Ranking => "📊",
+                        TaskType::BooruTag => "🏷",
+                        TaskType::BooruPool => "📦",
                     };
 
                     let display_info = if task.r#type == TaskType::Author {
@@ -142,6 +143,23 @@ impl BotHandler {
                                 )
                             }
                         }
+                    } else if task.r#type == TaskType::BooruTag
+                        || task.r#type == TaskType::BooruPool
+                    {
+                        let label = if task.r#type == TaskType::BooruPool {
+                            "Pool"
+                        } else {
+                            "标签"
+                        };
+                        if let Some(ref name) = task.author_name {
+                            format!(
+                                "{} \\| `{}`",
+                                markdown::escape(name),
+                                markdown::escape(&task.value)
+                            )
+                        } else {
+                            format!("{}: `{}`", label, markdown::escape(&task.value))
+                        }
                     } else {
                         task.value.replace('_', "\\_")
                     };
@@ -152,16 +170,29 @@ impl BotHandler {
                         String::new()
                     };
 
-                    message.push_str(&format!("{} {}{}\n", type_emoji, display_info, filter_info));
+                    let booru_filter_info = if let Some(ref bf) = sub.booru_filter {
+                        if !bf.is_empty() {
+                            format!("\n  🔍 {}", markdown::escape(&bf.format_for_display()))
+                        } else {
+                            String::new()
+                        }
+                    } else {
+                        String::new()
+                    };
+
+                    message.push_str(&format!(
+                        "{} {}{}{}\n",
+                        type_emoji, display_info, filter_info, booru_filter_info
+                    ));
                 }
 
                 if is_channel {
                     message.push_str(&format!(
-                        "\n💡 使用 `/unsub ch={} <id>` 或 `/unsubrank ch={} <mode>` 取消订阅",
-                        target_chat_id.0, target_chat_id.0
+                        "\n💡 使用 `/unsub ch={cid} <id>` `/unsubrank ch={cid} <mode>` `/bunsub ch={cid} <站点:标签>` 取消订阅",
+                        cid = target_chat_id.0
                     ));
                 } else {
-                    message.push_str("\n💡 使用 `/unsub <id>` 或 `/unsubrank <mode>` 取消订阅");
+                    message.push_str("\n💡 使用 `/unsub <id>` `/unsubrank <mode>` `/bunsub <站点:标签>` 取消订阅");
                 }
 
                 let keyboard = if total_pages > 1 {

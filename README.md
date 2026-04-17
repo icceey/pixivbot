@@ -4,7 +4,7 @@
 [![Docker Build](https://github.com/icceey/pixivbot/actions/workflows/docker.yml/badge.svg)](https://github.com/icceey/pixivbot/actions/workflows/docker.yml)
 [![Release](https://github.com/icceey/pixivbot/actions/workflows/release.yml/badge.svg)](https://github.com/icceey/pixivbot/actions/workflows/release.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Rust Version](https://img.shields.io/badge/rust-1.75%2B-blue.svg)](https://www.rust-lang.org/)
+[![Rust Version](https://img.shields.io/badge/rust-1.94%2B-blue.svg)](https://www.rust-lang.org/)
 [![Docker Image](https://img.shields.io/badge/docker-ghcr.io-blue)](https://github.com/icceey/pixivbot/pkgs/container/pixivbot)
 
 简体中文 | [English](docs/README.en.md) | [繁體中文](docs/README.zh-TW.md) | [文言文](docs/README.lzh.md) | [Esperanto](docs/README.eo.md) | [Ελληνικά](docs/README.el.md) | [संस्कृतम्](docs/README.sa.md) | [火星语](docs/README.mars.md) | [Kiswahili](docs/README.sw.md)
@@ -63,7 +63,7 @@
 如果你更喜欢直接在机器上运行：
 
 1. **前置要求**：
-    - Rust（最新稳定版）
+    - Rust 1.94+
     - SQLite
 
 2. **克隆并配置**：

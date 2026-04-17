@@ -71,6 +71,48 @@ pub fn build_ranking_caption(title: &str, index: usize, illust: &Illust) -> Stri
     }
 }
 
+/// Build caption for a booru post (MarkdownV2 format)
+pub fn build_booru_caption(
+    post: &booru_client::BooruPost,
+    site_name: &str,
+    base_url: &str,
+    engine_type: booru_client::BooruEngineType,
+) -> String {
+    let rating_emoji = match post.rating {
+        booru_client::BooruRating::Safe | booru_client::BooruRating::General => "🟢",
+        booru_client::BooruRating::Sensitive => "🟠",
+        booru_client::BooruRating::Questionable => "🟡",
+        booru_client::BooruRating::Explicit => "🔴",
+    };
+
+    let clean_base = base_url.trim_end_matches('/');
+    let post_url = format!("{}{}", clean_base, engine_type.post_path(post.id));
+
+    let tag_list: Vec<&str> = post.tags.split_whitespace().take(5).collect();
+    let tags_display = if tag_list.is_empty() {
+        String::new()
+    } else {
+        let sanitized = tag::format_tags(&tag_list);
+        let formatted: Vec<String> = sanitized
+            .iter()
+            .map(|t| format!("\\#{}", markdown::escape(t)))
+            .collect();
+        format!("\n\n{}", formatted.join("  "))
+    };
+
+    format!(
+        "🏷 *{}* \\| {}\n\n⭐ {} \\| ❤️ {} \\| {} {}\n🔗 [来源]({}){}\n",
+        markdown::escape(site_name),
+        markdown::escape(&format!("#{}", post.id)),
+        markdown::escape(&post.score.to_string()),
+        markdown::escape(&post.fav_count.to_string()),
+        rating_emoji,
+        markdown::escape(post.rating.as_short_str()),
+        markdown::escape_link_url(&post_url),
+        tags_display
+    )
+}
+
 fn build_standard_caption(prefix: &str, illust: &Illust, title_suffix: &str) -> String {
     let tags = tag::format_tags_escaped(illust);
 
@@ -246,5 +288,114 @@ mod tests {
             build_illust_caption(&illust),
             "🎨 \\_\\[\\]\\(\\)\\!\nby *A\\_B\\(C\\)\\!* \\(ID: `67890`\\)\n\n👀 123 \\| ❤️ 45 \\| 🔗 [来源](https://pixiv\\.net/artworks/12345)\n\n\\#tagtest"
         );
+    }
+
+    fn make_booru_post(
+        id: u64,
+        tags: &str,
+        score: i32,
+        fav_count: i32,
+        rating: booru_client::BooruRating,
+    ) -> booru_client::BooruPost {
+        booru_client::BooruPost {
+            id,
+            tags: tags.to_string(),
+            score,
+            fav_count,
+            file_url: Some("https://example.com/file.jpg".to_string()),
+            sample_url: Some("https://example.com/sample.jpg".to_string()),
+            preview_url: Some("https://example.com/preview.jpg".to_string()),
+            rating,
+            width: 1920,
+            height: 1080,
+            md5: None,
+            source: None,
+            created_at: None,
+            file_size: None,
+            file_ext: None,
+            status: None,
+        }
+    }
+
+    #[test]
+    fn build_booru_caption_moebooru_post_url() {
+        let post = make_booru_post(
+            12345,
+            "landscape sky",
+            100,
+            50,
+            booru_client::BooruRating::Safe,
+        );
+        let caption = build_booru_caption(
+            &post,
+            "konachan",
+            "https://konachan.com",
+            booru_client::BooruEngineType::Moebooru,
+        );
+        assert!(caption.contains("konachan"));
+        assert!(caption.contains("\\#landscape"));
+        assert!(caption.contains("\\#sky"));
+        assert!(caption.contains("/post/show/12345"));
+        assert!(caption.contains("🟢"));
+    }
+
+    #[test]
+    fn build_booru_caption_danbooru_post_url() {
+        let post = make_booru_post(99, "art", 10, 5, booru_client::BooruRating::Questionable);
+        let caption = build_booru_caption(
+            &post,
+            "danbooru",
+            "https://danbooru.donmai.us",
+            booru_client::BooruEngineType::Danbooru,
+        );
+        assert!(caption.contains("/posts/99"));
+        assert!(caption.contains("🟡"));
+    }
+
+    #[test]
+    fn build_booru_caption_gelbooru_post_url_escapes_query_string() {
+        let post = make_booru_post(42, "test", 0, 0, booru_client::BooruRating::Explicit);
+        let caption = build_booru_caption(
+            &post,
+            "gelbooru",
+            "https://gelbooru.com",
+            booru_client::BooruEngineType::Gelbooru,
+        );
+        assert!(caption.contains("page=post"));
+        assert!(caption.contains("id=42"));
+        assert!(caption.contains("🔴"));
+    }
+
+    #[test]
+    fn build_booru_caption_escapes_markdown_in_tags() {
+        let post = make_booru_post(
+            1,
+            "tag-with-dash tag_underscore",
+            5,
+            3,
+            booru_client::BooruRating::General,
+        );
+        let caption = build_booru_caption(
+            &post,
+            "test_site",
+            "https://example.com",
+            booru_client::BooruEngineType::Moebooru,
+        );
+        assert!(caption.contains("\\#tagwithdash"));
+        assert!(caption.contains("\\#tag\\_underscore"));
+        assert!(caption.contains("test\\_site"));
+    }
+
+    #[test]
+    fn build_booru_caption_escapes_negative_score() {
+        let post = make_booru_post(1, "test", -5, 0, booru_client::BooruRating::Safe);
+        let caption = build_booru_caption(
+            &post,
+            "danbooru",
+            "https://danbooru.donmai.us",
+            booru_client::BooruEngineType::Danbooru,
+        );
+        // The `-` in `-5` must be escaped for MarkdownV2
+        assert!(caption.contains("\\-5"));
     }
 }

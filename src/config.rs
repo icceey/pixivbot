@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use booru_client::BooruEngineType;
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
@@ -24,6 +25,8 @@ pub struct Config {
     pub scheduler: SchedulerConfig,
     #[serde(default)]
     pub content: ContentConfig,
+    #[serde(default)]
+    pub booru: BooruConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -198,10 +201,44 @@ impl Default for ContentConfig {
 }
 
 impl ContentConfig {
-    /// 获取经过验证的下载原图阈值 (限制在 1-10 范围内)
     pub fn download_threshold(&self) -> u8 {
         self.download_original_threshold.clamp(1, 10)
     }
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct BooruConfig {
+    #[serde(default)]
+    pub sites: Vec<BooruSiteConfig>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct BooruSiteConfig {
+    pub name: String,
+    pub engine_type: BooruEngineType,
+    pub base_url: String,
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub api_key: Option<String>,
+    #[serde(default = "default_booru_min_interval_sec")]
+    pub min_interval_sec: u64,
+    #[serde(default = "default_booru_max_interval_sec")]
+    pub max_interval_sec: u64,
+    #[serde(default = "default_booru_page_limit")]
+    pub page_limit: u32,
+}
+
+fn default_booru_min_interval_sec() -> u64 {
+    30 * 60
+}
+
+fn default_booru_max_interval_sec() -> u64 {
+    60 * 60
+}
+
+fn default_booru_page_limit() -> u32 {
+    20
 }
 
 impl Config {

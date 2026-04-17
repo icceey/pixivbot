@@ -74,7 +74,7 @@ jobs:
             os: macos-latest
             archive: tar.gz
           - target: x86_64-apple-darwin
-            os: macos-latest
+            os: macos-26-intel
             archive: tar.gz
           - target: x86_64-pc-windows-msvc
             os: windows-latest
@@ -84,9 +84,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
-      - name: Install Rust
+      - name: Install Rust 1.94
         uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: 1.94
           targets: ${{ matrix.target }}
 
       - name: Install FFmpeg development libraries (Linux)
@@ -177,4 +178,3 @@ jobs:
           files: artifacts/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-

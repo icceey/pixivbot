@@ -32,6 +32,10 @@ pub enum Command {
     Settings,
     #[command(description = "下载作品原图\n  用法: /download <url|id> 或回复消息")]
     Download(String),
+    #[command(description = "订阅 Booru 标签\n  用法: /bsub [ch=<频道ID>] <站点:标签> [过滤条件]")]
+    BSub(String),
+    #[command(description = "取消 Booru 标签订阅\n  用法: /bunsub [ch=<频道ID>] <站点:标签>")]
+    BUnsub(String),
     #[command(description = "取消当前设置操作")]
     Cancel,
 }
@@ -51,6 +55,8 @@ impl Command {
             BotCommand::new("unsubthis", "回复消息取消对应订阅"),
             BotCommand::new("settings", "显示和管理聊天设置"),
             BotCommand::new("download", "下载作品原图 - /download <url|id> 或回复消息"),
+            BotCommand::new("bsub", "订阅Booru标签 - /bsub <站点:标签> [过滤条件]"),
+            BotCommand::new("bunsub", "取消Booru标签订阅 - /bunsub <站点:标签>"),
             BotCommand::new("help", "显示帮助信息"),
         ]
     }

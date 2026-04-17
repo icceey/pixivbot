@@ -88,6 +88,7 @@ mod tests {
                 task_id INTEGER NOT NULL,
                 filter_tags TEXT NOT NULL DEFAULT '{"include":[],"exclude":[]}',
                 latest_data TEXT,
+                booru_filter TEXT,
                 created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (chat_id) REFERENCES chats(id) ON DELETE CASCADE ON UPDATE CASCADE,
                 FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE ON UPDATE CASCADE,

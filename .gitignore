@@ -225,3 +225,9 @@ $RECYCLE.BIN/
 /config.toml
 /data
 /logs
+*.heapsnapshot
+*.zip
+ci_logs.txt
+LoliSnatcher_Droid/
+ffmpeg-sys-next/
+.sisyphus/

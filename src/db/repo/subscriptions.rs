@@ -1,6 +1,6 @@
 use super::Repo;
 use crate::db::entities::{subscriptions, tasks};
-use crate::db::types::{SubscriptionState, TagFilter};
+use crate::db::types::{BooruFilter, SubscriptionState, TagFilter};
 use anyhow::{Context, Result};
 use chrono::Local;
 use sea_orm::{
@@ -88,12 +88,21 @@ impl Repo {
     }
 
     pub async fn delete_subscription_by_chat_task(&self, chat_id: i64, task_id: i32) -> Result<()> {
-        subscriptions::Entity::delete_many()
+        let result = subscriptions::Entity::delete_many()
             .filter(subscriptions::Column::ChatId.eq(chat_id))
             .filter(subscriptions::Column::TaskId.eq(task_id))
             .exec(&self.db)
             .await
             .context("Failed to delete subscription by chat and task")?;
+
+        if result.rows_affected == 0 {
+            anyhow::bail!(
+                "No subscription found for chat {} task {}",
+                chat_id,
+                task_id
+            );
+        }
+
         Ok(())
     }
 
@@ -122,5 +131,51 @@ impl Repo {
             .update(&self.db)
             .await
             .context("Failed to update subscription latest_data")
+    }
+
+    pub async fn upsert_booru_subscription(
+        &self,
+        chat_id: i64,
+        task_id: i32,
+        filter_tags: TagFilter,
+        booru_filter: Option<BooruFilter>,
+    ) -> Result<subscriptions::Model> {
+        let now = Local::now().naive_local();
+
+        let new_sub = subscriptions::ActiveModel {
+            chat_id: Set(chat_id),
+            task_id: Set(task_id),
+            filter_tags: Set(filter_tags),
+            booru_filter: Set(booru_filter),
+            created_at: Set(now),
+            ..Default::default()
+        };
+
+        subscriptions::Entity::insert(new_sub)
+            .on_conflict(
+                OnConflict::columns([subscriptions::Column::ChatId, subscriptions::Column::TaskId])
+                    .update_columns([
+                        subscriptions::Column::FilterTags,
+                        subscriptions::Column::BooruFilter,
+                    ])
+                    .to_owned(),
+            )
+            .exec(&self.db)
+            .await
+            .context("Failed to upsert booru subscription")?;
+
+        subscriptions::Entity::find()
+            .filter(subscriptions::Column::ChatId.eq(chat_id))
+            .filter(subscriptions::Column::TaskId.eq(task_id))
+            .one(&self.db)
+            .await
+            .context("Failed to fetch upserted booru subscription")?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Booru subscription for chat {} task {} not found after upsert",
+                    chat_id,
+                    task_id
+                )
+            })
     }
 }

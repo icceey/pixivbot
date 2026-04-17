@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "migration", "pixiv_client"]
+members = [".", "migration", "pixiv_client", "booru_client"]
 
 [workspace.package]
 version = "0.2.0"
@@ -13,6 +13,7 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
+rust-version = "1.94"
 
 [dependencies]
 anyhow = "1.0.102"
@@ -22,6 +23,7 @@ ffmpeg-next = { version = "8.1.0", default-features = false, features = ["codec"
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
 md5 = "0.8.0"
 migration = { path = "migration" }
+booru_client = { path = "booru_client" }
 pixiv_client = { path = "pixiv_client" }
 rand = "0.10.0"
 regex = "1.12.3"
@@ -39,4 +41,3 @@ tracing-appender = "0.2.4"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "chrono"] }
 url = "2.5.8"
 zip = "8.4.0"
-
