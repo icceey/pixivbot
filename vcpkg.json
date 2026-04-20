@@ -1,0 +1,17 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
+  "name": "pixivbot",
+  "version-string": "0.1.0",
+  "description": "Native dependencies for pixivbot (ffmpeg for ugoira encoding).",
+  "dependencies": [
+    {
+      "name": "ffmpeg",
+      "default-features": false,
+      "features": [
+        "avcodec",
+        "avformat",
+        "swscale"
+      ]
+    }
+  ]
+}
