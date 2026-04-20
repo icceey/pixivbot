@@ -65,13 +65,6 @@
 1. **前置要求**：
     - Rust 1.94+
     - SQLite
-    - FFmpeg 开发库（用于 ugoira → MP4 转码）
-        - **Linux**：通过包管理器安装 `pkg-config` 与 `libavcodec-dev libavformat-dev libavutil-dev libswscale-dev`（Debian/Ubuntu 包名）。
-        - **Windows（推荐 MSVC + vcpkg）**：
-            1. 安装 MSVC 工具链：`rustup default stable-x86_64-pc-windows-msvc`（可使用 `rust-toolchain.toml` 中的 `1.94` 通道，加上 `-x86_64-pc-windows-msvc` 后缀）。
-            2. 安装 [vcpkg](https://github.com/microsoft/vcpkg) 并设置 `VCPKG_ROOT` 环境变量。
-            3. 仓库根目录已提供 `vcpkg.json` 清单。在仓库目录执行 `vcpkg install --triplet x64-windows-static-md`（或 `x64-windows`），随后 `cargo build` 会自动通过 vcpkg 链接 FFmpeg。
-        - **Windows（GNU 工具链）**：通过 MSYS2 安装 `mingw-w64-x86_64-pkg-config` 与 `mingw-w64-x86_64-ffmpeg`，确保 `pkg-config` 在 PATH 中。
 
 2. **克隆并配置**：
 
