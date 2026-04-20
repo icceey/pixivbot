@@ -55,6 +55,10 @@ impl BooruEngine {
                 (Some(user), Some(key)) => client.with_auth(user, key),
                 _ => client,
             };
+            let client = match &cfg.bypass {
+                Some(bypass_cfg) => client.with_bypass(bypass_cfg.to_client_config()),
+                None => client,
+            };
             sites.insert(
                 cfg.name.to_lowercase(),
                 SiteContext {

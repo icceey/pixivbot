@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use booru_client::BooruEngineType;
+use booru_client::{BooruEngineType, BypassConfig};
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
@@ -227,6 +227,46 @@ pub struct BooruSiteConfig {
     pub max_interval_sec: u64,
     #[serde(default = "default_booru_page_limit")]
     pub page_limit: u32,
+    #[serde(default)]
+    pub bypass: Option<BooruBypassConfig>,
+}
+
+/// Optional per-site bot-protection bypass. Currently only FlareSolverr is
+/// supported; the `mode` discriminator keeps the door open for future
+/// strategies (cookie-injection, third-party captcha solver) without
+/// breaking existing config files.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(tag = "mode", rename_all = "lowercase")]
+pub enum BooruBypassConfig {
+    Flaresolverr {
+        endpoint: String,
+        #[serde(default = "default_flare_max_timeout_ms")]
+        max_timeout_ms: u32,
+        #[serde(default)]
+        session: Option<String>,
+    },
+}
+
+impl BooruBypassConfig {
+    pub fn to_client_config(&self) -> BypassConfig {
+        match self {
+            BooruBypassConfig::Flaresolverr {
+                endpoint,
+                max_timeout_ms,
+                session,
+            } => {
+                let mut cfg = BypassConfig::new(endpoint).with_max_timeout_ms(*max_timeout_ms);
+                if let Some(s) = session {
+                    cfg = cfg.with_session(s);
+                }
+                cfg
+            }
+        }
+    }
+}
+
+fn default_flare_max_timeout_ms() -> u32 {
+    60_000
 }
 
 fn default_booru_min_interval_sec() -> u64 {

@@ -55,3 +55,28 @@ image_size = "large"
 # When total images > this value, pack all images into a ZIP file
 # Default: 1 (only single-image works are sent as original files)
 download_original_threshold = 1
+
+# ----------------------------------------------------------------------------
+# Booru sites (optional). Add one [[booru.sites]] block per site to subscribe.
+# ----------------------------------------------------------------------------
+# [[booru.sites]]
+# name = "yandere"                       # Unique short identifier used in commands
+# engine_type = "moebooru"               # "moebooru" | "danbooru" | "gelbooru"
+# base_url = "https://yande.re"
+# # username = "your_username"           # Optional: API auth
+# # api_key  = "your_api_key"
+# min_interval_sec = 1800                # Min poll interval per subscription (default 1800)
+# max_interval_sec = 3600                # Max poll interval per subscription (default 3600)
+# page_limit = 20                        # Posts fetched per poll (default 20)
+#
+# # Optional: route this site's API requests through FlareSolverr to bypass
+# # Cloudflare's JavaScript challenge / Turnstile auto-pass. FlareSolverr is a
+# # separately-deployed service: https://github.com/FlareSolverr/FlareSolverr
+# # NOTE: Image hotlinks are fetched by Telegram's servers, not by the bot,
+# # so the bypass only protects API calls. If a site's image CDN is also
+# # CF-protected and Telegram fails to fetch images, this option will not help.
+# # Interactive captchas (visible reCAPTCHA / hCaptcha) are NOT supported.
+# # bypass = { mode = "flaresolverr", endpoint = "http://flaresolverr:8191/v1", max_timeout_ms = 60000 }
+# # Optional: reuse a long-lived FlareSolverr session for lower latency.
+# # The session must be created out-of-band via FlareSolverr's `sessions.create`.
+# # bypass = { mode = "flaresolverr", endpoint = "http://flaresolverr:8191/v1", max_timeout_ms = 60000, session = "pixivbot" }

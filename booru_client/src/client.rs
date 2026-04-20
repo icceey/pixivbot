@@ -1,3 +1,4 @@
+use crate::bypass::{self, BypassConfig};
 use crate::engine_type::BooruEngineType;
 use crate::error::{Error, Result};
 use crate::models::*;
@@ -11,6 +12,7 @@ pub struct BooruClient {
     engine_type: BooruEngineType,
     api_key: Option<String>,
     username: Option<String>,
+    bypass: Option<BypassConfig>,
 }
 
 impl BooruClient {
@@ -24,12 +26,23 @@ impl BooruClient {
             engine_type,
             api_key: None,
             username: None,
+            bypass: None,
         })
     }
 
     pub fn with_auth(mut self, username: &str, api_key: &str) -> Self {
         self.username = Some(username.to_string());
         self.api_key = Some(api_key.to_string());
+        self
+    }
+
+    /// Route every API request through the given FlareSolverr endpoint to
+    /// transparently bypass Cloudflare-style bot-protection challenges.
+    /// When set, all calls to `request()` go through the proxy; there is no
+    /// fallback or auto-detection. Image hotlinks are unaffected (they are
+    /// fetched by Telegram, not by this client).
+    pub fn with_bypass(mut self, bypass: BypassConfig) -> Self {
+        self.bypass = Some(bypass);
         self
     }
 
@@ -217,26 +230,20 @@ impl BooruClient {
             }
         }
 
-        let mut req = self
-            .client
-            .get(url)
-            .header(reqwest::header::USER_AGENT, DEFAULT_USER_AGENT)
-            .query(&query_params);
+        let (status, text) = if let Some(bypass_cfg) = &self.bypass {
+            self.request_via_bypass(url, &query_params, bypass_cfg)
+                .await?
+        } else {
+            self.request_direct(url, &query_params).await?
+        };
 
-        if let (Some(user), Some(key)) = (&self.username, &self.api_key) {
-            if self.engine_type == BooruEngineType::Danbooru {
-                req = req.basic_auth(user, Some(key));
-            }
-        }
-
-        let response = req.send().await?;
-        let status = response.status();
-        let text = response.text().await?;
-
-        if !status.is_success() {
+        if !reqwest::StatusCode::from_u16(status)
+            .map(|s| s.is_success())
+            .unwrap_or(false)
+        {
             return Err(Error::Api {
                 message: text,
-                status: status.as_u16(),
+                status,
             });
         }
 
@@ -250,6 +257,58 @@ impl BooruClient {
             tracing::debug!("Response body: {}", preview);
             e.into()
         })
+    }
+
+    async fn request_direct(
+        &self,
+        url: &str,
+        query_params: &[(&str, &str)],
+    ) -> Result<(u16, String)> {
+        let mut req = self
+            .client
+            .get(url)
+            .header(reqwest::header::USER_AGENT, DEFAULT_USER_AGENT)
+            .query(query_params);
+
+        if let (Some(user), Some(key)) = (&self.username, &self.api_key) {
+            if self.engine_type == BooruEngineType::Danbooru {
+                req = req.basic_auth(user, Some(key));
+            }
+        }
+
+        let response = req.send().await?;
+        let status = response.status().as_u16();
+        let text = response.text().await?;
+        Ok((status, text))
+    }
+
+    async fn request_via_bypass(
+        &self,
+        url: &str,
+        query_params: &[(&str, &str)],
+        bypass_cfg: &BypassConfig,
+    ) -> Result<(u16, String)> {
+        let mut full =
+            reqwest::Url::parse_with_params(url, query_params).map_err(|e| Error::Api {
+                message: format!("Invalid URL for bypass request: {}", e),
+                status: 0,
+            })?;
+
+        // FlareSolverr's `request.get` (v3+) does not accept arbitrary headers,
+        // so for Danbooru basic-auth we embed credentials in the URL. The
+        // underlying browser then forwards them as an Authorization header.
+        if self.engine_type == BooruEngineType::Danbooru {
+            if let (Some(user), Some(key)) = (&self.username, &self.api_key) {
+                if full.set_username(user).is_err() || full.set_password(Some(key)).is_err() {
+                    return Err(Error::Api {
+                        message: "Cannot embed basic-auth credentials in target URL".to_string(),
+                        status: 0,
+                    });
+                }
+            }
+        }
+
+        bypass::solve(&self.client, bypass_cfg, full.as_str()).await
     }
 }
 
