@@ -98,7 +98,7 @@ impl BotHandler {
         let mut booru_seen: HashSet<(String, u64)> = HashSet::new();
         let mut booru_refs: Vec<BooruPostRef> = Vec::new();
 
-        let mut absorb = |text: &str,
+        let absorb = |text: &str,
                           ids: &mut HashSet<u64>,
                           booru_seen: &mut HashSet<(String, u64)>,
                           booru_refs: &mut Vec<BooruPostRef>| {

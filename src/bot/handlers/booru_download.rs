@@ -5,7 +5,7 @@ use crate::bot::BotHandler;
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 use teloxide::prelude::*;
-use teloxide::types::{ChatAction, ParseMode};
+use teloxide::types::ChatAction;
 use teloxide::utils::markdown;
 use tokio::time::{sleep, Duration};
 use tracing::{error, info, warn};
