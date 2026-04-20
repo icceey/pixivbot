@@ -99,9 +99,9 @@ impl BotHandler {
         let mut booru_refs: Vec<BooruPostRef> = Vec::new();
 
         let absorb = |text: &str,
-                          ids: &mut HashSet<u64>,
-                          booru_seen: &mut HashSet<(String, u64)>,
-                          booru_refs: &mut Vec<BooruPostRef>| {
+                      ids: &mut HashSet<u64>,
+                      booru_seen: &mut HashSet<(String, u64)>,
+                      booru_refs: &mut Vec<BooruPostRef>| {
             for link in parse_pixiv_links(text) {
                 if let PixivLink::Illust(id) = link {
                     ids.insert(id);
