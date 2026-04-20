@@ -4,7 +4,9 @@
 //! - /download <url|id>
 //! - /download (as reply to bot message)
 
-use crate::bot::link_handler::{parse_pixiv_links, PixivLink};
+use crate::bot::link_handler::{
+    parse_booru_post_links, parse_pixiv_links, BooruPostRef, PixivLink,
+};
 use crate::bot::notifier::ThrottledBot;
 use crate::bot::BotHandler;
 use anyhow::{Context, Result};
@@ -38,15 +40,15 @@ impl BotHandler {
     ) -> ResponseResult<()> {
         info!("Processing /download command from chat {}", chat_id);
 
-        // Extract Pixiv IDs from arguments or reply message
-        let illust_ids = self.extract_illust_ids(&msg, &args).await;
+        let (illust_ids, booru_refs) = self.extract_targets(&msg, &args).await;
 
-        if illust_ids.is_empty() {
+        if illust_ids.is_empty() && booru_refs.is_empty() {
             bot.send_message(
                 chat_id,
                 "❌ 请提供作品 ID 或 URL，或回复包含作品链接的消息\n\n例如：\n\
                  • `/download 123456789`\n\
                  • `/download https://www.pixiv.net/artworks/123456789`\n\
+                 • `/download https://yande.re/post/show/123456`（需先在配置中启用）\n\
                  • 回复包含链接的消息并使用 `/download`",
             )
             .parse_mode(ParseMode::MarkdownV2)
@@ -54,9 +56,12 @@ impl BotHandler {
             return Ok(());
         }
 
-        info!("Found {} unique illust IDs to download", illust_ids.len());
+        info!(
+            "Found {} pixiv ids and {} booru refs to download",
+            illust_ids.len(),
+            booru_refs.len()
+        );
 
-        // Spawn background task to keep chat action alive
         let bot_clone = bot.clone();
         let action_task = tokio::spawn(async move {
             loop {
@@ -71,49 +76,58 @@ impl BotHandler {
             }
         });
 
-        // Process downloads
-        let result = self
-            .process_downloads(bot.clone(), chat_id, illust_ids)
-            .await;
+        let mut result: ResponseResult<()> = Ok(());
+        if !illust_ids.is_empty() {
+            result = self
+                .process_downloads(bot.clone(), chat_id, illust_ids)
+                .await;
+        }
+        if result.is_ok() && !booru_refs.is_empty() {
+            result = self
+                .process_booru_downloads(bot.clone(), chat_id, booru_refs)
+                .await;
+        }
 
-        // Stop the chat action task
         action_task.abort();
 
         result
     }
 
-    /// Extract illust IDs from command arguments or reply message
-    async fn extract_illust_ids(&self, msg: &Message, args: &str) -> Vec<u64> {
+    async fn extract_targets(&self, msg: &Message, args: &str) -> (Vec<u64>, Vec<BooruPostRef>) {
         let mut ids = HashSet::new();
+        let mut booru_seen: HashSet<(String, u64)> = HashSet::new();
+        let mut booru_refs: Vec<BooruPostRef> = Vec::new();
 
-        // Priority 1: Parse from command arguments
+        let mut absorb = |text: &str,
+                          ids: &mut HashSet<u64>,
+                          booru_seen: &mut HashSet<(String, u64)>,
+                          booru_refs: &mut Vec<BooruPostRef>| {
+            for link in parse_pixiv_links(text) {
+                if let PixivLink::Illust(id) = link {
+                    ids.insert(id);
+                }
+            }
+            for r in parse_booru_post_links(text, &self.booru_registry) {
+                if booru_seen.insert((r.site_name.clone(), r.post_id)) {
+                    booru_refs.push(r);
+                }
+            }
+        };
+
         if !args.trim().is_empty() {
-            // Try parsing as direct ID first
             if let Ok(id) = args.trim().parse::<u64>() {
                 ids.insert(id);
             } else {
-                // Try parsing as URL
-                for link in parse_pixiv_links(args) {
-                    if let PixivLink::Illust(id) = link {
-                        ids.insert(id);
-                    }
-                }
+                absorb(args, &mut ids, &mut booru_seen, &mut booru_refs);
             }
         }
 
-        // Priority 2: Parse from reply message
-        if ids.is_empty() {
+        if ids.is_empty() && booru_refs.is_empty() {
             if let Some(reply_msg) = msg.reply_to_message() {
-                // Parse text content for links
                 if let Some(text) = reply_msg.text().or_else(|| reply_msg.caption()) {
-                    for link in parse_pixiv_links(text) {
-                        if let PixivLink::Illust(id) = link {
-                            ids.insert(id);
-                        }
-                    }
+                    absorb(text, &mut ids, &mut booru_seen, &mut booru_refs);
                 }
 
-                // Parse message entities for hidden links (TextLink and Url)
                 let entities: Vec<MessageEntityRef<'_>> = reply_msg
                     .parse_entities()
                     .into_iter()
@@ -124,21 +138,12 @@ impl BotHandler {
                 for entity in entities {
                     match &entity.kind() {
                         MessageEntityKind::TextLink { url } => {
-                            for link in parse_pixiv_links(url.as_str()) {
-                                if let PixivLink::Illust(id) = link {
-                                    ids.insert(id);
-                                }
-                            }
+                            absorb(url.as_str(), &mut ids, &mut booru_seen, &mut booru_refs);
                         }
                         MessageEntityKind::Url => {
                             if let Some(text) = reply_msg.text() {
-                                // text.get() safely handles out-of-bounds ranges
                                 if let Some(url_text) = text.get(entity.range()) {
-                                    for link in parse_pixiv_links(url_text) {
-                                        if let PixivLink::Illust(id) = link {
-                                            ids.insert(id);
-                                        }
-                                    }
+                                    absorb(url_text, &mut ids, &mut booru_seen, &mut booru_refs);
                                 }
                             }
                         }
@@ -148,7 +153,7 @@ impl BotHandler {
             }
         }
 
-        ids.into_iter().collect()
+        (ids.into_iter().collect(), booru_refs)
     }
 
     /// Process downloads for multiple illusts
@@ -314,7 +319,7 @@ impl BotHandler {
     }
 
     /// Create a ZIP file from multiple files
-    async fn create_zip_file(&self, files: &[(PathBuf, String)]) -> Result<PathBuf> {
+    pub(super) async fn create_zip_file(&self, files: &[(PathBuf, String)]) -> Result<PathBuf> {
         let temp_dir = std::env::temp_dir();
         let zip_filename = format!(
             "pixivbot_download_{}.zip",
@@ -351,7 +356,7 @@ impl BotHandler {
     }
 
     /// Send a document file
-    async fn send_document(
+    pub(super) async fn send_document(
         &self,
         bot: &ThrottledBot,
         chat_id: ChatId,
@@ -440,7 +445,7 @@ impl BotHandler {
 }
 
 /// Sanitize filename by replacing illegal filesystem characters with underscore
-fn sanitize_filename(name: &str) -> String {
+pub(super) fn sanitize_filename(name: &str) -> String {
     name.chars()
         .map(|c| match c {
             '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => '_',

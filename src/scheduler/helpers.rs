@@ -171,7 +171,7 @@ pub async fn process_illust_push(
 
     // Build download button config
     // Skip download button for channel chats (channels don't support inline buttons)
-    let download_config = DownloadButtonConfig::for_chat(illust.id, &ctx.chat);
+    let download_config = DownloadButtonConfig::for_pixiv_chat(illust.id, &ctx.chat);
 
     // Send images with download button
     let continuation_numbering = (!already_sent_pages.is_empty()).then(|| {
@@ -283,7 +283,7 @@ async fn process_ugoira_push(
     let has_spoiler = sensitive::should_blur(&ctx.chat, illust);
 
     // Build download button config
-    let download_config = DownloadButtonConfig::for_chat(illust.id, &ctx.chat);
+    let download_config = DownloadButtonConfig::for_pixiv_chat(illust.id, &ctx.chat);
 
     // Send ugoira as MP4 animation
     let send_result = notifier

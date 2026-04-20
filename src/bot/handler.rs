@@ -1,7 +1,7 @@
+use crate::booru::BooruSiteRegistry;
 use crate::bot::link_handler::{parse_pixiv_links, PixivLink};
 use crate::bot::notifier::{DownloadButtonConfig, Notifier, ThrottledBot};
 use crate::bot::Command;
-use crate::config::BooruConfig;
 use crate::db::repo::Repo;
 use crate::db::types::{TagFilter, TaskType, UserRole};
 use crate::pixiv::client::PixivClient;
@@ -33,7 +33,7 @@ pub struct BotHandler {
     pub(crate) cache_dir: String,
     /// 日志目录路径 (用于管理员查看磁盘占用)
     pub(crate) log_dir: String,
-    pub(crate) booru_config: BooruConfig,
+    pub(crate) booru_registry: Arc<BooruSiteRegistry>,
 }
 
 impl BotHandler {
@@ -54,7 +54,7 @@ impl BotHandler {
         require_mention_in_group: bool,
         cache_dir: String,
         log_dir: String,
-        booru_config: BooruConfig,
+        booru_registry: Arc<BooruSiteRegistry>,
     ) -> Self {
         Self {
             repo,
@@ -68,7 +68,7 @@ impl BotHandler {
             require_mention_in_group,
             cache_dir,
             log_dir,
-            booru_config,
+            booru_registry,
         }
     }
 
@@ -247,8 +247,8 @@ impl BotHandler {
         // Build download button config
         // For one-off pushes via link, check chat type to skip channels
         let download_config = chat_settings
-            .map(|chat| DownloadButtonConfig::for_chat(illust.id, chat))
-            .unwrap_or_else(|| DownloadButtonConfig::new(illust.id));
+            .map(|chat| DownloadButtonConfig::for_pixiv_chat(illust.id, chat))
+            .unwrap_or_else(|| DownloadButtonConfig::pixiv(illust.id));
 
         if illust.is_ugoira() {
             let pixiv = self.pixiv_client.read().await;

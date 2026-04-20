@@ -1,3 +1,4 @@
+mod booru;
 mod bot;
 mod cache;
 mod config;
@@ -175,17 +176,19 @@ async fn main() -> Result<()> {
         name_update_engine.run().await;
     });
 
-    let booru_engine_handle = if !config.booru.sites.is_empty() {
+    let booru_registry = booru::BooruSiteRegistry::from_configs(&config.booru.sites);
+
+    let booru_engine_handle = if !booru_registry.is_empty() {
         let booru_engine = scheduler::BooruEngine::new(
             repo.clone(),
             notifier.clone(),
             scheduler_config.tick_interval_sec,
             scheduler_config.max_retry_count,
-            config.booru.sites.clone(),
+            booru_registry.clone(),
         );
         info!(
             "✅ Booru engine initialized with {} site(s)",
-            config.booru.sites.len()
+            booru_registry.len()
         );
         Some(tokio::spawn(async move {
             booru_engine.run().await;
@@ -213,7 +216,7 @@ async fn main() -> Result<()> {
     let download_threshold_for_bot = config.content.download_threshold();
     let cache_dir_for_bot = config.scheduler.cache_dir.clone();
     let log_dir_for_bot = config.logging.dir.clone();
-    let booru_config_for_bot = config.booru.clone();
+    let booru_registry_for_bot = booru_registry.clone();
     let bot_handle = tokio::spawn(async move {
         if let Err(e) = bot::run(
             bot,
@@ -226,7 +229,7 @@ async fn main() -> Result<()> {
             download_threshold_for_bot,
             cache_dir_for_bot,
             log_dir_for_bot,
-            booru_config_for_bot,
+            booru_registry_for_bot,
         )
         .await
         {

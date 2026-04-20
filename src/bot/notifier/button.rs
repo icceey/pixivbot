@@ -1,30 +1,55 @@
-use crate::bot::handlers::DOWNLOAD_CALLBACK_PREFIX;
+use crate::bot::handlers::{BOORU_DOWNLOAD_CALLBACK_PREFIX, DOWNLOAD_CALLBACK_PREFIX};
 use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup};
 
-/// Configuration for download button
-/// Only applicable to non-channel chats (private and group chats)
+#[derive(Clone, Debug)]
+pub enum DownloadTarget {
+    Pixiv(u64),
+    Booru { site_name: String, post_id: u64 },
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct DownloadButtonConfig {
-    /// The illust ID to download when button is clicked
-    pub illust_id: Option<u64>,
-    /// Whether the target chat is a channel (channels don't support inline buttons)
-    pub is_channel: bool,
+    target: Option<DownloadTarget>,
+    is_channel: bool,
 }
 
 impl DownloadButtonConfig {
-    pub fn new(illust_id: u64) -> Self {
+    pub fn pixiv(illust_id: u64) -> Self {
         Self {
-            illust_id: Some(illust_id),
+            target: Some(DownloadTarget::Pixiv(illust_id)),
             is_channel: false,
         }
     }
 
-    pub fn for_chat(illust_id: u64, chat: &crate::db::entities::chats::Model) -> Self {
-        let config = Self::new(illust_id);
+    pub fn booru(site_name: impl Into<String>, post_id: u64) -> Self {
+        Self {
+            target: Some(DownloadTarget::Booru {
+                site_name: site_name.into(),
+                post_id,
+            }),
+            is_channel: false,
+        }
+    }
+
+    pub fn for_pixiv_chat(illust_id: u64, chat: &crate::db::entities::chats::Model) -> Self {
+        let cfg = Self::pixiv(illust_id);
         if chat.r#type == "channel" {
-            config.for_channel()
+            cfg.for_channel()
         } else {
-            config
+            cfg
+        }
+    }
+
+    pub fn for_booru_chat(
+        site_name: impl Into<String>,
+        post_id: u64,
+        chat: &crate::db::entities::chats::Model,
+    ) -> Self {
+        let cfg = Self::booru(site_name, post_id);
+        if chat.r#type == "channel" {
+            cfg.for_channel()
+        } else {
+            cfg
         }
     }
 
@@ -34,7 +59,7 @@ impl DownloadButtonConfig {
     }
 
     pub(super) fn should_show_button(&self) -> bool {
-        self.illust_id.is_some() && !self.is_channel
+        self.target.is_some() && !self.is_channel
     }
 
     pub(super) fn build_keyboard(&self) -> Option<InlineKeyboardMarkup> {
@@ -42,9 +67,79 @@ impl DownloadButtonConfig {
             return None;
         }
 
-        let illust_id = self.illust_id.unwrap();
-        let callback_data = format!("{}{}", DOWNLOAD_CALLBACK_PREFIX, illust_id);
+        let callback_data = match self.target.as_ref()? {
+            DownloadTarget::Pixiv(id) => format!("{}{}", DOWNLOAD_CALLBACK_PREFIX, id),
+            DownloadTarget::Booru { site_name, post_id } => format!(
+                "{}{}:{}",
+                BOORU_DOWNLOAD_CALLBACK_PREFIX, site_name, post_id
+            ),
+        };
         let button = InlineKeyboardButton::callback(super::DOWNLOAD_BUTTON_LABEL, callback_data);
         Some(InlineKeyboardMarkup::new(vec![vec![button]]))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn chat(r#type: &str) -> crate::db::entities::chats::Model {
+        crate::db::entities::chats::Model {
+            id: 1,
+            r#type: r#type.to_string(),
+            title: None,
+            enabled: true,
+            blur_sensitive_tags: false,
+            excluded_tags: Default::default(),
+            sensitive_tags: Default::default(),
+            created_at: Default::default(),
+            allow_without_mention: false,
+        }
+    }
+
+    #[test]
+    fn pixiv_callback_data_format() {
+        let cfg = DownloadButtonConfig::pixiv(12345);
+        let kb = cfg.build_keyboard().expect("expected keyboard");
+        let row = &kb.inline_keyboard[0];
+        match &row[0].kind {
+            teloxide::types::InlineKeyboardButtonKind::CallbackData(s) => {
+                assert_eq!(s, "dl:12345");
+            }
+            _ => panic!("expected callback data"),
+        }
+    }
+
+    #[test]
+    fn booru_callback_data_format() {
+        let cfg = DownloadButtonConfig::booru("yandere", 999);
+        let kb = cfg.build_keyboard().expect("expected keyboard");
+        let row = &kb.inline_keyboard[0];
+        match &row[0].kind {
+            teloxide::types::InlineKeyboardButtonKind::CallbackData(s) => {
+                assert_eq!(s, "dlb:yandere:999");
+            }
+            _ => panic!("expected callback data"),
+        }
+    }
+
+    #[test]
+    fn channel_chat_hides_button_for_both_targets() {
+        assert!(DownloadButtonConfig::for_pixiv_chat(1, &chat("channel"))
+            .build_keyboard()
+            .is_none());
+        assert!(
+            DownloadButtonConfig::for_booru_chat("y", 1, &chat("channel"))
+                .build_keyboard()
+                .is_none()
+        );
+        assert!(DownloadButtonConfig::for_pixiv_chat(1, &chat("private"))
+            .build_keyboard()
+            .is_some());
+        assert!(
+            DownloadButtonConfig::for_booru_chat("y", 1, &chat("private"))
+                .build_keyboard()
+                .is_some()
+        );
     }
 }

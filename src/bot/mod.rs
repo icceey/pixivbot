@@ -6,15 +6,16 @@ pub mod middleware;
 pub mod notifier;
 pub mod state;
 
-use crate::config::{BooruConfig, TelegramConfig};
+use crate::booru::BooruSiteRegistry;
+use crate::config::TelegramConfig;
 use crate::db::repo::Repo;
 use crate::db::types::UserRole;
 use crate::pixiv::client::PixivClient;
 use anyhow::Result;
 use handlers::{
     handle_settings_callback, handle_settings_cancel, handle_settings_input,
-    parse_list_callback_data, ListPaginationAction, DOWNLOAD_CALLBACK_PREFIX, LIST_CALLBACK_PREFIX,
-    SETTINGS_CALLBACK_PREFIX,
+    parse_list_callback_data, ListPaginationAction, BOORU_DOWNLOAD_CALLBACK_PREFIX,
+    DOWNLOAD_CALLBACK_PREFIX, LIST_CALLBACK_PREFIX, SETTINGS_CALLBACK_PREFIX,
 };
 use notifier::ThrottledBot;
 use state::SettingsStorage;
@@ -44,7 +45,7 @@ pub async fn run(
     download_original_threshold: u8,
     cache_dir: String,
     log_dir: String,
-    booru_config: BooruConfig,
+    booru_registry: Arc<BooruSiteRegistry>,
 ) -> Result<()> {
     info!("Starting Telegram Bot...");
 
@@ -78,7 +79,7 @@ pub async fn run(
         config.require_mention_in_group,
         cache_dir,
         log_dir,
-        booru_config,
+        booru_registry,
     );
 
     info!("✅ Bot initialized, starting command handler");
@@ -205,6 +206,15 @@ fn build_callback_handlers(
         })
         .endpoint(handle_download_callback);
 
+    let booru_download_callback_handler = Update::filter_callback_query()
+        .filter_map(|q: CallbackQuery| {
+            q.data
+                .as_ref()
+                .filter(|data| data.starts_with(BOORU_DOWNLOAD_CALLBACK_PREFIX))
+                .cloned()
+        })
+        .endpoint(handle_booru_download_callback);
+
     let settings_callback_handler = Update::filter_callback_query()
         .filter_map(|q: CallbackQuery| {
             q.data
@@ -217,6 +227,7 @@ fn build_callback_handlers(
     dptree::entry()
         .branch(callback_handler)
         .branch(download_callback_handler)
+        .branch(booru_download_callback_handler)
         .branch(settings_callback_handler)
 }
 
@@ -474,6 +485,106 @@ async fn handle_download_callback(
         );
 
         // Try to notify the user with a generic error message
+        if let Err(send_err) = bot.send_message(chat_id, "❌ 下载失败，请稍后重试").await
+        {
+            error!(
+                "Failed to send download error message to chat {}: {:#}",
+                chat_id, send_err
+            );
+        }
+    }
+
+    Ok(())
+}
+
+async fn handle_booru_download_callback(
+    bot: ThrottledBot,
+    q: CallbackQuery,
+    callback_data: String,
+    handler: BotHandler,
+    repo: Arc<Repo>,
+) -> HandlerResult {
+    if let Err(e) = bot.answer_callback_query(q.id.clone()).cache_time(10).await {
+        warn!("Failed to answer callback query: {:#}", e);
+    }
+
+    let Some(payload) = callback_data.strip_prefix(BOORU_DOWNLOAD_CALLBACK_PREFIX) else {
+        warn!("Callback data missing expected prefix: {}", callback_data);
+        return Ok(());
+    };
+
+    let Some((site_name, post_id_str)) = payload.rsplit_once(':') else {
+        warn!("Invalid booru download callback payload: {}", payload);
+        return Ok(());
+    };
+
+    let post_id: u64 = match post_id_str.parse() {
+        Ok(id) => id,
+        Err(_) => {
+            warn!("Invalid post_id in booru callback data: {}", post_id_str);
+            return Ok(());
+        }
+    };
+
+    let chat_id = match &q.message {
+        Some(msg) => msg.chat().id,
+        None => {
+            warn!("No message found in booru download callback query");
+            return Ok(());
+        }
+    };
+
+    let user_id = q.from.id.0 as i64;
+    match repo.get_chat(chat_id.0).await {
+        Ok(Some(chat)) => {
+            if !chat.enabled {
+                match repo.get_user(user_id).await {
+                    Ok(Some(user)) if user.role.is_admin() => {}
+                    _ => {
+                        warn!(
+                            "User {} attempted to use booru download button in disabled chat {}",
+                            user_id, chat_id
+                        );
+                        let _ = bot
+                            .send_message(chat_id, "❌ 此聊天未启用，无法使用下载功能")
+                            .await;
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        Ok(None) => {
+            warn!(
+                "Chat {} not found in database for booru download callback",
+                chat_id
+            );
+            let _ = bot.send_message(chat_id, "❌ 无法处理下载请求").await;
+            return Ok(());
+        }
+        Err(e) => {
+            error!(
+                "Failed to get chat {} for authorization check: {:#}",
+                chat_id, e
+            );
+            let _ = bot.send_message(chat_id, "❌ 无法处理下载请求").await;
+            return Ok(());
+        }
+    }
+
+    info!(
+        "Booru download button clicked: site={} post_id={} chat_id={} user={:?}",
+        site_name, post_id, chat_id, q.from.id
+    );
+
+    if let Err(e) = handler
+        .handle_booru_download_callback(bot.clone(), chat_id, site_name.to_string(), post_id)
+        .await
+    {
+        error!(
+            "Failed to handle booru download callback for site={} post={} in chat {}: {:#}",
+            site_name, post_id, chat_id, e
+        );
+
         if let Err(send_err) = bot.send_message(chat_id, "❌ 下载失败，请稍后重试").await
         {
             error!(

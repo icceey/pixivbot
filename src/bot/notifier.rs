@@ -204,8 +204,8 @@ mod tests {
         let private_chat = make_chat("private");
         let channel_chat = make_chat("channel");
 
-        assert!(!DownloadButtonConfig::for_chat(123, &private_chat).is_channel);
-        assert!(DownloadButtonConfig::for_chat(123, &channel_chat).is_channel);
+        assert!(DownloadButtonConfig::for_pixiv_chat(123, &private_chat).should_show_button());
+        assert!(!DownloadButtonConfig::for_pixiv_chat(123, &channel_chat).should_show_button());
     }
 
     #[test]
@@ -252,8 +252,8 @@ mod tests {
     #[test]
     fn download_button_config_hides_button_without_illust_or_for_channels() {
         let without_illust = DownloadButtonConfig::default();
-        let for_channel = DownloadButtonConfig::new(123).for_channel();
-        let normal = DownloadButtonConfig::new(123);
+        let for_channel = DownloadButtonConfig::pixiv(123).for_channel();
+        let normal = DownloadButtonConfig::pixiv(123);
 
         assert!(!without_illust.should_show_button());
         assert!(!for_channel.should_show_button());

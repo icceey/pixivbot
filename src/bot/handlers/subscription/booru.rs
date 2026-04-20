@@ -57,18 +57,13 @@ impl BotHandler {
             }
         };
 
-        let site_config = self
-            .booru_config
-            .sites
-            .iter()
-            .find(|s| s.name.eq_ignore_ascii_case(site_name));
+        let site_config = self.booru_registry.get(site_name);
 
         if site_config.is_none() {
-            let available: Vec<&str> = self
-                .booru_config
-                .sites
+            let available: Vec<String> = self
+                .booru_registry
                 .iter()
-                .map(|s| s.name.as_str())
+                .map(|s| s.config.name.clone())
                 .collect();
             let msg = if available.is_empty() {
                 "❌ 未配置任何 Booru 站点".to_string()

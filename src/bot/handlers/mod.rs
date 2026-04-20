@@ -18,5 +18,11 @@ pub use subscription::{parse_list_callback_data, ListPaginationAction, LIST_CALL
 // Download handler
 mod download;
 
-/// Callback data prefix for download button
+mod booru_download;
+
+/// Callback data prefix for download button (Pixiv illust).
 pub const DOWNLOAD_CALLBACK_PREFIX: &str = "dl:";
+
+/// Callback data prefix for download button (Booru post).
+/// Format: `dlb:<site_name>:<post_id>`.
+pub const BOORU_DOWNLOAD_CALLBACK_PREFIX: &str = "dlb:";

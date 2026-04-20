@@ -1,3 +1,4 @@
+use crate::booru::{BooruSite, BooruSiteRegistry};
 use crate::bot::notifier::{DownloadButtonConfig, Notifier};
 use crate::config::BooruSiteConfig;
 use crate::db::repo::Repo;
@@ -8,10 +9,8 @@ use crate::scheduler::helpers::{
 };
 use crate::utils::{caption, sensitive};
 use anyhow::{Context, Result};
-use booru_client::BooruClient;
 use chrono::Local;
 use rand::RngExt;
-use std::collections::HashMap;
 use std::sync::Arc;
 use teloxide::prelude::*;
 use tokio::time::{sleep, Duration};
@@ -26,12 +25,7 @@ pub struct BooruEngine {
     notifier: Notifier,
     tick_interval_sec: u64,
     max_retry_count: i32,
-    sites: HashMap<String, SiteContext>,
-}
-
-struct SiteContext {
-    client: BooruClient,
-    config: BooruSiteConfig,
+    registry: Arc<BooruSiteRegistry>,
 }
 
 impl BooruEngine {
@@ -40,34 +34,8 @@ impl BooruEngine {
         notifier: Notifier,
         tick_interval_sec: u64,
         max_retry_count: i32,
-        site_configs: Vec<BooruSiteConfig>,
+        registry: Arc<BooruSiteRegistry>,
     ) -> Self {
-        let mut sites = HashMap::new();
-        for cfg in site_configs {
-            let client = match BooruClient::new(&cfg.base_url, cfg.engine_type) {
-                Ok(c) => c,
-                Err(e) => {
-                    error!("Failed to create BooruClient for {}: {:#}", cfg.name, e);
-                    continue;
-                }
-            };
-            let client = match (&cfg.username, &cfg.api_key) {
-                (Some(user), Some(key)) => client.with_auth(user, key),
-                _ => client,
-            };
-            let client = match &cfg.bypass {
-                Some(bypass_cfg) => client.with_bypass(bypass_cfg.to_client_config()),
-                None => client,
-            };
-            sites.insert(
-                cfg.name.to_lowercase(),
-                SiteContext {
-                    client,
-                    config: cfg,
-                },
-            );
-        }
-
         Self {
             repo,
             notifier,
@@ -75,16 +43,19 @@ impl BooruEngine {
             // Clamp to u8 range since retry_count in BooruTagState is u8.
             // Values > 255 would cause the counter to saturate and retry forever.
             max_retry_count: max_retry_count.min(255),
-            sites,
+            registry,
         }
     }
 
     pub async fn run(&self) {
-        if self.sites.is_empty() {
+        if self.registry.is_empty() {
             info!("No booru sites configured, booru engine disabled");
             return;
         }
-        info!("🚀 Booru engine started with {} site(s)", self.sites.len());
+        info!(
+            "🚀 Booru engine started with {} site(s)",
+            self.registry.len()
+        );
 
         let mut interval = tokio::time::interval(Duration::from_secs(self.tick_interval_sec));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -115,8 +86,8 @@ impl BooruEngine {
 
         if let Err(e) = result {
             error!("Booru tag task execution failed: {:#}", e);
-            if let Some(site_ctx) = self.site_for_task_value(&task.value) {
-                self.schedule_next_poll(task.id, &site_ctx.config).await?;
+            if let Some(site) = self.site_for_task_value(&task.value) {
+                self.schedule_next_poll(task.id, &site.config).await?;
             } else {
                 warn!(
                     "Task [{}] refers to unknown site '{}', scheduling backoff",
@@ -130,9 +101,9 @@ impl BooruEngine {
         Ok(())
     }
 
-    fn site_for_task_value(&self, task_value: &str) -> Option<&SiteContext> {
+    fn site_for_task_value(&self, task_value: &str) -> Option<&Arc<BooruSite>> {
         let site_name = task_value.split(':').next()?;
-        self.sites.get(site_name)
+        self.registry.get(site_name)
     }
 
     fn parse_task_value(task_value: &str) -> (&str, &str) {
@@ -285,13 +256,13 @@ impl BooruEngine {
     /// termination logic (checking `p.id <= last_id`) will malfunction.
     async fn fetch_posts_since(
         &self,
-        site_ctx: &SiteContext,
+        site: &BooruSite,
         tags: &str,
         oldest_latest_id: Option<u64>,
         api_filter_tags: &[String],
     ) -> Result<(Vec<booru_client::BooruPost>, bool)> {
         let mut all_posts = Vec::new();
-        let limit = site_ctx.config.page_limit;
+        let limit = site.config.page_limit;
         let mut reached_old = false;
 
         let query_tags = if api_filter_tags.is_empty() {
@@ -301,7 +272,7 @@ impl BooruEngine {
         };
 
         for page in 1..=MAX_FETCH_PAGES {
-            let posts = site_ctx
+            let posts = site
                 .client
                 .get_posts(&query_tags, limit, page)
                 .await
@@ -335,7 +306,7 @@ impl BooruEngine {
                 "Reached MAX_FETCH_PAGES ({}) for site '{}' tags '{}' without catching up to \
                  last known post (id: {:?}). Posts between the cursor and the oldest fetched \
                  post are permanently skipped.",
-                MAX_FETCH_PAGES, site_ctx.config.name, tags, oldest_latest_id
+                MAX_FETCH_PAGES, site.config.name, tags, oldest_latest_id
             );
         }
 
@@ -522,7 +493,7 @@ impl BooruEngine {
                 &[url.to_string()],
                 Some(&caption_text),
                 has_spoiler,
-                &DownloadButtonConfig::default(),
+                &DownloadButtonConfig::for_booru_chat(site_name, first.id, chat),
             )
             .await;
 
@@ -575,7 +546,7 @@ impl BooruEngine {
                 &[url.to_string()],
                 Some(&caption_text),
                 has_spoiler,
-                &DownloadButtonConfig::default(),
+                &DownloadButtonConfig::for_booru_chat(site_name, post.id, chat),
             )
             .await;
 
