@@ -45,7 +45,7 @@ impl BotHandler {
             bot.send_message(
                 chat_id,
                 format!(
-                    "❌ 用法: `/subrank [channel=<id>] <mode> [+tag1 -tag2]`\n可用模式: {}",
+                    "❌ 用法: `/subrank [ch=<频道ID>] <mode> [+tag1 -tag2]`\n可用模式: {}",
                     markdown::escape(&available_modes)
                 ),
             )
@@ -128,7 +128,7 @@ impl BotHandler {
         let mode_str = parsed.remaining.trim();
 
         if mode_str.is_empty() {
-            bot.send_message(chat_id, "❌ 用法: `/unsubrank [channel=<id>] <mode>`")
+            bot.send_message(chat_id, "❌ 用法: `/unsubrank [ch=<频道ID>] <mode>`")
                 .parse_mode(ParseMode::MarkdownV2)
                 .await?;
             return Ok(());
