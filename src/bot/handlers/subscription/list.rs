@@ -29,7 +29,11 @@ impl BotHandler {
         {
             Ok(result) => result,
             Err(e) => {
-                bot.send_message(chat_id, format!("❌ {}", e)).await?;
+                error!(
+                    "Failed to resolve subscription target in chat {}: {:#}",
+                    chat_id, e
+                );
+                bot.send_message(chat_id, "❌ 频道ID无效或无法访问").await?;
                 return Ok(());
             }
         };
