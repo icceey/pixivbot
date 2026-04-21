@@ -32,17 +32,15 @@ impl BotHandler {
         let parts: Vec<&str> = parsed.remaining.split_whitespace().collect();
 
         if parts.is_empty() {
-            bot.send_message(
-                chat_id,
-                "❌ 用法: `/bsub [ch=<频道ID>] <站点名:标签 [标签2 ...]> [score>=N] [fav>=N] [rating=s,q,e]`\n\n\
-                 示例:\n\
-                 `/bsub konachan:landscape`\n\
-                 `/bsub konachan:blue_sky clouds`\n\
-                 `/bsub konachan: score>=50`\n\
-                 `/bsub konachan:blue_sky rating=s`",
-            )
-            .parse_mode(ParseMode::MarkdownV2)
-            .await?;
+            let available: Vec<&str> = self
+                .booru_registry
+                .iter()
+                .map(|s| s.config.name.as_str())
+                .collect();
+
+            bot.send_message(chat_id, build_bsub_usage_message(&available))
+                .parse_mode(ParseMode::MarkdownV2)
+                .await?;
             return Ok(());
         }
 
@@ -50,7 +48,13 @@ impl BotHandler {
         let (site_name, first_tag) = match site_tags_str.split_once(':') {
             Some((site, tags)) => (site, tags),
             None => {
-                bot.send_message(chat_id, "❌ 格式: `站点名:标签`，例如 `konachan:landscape`")
+                let available: Vec<&str> = self
+                    .booru_registry
+                    .iter()
+                    .map(|site| site.config.name.as_str())
+                    .collect();
+
+                bot.send_message(chat_id, build_bsub_usage_message(&available))
                     .parse_mode(ParseMode::MarkdownV2)
                     .await?;
                 return Ok(());
@@ -316,6 +320,24 @@ fn parse_booru_filter_args(args: &[&str]) -> Result<(BooruFilter, TagFilter), St
     let tag_filter = TagFilter::parse_from_args(&tag_parts);
 
     Ok((booru_filter, tag_filter))
+}
+
+fn build_bsub_usage_message(site_names: &[&str]) -> String {
+    let Some(first_site) = site_names.first() else {
+        return "❌ 未配置任何 Booru 站点".to_string();
+    };
+
+    let available_sites = site_names
+        .iter()
+        .map(|site| markdown::escape(site))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let first_site = markdown::escape(first_site);
+
+    format!(
+        "❌ 用法: `/bsub [ch=<频道ID>] <站点名:标签 [标签2 ...]> [score>=N] [fav>=N] [rating=s,q,e]`\n\n可用站点: {}\n\n示例:\n`/bsub {}:landscape`\n`/bsub {}:blue_sky clouds`\n`/bsub {}: score>=50`\n`/bsub {}:blue_sky rating=s`",
+        available_sites, first_site, first_site, first_site, first_site
+    )
 }
 
 #[cfg(test)]
