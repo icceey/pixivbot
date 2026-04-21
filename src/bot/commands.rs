@@ -42,8 +42,8 @@ pub enum Command {
 
 impl Command {
     /// 获取普通用户可见的命令列表
-    pub fn user_commands() -> Vec<BotCommand> {
-        vec![
+    pub fn user_commands(has_booru: bool) -> Vec<BotCommand> {
+        let mut commands = vec![
             BotCommand::new("sub", "订阅作者 - /sub [ch=<频道ID>] <id,...>"),
             BotCommand::new("subrank", "订阅排行榜 - /subrank [ch=<频道ID>] <mode>"),
             BotCommand::new("list", "列出当前订阅 - /list [ch=<频道ID>]"),
@@ -55,15 +55,23 @@ impl Command {
             BotCommand::new("unsubthis", "回复消息取消对应订阅"),
             BotCommand::new("settings", "显示和管理聊天设置"),
             BotCommand::new("download", "下载作品原图 - /download <url|id> 或回复消息"),
-            BotCommand::new("bsub", "订阅Booru标签 - /bsub <站点:标签> [过滤条件]"),
-            BotCommand::new("bunsub", "取消Booru标签订阅 - /bunsub <站点:标签>"),
-            BotCommand::new("help", "显示帮助信息"),
-        ]
+        ];
+
+        if has_booru {
+            commands.extend([
+                BotCommand::new("bsub", "订阅Booru标签 - /bsub <站点:标签> [过滤条件]"),
+                BotCommand::new("bunsub", "取消Booru标签订阅 - /bunsub <站点:标签>"),
+            ]);
+        }
+
+        commands.push(BotCommand::new("help", "显示帮助信息"));
+
+        commands
     }
 
     /// 获取管理员可见的命令列表（包含普通命令 + 管理员命令）
-    pub fn admin_commands() -> Vec<BotCommand> {
-        let mut cmds = Self::user_commands();
+    pub fn admin_commands(has_booru: bool) -> Vec<BotCommand> {
+        let mut cmds = Self::user_commands(has_booru);
         cmds.extend([
             BotCommand::new("info", "[Admin] 查看 Bot 状态信息"),
             BotCommand::new("enablechat", "[Admin] 启用聊天 - /enablechat [chat_id]"),
@@ -73,12 +81,51 @@ impl Command {
     }
 
     /// 获取 Owner 可见的完整命令列表（包含所有命令）
-    pub fn owner_commands() -> Vec<BotCommand> {
-        let mut cmds = Self::admin_commands();
+    pub fn owner_commands(has_booru: bool) -> Vec<BotCommand> {
+        let mut cmds = Self::admin_commands(has_booru);
         cmds.extend([
             BotCommand::new("setadmin", "[Owner] 设置管理员 - /setadmin <user_id>"),
             BotCommand::new("unsetadmin", "[Owner] 移除管理员 - /unsetadmin <user_id>"),
         ]);
         cmds
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Command;
+
+    fn command_names(commands: Vec<teloxide::types::BotCommand>) -> Vec<String> {
+        commands
+            .into_iter()
+            .map(|command| command.command)
+            .collect()
+    }
+
+    #[test]
+    fn user_commands_omit_booru_entries_when_not_configured() {
+        let commands = command_names(Command::user_commands(false));
+
+        assert!(!commands.iter().any(|command| command == "bsub"));
+        assert!(!commands.iter().any(|command| command == "bunsub"));
+    }
+
+    #[test]
+    fn user_commands_include_booru_entries_when_configured() {
+        let commands = command_names(Command::user_commands(true));
+
+        assert!(commands.iter().any(|command| command == "bsub"));
+        assert!(commands.iter().any(|command| command == "bunsub"));
+    }
+
+    #[test]
+    fn admin_and_owner_commands_follow_booru_visibility() {
+        let admin_commands = command_names(Command::admin_commands(false));
+        let owner_commands = command_names(Command::owner_commands(false));
+
+        assert!(admin_commands.iter().any(|command| command == "info"));
+        assert!(owner_commands.iter().any(|command| command == "setadmin"));
+        assert!(!admin_commands.iter().any(|command| command == "bsub"));
+        assert!(!owner_commands.iter().any(|command| command == "bunsub"));
     }
 }
