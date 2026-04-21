@@ -84,6 +84,9 @@ impl BotHandler {
                 let start = page * PAGE_SIZE;
                 let end = (start + PAGE_SIZE).min(total);
                 let page_subscriptions = &all_subscriptions[start..end];
+                let page_has_booru_subscription = page_subscriptions.iter().any(|(_, task)| {
+                    matches!(task.r#type, TaskType::BooruTag | TaskType::BooruPool)
+                });
 
                 let header = if is_channel {
                     if total_pages > 1 {
@@ -187,12 +190,25 @@ impl BotHandler {
                 }
 
                 if is_channel {
-                    message.push_str(&format!(
-                        "\n💡 使用 `/unsub ch={cid} <id>` `/unsubrank ch={cid} <mode>` `/bunsub ch={cid} <站点:标签>` 取消订阅",
-                        cid = target_chat_id.0
-                    ));
+                    let footer = if page_has_booru_subscription {
+                        format!(
+                            "\n💡 使用 `/unsub ch={cid} <id>` `/unsubrank ch={cid} <mode>` `/bunsub ch={cid} <站点:标签>` 取消订阅",
+                            cid = target_chat_id.0
+                        )
+                    } else {
+                        format!(
+                            "\n💡 使用 `/unsub ch={cid} <id>` `/unsubrank ch={cid} <mode>` 取消订阅",
+                            cid = target_chat_id.0
+                        )
+                    };
+                    message.push_str(&footer);
                 } else {
-                    message.push_str("\n💡 使用 `/unsub <id>` `/unsubrank <mode>` `/bunsub <站点:标签>` 取消订阅");
+                    let footer = if page_has_booru_subscription {
+                        "\n💡 使用 `/unsub <id>` `/unsubrank <mode>` `/bunsub <站点:标签>` 取消订阅"
+                    } else {
+                        "\n💡 使用 `/unsub <id>` `/unsubrank <mode>` 取消订阅"
+                    };
+                    message.push_str(footer);
                 }
 
                 let keyboard = if total_pages > 1 {
