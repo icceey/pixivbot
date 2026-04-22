@@ -177,10 +177,12 @@ impl BotHandler {
             .await
         {
             Ok(_) => {
-                let mut msg = format!(
-                    "✅ 已订阅 Booru 标签: *{}*",
-                    markdown::escape(&display_name)
-                );
+                let label = if mode_label.is_some() {
+                    "Booru 排序"
+                } else {
+                    "Booru 标签"
+                };
+                let mut msg = format!("✅ 已订阅 {}: *{}*", label, markdown::escape(&display_name));
                 if let Some(label) = &mode_label {
                     msg.push_str(&format!("\n🏆 模式: `{}`", markdown::escape(label)));
                 }

@@ -44,8 +44,6 @@ impl MigrationTrait for Migration {
         .all(db)
         .await?;
 
-        let mut touched_old_task_ids: Vec<i32> = Vec::new();
-
         for row in rows {
             let sig = compute_signature(row.booru_filter.as_deref());
             let new_value = if sig.is_empty() {
@@ -76,10 +74,6 @@ impl MigrationTrait for Migration {
                 [target_id.into(), row.sub_id.into()],
             ))
             .await?;
-
-            if !touched_old_task_ids.contains(&row.task_id) {
-                touched_old_task_ids.push(row.task_id);
-            }
         }
 
         db.execute(Statement::from_string(
@@ -97,6 +91,10 @@ impl MigrationTrait for Migration {
     }
 
     async fn down(&self, _manager: &SchemaManager) -> Result<(), DbErr> {
+        // Intentional no-op: this migration is not reversible.
+        // up() rewrites tasks.task_value in place (old value lost) and merges
+        // multiple subscription.task_id rows into shared tasks (mapping lost).
+        // Inferring the original split would require external knowledge.
         Ok(())
     }
 }
