@@ -729,6 +729,11 @@ impl BooruEngine {
         let mut candidate_posts: Vec<&booru_client::BooruPost> = posts
             .iter()
             .filter(|p| p.id > latest_id || hot_ids.contains(&p.id))
+            // Mirror non-grace path (line ~653): skip posts without any image URL
+            // upfront. Letting them through would consume MAX_GRACE_SEND_ATTEMPTS
+            // failed sends and pin the cursor at (post_id - 1) for the entire
+            // grace window, since they're permanently unsendable.
+            .filter(|p| p.sample_url.is_some() || p.file_url.is_some() || p.preview_url.is_some())
             .collect();
         // Mirror non-grace first-run behavior (line ~617): on a brand-new
         // subscription (no prior state), only consider the single newest post

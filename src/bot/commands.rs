@@ -36,15 +36,15 @@ pub enum Command {
     BSub(String),
     #[command(description = "取消 Booru 标签订阅\n  用法: /bunsub [ch=<频道ID>] <站点:标签>")]
     BUnsub(String),
-    #[command(description = "订阅 Booru 排行榜: <site>[:<tags>] scale=day|week|month [filter]")]
+    #[command(description = "订阅 Booru 排行榜: <站点:> scale=day|week|month [过滤条件]")]
     BRank(String),
-    #[command(description = "订阅 Booru 日榜: <site>[:<tags>] [filter]")]
+    #[command(description = "订阅 Booru 日榜: <站点:> [过滤条件]")]
     BRankDay(String),
-    #[command(description = "订阅 Booru 周榜: <site>[:<tags>] [filter]")]
+    #[command(description = "订阅 Booru 周榜: <站点:> [过滤条件]")]
     BRankWeek(String),
-    #[command(description = "订阅 Booru 月榜: <site>[:<tags>] [filter]")]
+    #[command(description = "订阅 Booru 月榜: <站点:> [过滤条件]")]
     BRankMonth(String),
-    #[command(description = "订阅 Booru 随机推送: <site>:<ISO间隔> [filter]")]
+    #[command(description = "订阅 Booru 随机推送: <站点:间隔> 间隔支持 1h/2h30m 或 ISO8601")]
     BRand(String),
     #[command(description = "取消当前设置操作")]
     Cancel,
@@ -73,23 +73,20 @@ impl Command {
                 BotCommand::new("bunsub", "取消Booru标签订阅 - /bunsub <站点:标签>"),
                 BotCommand::new(
                     "brank",
-                    "订阅Booru排行榜 - /brank <站点[:标签]> scale=day|week|month [过滤条件]",
+                    "订阅Booru排行榜 - /brank <站点:> scale=day|week|month [+tag -tag]",
                 ),
-                BotCommand::new(
-                    "brankday",
-                    "订阅Booru日榜 - /brankday <站点[:标签]> [过滤条件]",
-                ),
+                BotCommand::new("brankday", "订阅Booru日榜 - /brankday <站点:> [+tag -tag]"),
                 BotCommand::new(
                     "brankweek",
-                    "订阅Booru周榜 - /brankweek <站点[:标签]> [过滤条件]",
+                    "订阅Booru周榜 - /brankweek <站点:> [+tag -tag]",
                 ),
                 BotCommand::new(
                     "brankmonth",
-                    "订阅Booru月榜 - /brankmonth <站点[:标签]> [过滤条件]",
+                    "订阅Booru月榜 - /brankmonth <站点:> [+tag -tag]",
                 ),
                 BotCommand::new(
                     "brand",
-                    "订阅Booru随机推送 - /brand <站点:ISO间隔> [过滤条件]",
+                    "订阅Booru随机推送 - /brand <站点:间隔> 间隔可用 1h/2h30m 或 ISO8601",
                 ),
             ]);
         }
