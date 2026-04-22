@@ -173,7 +173,11 @@ impl BooruClient {
             PopularScale::Month => "popular_by_month",
         };
         let url = format!("{}/post/{}.json", self.base_url, endpoint);
-        let raw: Vec<MoebooruRawPost> = self.request(&url, &[]).await?;
+        // moebooru popular endpoints accept ?limit= same as /post.json; pass it
+        // server-side to avoid downloading the full popular list. Keep .take()
+        // below as a safety cap in case the server ignores the param.
+        let raw: Vec<MoebooruRawPost> =
+            self.request(&url, &[("limit", &limit.to_string())]).await?;
         Ok(raw
             .into_iter()
             .take(limit as usize)

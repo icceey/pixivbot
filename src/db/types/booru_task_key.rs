@@ -100,14 +100,26 @@ impl BooruTaskKey {
         if !rest.is_empty() {
             for segment in rest.split('|') {
                 if let Some(sig) = segment.strip_prefix("f=") {
+                    if !filter_sig.is_empty() {
+                        return None;
+                    }
                     filter_sig = sig.to_string();
                 } else if let Some(mode) = segment.strip_prefix("o=") {
+                    if ranking.is_some() {
+                        return None;
+                    }
                     let kind = OrderbyKind::from_str(mode)?;
                     ranking = Some(BooruRankingMode::Orderby(kind));
                 } else if let Some(scale) = segment.strip_prefix("r=") {
+                    if ranking.is_some() {
+                        return None;
+                    }
                     let s = PopularScale::from_str(scale)?;
                     ranking = Some(BooruRankingMode::Popular(s));
                 } else if let Some(iso) = segment.strip_prefix("i=") {
+                    if ranking.is_some() {
+                        return None;
+                    }
                     ranking = Some(BooruRankingMode::Interval(iso.to_string()));
                 } else {
                     return None;
@@ -267,5 +279,16 @@ mod tests {
         assert!(BooruTaskKey::parse("nocolon").is_none());
         assert!(BooruTaskKey::parse("site:tags|unknown=value").is_none());
         assert!(BooruTaskKey::parse("site:tags|o=invalidmode").is_none());
+    }
+
+    #[test]
+    fn parse_rejects_duplicate_ranking_segments() {
+        // Two ranking modes — last would silently win, hiding malformed data.
+        assert!(BooruTaskKey::parse("site:|o=score|r=day").is_none());
+        assert!(BooruTaskKey::parse("site:|o=score|o=fav").is_none());
+        assert!(BooruTaskKey::parse("site:|i=PT1H|r=day").is_none());
+        assert!(BooruTaskKey::parse("site:|r=day|i=PT1H").is_none());
+        // Two filter sigs — should also reject.
+        assert!(BooruTaskKey::parse("site:tags|f=s|f=r").is_none());
     }
 }

@@ -280,14 +280,44 @@ impl BotHandler {
         let mut interval_iso: Option<String> = None;
         for &part in &parts[1..] {
             if let Some(val) = part.strip_prefix("order=") {
-                if let Some(k) = OrderbyKind::from_str(val) {
-                    orderby = Some(k);
+                if val.is_empty() {
+                    bot.send_message(chat_id, "❌ `order=` 需要值")
+                        .parse_mode(ParseMode::MarkdownV2)
+                        .await?;
+                    return Ok(());
+                }
+                match OrderbyKind::from_str(val) {
+                    Some(k) => orderby = Some(k),
+                    None => {
+                        bot.send_message(
+                            chat_id,
+                            format!("❌ order 值无效: `{}`，可用: score, fav, random", val),
+                        )
+                        .parse_mode(ParseMode::MarkdownV2)
+                        .await?;
+                        return Ok(());
+                    }
                 }
                 continue;
             }
             if let Some(val) = part.strip_prefix("scale=") {
-                if let Some(s) = PopularScale::from_str(val) {
-                    popular_scale = Some(s);
+                if val.is_empty() {
+                    bot.send_message(chat_id, "❌ `scale=` 需要值")
+                        .parse_mode(ParseMode::MarkdownV2)
+                        .await?;
+                    return Ok(());
+                }
+                match PopularScale::from_str(val) {
+                    Some(s) => popular_scale = Some(s),
+                    None => {
+                        bot.send_message(
+                            chat_id,
+                            format!("❌ scale 值无效: `{}`，可用: day, week, month", val),
+                        )
+                        .parse_mode(ParseMode::MarkdownV2)
+                        .await?;
+                        return Ok(());
+                    }
                 }
                 continue;
             }

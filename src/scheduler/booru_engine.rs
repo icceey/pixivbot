@@ -28,6 +28,13 @@ const MAX_GRACE_SEND_ATTEMPTS: u8 = 3;
 
 const MAX_RANKING_SEND_ATTEMPTS: u8 = 3;
 
+// Cap grace-window pushes per subscription per tick. Without this, when a large
+// fetched window suddenly qualifies (e.g. score threshold met on many posts at
+// once, or a new subscription with grace mode), to_push could include dozens of
+// posts and block the per-subscription send loop for minutes. The remainder
+// stays in candidate_posts and is naturally retried on the next tick.
+const MAX_GRACE_PUSH_PER_TICK: usize = 5;
+
 pub struct BooruEngine {
     repo: Arc<Repo>,
     notifier: Notifier,
@@ -755,6 +762,7 @@ impl BooruEngine {
             .filter(|p| {
                 filtered_set.contains(&p.id) && !hot_posts.iter().any(|h| h.id == p.id && h.pushed)
             })
+            .take(MAX_GRACE_PUSH_PER_TICK)
             .collect();
 
         for post in &to_push {
