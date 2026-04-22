@@ -10,7 +10,7 @@ use crate::scheduler::helpers::{
     booru_ranking_subscription_state, booru_tag_subscription_state, get_chat_if_should_notify,
     save_first_message_record, INTER_SUBSCRIPTION_DELAY_MS,
 };
-use crate::utils::{caption, duration::parse_friendly_or_iso8601, sensitive};
+use crate::utils::{caption, duration::parse_duration, sensitive};
 use anyhow::{Context, Result};
 use chrono::{Local, Utc};
 use rand::RngExt;
@@ -392,9 +392,11 @@ impl BooruEngine {
                     failed_attempts: Vec::new(),
                 });
 
-            let filtered = self.apply_booru_filters(sub, &chat, &post_refs);
+            let filtered: Vec<&booru_client::BooruPost> =
+                self.apply_booru_filters(sub, &chat, &post_refs);
             let new_posts: Vec<&booru_client::BooruPost> = filtered
-                .into_iter()
+                .iter()
+                .copied()
                 .filter(|p| !state.pushed_ids.contains(&p.id))
                 .take(MAX_RANKING_PUSH_PER_TICK)
                 .collect();
@@ -452,12 +454,13 @@ impl BooruEngine {
             let mut seen = std::collections::HashSet::new();
             new_state.pushed_ids.retain(|id| seen.insert(*id));
 
-            // GC: drop failed_attempts for posts that fell out of current ranking.
+            // GC: drop failed_attempts for posts that fell out of the current ranking.
+            // Must use the full filtered ranking, not just the push batch, so that
+            // a post still present in the ranking but outside MAX_RANKING_PUSH_PER_TICK
+            // retains its counter and is not retried from scratch on the next tick.
             let current_ids: std::collections::HashSet<u64> =
-                new_posts.iter().map(|p| p.id).collect();
-            new_state
-                .failed_attempts
-                .retain(|(id, _)| current_ids.contains(id));
+                filtered.iter().map(|p| p.id).collect();
+            gc_failed_attempts(&mut new_state.failed_attempts, &current_ids);
 
             new_state.trim_pushed(self.booru_config.ranking_pushed_cap);
             if let Err(e) = self
@@ -510,7 +513,7 @@ impl BooruEngine {
                 // (manual DB edits, future bugs, etc.) — prevents tight polling loops.
                 let min_interval = chrono::Duration::minutes(5);
                 let max_interval = chrono::Duration::days(30);
-                let parsed = parse_friendly_or_iso8601(iso).unwrap_or_else(|| {
+                let parsed = parse_duration(iso).unwrap_or_else(|| {
                     warn!("Invalid duration {}, defaulting to 6h", iso);
                     chrono::Duration::hours(6)
                 });
@@ -1124,6 +1127,17 @@ impl BooruEngine {
     }
 }
 
+/// Remove entries from `failed_attempts` whose post IDs are no longer present
+/// in the current ranking set. Should be keyed on the FULL filtered ranking,
+/// not just the current push batch, so that posts outside the batch retain
+/// their counters across ticks.
+fn gc_failed_attempts(
+    failed_attempts: &mut Vec<(u64, u8)>,
+    current_ranking_ids: &std::collections::HashSet<u64>,
+) {
+    failed_attempts.retain(|(id, _)| current_ranking_ids.contains(id));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1258,5 +1272,39 @@ mod tests {
 
         // ID 10 (oldest push) should be removed; ID 5 (newest push, low ID) stays
         assert_eq!(pushed_ids, vec![30, 50, 200, 5]);
+    }
+
+    /// Regression: GC for `failed_attempts` must be keyed on the FULL current ranking,
+    /// not just the truncated push batch. A post outside `MAX_RANKING_PUSH_PER_TICK`
+    /// but still present in the filtered ranking should retain its counter.
+    #[test]
+    fn failed_attempts_gc_retains_entries_for_posts_still_in_ranking() {
+        use std::collections::HashSet;
+
+        // Post 50 has one failure recorded. It's still in the current ranking but
+        // falls outside the push batch (indices 0..MAX_RANKING_PUSH_PER_TICK).
+        let mut failed_attempts: Vec<(u64, u8)> = vec![(20, 2), (50, 1)];
+
+        // Full filtered ranking: 10, 20, 30, 40, 50
+        let full_ranking: HashSet<u64> = [10u64, 20, 30, 40, 50].iter().copied().collect();
+
+        // Push batch (truncated to first 4): 10, 20, 30, 40 — post 50 is NOT here
+        let push_batch: HashSet<u64> = [10u64, 20, 30, 40].iter().copied().collect();
+
+        // GC keyed on push_batch (old buggy approach) — post 50 counter is wrongly dropped
+        let mut old_result = failed_attempts.clone();
+        old_result.retain(|(id, _)| push_batch.contains(id));
+        assert!(
+            !old_result.iter().any(|(id, _)| *id == 50),
+            "old approach: post 50 counter is dropped (the bug)"
+        );
+
+        // GC keyed on full_ranking (correct approach) — post 50 counter is retained
+        gc_failed_attempts(&mut failed_attempts, &full_ranking);
+        assert!(
+            failed_attempts.iter().any(|(id, _)| *id == 50),
+            "fix: post 50 counter retained because post is still in current ranking"
+        );
+        assert_eq!(failed_attempts, vec![(20, 2), (50, 1)]);
     }
 }

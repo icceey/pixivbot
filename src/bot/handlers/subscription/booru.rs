@@ -4,7 +4,7 @@ use crate::db::types::{
     BooruFilter, BooruRankingMode, BooruTaskKey, OrderbyKind, TagFilter, TaskType,
 };
 use crate::utils::args;
-use crate::utils::duration::{duration_to_canonical_iso8601, parse_friendly_or_iso8601};
+use crate::utils::duration::{duration_to_canonical_iso8601, parse_duration};
 use booru_client::{BooruEngineType, BooruRating, PopularScale};
 use teloxide::prelude::*;
 use teloxide::types::{ChatId, ParseMode, UserId};
@@ -344,18 +344,13 @@ impl BotHandler {
                         .await?;
                     return Ok(());
                 }
-                if parse_friendly_or_iso8601(val).is_none() {
-                    bot.send_message(
-                        chat_id,
-                        "❌ `interval=` 值无效（例: `1h` `30m` `1d2h` 或 `PT1H`）",
-                    )
-                    .parse_mode(ParseMode::MarkdownV2)
-                    .await?;
+                if parse_duration(val).is_none() {
+                    bot.send_message(chat_id, "❌ `interval=` 值无效（例: `1h` `30m` `1d2h`）")
+                        .parse_mode(ParseMode::MarkdownV2)
+                        .await?;
                     return Ok(());
                 }
-                interval_iso = Some(duration_to_canonical_iso8601(
-                    parse_friendly_or_iso8601(val).unwrap(),
-                ));
+                interval_iso = Some(duration_to_canonical_iso8601(parse_duration(val).unwrap()));
                 continue;
             }
             if part.starts_with("score>")
@@ -710,8 +705,8 @@ impl BotHandler {
         if parts.is_empty() {
             bot.send_message(
                 chat_id,
-                "❌ 用法: `/brand [ch=<频道ID>] <站点名:间隔> [score>=N] [fav>=N] [rating=s,q,e] [+tag -tag]`\n\
-                 间隔支持简易格式 `1h` `30m` `1d2h` 或 ISO8601 `PT1H` `P1D`",
+                 "❌ 用法: `/brand [ch=<频道ID>] <站点名:间隔> [score>=N] [fav>=N] [rating=s,q,e] [+tag -tag]`\n\
+                  间隔支持简易格式 `1h` `30m` `1d2h`",
             )
             .parse_mode(ParseMode::MarkdownV2)
             .await?;
@@ -722,12 +717,9 @@ impl BotHandler {
         let (site_name, iso_str) = match site_interval.split_once(':') {
             Some((site, iso)) if !site.is_empty() && !iso.is_empty() => (site, iso),
             _ => {
-                bot.send_message(
-                    chat_id,
-                    "❌ 格式: `站点名:间隔`，例如 `konachan:1h` 或 `konachan:PT1H`",
-                )
-                .parse_mode(ParseMode::MarkdownV2)
-                .await?;
+                bot.send_message(chat_id, "❌ 格式: `站点名:间隔`，例如 `konachan:1h`")
+                    .parse_mode(ParseMode::MarkdownV2)
+                    .await?;
                 return Ok(());
             }
         };
@@ -757,15 +749,12 @@ impl BotHandler {
             return Ok(());
         }
 
-        let interval = match parse_friendly_or_iso8601(iso_str) {
+        let interval = match parse_duration(iso_str) {
             Some(d) => d,
             None => {
-                bot.send_message(
-                    chat_id,
-                    "❌ 无效的间隔格式（例: `1h` `30m` `1d` `2h30m` 或 `PT1H` `P1D`）",
-                )
-                .parse_mode(ParseMode::MarkdownV2)
-                .await?;
+                bot.send_message(chat_id, "❌ 无效的间隔格式（例: `1h` `30m` `1d` `2h30m`）")
+                    .parse_mode(ParseMode::MarkdownV2)
+                    .await?;
                 return Ok(());
             }
         };
