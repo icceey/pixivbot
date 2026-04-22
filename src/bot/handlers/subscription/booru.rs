@@ -247,14 +247,6 @@ impl BotHandler {
         };
 
         let mut booru_query_tags: Vec<&str> = Vec::new();
-        let mut interval_iso: Option<&str> = None;
-        if !first_tag.is_empty() {
-            if iso8601_duration::Duration::parse(first_tag).is_ok() {
-                interval_iso = Some(first_tag);
-            } else {
-                booru_query_tags.push(first_tag);
-            }
-        }
         let mut filter_arg_parts: Vec<&str> = Vec::new();
         let mut orderby: Option<OrderbyKind> = None;
         let mut popular_scale: Option<PopularScale> = None;
@@ -281,6 +273,20 @@ impl BotHandler {
                 continue;
             }
             booru_query_tags.push(part);
+        }
+        // Explicit order=/scale= override the ISO8601 heuristic on first_tag,
+        // so /bunsub round-trips with /bsub and /brank when the same arg
+        // string is reused.
+        let mut interval_iso: Option<&str> = None;
+        if !first_tag.is_empty() {
+            if orderby.is_none()
+                && popular_scale.is_none()
+                && iso8601_duration::Duration::parse(first_tag).is_ok()
+            {
+                interval_iso = Some(first_tag);
+            } else {
+                booru_query_tags.push(first_tag);
+            }
         }
         let (booru_filter, _tag_filter) = match parse_booru_filter_args(&filter_arg_parts) {
             Ok(result) => result,
