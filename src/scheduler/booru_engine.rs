@@ -35,6 +35,13 @@ const MAX_RANKING_SEND_ATTEMPTS: u8 = 3;
 // stays in candidate_posts and is naturally retried on the next tick.
 const MAX_GRACE_PUSH_PER_TICK: usize = 5;
 
+// Same rationale for ranking tasks: with ranking_top_n defaulting to 20, a
+// fresh subscription would otherwise send all 20 in one tick (~40s with
+// INTER_SUBSCRIPTION_DELAY_MS), monopolizing the scheduler and blocking other
+// booru tasks. Unpushed posts naturally re-appear next tick if they're still
+// in the ranking (filtered by `!state.pushed_ids.contains`).
+const MAX_RANKING_PUSH_PER_TICK: usize = 5;
+
 pub struct BooruEngine {
     repo: Arc<Repo>,
     notifier: Notifier,
@@ -389,6 +396,7 @@ impl BooruEngine {
             let new_posts: Vec<&booru_client::BooruPost> = filtered
                 .into_iter()
                 .filter(|p| !state.pushed_ids.contains(&p.id))
+                .take(MAX_RANKING_PUSH_PER_TICK)
                 .collect();
 
             if new_posts.is_empty() {
@@ -756,12 +764,21 @@ impl BooruEngine {
         let filtered_now = self.apply_booru_filters(subscription, chat, &candidate_posts);
         let filtered_set: HashSet<u64> = filtered_now.iter().map(|p| p.id).collect();
 
+        // Precompute O(1) lookup sets to avoid O(n*m) scans of hot_posts
+        // across per-post filters in the to_push and add-to-hot loops below.
+        // hot_posts is capped at hot_posts_cap (default 500), candidate_posts
+        // can span MAX_FETCH_PAGES — naive .iter().any() compounds quickly.
+        let hot_pushed_ids: HashSet<u64> = hot_posts
+            .iter()
+            .filter(|h| h.pushed)
+            .map(|h| h.id)
+            .collect();
+        let mut hot_all_ids: HashSet<u64> = hot_posts.iter().map(|h| h.id).collect();
+
         let to_push: Vec<&booru_client::BooruPost> = candidate_posts
             .iter()
             .copied()
-            .filter(|p| {
-                filtered_set.contains(&p.id) && !hot_posts.iter().any(|h| h.id == p.id && h.pushed)
-            })
+            .filter(|p| filtered_set.contains(&p.id) && !hot_pushed_ids.contains(&p.id))
             .take(MAX_GRACE_PUSH_PER_TICK)
             .collect();
 
@@ -814,7 +831,7 @@ impl BooruEngine {
             // Existing `hot_posts` entries are preserved unconditionally
             // because they may already be ripening.
             if !filtered_set.contains(&post.id)
-                && !hot_posts.iter().any(|h| h.id == post.id)
+                && !hot_all_ids.contains(&post.id)
                 && self.passes_permanent_filters(subscription, chat, post)
             {
                 hot_posts.push(HotPost {
@@ -823,6 +840,7 @@ impl BooruEngine {
                     pushed: false,
                     attempts: 0,
                 });
+                hot_all_ids.insert(post.id);
             }
         }
 

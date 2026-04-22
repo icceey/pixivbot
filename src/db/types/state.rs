@@ -130,6 +130,13 @@ pub struct BooruRankingState {
 }
 
 impl BooruRankingState {
+    /// Drop the front of `pushed_ids` until length <= cap.
+    ///
+    /// **Ordering invariant**: caller MUST ensure `pushed_ids` is sorted
+    /// oldest→newest before calling, otherwise the wrong (newer) entries
+    /// will be dropped. The scheduler currently sorts via `sort_unstable()`
+    /// immediately before this call — preserve that pattern at any new
+    /// call site.
     pub fn trim_pushed(&mut self, cap: usize) {
         if self.pushed_ids.len() > cap {
             let drop = self.pushed_ids.len() - cap;
