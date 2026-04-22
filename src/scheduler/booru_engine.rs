@@ -21,8 +21,10 @@ use tokio::time::{sleep, Duration};
 use tracing::{debug, error, info, warn};
 
 const DRAIN_POLL_INTERVAL_SEC: u64 = 10;
-/// Maximum number of pages to fetch when catching up on missed posts.
+
 const MAX_FETCH_PAGES: u32 = 5;
+
+const MAX_GRACE_SEND_ATTEMPTS: u8 = 3;
 
 pub struct BooruEngine {
     repo: Arc<Repo>,
@@ -679,7 +681,7 @@ impl BooruEngine {
             .map(|h| h.id)
             .max()
             .unwrap_or(0);
-        let latest_id = latest_id.max(gc_pushed_max);
+        let mut latest_id = latest_id.max(gc_pushed_max);
         let mut hot_posts = live_hot;
 
         let hot_ids: HashSet<u64> = hot_posts.iter().map(|h| h.id).collect();
@@ -719,8 +721,21 @@ impl BooruEngine {
                         id: post.id,
                         first_seen: now,
                         pushed: true,
+                        attempts: 0,
                     });
                 }
+            } else if let Some(h) = hot_posts.iter_mut().find(|h| h.id == post.id) {
+                h.attempts = h.attempts.saturating_add(1);
+                if h.attempts >= MAX_GRACE_SEND_ATTEMPTS {
+                    h.pushed = true;
+                }
+            } else {
+                hot_posts.push(HotPost {
+                    id: post.id,
+                    first_seen: now,
+                    pushed: false,
+                    attempts: 1,
+                });
             }
             sleep(Duration::from_millis(INTER_SUBSCRIPTION_DELAY_MS)).await;
         }
@@ -731,14 +746,24 @@ impl BooruEngine {
                     id: post.id,
                     first_seen: now,
                     pushed: false,
+                    attempts: 0,
                 });
             }
         }
 
+        // Cap eviction: drop oldest by first_seen, but advance latest_id past any
+        // dropped pushed entries to prevent re-push if API still returns them.
         if hot_posts.len() > self.booru_config.hot_posts_cap {
             hot_posts.sort_by_key(|h| h.first_seen);
             let drop = hot_posts.len() - self.booru_config.hot_posts_cap;
-            hot_posts.drain(0..drop);
+            let evicted: Vec<HotPost> = hot_posts.drain(0..drop).collect();
+            let evicted_pushed_max = evicted
+                .iter()
+                .filter(|h| h.pushed)
+                .map(|h| h.id)
+                .max()
+                .unwrap_or(0);
+            latest_id = latest_id.max(evicted_pushed_max);
         }
 
         let new_latest_id = if let Some(min_hot) = hot_posts.iter().map(|h| h.id).min() {

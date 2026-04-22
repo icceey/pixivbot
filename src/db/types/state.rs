@@ -61,6 +61,9 @@ pub struct HotPost {
     /// `true` once pushed; dedup within grace window while cursor is held back.
     #[serde(default)]
     pub pushed: bool,
+    /// Send-failure counter; abandons after threshold to prevent infinite retries.
+    #[serde(default)]
+    pub attempts: u8,
 }
 
 impl BooruTagState {
