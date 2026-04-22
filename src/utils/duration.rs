@@ -1,3 +1,12 @@
+/// Serialize a duration to a canonical ISO8601 string of the form `PT{N}S`
+/// (total whole seconds). Two durations that are equal will always produce
+/// the same string, regardless of how they were originally entered by the user
+/// (e.g. `1h` and `PT1H` both become `"PT3600S"`). Useful for building
+/// stable, comparable subscription keys.
+pub fn duration_to_canonical_iso8601(d: chrono::Duration) -> String {
+    format!("PT{}S", d.num_seconds())
+}
+
 /// Parse a duration string accepting either friendly format (`1h`, `30m`, `2h30m`,
 /// `1d`) or ISO8601 (`PT1H`, `P1D`). Friendly format supports units `s`/`m`/`h`/`d`
 /// in any combination, e.g. `1d2h30m`. Returns `None` on parse failure.
@@ -115,6 +124,44 @@ mod tests {
         assert_eq!(
             parse_friendly_or_iso8601("  1h  "),
             Some(chrono::Duration::hours(1))
+        );
+    }
+
+    #[test]
+    fn canonical_iso8601_basic() {
+        assert_eq!(
+            duration_to_canonical_iso8601(chrono::Duration::hours(1)),
+            "PT3600S"
+        );
+        assert_eq!(
+            duration_to_canonical_iso8601(chrono::Duration::minutes(30)),
+            "PT1800S"
+        );
+        assert_eq!(
+            duration_to_canonical_iso8601(chrono::Duration::days(1)),
+            "PT86400S"
+        );
+        assert_eq!(
+            duration_to_canonical_iso8601(chrono::Duration::seconds(45)),
+            "PT45S"
+        );
+    }
+
+    #[test]
+    fn canonical_iso8601_same_for_equivalent_inputs() {
+        // "1h" and "PT1H" parse to the same Duration and must produce identical keys
+        let d1 = parse_friendly_or_iso8601("1h").unwrap();
+        let d2 = parse_friendly_or_iso8601("PT1H").unwrap();
+        assert_eq!(
+            duration_to_canonical_iso8601(d1),
+            duration_to_canonical_iso8601(d2)
+        );
+
+        let d3 = parse_friendly_or_iso8601("2h30m").unwrap();
+        let d4 = parse_friendly_or_iso8601("PT2H30M").unwrap();
+        assert_eq!(
+            duration_to_canonical_iso8601(d3),
+            duration_to_canonical_iso8601(d4)
         );
     }
 }

@@ -4,7 +4,7 @@ use crate::db::types::{
     BooruFilter, BooruRankingMode, BooruTaskKey, OrderbyKind, TagFilter, TaskType,
 };
 use crate::utils::args;
-use crate::utils::duration::parse_friendly_or_iso8601;
+use crate::utils::duration::{duration_to_canonical_iso8601, parse_friendly_or_iso8601};
 use booru_client::{BooruEngineType, BooruRating, PopularScale};
 use teloxide::prelude::*;
 use teloxide::types::{ChatId, ParseMode, UserId};
@@ -140,6 +140,22 @@ impl BotHandler {
         };
         booru_query_tags.sort_unstable();
         let tags = booru_query_tags.join(" ");
+
+        // Gelbooru does not support fav-ordered queries; the scheduler would
+        // silently fall back to sort:score. Reject early with a clear message
+        // (mirrors the equivalent check in handle_brank).
+        if orderby == Some(OrderbyKind::Fav) {
+            if let Some(site) = site_config {
+                if matches!(site.config.engine_type, BooruEngineType::Gelbooru) {
+                    bot.send_message(
+                        chat_id,
+                        "❌ Gelbooru 不支持 order=fav，请使用 order=score 或 order=random",
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            }
+        }
 
         let (task_type, task_value, mode_label) = match orderby {
             None => (
@@ -337,7 +353,9 @@ impl BotHandler {
                     .await?;
                     return Ok(());
                 }
-                interval_iso = Some(val.to_string());
+                interval_iso = Some(duration_to_canonical_iso8601(
+                    parse_friendly_or_iso8601(val).unwrap(),
+                ));
                 continue;
             }
             if part.starts_with("score>")
@@ -771,7 +789,7 @@ impl BotHandler {
         let task_value = BooruTaskKey::new_ranking(
             site_name,
             "",
-            BooruRankingMode::Interval(iso_str.to_string()),
+            BooruRankingMode::Interval(duration_to_canonical_iso8601(interval)),
             &booru_filter,
         )
         .to_task_value();

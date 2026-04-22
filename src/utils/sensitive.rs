@@ -36,9 +36,8 @@ pub fn should_blur_booru(chat: &chats::Model, tags: &str, rating: BooruRating) -
         return false;
     }
     match rating {
-        BooruRating::General | BooruRating::Safe => false,
-        BooruRating::Questionable | BooruRating::Explicit => true,
-        BooruRating::Sensitive => tags_match_sensitive(chat, tags),
+        BooruRating::General | BooruRating::Safe => tags_match_sensitive(chat, tags),
+        BooruRating::Sensitive | BooruRating::Questionable | BooruRating::Explicit => true,
     }
 }
 
@@ -146,16 +145,28 @@ mod tests {
     }
 
     #[test]
-    fn should_blur_booru_safe_never_blurs_even_with_matching_tag() {
+    fn should_blur_booru_safe_blurs_on_matching_tag() {
         let chat = make_chat(true, &["nude"]);
-        assert!(!should_blur_booru(
+        // Safe/General posts with a matching sensitive tag should be blurred
+        assert!(should_blur_booru(
             &chat,
             "nude landscape",
             BooruRating::Safe
         ));
-        assert!(!should_blur_booru(
+        assert!(should_blur_booru(
             &chat,
             "nude landscape",
+            BooruRating::General
+        ));
+        // Without a matching tag, Safe/General should not blur
+        assert!(!should_blur_booru(
+            &chat,
+            "landscape sky",
+            BooruRating::Safe
+        ));
+        assert!(!should_blur_booru(
+            &chat,
+            "landscape sky",
             BooruRating::General
         ));
     }
@@ -172,9 +183,10 @@ mod tests {
     }
 
     #[test]
-    fn should_blur_booru_sensitive_falls_back_to_tags() {
+    fn should_blur_booru_sensitive_always_blurs_when_enabled() {
         let chat = make_chat(true, &["nude"]);
-        assert!(!should_blur_booru(
+        // Sensitive rating always blurs regardless of tag match
+        assert!(should_blur_booru(
             &chat,
             "landscape",
             BooruRating::Sensitive

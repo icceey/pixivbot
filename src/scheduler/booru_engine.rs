@@ -446,8 +446,11 @@ impl BooruEngine {
                 sleep(Duration::from_millis(INTER_SUBSCRIPTION_DELAY_MS)).await;
             }
 
-            new_state.pushed_ids.sort_unstable();
-            new_state.pushed_ids.dedup();
+            // Deduplicate while preserving insertion order (oldest push at front,
+            // newest at back). This ensures trim_pushed drops truly oldest entries
+            // rather than lowest-ID entries that sort_unstable() would place first.
+            let mut seen = std::collections::HashSet::new();
+            new_state.pushed_ids.retain(|id| seen.insert(*id));
 
             // GC: drop failed_attempts for posts that fell out of current ranking.
             let current_ids: std::collections::HashSet<u64> =
@@ -1218,5 +1221,42 @@ mod tests {
                 rating
             );
         }
+    }
+
+    /// Verifies that appending new IDs then deduplicating preserves insertion
+    /// order so that `trim_pushed` (which drops the front) removes the truly
+    /// oldest-pushed entries rather than the numerically lowest IDs.
+    ///
+    /// Failure mode of the old `sort_unstable() + dedup()` approach:
+    ///   existing=[10,30,50]  append 50(dup),200,5
+    ///   sort  → [5,10,30,50,50,200]
+    ///   dedup → [5,10,30,50,200]
+    ///   trim(4) drops front 1 → [10,30,50,200]  ← ID 5 (newest push) wrongly dropped
+    ///
+    /// Expected behavior with order-preserving dedup:
+    ///   existing=[10,30,50]  append 50(dup),200,5
+    ///   dedup (retain) → [10,30,50,200,5]
+    ///   trim(4) drops front 1 → [30,50,200,5]  ← ID 10 (oldest push) correctly dropped
+    #[test]
+    fn test_pushed_ids_dedup_preserves_insertion_order() {
+        let mut pushed_ids: Vec<u64> = vec![10, 30, 50]; // existing, in push order
+                                                         // New posts this tick: 50 is a duplicate, 200 and 5 are new
+        pushed_ids.push(50);
+        pushed_ids.push(200);
+        pushed_ids.push(5);
+
+        // Apply order-preserving dedup (the fix)
+        let mut seen = std::collections::HashSet::new();
+        pushed_ids.retain(|id| seen.insert(*id));
+
+        // Trim oldest (front) to cap 4
+        let cap = 4;
+        if pushed_ids.len() > cap {
+            let drop = pushed_ids.len() - cap;
+            pushed_ids.drain(0..drop);
+        }
+
+        // ID 10 (oldest push) should be removed; ID 5 (newest push, low ID) stays
+        assert_eq!(pushed_ids, vec![30, 50, 200, 5]);
     }
 }
