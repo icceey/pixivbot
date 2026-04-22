@@ -459,6 +459,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "ffmpeg-codec")]
     fn test_encode_ugoira_mp4_basic() {
         let frame0 = create_test_png(255, 0, 0); // Red
         let frame1 = create_test_png(0, 255, 0); // Green
@@ -497,6 +498,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "ffmpeg-codec")]
     fn test_encode_ugoira_mp4_single_frame() {
         let frame0 = create_test_png(128, 128, 128);
         let zip_data = create_test_zip(&[("000000.png", &frame0)]);
@@ -516,6 +518,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "ffmpeg-codec")]
     fn test_encode_ugoira_mp4_odd_dimensions() {
         let frame0 = create_test_png_with_size(3, 5, 255, 0, 0);
         let frame1 = create_test_png_with_size(3, 5, 0, 255, 0);
@@ -542,6 +545,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "ffmpeg-codec")]
     fn test_encode_ugoira_mp4_missing_frame() {
         let frame0 = create_test_png(255, 0, 0);
         let zip_data = create_test_zip(&[("000000.png", &frame0)]);
