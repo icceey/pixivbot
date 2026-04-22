@@ -551,7 +551,18 @@ impl BotHandler {
         for &part in &parts[1..] {
             if let Some(val) = part.strip_prefix("scale=") {
                 if fixed_scale.is_some() {
-                    continue;
+                    bot.send_message(
+                        chat_id,
+                        format!(
+                            "❌ 此命令已固定榜单类型，不支持 `scale=` 参数\n\
+                             如需选择榜单类型，请使用 `/brank {} scale={}`",
+                            markdown::escape(parts[0]),
+                            markdown::escape(val)
+                        ),
+                    )
+                    .parse_mode(ParseMode::MarkdownV2)
+                    .await?;
+                    return Ok(());
                 }
                 dynamic_scale = PopularScale::from_str(val);
                 if dynamic_scale.is_none() {
