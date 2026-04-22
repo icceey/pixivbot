@@ -51,6 +51,7 @@ pub async fn run(
 
     // Parse bot mode from config
     let is_public_mode = config.bot_mode.is_public();
+    let has_booru = !booru_registry.is_empty();
 
     info!(
         "Bot mode: {:?} (new chats will be {} by default)",
@@ -88,7 +89,7 @@ pub async fn run(
     let settings_storage = state::new_settings_storage();
 
     // 设置命令可见性
-    setup_commands(&bot, &repo).await;
+    setup_commands(&bot, &repo, has_booru).await;
 
     // 构建 handler 树
     let handler_tree = build_handler_tree();
@@ -651,10 +652,10 @@ async fn handle_chat_migration(msg: Message, repo: Arc<Repo>) -> HandlerResult {
 /// - 普通用户看到基础命令
 /// - 数据库中的 Admin 用户看到管理员命令
 /// - 数据库中的 Owner 用户看到所有命令
-async fn setup_commands(bot: &ThrottledBot, repo: &Repo) {
+async fn setup_commands(bot: &ThrottledBot, repo: &Repo, has_booru: bool) {
     // 1. 设置默认命令（所有用户都能看到的基础命令）
     if let Err(e) = bot
-        .set_my_commands(Command::user_commands())
+        .set_my_commands(Command::user_commands(has_booru))
         .scope(BotCommandScope::Default)
         .await
     {
@@ -668,8 +669,8 @@ async fn setup_commands(bot: &ThrottledBot, repo: &Repo) {
         Ok(admin_users) => {
             for user in admin_users {
                 let commands = match user.role {
-                    UserRole::Owner => Command::owner_commands(),
-                    UserRole::Admin => Command::admin_commands(),
+                    UserRole::Owner => Command::owner_commands(has_booru),
+                    UserRole::Admin => Command::admin_commands(has_booru),
                     UserRole::User => continue, // 不应该出现，但以防万一
                 };
 

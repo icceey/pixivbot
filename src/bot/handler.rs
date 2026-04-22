@@ -6,6 +6,7 @@ use crate::db::repo::Repo;
 use crate::db::types::{TagFilter, TaskType, UserRole};
 use crate::pixiv::client::PixivClient;
 use crate::utils::caption;
+use booru_client::PopularScale;
 use std::sync::Arc;
 use teloxide::prelude::*;
 use teloxide::types::ParseMode;
@@ -139,6 +140,23 @@ impl BotHandler {
             // Booru subscription commands (defined in handlers/subscription/booru.rs)
             Command::BSub(args) => self.handle_bsub(bot, chat_id, user_id, args).await,
             Command::BUnsub(args) => self.handle_bunsub(bot, chat_id, user_id, args).await,
+            Command::BRank(args) => {
+                self.handle_brank(bot, msg.chat.id, user_id, args, None)
+                    .await
+            }
+            Command::BRankDay(args) => {
+                self.handle_brank(bot, msg.chat.id, user_id, args, Some(PopularScale::Day))
+                    .await
+            }
+            Command::BRankWeek(args) => {
+                self.handle_brank(bot, msg.chat.id, user_id, args, Some(PopularScale::Week))
+                    .await
+            }
+            Command::BRankMonth(args) => {
+                self.handle_brank(bot, msg.chat.id, user_id, args, Some(PopularScale::Month))
+                    .await
+            }
+            Command::BRand(args) => self.handle_brand(bot, msg.chat.id, user_id, args).await,
 
             // Admin commands (require admin or owner role, defined in handlers/admin.rs)
             Command::EnableChat(args) if user_role.is_admin() => {

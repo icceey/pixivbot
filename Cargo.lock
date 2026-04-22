@@ -1797,6 +1797,7 @@ version = "0.2.0"
 dependencies = [
  "sea-orm",
  "sea-orm-migration",
+ "serde_json",
 ]
 
 [[package]]

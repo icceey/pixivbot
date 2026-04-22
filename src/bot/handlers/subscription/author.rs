@@ -30,7 +30,11 @@ impl BotHandler {
         {
             Ok(result) => result,
             Err(e) => {
-                bot.send_message(chat_id, format!("❌ {}", e)).await?;
+                error!(
+                    "Failed to resolve subscription target in chat {}: {:#}",
+                    chat_id, e
+                );
+                bot.send_message(chat_id, "❌ 频道ID无效或无法访问").await?;
                 return Ok(());
             }
         };
@@ -40,7 +44,7 @@ impl BotHandler {
         if parts.is_empty() {
             bot.send_message(
                 chat_id,
-                "❌ 用法: `/sub [channel=<id>] <id,...> [+tag1 -tag2]`",
+                "❌ 用法: `/sub [ch=<频道ID>] <id,...> [+tag1 -tag2]`",
             )
             .parse_mode(ParseMode::MarkdownV2)
             .await?;
@@ -150,7 +154,11 @@ impl BotHandler {
         {
             Ok(result) => result,
             Err(e) => {
-                bot.send_message(chat_id, format!("❌ {}", e)).await?;
+                error!(
+                    "Failed to resolve subscription target in chat {}: {:#}",
+                    chat_id, e
+                );
+                bot.send_message(chat_id, "❌ 频道ID无效或无法访问").await?;
                 return Ok(());
             }
         };
@@ -158,7 +166,7 @@ impl BotHandler {
         let ids_str = parsed.remaining.trim();
 
         if ids_str.is_empty() {
-            bot.send_message(chat_id, "❌ 用法: `/unsub [channel=<id>] <author_id,...>`")
+            bot.send_message(chat_id, "❌ 用法: `/unsub [ch=<频道ID>] <author_id,...>`")
                 .parse_mode(ParseMode::MarkdownV2)
                 .await?;
             return Ok(());
@@ -299,6 +307,9 @@ impl BotHandler {
             }
             TaskType::BooruPool => {
                 format!("Booru Pool `{}`", markdown::escape(&task_value))
+            }
+            TaskType::BooruRanking => {
+                format!("Booru排行 `{}`", markdown::escape(&task_value))
             }
         };
 

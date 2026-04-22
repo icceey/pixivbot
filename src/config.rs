@@ -206,10 +206,46 @@ impl ContentConfig {
     }
 }
 
-#[derive(Debug, Deserialize, Clone, Default)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct BooruConfig {
     #[serde(default)]
     pub sites: Vec<BooruSiteConfig>,
+    #[serde(default = "default_grace_window_hours")]
+    pub grace_window_hours: u64,
+    #[serde(default = "default_ranking_top_n")]
+    pub ranking_top_n: u32,
+    #[serde(default = "default_ranking_pushed_cap")]
+    pub ranking_pushed_cap: usize,
+    #[serde(default = "default_hot_posts_cap")]
+    pub hot_posts_cap: usize,
+}
+
+impl Default for BooruConfig {
+    fn default() -> Self {
+        Self {
+            sites: Vec::new(),
+            grace_window_hours: default_grace_window_hours(),
+            ranking_top_n: default_ranking_top_n(),
+            ranking_pushed_cap: default_ranking_pushed_cap(),
+            hot_posts_cap: default_hot_posts_cap(),
+        }
+    }
+}
+
+fn default_grace_window_hours() -> u64 {
+    48
+}
+
+fn default_ranking_top_n() -> u32 {
+    20
+}
+
+fn default_ranking_pushed_cap() -> usize {
+    500
+}
+
+fn default_hot_posts_cap() -> usize {
+    500
 }
 
 #[derive(Debug, Deserialize, Clone)]

@@ -15,6 +15,12 @@ authors.workspace = true
 license.workspace = true
 rust-version = "1.94"
 
+[features]
+default = []
+# Enable tests that require a working ffmpeg H.264 encoder (libx264).
+# Off by default because many environments (e.g. vcpkg ffmpeg without x264) cannot run them.
+ffmpeg-codec = []
+
 [dependencies]
 anyhow = "1.0.102"
 chrono = { version = "0.4.44", features = ["serde"] }

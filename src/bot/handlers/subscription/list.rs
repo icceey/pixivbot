@@ -1,7 +1,7 @@
 use super::{ListPaginationAction, PAGE_SIZE};
 use crate::bot::notifier::ThrottledBot;
 use crate::bot::BotHandler;
-use crate::db::types::TaskType;
+use crate::db::types::{BooruRankingMode, BooruTaskKey, TaskType};
 use crate::pixiv::model::RankingMode;
 use crate::utils::args;
 use teloxide::prelude::*;
@@ -29,7 +29,11 @@ impl BotHandler {
         {
             Ok(result) => result,
             Err(e) => {
-                bot.send_message(chat_id, format!("❌ {}", e)).await?;
+                error!(
+                    "Failed to resolve subscription target in chat {}: {:#}",
+                    chat_id, e
+                );
+                bot.send_message(chat_id, "❌ 频道ID无效或无法访问").await?;
                 return Ok(());
             }
         };
@@ -84,6 +88,12 @@ impl BotHandler {
                 let start = page * PAGE_SIZE;
                 let end = (start + PAGE_SIZE).min(total);
                 let page_subscriptions = &all_subscriptions[start..end];
+                let page_has_booru_subscription = page_subscriptions.iter().any(|(_, task)| {
+                    matches!(
+                        task.r#type,
+                        TaskType::BooruTag | TaskType::BooruPool | TaskType::BooruRanking
+                    )
+                });
 
                 let header = if is_channel {
                     if total_pages > 1 {
@@ -118,6 +128,7 @@ impl BotHandler {
                         TaskType::Ranking => "📊",
                         TaskType::BooruTag => "🏷",
                         TaskType::BooruPool => "📦",
+                        TaskType::BooruRanking => "🏆",
                     };
 
                     let display_info = if task.r#type == TaskType::Author {
@@ -145,20 +156,47 @@ impl BotHandler {
                         }
                     } else if task.r#type == TaskType::BooruTag
                         || task.r#type == TaskType::BooruPool
+                        || task.r#type == TaskType::BooruRanking
                     {
                         let label = if task.r#type == TaskType::BooruPool {
                             "Pool"
+                        } else if task.r#type == TaskType::BooruRanking {
+                            "排行"
                         } else {
                             "标签"
                         };
+                        let ranking_suffix = if task.r#type == TaskType::BooruRanking {
+                            BooruTaskKey::parse(&task.value)
+                                .and_then(|k| k.ranking)
+                                .map(|mode| match mode {
+                                    BooruRankingMode::Orderby(kind) => {
+                                        format!(" 🏆order={}", markdown::escape(kind.as_str()))
+                                    }
+                                    BooruRankingMode::Popular(scale) => {
+                                        format!(" 🏆{}榜", markdown::escape(scale.as_str()))
+                                    }
+                                    BooruRankingMode::Interval(iso) => {
+                                        format!(" 🎲每{}", markdown::escape(&iso))
+                                    }
+                                })
+                                .unwrap_or_default()
+                        } else {
+                            String::new()
+                        };
                         if let Some(ref name) = task.author_name {
                             format!(
-                                "{} \\| `{}`",
+                                "{} \\| `{}`{}",
                                 markdown::escape(name),
-                                markdown::escape(&task.value)
+                                markdown::escape(&task.value),
+                                ranking_suffix
                             )
                         } else {
-                            format!("{}: `{}`", label, markdown::escape(&task.value))
+                            format!(
+                                "{}: `{}`{}",
+                                label,
+                                markdown::escape(&task.value),
+                                ranking_suffix
+                            )
                         }
                     } else {
                         task.value.replace('_', "\\_")
@@ -187,12 +225,25 @@ impl BotHandler {
                 }
 
                 if is_channel {
-                    message.push_str(&format!(
-                        "\n💡 使用 `/unsub ch={cid} <id>` `/unsubrank ch={cid} <mode>` `/bunsub ch={cid} <站点:标签>` 取消订阅",
-                        cid = target_chat_id.0
-                    ));
+                    let footer = if page_has_booru_subscription {
+                        format!(
+                            "\n💡 使用 `/unsub ch={cid} <id>` `/unsubrank ch={cid} <mode>` `/bunsub ch={cid} <站点:标签>` 取消订阅",
+                            cid = target_chat_id.0
+                        )
+                    } else {
+                        format!(
+                            "\n💡 使用 `/unsub ch={cid} <id>` `/unsubrank ch={cid} <mode>` 取消订阅",
+                            cid = target_chat_id.0
+                        )
+                    };
+                    message.push_str(&footer);
                 } else {
-                    message.push_str("\n💡 使用 `/unsub <id>` `/unsubrank <mode>` `/bunsub <站点:标签>` 取消订阅");
+                    let footer = if page_has_booru_subscription {
+                        "\n💡 使用 `/unsub <id>` `/unsubrank <mode>` `/bunsub <站点:标签>` 取消订阅"
+                    } else {
+                        "\n💡 使用 `/unsub <id>` `/unsubrank <mode>` 取消订阅"
+                    };
+                    message.push_str(footer);
                 }
 
                 let keyboard = if total_pages > 1 {

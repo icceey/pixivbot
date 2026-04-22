@@ -1,24 +1,50 @@
 use crate::booru::{BooruSite, BooruSiteRegistry};
 use crate::bot::notifier::{DownloadButtonConfig, Notifier};
-use crate::config::BooruSiteConfig;
+use crate::config::{BooruConfig, BooruSiteConfig};
 use crate::db::repo::Repo;
-use crate::db::types::{BooruFilter, BooruTagState, QueuedBooruPost, SubscriptionState, TaskType};
-use crate::scheduler::helpers::{
-    booru_tag_subscription_state, get_chat_if_should_notify, save_first_message_record,
-    INTER_SUBSCRIPTION_DELAY_MS,
+use crate::db::types::{
+    BooruFilter, BooruRankingMode, BooruRankingState, BooruTagState, BooruTaskKey, HotPost,
+    OrderbyKind, PopularScale, QueuedBooruPost, SubscriptionState, TaskType,
 };
-use crate::utils::{caption, sensitive};
+use crate::scheduler::helpers::{
+    booru_ranking_subscription_state, booru_tag_subscription_state, get_chat_if_should_notify,
+    save_first_message_record, INTER_SUBSCRIPTION_DELAY_MS,
+};
+use crate::utils::{
+    caption,
+    duration::{parse_canonical_duration, parse_duration},
+    sensitive,
+};
 use anyhow::{Context, Result};
-use chrono::Local;
+use chrono::{Local, Utc};
 use rand::RngExt;
+use std::collections::HashSet;
 use std::sync::Arc;
 use teloxide::prelude::*;
 use tokio::time::{sleep, Duration};
 use tracing::{debug, error, info, warn};
 
 const DRAIN_POLL_INTERVAL_SEC: u64 = 10;
-/// Maximum number of pages to fetch when catching up on missed posts.
+
 const MAX_FETCH_PAGES: u32 = 5;
+
+const MAX_GRACE_SEND_ATTEMPTS: u8 = 3;
+
+const MAX_RANKING_SEND_ATTEMPTS: u8 = 3;
+
+// Cap grace-window pushes per subscription per tick. Without this, when a large
+// fetched window suddenly qualifies (e.g. score threshold met on many posts at
+// once, or a new subscription with grace mode), to_push could include dozens of
+// posts and block the per-subscription send loop for minutes. The remainder
+// stays in candidate_posts and is naturally retried on the next tick.
+const MAX_GRACE_PUSH_PER_TICK: usize = 5;
+
+// Same rationale for ranking tasks: with ranking_top_n defaulting to 20, a
+// fresh subscription would otherwise send all 20 in one tick (~40s with
+// INTER_SUBSCRIPTION_DELAY_MS), monopolizing the scheduler and blocking other
+// booru tasks. Unpushed posts naturally re-appear next tick if they're still
+// in the ranking (filtered by `!state.pushed_ids.contains`).
+const MAX_RANKING_PUSH_PER_TICK: usize = 5;
 
 pub struct BooruEngine {
     repo: Arc<Repo>,
@@ -26,6 +52,7 @@ pub struct BooruEngine {
     tick_interval_sec: u64,
     max_retry_count: i32,
     registry: Arc<BooruSiteRegistry>,
+    booru_config: Arc<BooruConfig>,
 }
 
 impl BooruEngine {
@@ -35,6 +62,7 @@ impl BooruEngine {
         tick_interval_sec: u64,
         max_retry_count: i32,
         registry: Arc<BooruSiteRegistry>,
+        booru_config: Arc<BooruConfig>,
     ) -> Self {
         Self {
             repo,
@@ -44,6 +72,7 @@ impl BooruEngine {
             // Values > 255 would cause the counter to saturate and retry forever.
             max_retry_count: max_retry_count.min(255),
             registry,
+            booru_config,
         }
     }
 
@@ -69,30 +98,34 @@ impl BooruEngine {
     }
 
     async fn tick(&self) -> Result<()> {
-        // TODO: BooruPool task type support (currently only BooruTag is implemented)
-        let tasks = self
+        let tag_task = self
             .repo
             .get_pending_tasks_by_type(TaskType::BooruTag, 1)
-            .await?;
+            .await?
+            .into_iter()
+            .next();
+        let ranking_task = self
+            .repo
+            .get_pending_tasks_by_type(TaskType::BooruRanking, 1)
+            .await?
+            .into_iter()
+            .next();
 
-        let task = match tasks.first() {
-            Some(t) => t,
-            None => return Ok(()),
-        };
+        if let Some(task) = tag_task {
+            debug!("⚙️  Executing booru tag task [{}] {}", task.id, task.value);
+            if let Err(e) = self.execute_booru_tag_task(&task).await {
+                error!("Booru tag task execution failed: {:#}", e);
+                self.handle_tag_task_error(&task).await?;
+            }
+        }
 
-        debug!("⚙️  Executing booru tag task [{}] {}", task.id, task.value);
-
-        let result = self.execute_booru_tag_task(task).await;
-
-        if let Err(e) = result {
-            error!("Booru tag task execution failed: {:#}", e);
-            if let Some(site) = self.site_for_task_value(&task.value) {
-                self.schedule_next_poll(task.id, &site.config).await?;
-            } else {
-                warn!(
-                    "Task [{}] refers to unknown site '{}', scheduling backoff",
-                    task.id, task.value
-                );
+        if let Some(task) = ranking_task {
+            debug!(
+                "⚙️  Executing booru ranking task [{}] {}",
+                task.id, task.value
+            );
+            if let Err(e) = self.execute_booru_ranking_task(&task).await {
+                error!("Booru ranking task execution failed: {:#}", e);
                 let backoff = Local::now() + chrono::Duration::hours(1);
                 self.repo.update_task_after_poll(task.id, backoff).await?;
             }
@@ -102,15 +135,31 @@ impl BooruEngine {
     }
 
     fn site_for_task_value(&self, task_value: &str) -> Option<&Arc<BooruSite>> {
-        let site_name = task_value.split(':').next()?;
+        let core = task_value.split('|').next().unwrap_or(task_value);
+        let site_name = core.split(':').next()?;
         self.registry.get(site_name)
     }
 
     fn parse_task_value(task_value: &str) -> (&str, &str) {
-        match task_value.split_once(':') {
+        let core = task_value.split('|').next().unwrap_or(task_value);
+        match core.split_once(':') {
             Some((site, tags)) => (site, tags),
-            None => (task_value, ""),
+            None => (core, ""),
         }
+    }
+
+    async fn handle_tag_task_error(&self, task: &crate::db::entities::tasks::Model) -> Result<()> {
+        if let Some(site) = self.site_for_task_value(&task.value) {
+            self.schedule_next_poll(task.id, &site.config).await?;
+        } else {
+            warn!(
+                "Task [{}] refers to unknown site '{}', scheduling backoff",
+                task.id, task.value
+            );
+            let backoff = Local::now() + chrono::Duration::hours(1);
+            self.repo.update_task_after_poll(task.id, backoff).await?;
+        }
+        Ok(())
     }
 
     async fn execute_booru_tag_task(&self, task: &crate::db::entities::tasks::Model) -> Result<()> {
@@ -245,6 +294,245 @@ impl BooruEngine {
         Ok(())
     }
 
+    async fn execute_booru_ranking_task(
+        &self,
+        task: &crate::db::entities::tasks::Model,
+    ) -> Result<()> {
+        let key = BooruTaskKey::parse(&task.value)
+            .ok_or_else(|| anyhow::anyhow!("Invalid ranking task_value: {}", task.value))?;
+        let site_ctx = self
+            .registry
+            .get(&key.site)
+            .ok_or_else(|| anyhow::anyhow!("Unknown site in ranking task: {}", key.site))?;
+        let mode = key
+            .ranking
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("Ranking task missing mode: {}", task.value))?;
+
+        let subscriptions = self.repo.list_subscriptions_by_task(task.id).await?;
+        if subscriptions.is_empty() {
+            self.schedule_ranking_next_poll(task.id, &mode).await?;
+            return Ok(());
+        }
+
+        let posts = match &mode {
+            BooruRankingMode::Orderby(kind) => {
+                let order_tag = Self::orderby_tag_for(site_ctx.config.engine_type, *kind);
+                let api_filter_tags: Vec<Option<&BooruFilter>> = subscriptions
+                    .iter()
+                    .map(|s| s.booru_filter.as_ref())
+                    .collect();
+                let aggregate = BooruFilter::aggregate(&api_filter_tags);
+
+                let mut parts = Vec::new();
+                if !key.tags.is_empty() {
+                    parts.push(key.tags.clone());
+                }
+                parts.push(order_tag);
+                for t in aggregate.to_api_tags(site_ctx.config.engine_type) {
+                    parts.push(t);
+                }
+
+                let query = parts.join(" ");
+                site_ctx
+                    .client
+                    .get_posts(&query, self.booru_config.ranking_top_n, 1)
+                    .await
+                    .context("Failed to fetch ranking posts")?
+            }
+            BooruRankingMode::Popular(scale) => site_ctx
+                .client
+                .get_popular_posts(*scale, self.booru_config.ranking_top_n)
+                .await
+                .context("Failed to fetch popular ranking posts")?,
+            BooruRankingMode::Interval(_) => {
+                let aggregate_filter = BooruFilter::aggregate(
+                    &subscriptions
+                        .iter()
+                        .map(|s| s.booru_filter.as_ref())
+                        .collect::<Vec<_>>(),
+                );
+                let mut query = key.tags.clone();
+                if !aggregate_filter.is_empty() {
+                    let api_tags = aggregate_filter.to_api_tags(site_ctx.config.engine_type);
+                    if !query.is_empty() && !api_tags.is_empty() {
+                        query.push(' ');
+                    }
+                    query.push_str(&api_tags.join(" "));
+                }
+
+                let mut posts = site_ctx
+                    .client
+                    .get_posts(&query, self.booru_config.ranking_top_n * 3, 1)
+                    .await
+                    .context("Failed to fetch interval ranking posts")?;
+                use rand::seq::SliceRandom;
+                let mut rng = rand::rng();
+                posts.shuffle(&mut rng);
+                posts.truncate(self.booru_config.ranking_top_n as usize);
+                posts
+            }
+        };
+
+        // `posts` is constant for this task; build the reference vec once and reuse
+        // across all subscriptions to avoid per-subscription allocations.
+        let post_refs: Vec<&booru_client::BooruPost> = posts.iter().collect();
+
+        for sub in &subscriptions {
+            let chat = match get_chat_if_should_notify(&self.repo, sub.chat_id).await {
+                Ok(Some(c)) => c,
+                Ok(None) => continue,
+                Err(e) => {
+                    error!("chat fetch failed: {:#}", e);
+                    continue;
+                }
+            };
+
+            let state =
+                booru_ranking_subscription_state(sub).unwrap_or_else(|| BooruRankingState {
+                    pushed_ids: Vec::new(),
+                    retry_count: 0,
+                    pending_post: None,
+                    failed_attempts: Vec::new(),
+                });
+
+            let filtered: Vec<&booru_client::BooruPost> =
+                self.apply_booru_filters(sub, &chat, &post_refs);
+            let new_posts: Vec<&booru_client::BooruPost> = filtered
+                .iter()
+                .copied()
+                .filter(|p| !state.pushed_ids.contains(&p.id))
+                .take(MAX_RANKING_PUSH_PER_TICK)
+                .collect();
+
+            if new_posts.is_empty() {
+                continue;
+            }
+
+            let mut new_state = state.clone();
+            for post in &new_posts {
+                let sent = self
+                    .push_single_post(
+                        ChatId(sub.chat_id),
+                        sub.id,
+                        post,
+                        &chat,
+                        &key.site,
+                        &site_ctx.config.base_url,
+                        site_ctx.config.engine_type,
+                    )
+                    .await;
+                if sent {
+                    new_state.pushed_ids.push(post.id);
+                    new_state.failed_attempts.retain(|(id, _)| *id != post.id);
+                } else {
+                    let entry = new_state
+                        .failed_attempts
+                        .iter_mut()
+                        .find(|(id, _)| *id == post.id);
+                    let attempts = match entry {
+                        Some((_, n)) => {
+                            *n = n.saturating_add(1);
+                            *n
+                        }
+                        None => {
+                            new_state.failed_attempts.push((post.id, 1));
+                            1
+                        }
+                    };
+                    if attempts >= MAX_RANKING_SEND_ATTEMPTS {
+                        warn!(
+                            "Abandoning ranking post {} for sub {} after {} send failures",
+                            post.id, sub.id, attempts
+                        );
+                        new_state.pushed_ids.push(post.id);
+                        new_state.failed_attempts.retain(|(id, _)| *id != post.id);
+                    }
+                }
+                sleep(Duration::from_millis(INTER_SUBSCRIPTION_DELAY_MS)).await;
+            }
+
+            // Deduplicate while preserving insertion order (oldest push at front,
+            // newest at back). This ensures trim_pushed drops truly oldest entries
+            // rather than lowest-ID entries that sort_unstable() would place first.
+            let mut seen = std::collections::HashSet::new();
+            new_state.pushed_ids.retain(|id| seen.insert(*id));
+
+            // GC: drop failed_attempts for posts that fell out of the current ranking.
+            // Must use the full filtered ranking, not just the push batch, so that
+            // a post still present in the ranking but outside MAX_RANKING_PUSH_PER_TICK
+            // retains its counter and is not retried from scratch on the next tick.
+            let current_ids: std::collections::HashSet<u64> =
+                filtered.iter().map(|p| p.id).collect();
+            gc_failed_attempts(&mut new_state.failed_attempts, &current_ids);
+
+            new_state.trim_pushed(self.booru_config.ranking_pushed_cap);
+            if let Err(e) = self
+                .repo
+                .update_subscription_latest_data(
+                    sub.id,
+                    Some(SubscriptionState::BooruRanking(new_state)),
+                )
+                .await
+            {
+                error!("update sub state failed: {:#}", e);
+            }
+        }
+
+        self.schedule_ranking_next_poll(task.id, &mode).await?;
+        Ok(())
+    }
+
+    fn orderby_tag_for(engine: booru_client::BooruEngineType, kind: OrderbyKind) -> String {
+        match engine {
+            booru_client::BooruEngineType::Gelbooru => match kind {
+                OrderbyKind::Score => "sort:score".into(),
+                OrderbyKind::Fav => {
+                    warn!("Gelbooru does not support order=fav; falling back to sort:score");
+                    "sort:score".into()
+                }
+                OrderbyKind::Random => "sort:random".into(),
+            },
+            _ => match kind {
+                OrderbyKind::Score => "order:score".into(),
+                OrderbyKind::Fav => "order:favcount".into(),
+                OrderbyKind::Random => "order:random".into(),
+            },
+        }
+    }
+
+    async fn schedule_ranking_next_poll(
+        &self,
+        task_id: i32,
+        mode: &BooruRankingMode,
+    ) -> Result<()> {
+        let interval = match mode {
+            BooruRankingMode::Orderby(_) => chrono::Duration::hours(2),
+            BooruRankingMode::Popular(PopularScale::Day) => chrono::Duration::hours(12),
+            BooruRankingMode::Popular(PopularScale::Week) => chrono::Duration::days(3),
+            BooruRankingMode::Popular(PopularScale::Month) => chrono::Duration::days(7),
+            BooruRankingMode::Interval(iso) => {
+                // Defense-in-depth: /brand validates 5min..30days at parse time, but
+                // clamp here too in case a malformed task_value reaches the scheduler
+                // (manual DB edits, future bugs, etc.) — prevents tight polling loops.
+                let min_interval = chrono::Duration::minutes(5);
+                let max_interval = chrono::Duration::days(30);
+                // Parse the stored canonical value (PT{N}S) first; fall back to
+                // friendly format for legacy entries created before normalization.
+                let parsed = parse_canonical_duration(iso)
+                    .or_else(|| parse_duration(iso))
+                    .unwrap_or_else(|| {
+                        warn!("Invalid duration {}, defaulting to 6h", iso);
+                        chrono::Duration::hours(6)
+                    });
+                parsed.clamp(min_interval, max_interval)
+            }
+        };
+        let next = Local::now() + interval;
+        self.repo.update_task_after_poll(task_id, next).await?;
+        Ok(())
+    }
+
     /// Fetch posts since the given ID. Returns `(posts, reached_old)` where
     /// `reached_old` indicates whether we successfully fetched back to (or past)
     /// the `oldest_latest_id`. When `false`, some posts between the cursor and
@@ -342,94 +630,265 @@ impl BooruEngine {
             }
         }
 
-        let latest_id = sub_state.as_ref().map(|s| s.latest_post_id);
+        let has_score_fav_filter = subscription
+            .booru_filter
+            .as_ref()
+            .is_some_and(|f| f.score_min.is_some() || f.fav_count_min.is_some());
 
-        let new_posts: Vec<&booru_client::BooruPost> = if let Some(last_id) = latest_id {
-            posts.iter().filter(|p| p.id > last_id).collect()
-        } else {
-            posts.iter().take(1).collect()
-        };
+        let has_existing_state = sub_state.is_some();
+        let prev_state = sub_state.unwrap_or_else(|| BooruTagState::cleared(0));
+        let latest_id = prev_state.latest_post_id;
 
-        if new_posts.is_empty() {
-            return Ok(None);
-        }
+        if !has_score_fav_filter {
+            let new_posts: Vec<&booru_client::BooruPost> = if has_existing_state {
+                posts.iter().filter(|p| p.id > latest_id).collect()
+            } else {
+                posts.iter().take(1).collect()
+            };
 
-        let newest_id = new_posts.iter().map(|p| p.id).max().unwrap_or(0);
+            if new_posts.is_empty() {
+                return Ok(None);
+            }
 
-        if !reached_old {
-            if let Some(last_id) = latest_id {
+            let newest_id = new_posts.iter().map(|p| p.id).max().unwrap_or(0);
+
+            if !reached_old && has_existing_state {
                 let oldest_fetched = new_posts.iter().map(|p| p.id).min().unwrap_or(0);
                 warn!(
                     "Catch-up overflow for sub {} chat {}: advancing cursor from {} to {} \
                      but posts in range {}..{} may have been missed (MAX_FETCH_PAGES exhausted)",
                     subscription.id,
                     ChatId(subscription.chat_id),
-                    last_id,
+                    latest_id,
                     newest_id,
-                    last_id + 1,
+                    latest_id + 1,
                     oldest_fetched.saturating_sub(1),
                 );
             }
-        }
 
-        let filtered = self.apply_booru_filters(subscription, chat, &new_posts);
+            let filtered = self.apply_booru_filters(subscription, chat, &new_posts);
 
-        if filtered.is_empty() {
-            return Ok(Some(BooruTagState::cleared(newest_id)));
-        }
+            if filtered.is_empty() {
+                return Ok(Some(BooruTagState::cleared(newest_id)));
+            }
 
-        // Queue remaining posts for later delivery (applies to all modes).
-        // Filter out posts without any image URL at construction time to avoid
-        // tick-by-tick drain of permanently unsendable posts.
-        let queue: Vec<QueuedBooruPost> = filtered
-            .iter()
-            .skip(1)
-            .filter(|p| p.sample_url.is_some() || p.file_url.is_some() || p.preview_url.is_some())
-            .map(|p| Self::post_to_queued(p))
-            .collect();
+            // Queue remaining posts for later delivery (applies to all modes).
+            // Filter out posts without any image URL at construction time to avoid
+            // tick-by-tick drain of permanently unsendable posts.
+            let queue: Vec<QueuedBooruPost> = filtered
+                .iter()
+                .skip(1)
+                .filter(|p| {
+                    p.sample_url.is_some() || p.file_url.is_some() || p.preview_url.is_some()
+                })
+                .map(|p| Self::post_to_queued(p))
+                .collect();
 
-        let first = filtered.first().unwrap();
+            let Some(first) = filtered.first() else {
+                return Ok(Some(BooruTagState::cleared(newest_id)));
+            };
 
-        // Check if the first post has a sendable image URL. If not, skip it
-        // rather than queueing it for retry (it will never become sendable).
-        let has_image =
-            first.sample_url.is_some() || first.file_url.is_some() || first.preview_url.is_some();
+            // Check if the first post has a sendable image URL. If not, skip it
+            // rather than queueing it for retry (it will never become sendable).
+            let has_image = first.sample_url.is_some()
+                || first.file_url.is_some()
+                || first.preview_url.is_some();
 
-        if !has_image {
-            warn!(
-                "No image URL for booru post {} (sub {} chat {}), skipping",
-                first.id, subscription.id, chat_id
-            );
+            if !has_image {
+                warn!(
+                    "No image URL for booru post {} (sub {} chat {}), skipping",
+                    first.id, subscription.id, chat_id
+                );
+                return Ok(Some(BooruTagState {
+                    latest_post_id: newest_id,
+                    pending_queue: queue,
+                    retry_count: 0,
+                    hot_posts: Vec::new(),
+                }));
+            }
+
+            let send_ok = self
+                .push_single_post(
+                    chat_id,
+                    subscription.id,
+                    first,
+                    chat,
+                    site_name,
+                    base_url,
+                    engine_type,
+                )
+                .await;
+
             return Ok(Some(BooruTagState {
                 latest_post_id: newest_id,
-                pending_queue: queue,
-                retry_count: 0,
+                pending_queue: if send_ok {
+                    queue
+                } else {
+                    // Failed: put the unsent post back at the front of the queue
+                    let mut full_queue = vec![Self::post_to_queued(first)];
+                    full_queue.extend(queue);
+                    full_queue
+                },
+                retry_count: if send_ok { 0 } else { 1 },
+                hot_posts: Vec::new(),
             }));
         }
 
-        let send_ok = self
-            .push_single_post(
-                chat_id,
-                subscription.id,
-                first,
-                chat,
-                site_name,
-                base_url,
-                engine_type,
-            )
-            .await;
+        let grace_window = chrono::Duration::hours(self.booru_config.grace_window_hours as i64);
+        let now = Utc::now();
+        let cutoff = now - grace_window;
+
+        // GC: drop hot posts older than grace window. For pushed entries being
+        // GC'd, advance the floor cursor to prevent re-push if they still appear
+        // in API results after eviction (cursor may have been held back by them).
+        let (live_hot, gc_hot): (Vec<HotPost>, Vec<HotPost>) = prev_state
+            .hot_posts
+            .into_iter()
+            .partition(|h| h.first_seen >= cutoff);
+        let gc_pushed_max = gc_hot
+            .iter()
+            .filter(|h| h.pushed)
+            .map(|h| h.id)
+            .max()
+            .unwrap_or(0);
+        let mut latest_id = latest_id.max(gc_pushed_max);
+        let mut hot_posts = live_hot;
+
+        let hot_ids: HashSet<u64> = hot_posts.iter().map(|h| h.id).collect();
+        let mut candidate_posts: Vec<&booru_client::BooruPost> = posts
+            .iter()
+            .filter(|p| p.id > latest_id || hot_ids.contains(&p.id))
+            // Mirror non-grace path (line ~653): skip posts without any image URL
+            // upfront. Letting them through would consume MAX_GRACE_SEND_ATTEMPTS
+            // failed sends and pin the cursor at (post_id - 1) for the entire
+            // grace window, since they're permanently unsendable.
+            .filter(|p| p.sample_url.is_some() || p.file_url.is_some() || p.preview_url.is_some())
+            .collect();
+        // Mirror non-grace first-run behavior (line ~617): on a brand-new
+        // subscription (no prior state), only consider the single newest post
+        // to avoid spamming the chat with the entire fetched window.
+        if !has_existing_state {
+            candidate_posts = candidate_posts
+                .into_iter()
+                .max_by_key(|p| p.id)
+                .into_iter()
+                .collect();
+        }
+
+        let filtered_now = self.apply_booru_filters(subscription, chat, &candidate_posts);
+        let filtered_set: HashSet<u64> = filtered_now.iter().map(|p| p.id).collect();
+
+        // Precompute O(1) lookup sets to avoid O(n*m) scans of hot_posts
+        // across per-post filters in the to_push and add-to-hot loops below.
+        // hot_posts is capped at hot_posts_cap (default 500), candidate_posts
+        // can span MAX_FETCH_PAGES — naive .iter().any() compounds quickly.
+        let hot_pushed_ids: HashSet<u64> = hot_posts
+            .iter()
+            .filter(|h| h.pushed)
+            .map(|h| h.id)
+            .collect();
+        let mut hot_all_ids: HashSet<u64> = hot_posts.iter().map(|h| h.id).collect();
+
+        let to_push: Vec<&booru_client::BooruPost> = candidate_posts
+            .iter()
+            .copied()
+            .filter(|p| filtered_set.contains(&p.id) && !hot_pushed_ids.contains(&p.id))
+            .take(MAX_GRACE_PUSH_PER_TICK)
+            .collect();
+
+        for post in &to_push {
+            let sent = self
+                .push_single_post(
+                    ChatId(subscription.chat_id),
+                    subscription.id,
+                    post,
+                    chat,
+                    site_name,
+                    base_url,
+                    engine_type,
+                )
+                .await;
+            if sent {
+                if let Some(h) = hot_posts.iter_mut().find(|h| h.id == post.id) {
+                    h.pushed = true;
+                } else {
+                    hot_posts.push(HotPost {
+                        id: post.id,
+                        first_seen: now,
+                        pushed: true,
+                        attempts: 0,
+                    });
+                }
+            } else if let Some(h) = hot_posts.iter_mut().find(|h| h.id == post.id) {
+                h.attempts = h.attempts.saturating_add(1);
+                if h.attempts >= MAX_GRACE_SEND_ATTEMPTS {
+                    h.pushed = true;
+                }
+            } else {
+                hot_posts.push(HotPost {
+                    id: post.id,
+                    first_seen: now,
+                    pushed: false,
+                    attempts: 1,
+                });
+            }
+            sleep(Duration::from_millis(INTER_SUBSCRIPTION_DELAY_MS)).await;
+        }
+
+        for post in &candidate_posts {
+            // Only add NEW posts to the score/fav grace window if they fail
+            // *transient* (ripening) filters. Posts that fail PERMANENT filters
+            // (rating / excluded tags) can never become eligible, and tracking
+            // them in `hot_posts` would pin `min_hot.saturating_sub(1)` and
+            // hold the cursor back for the entire grace window — increasing
+            // the chance of hitting `MAX_FETCH_PAGES` and skipping posts.
+            // Existing `hot_posts` entries are preserved unconditionally
+            // because they may already be ripening.
+            if !filtered_set.contains(&post.id)
+                && !hot_all_ids.contains(&post.id)
+                && self.passes_permanent_filters(subscription, chat, post)
+            {
+                hot_posts.push(HotPost {
+                    id: post.id,
+                    first_seen: now,
+                    pushed: false,
+                    attempts: 0,
+                });
+                hot_all_ids.insert(post.id);
+            }
+        }
+
+        // Cap eviction: drop oldest by first_seen, but advance latest_id past any
+        // dropped pushed entries to prevent re-push if API still returns them.
+        if hot_posts.len() > self.booru_config.hot_posts_cap {
+            hot_posts.sort_by_key(|h| h.first_seen);
+            let drop = hot_posts.len() - self.booru_config.hot_posts_cap;
+            let evicted: Vec<HotPost> = hot_posts.drain(0..drop).collect();
+            let evicted_pushed_max = evicted
+                .iter()
+                .filter(|h| h.pushed)
+                .map(|h| h.id)
+                .max()
+                .unwrap_or(0);
+            latest_id = latest_id.max(evicted_pushed_max);
+        }
+
+        let new_latest_id = if let Some(min_hot) = hot_posts.iter().map(|h| h.id).min() {
+            min_hot.saturating_sub(1).max(latest_id)
+        } else {
+            posts
+                .iter()
+                .map(|p| p.id)
+                .max()
+                .unwrap_or(latest_id)
+                .max(latest_id)
+        };
 
         Ok(Some(BooruTagState {
-            latest_post_id: newest_id,
-            pending_queue: if send_ok {
-                queue
-            } else {
-                // Failed: put the unsent post back at the front of the queue
-                let mut full_queue = vec![Self::post_to_queued(first)];
-                full_queue.extend(queue);
-                full_queue
-            },
-            retry_count: if send_ok { 0 } else { 1 },
+            latest_post_id: new_latest_id,
+            pending_queue: Vec::new(),
+            retry_count: 0,
+            hot_posts,
         }))
     }
 
@@ -483,8 +942,7 @@ impl BooruEngine {
         );
 
         let queued_rating = booru_client::BooruRating::from_short_str(&first.rating);
-        let has_spoiler = sensitive::should_blur_booru_tags(chat, &first.tags)
-            || (chat.blur_sensitive_tags && queued_rating.is_nsfw());
+        let has_spoiler = sensitive::should_blur_booru(chat, &first.tags, queued_rating);
 
         let send_result = self
             .notifier
@@ -536,8 +994,7 @@ impl BooruEngine {
         };
 
         let caption_text = caption::build_booru_caption(post, site_name, base_url, engine_type);
-        let has_spoiler = sensitive::should_blur_booru_tags(chat, &post.tags)
-            || (chat.blur_sensitive_tags && post.rating.is_nsfw());
+        let has_spoiler = sensitive::should_blur_booru(chat, &post.tags, post.rating);
 
         let send_result = self
             .notifier
@@ -568,6 +1025,30 @@ impl BooruEngine {
             );
             false
         }
+    }
+
+    /// Permanent (non-ripening) filter check used by the score/fav grace
+    /// window. Returns true iff the post passes excluded-tag and
+    /// allowed-rating constraints — i.e. the conditions a post can never
+    /// satisfy later by gaining score/favs.
+    fn passes_permanent_filters(
+        &self,
+        subscription: &crate::db::entities::subscriptions::Model,
+        chat: &crate::db::entities::chats::Model,
+        post: &booru_client::BooruPost,
+    ) -> bool {
+        let chat_filter = crate::db::types::TagFilter::from_excluded_tags(&chat.excluded_tags);
+        let combined_tag_filter = subscription.filter_tags.merged(&chat_filter);
+        let tag_refs: Vec<&str> = post.tags.split_whitespace().collect();
+        if !combined_tag_filter.is_empty() && !combined_tag_filter.matches_tag_strings(&tag_refs) {
+            return false;
+        }
+        if let Some(ref bf) = subscription.booru_filter {
+            if !bf.allowed_ratings.is_empty() && !bf.allowed_ratings.contains(&post.rating) {
+                return false;
+            }
+        }
+        true
     }
 
     fn apply_booru_filters<'a>(
@@ -654,6 +1135,17 @@ impl BooruEngine {
     }
 }
 
+/// Remove entries from `failed_attempts` whose post IDs are no longer present
+/// in the current ranking set. Should be keyed on the FULL filtered ranking,
+/// not just the current push batch, so that posts outside the batch retain
+/// their counters across ticks.
+fn gc_failed_attempts(
+    failed_attempts: &mut Vec<(u64, u8)>,
+    current_ranking_ids: &std::collections::HashSet<u64>,
+) {
+    failed_attempts.retain(|(id, _)| current_ranking_ids.contains(id));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -702,6 +1194,20 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_task_value_strips_ranking_and_filter_suffixes() {
+        let (site, tags) = BooruEngine::parse_task_value("konachan:cat|o=score|f=s");
+        assert_eq!(site, "konachan");
+        assert_eq!(tags, "cat");
+    }
+
+    #[test]
+    fn test_parse_task_value_strips_filter_suffix() {
+        let (site, tags) = BooruEngine::parse_task_value("konachan:cat|f=s");
+        assert_eq!(site, "konachan");
+        assert_eq!(tags, "cat");
+    }
+
+    #[test]
     fn test_post_to_queued_roundtrip() {
         let post = make_post(42, "landscape sky", 100, BooruRating::Safe);
         let queued = BooruEngine::post_to_queued(&post);
@@ -737,5 +1243,76 @@ mod tests {
                 rating
             );
         }
+    }
+
+    /// Verifies that appending new IDs then deduplicating preserves insertion
+    /// order so that `trim_pushed` (which drops the front) removes the truly
+    /// oldest-pushed entries rather than the numerically lowest IDs.
+    ///
+    /// Failure mode of the old `sort_unstable() + dedup()` approach:
+    ///   existing=[10,30,50]  append 50(dup),200,5
+    ///   sort  → [5,10,30,50,50,200]
+    ///   dedup → [5,10,30,50,200]
+    ///   trim(4) drops front 1 → [10,30,50,200]  ← ID 5 (newest push) wrongly dropped
+    ///
+    /// Expected behavior with order-preserving dedup:
+    ///   existing=[10,30,50]  append 50(dup),200,5
+    ///   dedup (retain) → [10,30,50,200,5]
+    ///   trim(4) drops front 1 → [30,50,200,5]  ← ID 10 (oldest push) correctly dropped
+    #[test]
+    fn test_pushed_ids_dedup_preserves_insertion_order() {
+        let mut pushed_ids: Vec<u64> = vec![10, 30, 50]; // existing, in push order
+                                                         // New posts this tick: 50 is a duplicate, 200 and 5 are new
+        pushed_ids.push(50);
+        pushed_ids.push(200);
+        pushed_ids.push(5);
+
+        // Apply order-preserving dedup (the fix)
+        let mut seen = std::collections::HashSet::new();
+        pushed_ids.retain(|id| seen.insert(*id));
+
+        // Trim oldest (front) to cap 4
+        let cap = 4;
+        if pushed_ids.len() > cap {
+            let drop = pushed_ids.len() - cap;
+            pushed_ids.drain(0..drop);
+        }
+
+        // ID 10 (oldest push) should be removed; ID 5 (newest push, low ID) stays
+        assert_eq!(pushed_ids, vec![30, 50, 200, 5]);
+    }
+
+    /// Regression: GC for `failed_attempts` must be keyed on the FULL current ranking,
+    /// not just the truncated push batch. A post outside `MAX_RANKING_PUSH_PER_TICK`
+    /// but still present in the filtered ranking should retain its counter.
+    #[test]
+    fn failed_attempts_gc_retains_entries_for_posts_still_in_ranking() {
+        use std::collections::HashSet;
+
+        // Post 50 has one failure recorded. It's still in the current ranking but
+        // falls outside the push batch (indices 0..MAX_RANKING_PUSH_PER_TICK).
+        let mut failed_attempts: Vec<(u64, u8)> = vec![(20, 2), (50, 1)];
+
+        // Full filtered ranking: 10, 20, 30, 40, 50
+        let full_ranking: HashSet<u64> = [10u64, 20, 30, 40, 50].iter().copied().collect();
+
+        // Push batch (truncated to first 4): 10, 20, 30, 40 — post 50 is NOT here
+        let push_batch: HashSet<u64> = [10u64, 20, 30, 40].iter().copied().collect();
+
+        // GC keyed on push_batch (old buggy approach) — post 50 counter is wrongly dropped
+        let mut old_result = failed_attempts.clone();
+        old_result.retain(|(id, _)| push_batch.contains(id));
+        assert!(
+            !old_result.iter().any(|(id, _)| *id == 50),
+            "old approach: post 50 counter is dropped (the bug)"
+        );
+
+        // GC keyed on full_ranking (correct approach) — post 50 counter is retained
+        gc_failed_attempts(&mut failed_attempts, &full_ranking);
+        assert!(
+            failed_attempts.iter().any(|(id, _)| *id == 50),
+            "fix: post 50 counter retained because post is still in current ranking"
+        );
+        assert_eq!(failed_attempts, vec![(20, 2), (50, 1)]);
     }
 }
