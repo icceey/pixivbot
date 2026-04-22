@@ -89,7 +89,10 @@ impl BotHandler {
                 let end = (start + PAGE_SIZE).min(total);
                 let page_subscriptions = &all_subscriptions[start..end];
                 let page_has_booru_subscription = page_subscriptions.iter().any(|(_, task)| {
-                    matches!(task.r#type, TaskType::BooruTag | TaskType::BooruPool)
+                    matches!(
+                        task.r#type,
+                        TaskType::BooruTag | TaskType::BooruPool | TaskType::BooruRanking
+                    )
                 });
 
                 let header = if is_channel {

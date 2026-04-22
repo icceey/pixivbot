@@ -241,7 +241,13 @@ impl BotHandler {
         let parts: Vec<&str> = parsed.remaining.split_whitespace().collect();
 
         if parts.is_empty() {
-            bot.send_message(chat_id, "❌ 用法: `/bunsub [ch=<频道ID>] <站点名:标签>`")
+            let available: Vec<&str> = self
+                .booru_registry
+                .iter()
+                .map(|s| s.config.name.as_str())
+                .collect();
+
+            bot.send_message(chat_id, build_bunsub_usage_message(&available))
                 .parse_mode(ParseMode::MarkdownV2)
                 .await?;
             return Ok(());
@@ -251,7 +257,13 @@ impl BotHandler {
         let (site_name, first_tag) = match site_tags_str.split_once(':') {
             Some((site, tags)) => (site, tags),
             None => {
-                bot.send_message(chat_id, "❌ 格式: `站点名:标签`")
+                let available: Vec<&str> = self
+                    .booru_registry
+                    .iter()
+                    .map(|site| site.config.name.as_str())
+                    .collect();
+
+                bot.send_message(chat_id, build_bunsub_usage_message(&available))
                     .parse_mode(ParseMode::MarkdownV2)
                     .await?;
                 return Ok(());
@@ -392,7 +404,11 @@ impl BotHandler {
         {
             Ok(result) => result,
             Err(e) => {
-                bot.send_message(chat_id, format!("❌ {}", e)).await?;
+                error!(
+                    "Failed to resolve subscription target in chat {}: {:#}",
+                    chat_id, e
+                );
+                bot.send_message(chat_id, "❌ 频道ID无效或无法访问").await?;
                 return Ok(());
             }
         };
@@ -594,7 +610,11 @@ impl BotHandler {
         {
             Ok(result) => result,
             Err(e) => {
-                bot.send_message(chat_id, format!("❌ {}", e)).await?;
+                error!(
+                    "Failed to resolve subscription target in chat {}: {:#}",
+                    chat_id, e
+                );
+                bot.send_message(chat_id, "❌ 频道ID无效或无法访问").await?;
                 return Ok(());
             }
         };
@@ -833,6 +853,24 @@ fn build_bsub_usage_message(site_names: &[&str]) -> String {
     format!(
         "❌ 用法: `/bsub [ch=<频道ID>] <站点名:标签 [标签2 ...]> [score>=N] [fav>=N] [rating=s,q,e]`\n\n可用站点: {}\n\n示例:\n`/bsub {}:landscape`\n`/bsub {}:blue_sky clouds`\n`/bsub {}: score>=50`\n`/bsub {}:blue_sky rating=s`",
         available_sites, first_site, first_site, first_site, first_site
+    )
+}
+
+fn build_bunsub_usage_message(site_names: &[&str]) -> String {
+    let Some(first_site) = site_names.first() else {
+        return "❌ 未配置任何 Booru 站点".to_string();
+    };
+
+    let available_sites = site_names
+        .iter()
+        .map(|site| markdown::escape(site))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let first_site = markdown::escape(first_site);
+
+    format!(
+        "❌ 用法: `/bunsub [ch=<频道ID>] <站点名[:标签]> [order=...|scale=day|week|month|<ISO间隔>] [过滤条件]`\n\n可用站点: {}\n\n示例:\n`/bunsub {}:landscape`\n`/bunsub {}:landscape scale=day`\n`/bunsub {}:PT1H`",
+        available_sites, first_site, first_site, first_site
     )
 }
 
