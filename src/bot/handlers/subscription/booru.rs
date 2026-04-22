@@ -4,6 +4,7 @@ use crate::db::types::{
     BooruFilter, BooruRankingMode, BooruTaskKey, OrderbyKind, TagFilter, TaskType,
 };
 use crate::utils::args;
+use crate::utils::duration::parse_friendly_or_iso8601;
 use booru_client::{BooruEngineType, BooruRating, PopularScale};
 use teloxide::prelude::*;
 use teloxide::types::{ChatId, ParseMode, UserId};
@@ -307,7 +308,7 @@ impl BotHandler {
         if !first_tag.is_empty() {
             if orderby.is_none()
                 && popular_scale.is_none()
-                && iso8601_duration::Duration::parse(first_tag).is_ok()
+                && parse_friendly_or_iso8601(first_tag).is_some()
             {
                 interval_iso = Some(first_tag);
             } else {
@@ -325,6 +326,17 @@ impl BotHandler {
         let tags = booru_query_tags.join(" ");
 
         let (task_type, task_value) = if let Some(iso) = interval_iso {
+            // Interval mode does not support search tags; reject ambiguous input
+            // like `site:PT1H landscape` rather than silently dropping them.
+            if !booru_query_tags.is_empty() {
+                bot.send_message(
+                    chat_id,
+                    "❌ 间隔模式不支持搜索标签，请只填站点和间隔，例如 `konachan:1h`",
+                )
+                .parse_mode(ParseMode::MarkdownV2)
+                .await?;
+                return Ok(());
+            }
             (
                 TaskType::BooruRanking,
                 BooruTaskKey::new_ranking(
@@ -418,9 +430,9 @@ impl BotHandler {
         let parts: Vec<&str> = parsed.remaining.split_whitespace().collect();
         if parts.is_empty() {
             let usage = if fixed_scale.is_some() {
-                "❌ 用法: `/brankday|/brankweek|/brankmonth [ch=<频道ID>] <站点名[:标签 [标签2 ...]]> [score>=N] [fav>=N] [rating=s,q,e] [+tag -tag]`"
+                "❌ 用法: `/brankday|/brankweek|/brankmonth [ch=<频道ID>] <站点名:> [score>=N] [fav>=N] [rating=s,q,e] [+tag -tag]`"
             } else {
-                "❌ 用法: `/brank [ch=<频道ID>] <站点名[:标签 [标签2 ...]]> scale=day|week|month [score>=N] [fav>=N] [rating=s,q,e] [+tag -tag]`"
+                "❌ 用法: `/brank [ch=<频道ID>] <站点名:> scale=day|week|month [score>=N] [fav>=N] [rating=s,q,e] [+tag -tag]`"
             };
             bot.send_message(chat_id, usage)
                 .parse_mode(ParseMode::MarkdownV2)
@@ -430,8 +442,13 @@ impl BotHandler {
 
         let site_tags_str = parts[0];
         let (site_name, first_tag) = match site_tags_str.split_once(':') {
-            Some((site, tags)) => (site, tags),
-            None => (site_tags_str, ""),
+            Some((site, tags)) if !site.is_empty() => (site, tags),
+            _ => {
+                bot.send_message(chat_id, "❌ 站点名后必须带 `:`，例如 `konachan:`")
+                    .parse_mode(ParseMode::MarkdownV2)
+                    .await?;
+                return Ok(());
+            }
         };
 
         let site = match self.booru_registry.get(site_name) {
@@ -534,7 +551,7 @@ impl BotHandler {
         if !tags.is_empty() {
             bot.send_message(
                 chat_id,
-                "❌ 排行榜模式不支持搜索标签 (Pixiv Popular API 仅按时间窗口返回热门作品)\n\
+                "❌ 排行榜模式不支持搜索标签 (Booru 热门排行 API 仅按时间窗口返回作品)\n\
                  如需按标签过滤，请使用 `+tag` / `-tag` 进行客户端过滤",
             )
             .parse_mode(ParseMode::MarkdownV2)
@@ -636,7 +653,8 @@ impl BotHandler {
         if parts.is_empty() {
             bot.send_message(
                 chat_id,
-                "❌ 用法: `/brand [ch=<频道ID>] <站点名:ISO8601间隔> [score>=N] [fav>=N] [rating=s,q,e] [+tag -tag]`",
+                "❌ 用法: `/brand [ch=<频道ID>] <站点名:间隔> [score>=N] [fav>=N] [rating=s,q,e] [+tag -tag]`\n\
+                 间隔支持简易格式 `1h` `30m` `1d2h` 或 ISO8601 `PT1H` `P1D`",
             )
             .parse_mode(ParseMode::MarkdownV2)
             .await?;
@@ -649,7 +667,7 @@ impl BotHandler {
             _ => {
                 bot.send_message(
                     chat_id,
-                    "❌ 格式: `站点名:ISO8601间隔`，例如 `konachan:PT1H`",
+                    "❌ 格式: `站点名:间隔`，例如 `konachan:1h` 或 `konachan:PT1H`",
                 )
                 .parse_mode(ParseMode::MarkdownV2)
                 .await?;
@@ -682,35 +700,14 @@ impl BotHandler {
             return Ok(());
         }
 
-        let parsed_duration = match iso8601_duration::Duration::parse(iso_str) {
-            Ok(d) => d,
-            Err(_) => {
-                bot.send_message(
-                    chat_id,
-                    "❌ 无效的 ISO8601 间隔格式（例: PT1H, PT30M, P1D）",
-                )
-                .await?;
-                return Ok(());
-            }
-        };
-        let std_duration = match parsed_duration.to_std() {
+        let interval = match parse_friendly_or_iso8601(iso_str) {
             Some(d) => d,
             None => {
                 bot.send_message(
                     chat_id,
-                    "❌ 无效的 ISO8601 间隔格式（例: PT1H, PT30M, P1D）",
+                    "❌ 无效的间隔格式（例: `1h` `30m` `1d` `2h30m` 或 `PT1H` `P1D`）",
                 )
-                .await?;
-                return Ok(());
-            }
-        };
-        let interval = match chrono::Duration::from_std(std_duration) {
-            Ok(d) => d,
-            Err(_) => {
-                bot.send_message(
-                    chat_id,
-                    "❌ 无效的 ISO8601 间隔格式（例: PT1H, PT30M, P1D）",
-                )
+                .parse_mode(ParseMode::MarkdownV2)
                 .await?;
                 return Ok(());
             }

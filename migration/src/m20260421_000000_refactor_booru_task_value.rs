@@ -7,19 +7,14 @@ pub struct Migration;
 #[derive(Debug, FromQueryResult)]
 struct BooruSubRow {
     sub_id: i32,
-    task_id: i32,
     task_value: String,
     booru_filter: Option<String>,
+    author_name: Option<String>,
 }
 
 #[derive(Debug, FromQueryResult)]
 struct IdRow {
     id: i32,
-}
-
-#[derive(Debug, FromQueryResult)]
-struct AuthorRow {
-    author_name: Option<String>,
 }
 
 #[async_trait::async_trait]
@@ -34,6 +29,7 @@ impl MigrationTrait for Migration {
             SELECT s.id as sub_id,
                    s.task_id as task_id,
                    t.value as task_value,
+                   t.author_name as author_name,
                    CAST(s.booru_filter AS TEXT) as booru_filter
             FROM subscriptions s
             JOIN tasks t ON s.task_id = t.id
@@ -56,17 +52,9 @@ impl MigrationTrait for Migration {
                 continue;
             }
 
-            let author = AuthorRow::find_by_statement(Statement::from_sql_and_values(
-                backend,
-                "SELECT author_name FROM tasks WHERE id = ?",
-                [row.task_id.into()],
-            ))
-            .one(db)
-            .await?
-            .and_then(|r| r.author_name);
-
             let target_id =
-                find_or_create_booru_tag_task(db, backend, &new_value, author.as_deref()).await?;
+                find_or_create_booru_tag_task(db, backend, &new_value, row.author_name.as_deref())
+                    .await?;
 
             db.execute(Statement::from_sql_and_values(
                 backend,
@@ -148,9 +136,26 @@ async fn find_or_create_booru_tag_task(
         Some(s) => s.into(),
         None => sea_orm::Value::String(None),
     };
+    // Stagger newly-created tasks by 60s to match Repo::get_or_create_task
+    // (src/db/repo/tasks.rs:31). Without this, all migrated tasks share an
+    // identical next_poll_at and trigger a burst poll right after migration.
+    let insert_sql = match backend {
+        sea_orm::DatabaseBackend::Sqlite => {
+            "INSERT INTO tasks (type, value, author_name, next_poll_at) \
+             VALUES ('booru_tag', ?, ?, DATETIME(CURRENT_TIMESTAMP, '+60 seconds'))"
+        }
+        sea_orm::DatabaseBackend::Postgres => {
+            "INSERT INTO tasks (type, value, author_name, next_poll_at) \
+             VALUES ('booru_tag', ?, ?, CURRENT_TIMESTAMP + INTERVAL '60 seconds')"
+        }
+        sea_orm::DatabaseBackend::MySql => {
+            "INSERT INTO tasks (type, value, author_name, next_poll_at) \
+             VALUES ('booru_tag', ?, ?, CURRENT_TIMESTAMP + INTERVAL 60 SECOND)"
+        }
+    };
     db.execute(Statement::from_sql_and_values(
         backend,
-        "INSERT INTO tasks (type, value, author_name, next_poll_at) VALUES ('booru_tag', ?, ?, CURRENT_TIMESTAMP)",
+        insert_sql,
         [value.into(), author_val],
     ))
     .await?;

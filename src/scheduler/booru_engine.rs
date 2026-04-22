@@ -10,7 +10,7 @@ use crate::scheduler::helpers::{
     booru_ranking_subscription_state, booru_tag_subscription_state, get_chat_if_should_notify,
     save_first_message_record, INTER_SUBSCRIPTION_DELAY_MS,
 };
-use crate::utils::{caption, sensitive};
+use crate::utils::{caption, duration::parse_friendly_or_iso8601, sensitive};
 use anyhow::{Context, Result};
 use chrono::{Local, Utc};
 use rand::RngExt;
@@ -492,14 +492,10 @@ impl BooruEngine {
                 // (manual DB edits, future bugs, etc.) — prevents tight polling loops.
                 let min_interval = chrono::Duration::minutes(5);
                 let max_interval = chrono::Duration::days(30);
-                let parsed = iso8601_duration::Duration::parse(iso)
-                    .ok()
-                    .and_then(|d| d.to_std())
-                    .and_then(|d| chrono::Duration::from_std(d).ok())
-                    .unwrap_or_else(|| {
-                        warn!("Invalid ISO duration {}, defaulting to 6h", iso);
-                        chrono::Duration::hours(6)
-                    });
+                let parsed = parse_friendly_or_iso8601(iso).unwrap_or_else(|| {
+                    warn!("Invalid duration {}, defaulting to 6h", iso);
+                    chrono::Duration::hours(6)
+                });
                 parsed.clamp(min_interval, max_interval)
             }
         };
@@ -730,10 +726,20 @@ impl BooruEngine {
         let mut hot_posts = live_hot;
 
         let hot_ids: HashSet<u64> = hot_posts.iter().map(|h| h.id).collect();
-        let candidate_posts: Vec<&booru_client::BooruPost> = posts
+        let mut candidate_posts: Vec<&booru_client::BooruPost> = posts
             .iter()
             .filter(|p| p.id > latest_id || hot_ids.contains(&p.id))
             .collect();
+        // Mirror non-grace first-run behavior (line ~617): on a brand-new
+        // subscription (no prior state), only consider the single newest post
+        // to avoid spamming the chat with the entire fetched window.
+        if !has_existing_state {
+            candidate_posts = candidate_posts
+                .into_iter()
+                .max_by_key(|p| p.id)
+                .into_iter()
+                .collect();
+        }
 
         let filtered_now = self.apply_booru_filters(subscription, chat, &candidate_posts);
         let filtered_set: HashSet<u64> = filtered_now.iter().map(|p| p.id).collect();
