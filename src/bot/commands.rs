@@ -44,7 +44,9 @@ pub enum Command {
     BRankWeek(String),
     #[command(description = "订阅 Booru 月榜: <站点:> [过滤条件]")]
     BRankMonth(String),
-    #[command(description = "订阅 Booru 随机推送: <站点:间隔> 间隔支持 1h/2h30m 或 ISO8601")]
+    #[command(
+        description = "订阅 Booru 随机推送: <站点:间隔> [过滤条件]  间隔支持 1h/2h30m 或 ISO8601"
+    )]
     BRand(String),
     #[command(description = "取消当前设置操作")]
     Cancel,
@@ -86,7 +88,7 @@ impl Command {
                 ),
                 BotCommand::new(
                     "brand",
-                    "订阅Booru随机推送 - /brand <站点:间隔> 间隔可用 1h/2h30m 或 ISO8601",
+                    "订阅Booru随机推送 - /brand <站点:间隔> [过滤条件]  间隔可用 1h/2h30m 或 ISO8601",
                 ),
             ]);
         }
