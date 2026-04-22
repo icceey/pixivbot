@@ -207,7 +207,6 @@ impl ContentConfig {
 }
 
 #[derive(Debug, Deserialize, Clone)]
-#[allow(dead_code)]
 pub struct BooruConfig {
     #[serde(default)]
     pub sites: Vec<BooruSiteConfig>,

@@ -356,6 +356,10 @@ impl BooruEngine {
             }
         };
 
+        // `posts` is constant for this task; build the reference vec once and reuse
+        // across all subscriptions to avoid per-subscription allocations.
+        let post_refs: Vec<&booru_client::BooruPost> = posts.iter().collect();
+
         for sub in &subscriptions {
             let chat = match get_chat_if_should_notify(&self.repo, sub.chat_id).await {
                 Ok(Some(c)) => c,
@@ -374,7 +378,6 @@ impl BooruEngine {
                     failed_attempts: Vec::new(),
                 });
 
-            let post_refs: Vec<&booru_client::BooruPost> = posts.iter().collect();
             let filtered = self.apply_booru_filters(sub, &chat, &post_refs);
             let new_posts: Vec<&booru_client::BooruPost> = filtered
                 .into_iter()
@@ -483,14 +486,22 @@ impl BooruEngine {
             BooruRankingMode::Popular(PopularScale::Day) => chrono::Duration::hours(12),
             BooruRankingMode::Popular(PopularScale::Week) => chrono::Duration::days(3),
             BooruRankingMode::Popular(PopularScale::Month) => chrono::Duration::days(7),
-            BooruRankingMode::Interval(iso) => iso8601_duration::Duration::parse(iso)
-                .ok()
-                .and_then(|d| d.to_std())
-                .and_then(|d| chrono::Duration::from_std(d).ok())
-                .unwrap_or_else(|| {
-                    warn!("Invalid ISO duration {}, defaulting to 6h", iso);
-                    chrono::Duration::hours(6)
-                }),
+            BooruRankingMode::Interval(iso) => {
+                // Defense-in-depth: /brand validates 5min..30days at parse time, but
+                // clamp here too in case a malformed task_value reaches the scheduler
+                // (manual DB edits, future bugs, etc.) — prevents tight polling loops.
+                let min_interval = chrono::Duration::minutes(5);
+                let max_interval = chrono::Duration::days(30);
+                let parsed = iso8601_duration::Duration::parse(iso)
+                    .ok()
+                    .and_then(|d| d.to_std())
+                    .and_then(|d| chrono::Duration::from_std(d).ok())
+                    .unwrap_or_else(|| {
+                        warn!("Invalid ISO duration {}, defaulting to 6h", iso);
+                        chrono::Duration::hours(6)
+                    });
+                parsed.clamp(min_interval, max_interval)
+            }
         };
         let next = Local::now() + interval;
         self.repo.update_task_after_poll(task_id, next).await?;

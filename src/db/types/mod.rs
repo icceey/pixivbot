@@ -1,5 +1,4 @@
 mod booru_filter;
-#[allow(dead_code)]
 mod booru_task_key;
 mod role;
 mod state;
