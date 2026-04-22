@@ -277,6 +277,7 @@ impl BotHandler {
         let mut filter_arg_parts: Vec<&str> = Vec::new();
         let mut orderby: Option<OrderbyKind> = None;
         let mut popular_scale: Option<PopularScale> = None;
+        let mut interval_iso: Option<String> = None;
         for &part in &parts[1..] {
             if let Some(val) = part.strip_prefix("order=") {
                 if let Some(k) = OrderbyKind::from_str(val) {
@@ -290,6 +291,25 @@ impl BotHandler {
                 }
                 continue;
             }
+            if let Some(val) = part.strip_prefix("interval=") {
+                if val.is_empty() {
+                    bot.send_message(chat_id, "❌ `interval=` 需要值，例如 `interval=1h`")
+                        .parse_mode(ParseMode::MarkdownV2)
+                        .await?;
+                    return Ok(());
+                }
+                if parse_friendly_or_iso8601(val).is_none() {
+                    bot.send_message(
+                        chat_id,
+                        "❌ `interval=` 值无效（例: `1h` `30m` `1d2h` 或 `PT1H`）",
+                    )
+                    .parse_mode(ParseMode::MarkdownV2)
+                    .await?;
+                    return Ok(());
+                }
+                interval_iso = Some(val.to_string());
+                continue;
+            }
             if part.starts_with("score>")
                 || part.starts_with("fav>")
                 || part.starts_with("rating=")
@@ -301,19 +321,12 @@ impl BotHandler {
             }
             booru_query_tags.push(part);
         }
-        // Explicit order=/scale= override the ISO8601 heuristic on first_tag,
-        // so /bunsub round-trips with /bsub and /brank when the same arg
-        // string is reused.
-        let mut interval_iso: Option<&str> = None;
+        // Interval mode requires explicit `interval=...` to disambiguate from
+        // tag subscriptions whose tag happens to look like a duration (e.g.
+        // a tag literally named "1h"). Prior auto-detection via
+        // parse_friendly_or_iso8601 made it impossible to unsubscribe such tags.
         if !first_tag.is_empty() {
-            if orderby.is_none()
-                && popular_scale.is_none()
-                && parse_friendly_or_iso8601(first_tag).is_some()
-            {
-                interval_iso = Some(first_tag);
-            } else {
-                booru_query_tags.push(first_tag);
-            }
+            booru_query_tags.push(first_tag);
         }
         let (booru_filter, _tag_filter) = match parse_booru_filter_args(&filter_arg_parts) {
             Ok(result) => result,
@@ -331,7 +344,7 @@ impl BotHandler {
             if !booru_query_tags.is_empty() {
                 bot.send_message(
                     chat_id,
-                    "❌ 间隔模式不支持搜索标签，请只填站点和间隔，例如 `konachan:1h`",
+                    "❌ 间隔模式不支持搜索标签，请只填站点和 `interval=`，例如 `konachan: interval=1h`",
                 )
                 .parse_mode(ParseMode::MarkdownV2)
                 .await?;
@@ -567,11 +580,7 @@ impl BotHandler {
         )
         .to_task_value();
 
-        let display_name = if tags.is_empty() {
-            format!("{} ({})", site_name, scale.as_str())
-        } else {
-            format!("{}:{} ({})", site_name, tags, scale.as_str())
-        };
+        let display_name = format!("{} ({})", site_name, scale.as_str());
 
         match self
             .create_booru_subscription(
@@ -879,7 +888,7 @@ fn build_bunsub_usage_message(site_names: &[&str]) -> String {
     let first_site = markdown::escape(first_site);
 
     format!(
-        "❌ 用法: `/bunsub [ch=<频道ID>] <站点名[:标签]> [order=...|scale=day|week|month|<ISO间隔>] [过滤条件]`\n\n可用站点: {}\n\n示例:\n`/bunsub {}:landscape`\n`/bunsub {}:landscape scale=day`\n`/bunsub {}:PT1H`",
+        "❌ 用法: `/bunsub [ch=<频道ID>] <站点名:[标签]> [order=...|scale=day|week|month|interval=<时长>] [过滤条件]`\n\n可用站点: {}\n\n示例:\n`/bunsub {}:landscape`\n`/bunsub {}:landscape scale=day`\n`/bunsub {}: interval=1h`",
         available_sites, first_site, first_site, first_site
     )
 }
