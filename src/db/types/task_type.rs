@@ -14,6 +14,8 @@ pub enum TaskType {
     BooruTag,
     #[sea_orm(string_value = "booru_pool")]
     BooruPool,
+    #[sea_orm(string_value = "booru_ranking")]
+    BooruRanking,
 }
 
 impl fmt::Display for TaskType {
@@ -23,6 +25,7 @@ impl fmt::Display for TaskType {
             TaskType::Ranking => write!(f, "ranking"),
             TaskType::BooruTag => write!(f, "booru_tag"),
             TaskType::BooruPool => write!(f, "booru_pool"),
+            TaskType::BooruRanking => write!(f, "booru_ranking"),
         }
     }
 }

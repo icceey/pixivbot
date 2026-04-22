@@ -1590,6 +1590,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a6cb138bb79a146c1bd460005623e142ef0181e3d0219cb493e02f7d08a35695"
 
 [[package]]
+name = "iso8601-duration"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a26adff60a5d3ca10dc271ad37a34ff376595d2a1e5f21d02564929ca888c511"
+dependencies = [
+ "nom",
+]
+
+[[package]]
 name = "itertools"
 version = "0.10.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1797,6 +1806,7 @@ version = "0.2.0"
 dependencies = [
  "sea-orm",
  "sea-orm-migration",
+ "serde_json",
 ]
 
 [[package]]
@@ -2164,6 +2174,7 @@ dependencies = [
  "config",
  "ffmpeg-next",
  "image",
+ "iso8601-duration",
  "md5",
  "migration",
  "pixiv_client",

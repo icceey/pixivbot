@@ -8,4 +8,4 @@ pub use bypass::BypassConfig;
 pub use client::BooruClient;
 pub use engine_type::BooruEngineType;
 pub use error::{Error, Result};
-pub use models::{BooruPoolInfo, BooruPost, BooruRating};
+pub use models::{BooruPoolInfo, BooruPost, BooruRating, PopularScale};

@@ -152,6 +152,34 @@ impl fmt::Display for BooruRating {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PopularScale {
+    Day,
+    Week,
+    Month,
+}
+
+impl PopularScale {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            PopularScale::Day => "day",
+            PopularScale::Week => "week",
+            PopularScale::Month => "month",
+        }
+    }
+
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "day" => Some(PopularScale::Day),
+            "week" => Some(PopularScale::Week),
+            "month" => Some(PopularScale::Month),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BooruPoolInfo {
     pub id: u64,

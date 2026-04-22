@@ -62,6 +62,22 @@ impl BooruClient {
         }
     }
 
+    pub async fn get_popular_posts(
+        &self,
+        scale: PopularScale,
+        limit: u32,
+    ) -> Result<Vec<BooruPost>> {
+        match self.engine_type {
+            BooruEngineType::Moebooru => self.get_popular_posts_moebooru(scale, limit).await,
+            BooruEngineType::Danbooru => self.get_popular_posts_danbooru(scale, limit).await,
+            BooruEngineType::Gelbooru => Err(Error::Api {
+                message: "Gelbooru does not support popular_by_{day,week,month} endpoints"
+                    .to_string(),
+                status: 0,
+            }),
+        }
+    }
+
     pub async fn get_pool(&self, pool_id: u64) -> Result<BooruPoolInfo> {
         match self.engine_type {
             BooruEngineType::Moebooru => self.get_pool_moebooru(pool_id).await,
@@ -144,6 +160,40 @@ impl BooruClient {
             .take(limit as usize)
             .map(|r| r.into_booru_post())
             .collect())
+    }
+
+    async fn get_popular_posts_moebooru(
+        &self,
+        scale: PopularScale,
+        limit: u32,
+    ) -> Result<Vec<BooruPost>> {
+        let endpoint = match scale {
+            PopularScale::Day => "popular_by_day",
+            PopularScale::Week => "popular_by_week",
+            PopularScale::Month => "popular_by_month",
+        };
+        let url = format!("{}/post/{}.json", self.base_url, endpoint);
+        let raw: Vec<MoebooruRawPost> = self.request(&url, &[]).await?;
+        Ok(raw
+            .into_iter()
+            .take(limit as usize)
+            .map(|r| r.into_booru_post())
+            .collect())
+    }
+
+    async fn get_popular_posts_danbooru(
+        &self,
+        scale: PopularScale,
+        limit: u32,
+    ) -> Result<Vec<BooruPost>> {
+        let url = format!("{}/explore/posts/popular.json", self.base_url);
+        let raw: Vec<DanbooruRawPost> = self
+            .request(
+                &url,
+                &[("scale", scale.as_str()), ("limit", &limit.to_string())],
+            )
+            .await?;
+        Ok(raw.into_iter().map(|r| r.into_booru_post()).collect())
     }
 
     async fn get_posts_danbooru(

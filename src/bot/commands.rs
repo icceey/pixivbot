@@ -36,6 +36,16 @@ pub enum Command {
     BSub(String),
     #[command(description = "取消 Booru 标签订阅\n  用法: /bunsub [ch=<频道ID>] <站点:标签>")]
     BUnsub(String),
+    #[command(description = "订阅 Booru 排行榜: <site>[:<tags>] scale=day|week|month [filter]")]
+    BRank(String),
+    #[command(description = "订阅 Booru 日榜: <site>[:<tags>] [filter]")]
+    BRankDay(String),
+    #[command(description = "订阅 Booru 周榜: <site>[:<tags>] [filter]")]
+    BRankWeek(String),
+    #[command(description = "订阅 Booru 月榜: <site>[:<tags>] [filter]")]
+    BRankMonth(String),
+    #[command(description = "订阅 Booru 随机推送: <site>:<ISO间隔> [filter]")]
+    BRand(String),
     #[command(description = "取消当前设置操作")]
     Cancel,
 }
@@ -57,6 +67,26 @@ impl Command {
             BotCommand::new("download", "下载作品原图 - /download <url|id> 或回复消息"),
             BotCommand::new("bsub", "订阅Booru标签 - /bsub <站点:标签> [过滤条件]"),
             BotCommand::new("bunsub", "取消Booru标签订阅 - /bunsub <站点:标签>"),
+            BotCommand::new(
+                "brank",
+                "订阅Booru排行榜 - /brank <站点[:标签]> scale=day|week|month [过滤条件]",
+            ),
+            BotCommand::new(
+                "brankday",
+                "订阅Booru日榜 - /brankday <站点[:标签]> [过滤条件]",
+            ),
+            BotCommand::new(
+                "brankweek",
+                "订阅Booru周榜 - /brankweek <站点[:标签]> [过滤条件]",
+            ),
+            BotCommand::new(
+                "brankmonth",
+                "订阅Booru月榜 - /brankmonth <站点[:标签]> [过滤条件]",
+            ),
+            BotCommand::new(
+                "brand",
+                "订阅Booru随机推送 - /brand <站点:ISO间隔> [过滤条件]",
+            ),
             BotCommand::new("help", "显示帮助信息"),
         ]
     }

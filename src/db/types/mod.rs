@@ -1,10 +1,13 @@
 mod booru_filter;
+#[allow(dead_code)]
+mod booru_task_key;
 mod role;
 mod state;
 mod tag;
 mod task_type;
 
 pub use booru_filter::*;
+pub use booru_task_key::*;
 pub use role::*;
 pub use state::*;
 pub use tag::*;

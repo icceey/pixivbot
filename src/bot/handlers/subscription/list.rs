@@ -1,7 +1,7 @@
 use super::{ListPaginationAction, PAGE_SIZE};
 use crate::bot::notifier::ThrottledBot;
 use crate::bot::BotHandler;
-use crate::db::types::TaskType;
+use crate::db::types::{BooruRankingMode, BooruTaskKey, TaskType};
 use crate::pixiv::model::RankingMode;
 use crate::utils::args;
 use teloxide::prelude::*;
@@ -118,6 +118,7 @@ impl BotHandler {
                         TaskType::Ranking => "📊",
                         TaskType::BooruTag => "🏷",
                         TaskType::BooruPool => "📦",
+                        TaskType::BooruRanking => "🏆",
                     };
 
                     let display_info = if task.r#type == TaskType::Author {
@@ -145,20 +146,47 @@ impl BotHandler {
                         }
                     } else if task.r#type == TaskType::BooruTag
                         || task.r#type == TaskType::BooruPool
+                        || task.r#type == TaskType::BooruRanking
                     {
                         let label = if task.r#type == TaskType::BooruPool {
                             "Pool"
+                        } else if task.r#type == TaskType::BooruRanking {
+                            "排行"
                         } else {
                             "标签"
                         };
+                        let ranking_suffix = if task.r#type == TaskType::BooruRanking {
+                            BooruTaskKey::parse(&task.value)
+                                .and_then(|k| k.ranking)
+                                .map(|mode| match mode {
+                                    BooruRankingMode::Orderby(kind) => {
+                                        format!(" 🏆order={}", markdown::escape(kind.as_str()))
+                                    }
+                                    BooruRankingMode::Popular(scale) => {
+                                        format!(" 🏆{}榜", markdown::escape(scale.as_str()))
+                                    }
+                                    BooruRankingMode::Interval(iso) => {
+                                        format!(" 🎲每{}", markdown::escape(&iso))
+                                    }
+                                })
+                                .unwrap_or_default()
+                        } else {
+                            String::new()
+                        };
                         if let Some(ref name) = task.author_name {
                             format!(
-                                "{} \\| `{}`",
+                                "{} \\| `{}`{}",
                                 markdown::escape(name),
-                                markdown::escape(&task.value)
+                                markdown::escape(&task.value),
+                                ranking_suffix
                             )
                         } else {
-                            format!("{}: `{}`", label, markdown::escape(&task.value))
+                            format!(
+                                "{}: `{}`{}",
+                                label,
+                                markdown::escape(&task.value),
+                                ranking_suffix
+                            )
                         }
                     } else {
                         task.value.replace('_', "\\_")

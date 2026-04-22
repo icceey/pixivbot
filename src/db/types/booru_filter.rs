@@ -29,6 +29,24 @@ impl BooruFilter {
         self.score_min.is_none() && self.fav_count_min.is_none() && self.allowed_ratings.is_empty()
     }
 
+    /// Task-value filter-key signature: alphabetical subset of `{s,f,r}` marking which
+    /// keys are SET. Used to dedup subscriptions by filter-KEY set (not filter-VALUES):
+    /// `score>=10` and `score>=50` share one task; `score>=10` and `fav>=5` are separate tasks.
+    /// Returns `""` when no filter is set.
+    pub fn task_value_signature(&self) -> String {
+        let mut sig = String::with_capacity(3);
+        if self.score_min.is_some() {
+            sig.push('s');
+        }
+        if self.fav_count_min.is_some() {
+            sig.push('f');
+        }
+        if !self.allowed_ratings.is_empty() {
+            sig.push('r');
+        }
+        sig
+    }
+
     pub fn matches(&self, score: i32, fav_count: i32, rating: &BooruRating) -> bool {
         if let Some(min) = self.score_min {
             if score < min {

@@ -1,3 +1,4 @@
+use chrono::{DateTime, Utc};
 use sea_orm::FromJsonQueryResult;
 use serde::{Deserialize, Serialize};
 
@@ -8,6 +9,7 @@ pub enum SubscriptionState {
     Ranking(RankingState),
     BooruTag(BooruTagState),
     BooruPool(BooruPoolState),
+    BooruRanking(BooruRankingState),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -46,15 +48,28 @@ pub struct BooruTagState {
     /// Retry count for failed pushes
     #[serde(default)]
     pub retry_count: u8,
+    /// Posts below filter threshold awaiting fav/score ripening. GC uses local `first_seen`
+    /// (not server `created_at`) for uniform behaviour across Danbooru/Moebooru/Gelbooru.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hot_posts: Vec<HotPost>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HotPost {
+    pub id: u64,
+    pub first_seen: DateTime<Utc>,
+    /// `true` once pushed; dedup within grace window while cursor is held back.
+    #[serde(default)]
+    pub pushed: bool,
 }
 
 impl BooruTagState {
-    /// Create state with no pending queue (all caught up or queue cleared).
     pub fn cleared(latest_post_id: u64) -> Self {
         Self {
             latest_post_id,
             pending_queue: Vec::new(),
             retry_count: 0,
+            hot_posts: Vec::new(),
         }
     }
 
@@ -66,6 +81,7 @@ impl BooruTagState {
             latest_post_id: self.latest_post_id,
             pending_queue: self.pending_queue[1..].to_vec(),
             retry_count: 0,
+            hot_posts: self.hot_posts.clone(),
         }
     }
 
@@ -75,6 +91,7 @@ impl BooruTagState {
             latest_post_id: self.latest_post_id,
             pending_queue: self.pending_queue.clone(),
             retry_count: self.retry_count.saturating_add(1),
+            hot_posts: self.hot_posts.clone(),
         }
     }
 
@@ -95,6 +112,24 @@ pub struct BooruPoolState {
     /// Retry count for failed pushes
     #[serde(default)]
     pub retry_count: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BooruRankingState {
+    pub pushed_ids: Vec<u64>,
+    #[serde(default)]
+    pub retry_count: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_post: Option<QueuedBooruPost>,
+}
+
+impl BooruRankingState {
+    pub fn trim_pushed(&mut self, cap: usize) {
+        if self.pushed_ids.len() > cap {
+            let drop = self.pushed_ids.len() - cap;
+            self.pushed_ids.drain(0..drop);
+        }
+    }
 }
 
 /// A queued booru post with full data for pending delivery.
@@ -153,6 +188,7 @@ mod tests {
                 make_queued_post(3),
             ],
             retry_count: 2,
+            hot_posts: Vec::new(),
         };
         let popped = state.popped_front();
         assert_eq!(popped.latest_post_id, 100);
@@ -168,6 +204,7 @@ mod tests {
             latest_post_id: 100,
             pending_queue: vec![make_queued_post(1)],
             retry_count: 2,
+            hot_posts: Vec::new(),
         };
         let retried = state.with_retry_increment();
         assert_eq!(retried.latest_post_id, 100);
@@ -181,6 +218,7 @@ mod tests {
             latest_post_id: 100,
             pending_queue: vec![make_queued_post(1)],
             retry_count: u8::MAX,
+            hot_posts: Vec::new(),
         };
         let retried = state.with_retry_increment();
         assert_eq!(retried.retry_count, u8::MAX);
@@ -192,6 +230,7 @@ mod tests {
             latest_post_id: 100,
             pending_queue: vec![make_queued_post(1)],
             retry_count: 0,
+            hot_posts: Vec::new(),
         };
         // max_retry_count <= 0 means retry disabled
         assert!(state.should_abandon_queue(0));
@@ -204,6 +243,7 @@ mod tests {
             latest_post_id: 100,
             pending_queue: vec![make_queued_post(1)],
             retry_count: 3,
+            hot_posts: Vec::new(),
         };
         assert!(state.should_abandon_queue(3));
         assert!(state.should_abandon_queue(2));
@@ -216,6 +256,7 @@ mod tests {
             latest_post_id: 100,
             pending_queue: vec![make_queued_post(1)],
             retry_count: 1,
+            hot_posts: Vec::new(),
         };
         assert!(!state.should_abandon_queue(3));
         assert!(!state.should_abandon_queue(2));

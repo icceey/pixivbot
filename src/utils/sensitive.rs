@@ -1,5 +1,6 @@
 use super::tag::normalize_tag;
 use crate::db::entities::chats;
+use booru_client::BooruRating;
 use pixiv_client::Illust;
 use std::collections::HashSet;
 
@@ -30,22 +31,33 @@ pub fn should_blur(chat: &chats::Model, illust: &Illust) -> bool {
     chat.blur_sensitive_tags && contains_sensitive_tags(illust, get_chat_sensitive_tags(chat))
 }
 
-pub fn should_blur_booru_tags(chat: &chats::Model, tags: &str) -> bool {
+pub fn should_blur_booru(chat: &chats::Model, tags: &str, rating: BooruRating) -> bool {
     if !chat.blur_sensitive_tags {
         return false;
     }
-    let sensitive_tags = get_chat_sensitive_tags(chat);
-    let post_tags: Vec<String> = tags.split_whitespace().map(normalize_tag).collect();
+    match rating {
+        BooruRating::General | BooruRating::Safe => false,
+        BooruRating::Questionable | BooruRating::Explicit => true,
+        BooruRating::Sensitive => tags_match_sensitive(chat, tags),
+    }
+}
 
-    let sensitive_set: HashSet<String> = sensitive_tags.iter().map(|s| normalize_tag(s)).collect();
-    post_tags.iter().any(|pt| sensitive_set.contains(pt))
+fn tags_match_sensitive(chat: &chats::Model, tags: &str) -> bool {
+    let sensitive_set: HashSet<String> = get_chat_sensitive_tags(chat)
+        .iter()
+        .map(|s| normalize_tag(s))
+        .collect();
+    tags.split_whitespace()
+        .map(normalize_tag)
+        .any(|pt| sensitive_set.contains(&pt))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{contains_sensitive_tags, should_blur};
+    use super::{contains_sensitive_tags, should_blur, should_blur_booru};
     use crate::db::entities::chats;
     use crate::db::types::Tags;
+    use booru_client::BooruRating;
     use pixiv_client::Illust;
     use serde_json::json;
 
@@ -131,5 +143,52 @@ mod tests {
         let chat = make_chat(true, &["R-18"]);
         let illust = make_illust(&["r18"]);
         assert!(should_blur(&chat, &illust));
+    }
+
+    #[test]
+    fn should_blur_booru_safe_never_blurs_even_with_matching_tag() {
+        let chat = make_chat(true, &["nude"]);
+        assert!(!should_blur_booru(
+            &chat,
+            "nude landscape",
+            BooruRating::Safe
+        ));
+        assert!(!should_blur_booru(
+            &chat,
+            "nude landscape",
+            BooruRating::General
+        ));
+    }
+
+    #[test]
+    fn should_blur_booru_explicit_always_blurs() {
+        let chat = make_chat(true, &[]);
+        assert!(should_blur_booru(&chat, "landscape", BooruRating::Explicit));
+        assert!(should_blur_booru(
+            &chat,
+            "landscape",
+            BooruRating::Questionable
+        ));
+    }
+
+    #[test]
+    fn should_blur_booru_sensitive_falls_back_to_tags() {
+        let chat = make_chat(true, &["nude"]);
+        assert!(!should_blur_booru(
+            &chat,
+            "landscape",
+            BooruRating::Sensitive
+        ));
+        assert!(should_blur_booru(
+            &chat,
+            "nude landscape",
+            BooruRating::Sensitive
+        ));
+    }
+
+    #[test]
+    fn should_blur_booru_disabled_blur_setting_returns_false() {
+        let chat = make_chat(false, &["nude"]);
+        assert!(!should_blur_booru(&chat, "nude", BooruRating::Explicit));
     }
 }

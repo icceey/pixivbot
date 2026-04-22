@@ -185,6 +185,7 @@ async fn main() -> Result<()> {
             scheduler_config.tick_interval_sec,
             scheduler_config.max_retry_count,
             booru_registry.clone(),
+            std::sync::Arc::new(config.booru.clone()),
         );
         info!(
             "✅ Booru engine initialized with {} site(s)",
