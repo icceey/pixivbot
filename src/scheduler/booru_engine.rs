@@ -775,7 +775,18 @@ impl BooruEngine {
         }
 
         for post in &candidate_posts {
-            if !filtered_set.contains(&post.id) && !hot_posts.iter().any(|h| h.id == post.id) {
+            // Only add NEW posts to the score/fav grace window if they fail
+            // *transient* (ripening) filters. Posts that fail PERMANENT filters
+            // (rating / excluded tags) can never become eligible, and tracking
+            // them in `hot_posts` would pin `min_hot.saturating_sub(1)` and
+            // hold the cursor back for the entire grace window — increasing
+            // the chance of hitting `MAX_FETCH_PAGES` and skipping posts.
+            // Existing `hot_posts` entries are preserved unconditionally
+            // because they may already be ripening.
+            if !filtered_set.contains(&post.id)
+                && !hot_posts.iter().any(|h| h.id == post.id)
+                && self.passes_permanent_filters(subscription, chat, post)
+            {
                 hot_posts.push(HotPost {
                     id: post.id,
                     first_seen: now,
@@ -952,6 +963,30 @@ impl BooruEngine {
             );
             false
         }
+    }
+
+    /// Permanent (non-ripening) filter check used by the score/fav grace
+    /// window. Returns true iff the post passes excluded-tag and
+    /// allowed-rating constraints — i.e. the conditions a post can never
+    /// satisfy later by gaining score/favs.
+    fn passes_permanent_filters(
+        &self,
+        subscription: &crate::db::entities::subscriptions::Model,
+        chat: &crate::db::entities::chats::Model,
+        post: &booru_client::BooruPost,
+    ) -> bool {
+        let chat_filter = crate::db::types::TagFilter::from_excluded_tags(&chat.excluded_tags);
+        let combined_tag_filter = subscription.filter_tags.merged(&chat_filter);
+        let tag_refs: Vec<&str> = post.tags.split_whitespace().collect();
+        if !combined_tag_filter.is_empty() && !combined_tag_filter.matches_tag_strings(&tag_refs) {
+            return false;
+        }
+        if let Some(ref bf) = subscription.booru_filter {
+            if !bf.allowed_ratings.is_empty() && !bf.allowed_ratings.contains(&post.rating) {
+                return false;
+            }
+        }
+        true
     }
 
     fn apply_booru_filters<'a>(

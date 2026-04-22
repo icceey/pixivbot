@@ -529,6 +529,17 @@ impl BotHandler {
         booru_query_tags.sort_unstable();
         let tags = booru_query_tags.join(" ");
 
+        if !tags.is_empty() {
+            bot.send_message(
+                chat_id,
+                "❌ 排行榜模式不支持搜索标签 (Pixiv Popular API 仅按时间窗口返回热门作品)\n\
+                 如需按标签过滤，请使用 `+tag` / `-tag` 进行客户端过滤",
+            )
+            .parse_mode(ParseMode::MarkdownV2)
+            .await?;
+            return Ok(());
+        }
+
         let task_value = BooruTaskKey::new_ranking(
             site_name,
             &tags,
