@@ -124,6 +124,9 @@ pub struct BooruRankingState {
     pub retry_count: u8,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_post: Option<QueuedBooruPost>,
+    /// Per-post send-failure counters; abandons after threshold (mirrors HotPost.attempts).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failed_attempts: Vec<(u64, u8)>,
 }
 
 impl BooruRankingState {

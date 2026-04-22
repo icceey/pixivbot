@@ -450,6 +450,7 @@ mod tests {
             pushed_ids: vec![11, 12],
             retry_count: 1,
             pending_post: None,
+            failed_attempts: Vec::new(),
         };
         let subscription = make_subscription(
             Some(SubscriptionState::BooruRanking(booru_ranking.clone())),

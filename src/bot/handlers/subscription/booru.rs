@@ -247,15 +247,27 @@ impl BotHandler {
         };
 
         let mut booru_query_tags: Vec<&str> = Vec::new();
+        let mut interval_iso: Option<&str> = None;
         if !first_tag.is_empty() {
-            booru_query_tags.push(first_tag);
+            if iso8601_duration::Duration::parse(first_tag).is_ok() {
+                interval_iso = Some(first_tag);
+            } else {
+                booru_query_tags.push(first_tag);
+            }
         }
         let mut filter_arg_parts: Vec<&str> = Vec::new();
         let mut orderby: Option<OrderbyKind> = None;
+        let mut popular_scale: Option<PopularScale> = None;
         for &part in &parts[1..] {
             if let Some(val) = part.strip_prefix("order=") {
                 if let Some(k) = OrderbyKind::from_str(val) {
                     orderby = Some(k);
+                }
+                continue;
+            }
+            if let Some(val) = part.strip_prefix("scale=") {
+                if let Some(s) = PopularScale::from_str(val) {
+                    popular_scale = Some(s);
                 }
                 continue;
             }
@@ -280,12 +292,30 @@ impl BotHandler {
         booru_query_tags.sort_unstable();
         let tags = booru_query_tags.join(" ");
 
-        let (task_type, task_value) = match orderby {
-            None => (
-                TaskType::BooruTag,
-                BooruTaskKey::new_tag(site_name, &tags, &booru_filter).to_task_value(),
-            ),
-            Some(kind) => (
+        let (task_type, task_value) = if let Some(iso) = interval_iso {
+            (
+                TaskType::BooruRanking,
+                BooruTaskKey::new_ranking(
+                    site_name,
+                    "",
+                    BooruRankingMode::Interval(iso.to_string()),
+                    &booru_filter,
+                )
+                .to_task_value(),
+            )
+        } else if let Some(scale) = popular_scale {
+            (
+                TaskType::BooruRanking,
+                BooruTaskKey::new_ranking(
+                    site_name,
+                    &tags,
+                    BooruRankingMode::Popular(scale),
+                    &booru_filter,
+                )
+                .to_task_value(),
+            )
+        } else if let Some(kind) = orderby {
+            (
                 TaskType::BooruRanking,
                 BooruTaskKey::new_ranking(
                     site_name,
@@ -294,7 +324,12 @@ impl BotHandler {
                     &booru_filter,
                 )
                 .to_task_value(),
-            ),
+            )
+        } else {
+            (
+                TaskType::BooruTag,
+                BooruTaskKey::new_tag(site_name, &tags, &booru_filter).to_task_value(),
+            )
         };
 
         match self

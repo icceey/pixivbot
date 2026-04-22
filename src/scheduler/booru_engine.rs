@@ -26,6 +26,8 @@ const MAX_FETCH_PAGES: u32 = 5;
 
 const MAX_GRACE_SEND_ATTEMPTS: u8 = 3;
 
+const MAX_RANKING_SEND_ATTEMPTS: u8 = 3;
+
 pub struct BooruEngine {
     repo: Arc<Repo>,
     notifier: Notifier,
@@ -369,6 +371,7 @@ impl BooruEngine {
                     pushed_ids: Vec::new(),
                     retry_count: 0,
                     pending_post: None,
+                    failed_attempts: Vec::new(),
                 });
 
             let post_refs: Vec<&booru_client::BooruPost> = posts.iter().collect();
@@ -397,12 +400,43 @@ impl BooruEngine {
                     .await;
                 if sent {
                     new_state.pushed_ids.push(post.id);
+                    new_state.failed_attempts.retain(|(id, _)| *id != post.id);
+                } else {
+                    let entry = new_state
+                        .failed_attempts
+                        .iter_mut()
+                        .find(|(id, _)| *id == post.id);
+                    let attempts = match entry {
+                        Some((_, n)) => {
+                            *n = n.saturating_add(1);
+                            *n
+                        }
+                        None => {
+                            new_state.failed_attempts.push((post.id, 1));
+                            1
+                        }
+                    };
+                    if attempts >= MAX_RANKING_SEND_ATTEMPTS {
+                        warn!(
+                            "Abandoning ranking post {} for sub {} after {} send failures",
+                            post.id, sub.id, attempts
+                        );
+                        new_state.pushed_ids.push(post.id);
+                        new_state.failed_attempts.retain(|(id, _)| *id != post.id);
+                    }
                 }
                 sleep(Duration::from_millis(INTER_SUBSCRIPTION_DELAY_MS)).await;
             }
 
             new_state.pushed_ids.sort_unstable();
             new_state.pushed_ids.dedup();
+
+            // GC: drop failed_attempts for posts that fell out of current ranking.
+            let current_ids: std::collections::HashSet<u64> =
+                new_posts.iter().map(|p| p.id).collect();
+            new_state
+                .failed_attempts
+                .retain(|(id, _)| current_ids.contains(id));
 
             new_state.trim_pushed(self.booru_config.ranking_pushed_cap);
             if let Err(e) = self
