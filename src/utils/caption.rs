@@ -111,7 +111,7 @@ pub fn build_booru_caption(
     };
 
     format!(
-        "🏷 *{}* \\| {}\n\n{} {} {}\n🔗 [来源]({}){}\n",
+        "🏷 *{}* \\| {}\n\n{} {} {} \\| 🔗 [来源]({}){}\n",
         markdown::escape(site_name),
         markdown::escape(&format!("#{}", post.id)),
         metrics,
