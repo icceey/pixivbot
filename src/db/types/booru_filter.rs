@@ -52,13 +52,23 @@ impl BooruFilter {
     }
 
     pub fn matches(&self, score: i32, fav_count: i32, rating: &BooruRating) -> bool {
+        self.matches_for_engine(score, fav_count, rating, BooruEngineType::Danbooru)
+    }
+
+    pub fn matches_for_engine(
+        &self,
+        score: i32,
+        fav_count: i32,
+        rating: &BooruRating,
+        engine_type: BooruEngineType,
+    ) -> bool {
         if let Some(min) = self.score_min {
             if score < min {
                 return false;
             }
         }
         if let Some(min) = self.fav_count_min {
-            if fav_count < min {
+            if engine_type.supports_fav_count() && fav_count < min {
                 return false;
             }
         }
@@ -135,7 +145,7 @@ impl BooruFilter {
         }
 
         if let Some(fav) = self.fav_count_min {
-            if engine_type == BooruEngineType::Danbooru {
+            if engine_type.supports_fav_count() {
                 tags.push(format!("favcount:>={}", fav));
             }
         }
@@ -232,6 +242,25 @@ mod tests {
         assert!(!filter.matches(10, 3, &BooruRating::Safe));
         assert!(!filter.matches(10, 5, &BooruRating::Explicit));
         assert!(filter.matches(10, 5, &BooruRating::Safe));
+    }
+
+    #[test]
+    fn matches_for_engine_ignores_only_unsupported_fav_count() {
+        let filter = BooruFilter {
+            score_min: Some(10),
+            fav_count_min: Some(5),
+            allowed_ratings: vec![BooruRating::Safe],
+        };
+
+        assert!(filter.matches_for_engine(10, 0, &BooruRating::Safe, BooruEngineType::Moebooru));
+        assert!(!filter.matches_for_engine(10, 0, &BooruRating::Safe, BooruEngineType::Danbooru));
+        assert!(!filter.matches_for_engine(5, 100, &BooruRating::Safe, BooruEngineType::Moebooru));
+        assert!(!filter.matches_for_engine(
+            10,
+            100,
+            &BooruRating::Explicit,
+            BooruEngineType::Moebooru
+        ));
     }
 
     #[test]

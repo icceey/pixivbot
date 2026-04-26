@@ -100,12 +100,21 @@ pub fn build_booru_caption(
         format!("\n\n{}", formatted.join("  "))
     };
 
+    let metrics = if engine_type.supports_fav_count() {
+        format!(
+            "⭐ {} \\| ❤️ {} \\|",
+            markdown::escape(&post.score.to_string()),
+            markdown::escape(&post.fav_count.to_string())
+        )
+    } else {
+        format!("⭐ {} \\|", markdown::escape(&post.score.to_string()))
+    };
+
     format!(
-        "🏷 *{}* \\| {}\n\n⭐ {} \\| ❤️ {} \\| {} {}\n🔗 [来源]({}){}\n",
+        "🏷 *{}* \\| {}\n\n{} {} {}\n🔗 [来源]({}){}\n",
         markdown::escape(site_name),
         markdown::escape(&format!("#{}", post.id)),
-        markdown::escape(&post.score.to_string()),
-        markdown::escape(&post.fav_count.to_string()),
+        metrics,
         rating_emoji,
         markdown::escape(post.rating.as_short_str()),
         markdown::escape_link_url(&post_url),
@@ -337,6 +346,7 @@ mod tests {
         assert!(caption.contains("\\#sky"));
         assert!(caption.contains("/post/show/12345"));
         assert!(caption.contains("🟢"));
+        assert!(!caption.contains("❤️"));
     }
 
     #[test]
@@ -350,6 +360,7 @@ mod tests {
         );
         assert!(caption.contains("/posts/99"));
         assert!(caption.contains("🟡"));
+        assert!(caption.contains("❤️ 5"));
     }
 
     #[test]
@@ -364,6 +375,7 @@ mod tests {
         assert!(caption.contains("page=post"));
         assert!(caption.contains("id=42"));
         assert!(caption.contains("🔴"));
+        assert!(!caption.contains("❤️"));
     }
 
     #[test]
