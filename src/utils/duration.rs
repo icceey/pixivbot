@@ -1,29 +1,27 @@
-/// Serialize a duration to a canonical string of the form `PT{N}S`
-/// (total whole seconds). Two equal durations always produce the same string
-/// regardless of how they were originally entered (e.g. `1h` and `3600s`
-/// both become `"PT3600S"`). Useful for building stable, comparable
-/// subscription keys.
-pub fn duration_to_canonical_iso8601(d: chrono::Duration) -> String {
-    format!("PT{}S", d.num_seconds())
+/// Serialize a duration for internal task keys as total whole seconds.
+/// Two equal durations always produce the same string regardless of how they
+/// were originally entered (e.g. `1h` and `3600s` both become `"3600s"`).
+pub fn duration_to_key(d: chrono::Duration) -> String {
+    format!("{}s", d.num_seconds())
 }
 
-/// Parse a canonical duration string of the form `PT{N}S` as produced by
-/// [`duration_to_canonical_iso8601`]. This is intentionally narrower than full
-/// ISO 8601: it only accepts the exact format we write, making it safe to use
-/// for reading stored subscription keys.
-///
-/// Returns `None` for zero, negative, or any non-canonical string.
-pub fn parse_canonical_duration(s: &str) -> Option<chrono::Duration> {
-    let inner = s.strip_prefix("PT")?.strip_suffix('S')?;
-    let secs: i64 = inner.parse().ok()?;
-    if secs <= 0 {
+pub fn parse_duration_key(input: &str) -> Option<chrono::Duration> {
+    let seconds = input.strip_suffix('s')?;
+    if seconds.is_empty()
+        || (seconds.len() > 1 && seconds.starts_with('0'))
+        || !seconds.bytes().all(|b| b.is_ascii_digit())
+    {
         return None;
     }
-    Some(chrono::Duration::seconds(secs))
+    let seconds: i64 = seconds.parse().ok()?;
+    if seconds <= 0 {
+        return None;
+    }
+    Some(chrono::Duration::seconds(seconds))
 }
 
 /// Supports units `s`/`m`/`h`/`d` in any combination. Returns `None` on
-/// parse failure or if the string uses ISO 8601 format (not supported).
+/// parse failure.
 pub fn parse_duration(input: &str) -> Option<chrono::Duration> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
@@ -105,41 +103,19 @@ mod tests {
     }
 
     #[test]
-    fn rejects_iso8601_input() {
-        // ISO 8601 inputs must no longer be accepted — only friendly format is supported
-        assert_eq!(parse_duration("PT1H"), None);
-        assert_eq!(parse_duration("PT30M"), None);
-        assert_eq!(parse_duration("P1D"), None);
-        assert_eq!(parse_duration("PT2H30M"), None);
+    fn duration_key_basic() {
+        assert_eq!(duration_to_key(chrono::Duration::hours(1)), "3600s");
+        assert_eq!(duration_to_key(chrono::Duration::minutes(30)), "1800s");
+        assert_eq!(duration_to_key(chrono::Duration::days(1)), "86400s");
+        assert_eq!(duration_to_key(chrono::Duration::seconds(45)), "45s");
     }
 
     #[test]
-    fn canonical_iso8601_basic() {
-        assert_eq!(
-            duration_to_canonical_iso8601(chrono::Duration::hours(1)),
-            "PT3600S"
-        );
-        assert_eq!(
-            duration_to_canonical_iso8601(chrono::Duration::minutes(30)),
-            "PT1800S"
-        );
-        assert_eq!(
-            duration_to_canonical_iso8601(chrono::Duration::days(1)),
-            "PT86400S"
-        );
-        assert_eq!(
-            duration_to_canonical_iso8601(chrono::Duration::seconds(45)),
-            "PT45S"
-        );
-    }
-
-    #[test]
-    fn parse_canonical_roundtrip() {
-        // Scheduler reads the value that the handler wrote via duration_to_canonical_iso8601.
+    fn duration_key_roundtrip() {
         for (input, expected_secs) in &[("1h", 3600i64), ("30m", 1800), ("1d", 86400)] {
             let d = parse_duration(input).unwrap();
-            let stored = duration_to_canonical_iso8601(d);
-            let recovered = parse_canonical_duration(&stored).unwrap();
+            let stored = duration_to_key(d);
+            let recovered = parse_duration_key(&stored).unwrap();
             assert_eq!(
                 recovered.num_seconds(),
                 *expected_secs,
@@ -149,11 +125,15 @@ mod tests {
     }
 
     #[test]
-    fn parse_canonical_rejects_friendly_and_legacy_iso() {
-        assert_eq!(parse_canonical_duration("1h"), None);
-        assert_eq!(parse_canonical_duration("PT1H"), None); // legacy ISO, not our canonical form
-        assert_eq!(parse_canonical_duration("P1D"), None);
-        assert_eq!(parse_canonical_duration(""), None);
-        assert_eq!(parse_canonical_duration("PT0S"), None); // zero duration
+    fn parse_duration_key_requires_seconds_suffix() {
+        assert_eq!(
+            parse_duration_key("3600s"),
+            Some(chrono::Duration::hours(1))
+        );
+        assert_eq!(parse_duration_key("1h"), None);
+        assert_eq!(parse_duration_key("60m"), None);
+        assert_eq!(parse_duration_key("0s"), None);
+        assert_eq!(parse_duration_key("060s"), None);
+        assert_eq!(parse_duration_key("abc"), None);
     }
 }

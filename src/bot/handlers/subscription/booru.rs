@@ -4,7 +4,7 @@ use crate::db::types::{
     BooruFilter, BooruRankingMode, BooruTaskKey, OrderbyKind, TagFilter, TaskType,
 };
 use crate::utils::args;
-use crate::utils::duration::{duration_to_canonical_iso8601, parse_duration};
+use crate::utils::duration::{duration_to_key, parse_duration};
 use booru_client::{BooruEngineType, BooruRating, PopularScale};
 use teloxide::prelude::*;
 use teloxide::types::{ChatId, ParseMode, UserId};
@@ -282,164 +282,174 @@ impl BotHandler {
             return Ok(());
         }
 
-        let site_tags_str = parts[0];
-        let (site_name, first_tag) = match site_tags_str.split_once(':') {
-            Some((site, tags)) => (site, tags),
-            None => {
-                let available: Vec<&str> = self
-                    .booru_registry
-                    .iter()
-                    .map(|site| site.config.name.as_str())
-                    .collect();
+        let internal_target = if parts.len() == 1 {
+            parse_bunsub_internal_key(parts[0])
+        } else {
+            None
+        };
 
-                bot.send_message(chat_id, build_bunsub_usage_message(&available))
+        let (task_type, task_value) = if let Some(target) = internal_target {
+            target
+        } else {
+            let site_tags_str = parts[0];
+            let (site_name, first_tag) = match site_tags_str.split_once(':') {
+                Some((site, tags)) => (site, tags),
+                None => {
+                    let available: Vec<&str> = self
+                        .booru_registry
+                        .iter()
+                        .map(|site| site.config.name.as_str())
+                        .collect();
+
+                    bot.send_message(chat_id, build_bunsub_usage_message(&available))
+                        .parse_mode(ParseMode::MarkdownV2)
+                        .await?;
+                    return Ok(());
+                }
+            };
+
+            let mut booru_query_tags: Vec<&str> = Vec::new();
+            let mut filter_arg_parts: Vec<&str> = Vec::new();
+            let mut orderby: Option<OrderbyKind> = None;
+            let mut popular_scale: Option<PopularScale> = None;
+            let mut interval_key: Option<String> = None;
+            for &part in &parts[1..] {
+                if let Some(val) = part.strip_prefix("order=") {
+                    if val.is_empty() {
+                        bot.send_message(chat_id, "❌ `order=` 需要值")
+                            .parse_mode(ParseMode::MarkdownV2)
+                            .await?;
+                        return Ok(());
+                    }
+                    match OrderbyKind::from_str(val) {
+                        Some(k) => orderby = Some(k),
+                        None => {
+                            bot.send_message(
+                                chat_id,
+                                format!("❌ order 值无效: `{}`，可用: score, fav, random", val),
+                            )
+                            .parse_mode(ParseMode::MarkdownV2)
+                            .await?;
+                            return Ok(());
+                        }
+                    }
+                    continue;
+                }
+                if let Some(val) = part.strip_prefix("scale=") {
+                    if val.is_empty() {
+                        bot.send_message(chat_id, "❌ `scale=` 需要值")
+                            .parse_mode(ParseMode::MarkdownV2)
+                            .await?;
+                        return Ok(());
+                    }
+                    match PopularScale::from_str(val) {
+                        Some(s) => popular_scale = Some(s),
+                        None => {
+                            bot.send_message(
+                                chat_id,
+                                format!("❌ scale 值无效: `{}`，可用: day, week, month", val),
+                            )
+                            .parse_mode(ParseMode::MarkdownV2)
+                            .await?;
+                            return Ok(());
+                        }
+                    }
+                    continue;
+                }
+                if let Some(val) = part.strip_prefix("interval=") {
+                    if val.is_empty() {
+                        bot.send_message(chat_id, "❌ `interval=` 需要值，例如 `interval=1h`")
+                            .parse_mode(ParseMode::MarkdownV2)
+                            .await?;
+                        return Ok(());
+                    }
+                    if parse_duration(val).is_none() {
+                        bot.send_message(chat_id, "❌ `interval=` 值无效（例: `1h` `30m` `1d2h`）")
+                            .parse_mode(ParseMode::MarkdownV2)
+                            .await?;
+                        return Ok(());
+                    }
+                    interval_key = Some(duration_to_key(parse_duration(val).unwrap()));
+                    continue;
+                }
+                if part.starts_with("score>")
+                    || part.starts_with("fav>")
+                    || part.starts_with("rating=")
+                    || part.starts_with('+')
+                    || part.starts_with('-')
+                {
+                    filter_arg_parts.push(part);
+                    continue;
+                }
+                booru_query_tags.push(part);
+            }
+            // Interval mode requires explicit `interval=...` to disambiguate from
+            // tag subscriptions whose tag happens to look like a duration (e.g.
+            // a tag literally named "1h"). Prior auto-detection made it
+            // impossible to unsubscribe such tags.
+            if !first_tag.is_empty() {
+                booru_query_tags.push(first_tag);
+            }
+            let (booru_filter, _tag_filter) = match parse_booru_filter_args(&filter_arg_parts) {
+                Ok(result) => result,
+                Err(msg) => {
+                    bot.send_message(chat_id, format!("❌ {}", msg)).await?;
+                    return Ok(());
+                }
+            };
+            booru_query_tags.sort_unstable();
+            let tags = booru_query_tags.join(" ");
+
+            if let Some(interval) = interval_key {
+                // Interval mode does not support search tags; reject ambiguous input
+                // like `site:1h landscape` rather than silently dropping them.
+                if !booru_query_tags.is_empty() {
+                    bot.send_message(
+                        chat_id,
+                        "❌ 间隔模式不支持搜索标签，请只填站点和 `interval=`，例如 `konachan: interval=1h`",
+                    )
                     .parse_mode(ParseMode::MarkdownV2)
                     .await?;
-                return Ok(());
-            }
-        };
-
-        let mut booru_query_tags: Vec<&str> = Vec::new();
-        let mut filter_arg_parts: Vec<&str> = Vec::new();
-        let mut orderby: Option<OrderbyKind> = None;
-        let mut popular_scale: Option<PopularScale> = None;
-        let mut interval_iso: Option<String> = None;
-        for &part in &parts[1..] {
-            if let Some(val) = part.strip_prefix("order=") {
-                if val.is_empty() {
-                    bot.send_message(chat_id, "❌ `order=` 需要值")
-                        .parse_mode(ParseMode::MarkdownV2)
-                        .await?;
                     return Ok(());
                 }
-                match OrderbyKind::from_str(val) {
-                    Some(k) => orderby = Some(k),
-                    None => {
-                        bot.send_message(
-                            chat_id,
-                            format!("❌ order 值无效: `{}`，可用: score, fav, random", val),
-                        )
-                        .parse_mode(ParseMode::MarkdownV2)
-                        .await?;
-                        return Ok(());
-                    }
-                }
-                continue;
-            }
-            if let Some(val) = part.strip_prefix("scale=") {
-                if val.is_empty() {
-                    bot.send_message(chat_id, "❌ `scale=` 需要值")
-                        .parse_mode(ParseMode::MarkdownV2)
-                        .await?;
-                    return Ok(());
-                }
-                match PopularScale::from_str(val) {
-                    Some(s) => popular_scale = Some(s),
-                    None => {
-                        bot.send_message(
-                            chat_id,
-                            format!("❌ scale 值无效: `{}`，可用: day, week, month", val),
-                        )
-                        .parse_mode(ParseMode::MarkdownV2)
-                        .await?;
-                        return Ok(());
-                    }
-                }
-                continue;
-            }
-            if let Some(val) = part.strip_prefix("interval=") {
-                if val.is_empty() {
-                    bot.send_message(chat_id, "❌ `interval=` 需要值，例如 `interval=1h`")
-                        .parse_mode(ParseMode::MarkdownV2)
-                        .await?;
-                    return Ok(());
-                }
-                if parse_duration(val).is_none() {
-                    bot.send_message(chat_id, "❌ `interval=` 值无效（例: `1h` `30m` `1d2h`）")
-                        .parse_mode(ParseMode::MarkdownV2)
-                        .await?;
-                    return Ok(());
-                }
-                interval_iso = Some(duration_to_canonical_iso8601(parse_duration(val).unwrap()));
-                continue;
-            }
-            if part.starts_with("score>")
-                || part.starts_with("fav>")
-                || part.starts_with("rating=")
-                || part.starts_with('+')
-                || part.starts_with('-')
-            {
-                filter_arg_parts.push(part);
-                continue;
-            }
-            booru_query_tags.push(part);
-        }
-        // Interval mode requires explicit `interval=...` to disambiguate from
-        // tag subscriptions whose tag happens to look like a duration (e.g.
-        // a tag literally named "1h"). Prior auto-detection via
-        // parse_friendly_or_iso8601 made it impossible to unsubscribe such tags.
-        if !first_tag.is_empty() {
-            booru_query_tags.push(first_tag);
-        }
-        let (booru_filter, _tag_filter) = match parse_booru_filter_args(&filter_arg_parts) {
-            Ok(result) => result,
-            Err(msg) => {
-                bot.send_message(chat_id, format!("❌ {}", msg)).await?;
-                return Ok(());
-            }
-        };
-        booru_query_tags.sort_unstable();
-        let tags = booru_query_tags.join(" ");
-
-        let (task_type, task_value) = if let Some(iso) = interval_iso {
-            // Interval mode does not support search tags; reject ambiguous input
-            // like `site:PT1H landscape` rather than silently dropping them.
-            if !booru_query_tags.is_empty() {
-                bot.send_message(
-                    chat_id,
-                    "❌ 间隔模式不支持搜索标签，请只填站点和 `interval=`，例如 `konachan: interval=1h`",
+                (
+                    TaskType::BooruRanking,
+                    BooruTaskKey::new_ranking(
+                        site_name,
+                        "",
+                        BooruRankingMode::Interval(interval),
+                        &booru_filter,
+                    )
+                    .to_task_value(),
                 )
-                .parse_mode(ParseMode::MarkdownV2)
-                .await?;
-                return Ok(());
+            } else if let Some(scale) = popular_scale {
+                (
+                    TaskType::BooruRanking,
+                    BooruTaskKey::new_ranking(
+                        site_name,
+                        &tags,
+                        BooruRankingMode::Popular(scale),
+                        &booru_filter,
+                    )
+                    .to_task_value(),
+                )
+            } else if let Some(kind) = orderby {
+                (
+                    TaskType::BooruRanking,
+                    BooruTaskKey::new_ranking(
+                        site_name,
+                        &tags,
+                        BooruRankingMode::Orderby(kind),
+                        &booru_filter,
+                    )
+                    .to_task_value(),
+                )
+            } else {
+                (
+                    TaskType::BooruTag,
+                    BooruTaskKey::new_tag(site_name, &tags, &booru_filter).to_task_value(),
+                )
             }
-            (
-                TaskType::BooruRanking,
-                BooruTaskKey::new_ranking(
-                    site_name,
-                    "",
-                    BooruRankingMode::Interval(iso.to_string()),
-                    &booru_filter,
-                )
-                .to_task_value(),
-            )
-        } else if let Some(scale) = popular_scale {
-            (
-                TaskType::BooruRanking,
-                BooruTaskKey::new_ranking(
-                    site_name,
-                    &tags,
-                    BooruRankingMode::Popular(scale),
-                    &booru_filter,
-                )
-                .to_task_value(),
-            )
-        } else if let Some(kind) = orderby {
-            (
-                TaskType::BooruRanking,
-                BooruTaskKey::new_ranking(
-                    site_name,
-                    &tags,
-                    BooruRankingMode::Orderby(kind),
-                    &booru_filter,
-                )
-                .to_task_value(),
-            )
-        } else {
-            (
-                TaskType::BooruTag,
-                BooruTaskKey::new_tag(site_name, &tags, &booru_filter).to_task_value(),
-            )
         };
 
         match self
@@ -743,8 +753,8 @@ impl BotHandler {
         }
 
         let site_interval = parts[0];
-        let (site_name, iso_str) = match site_interval.split_once(':') {
-            Some((site, iso)) if !site.is_empty() && !iso.is_empty() => (site, iso),
+        let (site_name, interval_str) = match site_interval.split_once(':') {
+            Some((site, interval)) if !site.is_empty() && !interval.is_empty() => (site, interval),
             _ => {
                 bot.send_message(chat_id, "❌ 格式: `站点名:间隔`，例如 `konachan:1h`")
                     .parse_mode(ParseMode::MarkdownV2)
@@ -778,7 +788,7 @@ impl BotHandler {
             return Ok(());
         }
 
-        let interval = match parse_duration(iso_str) {
+        let interval = match parse_duration(interval_str) {
             Some(d) => d,
             None => {
                 bot.send_message(chat_id, "❌ 无效的间隔格式（例: `1h` `30m` `1d` `2h30m`）")
@@ -821,11 +831,11 @@ impl BotHandler {
         let task_value = BooruTaskKey::new_ranking(
             site_name,
             "",
-            BooruRankingMode::Interval(duration_to_canonical_iso8601(interval)),
+            BooruRankingMode::Interval(duration_to_key(interval)),
             &booru_filter,
         )
         .to_task_value();
-        let display_name = format!("{} (interval:{})", site_name, iso_str);
+        let display_name = format!("{} (interval:{})", site_name, interval_str);
 
         match self
             .create_booru_subscription(
@@ -842,7 +852,7 @@ impl BotHandler {
                 let mut msg = format!(
                     "✅ 已订阅 {} 随机推送（每 {}）",
                     markdown::escape(site_name),
-                    markdown::escape(iso_str)
+                    markdown::escape(interval_str)
                 );
                 if !booru_filter.is_empty() {
                     msg.push_str(&format!(
@@ -863,7 +873,7 @@ impl BotHandler {
             Err(e) => {
                 error!(
                     "Failed to subscribe to booru interval {}:{} for chat {}: {:#}",
-                    site_name, iso_str, target_chat_id.0, e
+                    site_name, interval_str, target_chat_id.0, e
                 );
                 bot.send_message(chat_id, "❌ 订阅失败").await?;
             }
@@ -950,6 +960,21 @@ fn unsupported_fav_filter_message(
     } else {
         None
     }
+}
+
+fn parse_bunsub_internal_key(value: &str) -> Option<(TaskType, String)> {
+    if !value.contains('|') {
+        return None;
+    }
+
+    let key = BooruTaskKey::parse(value)?;
+    let task_type = if key.ranking.is_some() {
+        TaskType::BooruRanking
+    } else {
+        TaskType::BooruTag
+    };
+
+    Some((task_type, value.to_string()))
 }
 
 fn build_bsub_usage_message(site_names: &[&str]) -> String {
@@ -1057,6 +1082,23 @@ mod tests {
         let (booru, tags) = parse_booru_filter_args(&args).unwrap();
         assert!(booru.is_empty());
         assert!(tags.is_empty());
+    }
+
+    #[test]
+    fn bunsub_internal_interval_key_targets_booru_ranking() {
+        let target = parse_bunsub_internal_key("yd:|i=900s|f=sf").unwrap();
+        assert_eq!(target, (TaskType::BooruRanking, "yd:|i=900s|f=sf".into()));
+    }
+
+    #[test]
+    fn bunsub_internal_tag_key_targets_booru_tag() {
+        let target = parse_bunsub_internal_key("yd:interval=8h|f=sf").unwrap();
+        assert_eq!(target, (TaskType::BooruTag, "yd:interval=8h|f=sf".into()));
+    }
+
+    #[test]
+    fn bunsub_plain_tag_is_not_internal_key() {
+        assert_eq!(parse_bunsub_internal_key("yd:landscape"), None);
     }
 
     #[test]

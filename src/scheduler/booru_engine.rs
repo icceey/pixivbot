@@ -10,11 +10,7 @@ use crate::scheduler::helpers::{
     booru_ranking_subscription_state, booru_tag_subscription_state, get_chat_if_should_notify,
     save_first_message_record, INTER_SUBSCRIPTION_DELAY_MS,
 };
-use crate::utils::{
-    caption,
-    duration::{parse_canonical_duration, parse_duration},
-    sensitive,
-};
+use crate::utils::{caption, duration::parse_duration_key, sensitive};
 use anyhow::{Context, Result};
 use chrono::{Local, Utc};
 use rand::RngExt;
@@ -511,20 +507,16 @@ impl BooruEngine {
             BooruRankingMode::Popular(PopularScale::Day) => chrono::Duration::hours(12),
             BooruRankingMode::Popular(PopularScale::Week) => chrono::Duration::days(3),
             BooruRankingMode::Popular(PopularScale::Month) => chrono::Duration::days(7),
-            BooruRankingMode::Interval(iso) => {
+            BooruRankingMode::Interval(interval_key) => {
                 // Defense-in-depth: /brand validates 5min..30days at parse time, but
                 // clamp here too in case a malformed task_value reaches the scheduler
                 // (manual DB edits, future bugs, etc.) — prevents tight polling loops.
                 let min_interval = chrono::Duration::minutes(5);
                 let max_interval = chrono::Duration::days(30);
-                // Parse the stored canonical value (PT{N}S) first; fall back to
-                // friendly format for legacy entries created before normalization.
-                let parsed = parse_canonical_duration(iso)
-                    .or_else(|| parse_duration(iso))
-                    .unwrap_or_else(|| {
-                        warn!("Invalid duration {}, defaulting to 6h", iso);
-                        chrono::Duration::hours(6)
-                    });
+                let parsed = parse_duration_key(interval_key).unwrap_or_else(|| {
+                    warn!("Invalid duration {}, defaulting to 6h", interval_key);
+                    chrono::Duration::hours(6)
+                });
                 parsed.clamp(min_interval, max_interval)
             }
         };

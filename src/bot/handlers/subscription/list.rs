@@ -175,8 +175,8 @@ impl BotHandler {
                                     BooruRankingMode::Popular(scale) => {
                                         format!(" 🏆{}榜", markdown::escape(scale.as_str()))
                                     }
-                                    BooruRankingMode::Interval(iso) => {
-                                        format!(" 🎲每{}", markdown::escape(&iso))
+                                    BooruRankingMode::Interval(interval_key) => {
+                                        format!(" 🎲每{}", markdown::escape(&interval_key))
                                     }
                                 })
                                 .unwrap_or_default()
