@@ -138,6 +138,16 @@ impl BotHandler {
                 return Ok(());
             }
         };
+        if let Some(msg) = unsupported_fav_filter_message(
+            site_name,
+            site_config.expect("site checked").config.engine_type,
+            &booru_filter,
+        ) {
+            bot.send_message(chat_id, msg)
+                .parse_mode(ParseMode::MarkdownV2)
+                .await?;
+            return Ok(());
+        }
         booru_query_tags.sort_unstable();
         let tags = booru_query_tags.join(" ");
 
@@ -611,6 +621,14 @@ impl BotHandler {
                 return Ok(());
             }
         };
+        if let Some(msg) =
+            unsupported_fav_filter_message(site_name, site.config.engine_type, &booru_filter)
+        {
+            bot.send_message(chat_id, msg)
+                .parse_mode(ParseMode::MarkdownV2)
+                .await?;
+            return Ok(());
+        }
 
         booru_query_tags.sort_unstable();
         let tags = booru_query_tags.join(" ");
@@ -785,6 +803,20 @@ impl BotHandler {
                 return Ok(());
             }
         };
+        if let Some(msg) = unsupported_fav_filter_message(
+            site_name,
+            self.booru_registry
+                .get(site_name)
+                .expect("site checked")
+                .config
+                .engine_type,
+            &booru_filter,
+        ) {
+            bot.send_message(chat_id, msg)
+                .parse_mode(ParseMode::MarkdownV2)
+                .await?;
+            return Ok(());
+        }
 
         let task_value = BooruTaskKey::new_ranking(
             site_name,
@@ -905,6 +937,21 @@ fn parse_booru_filter_args(args: &[&str]) -> Result<(BooruFilter, TagFilter), St
     Ok((booru_filter, tag_filter))
 }
 
+fn unsupported_fav_filter_message(
+    site_name: &str,
+    engine_type: BooruEngineType,
+    filter: &BooruFilter,
+) -> Option<String> {
+    if filter.fav_count_min.is_some() && !engine_type.supports_fav_count() {
+        Some(format!(
+            "❌ {} 不支持 fav 过滤",
+            markdown::escape(site_name)
+        ))
+    } else {
+        None
+    }
+}
+
 fn build_bsub_usage_message(site_names: &[&str]) -> String {
     let Some(first_site) = site_names.first() else {
         return "❌ 未配置任何 Booru 站点".to_string();
@@ -1018,5 +1065,19 @@ mod tests {
         let (booru, _) = parse_booru_filter_args(&args).unwrap();
         assert_eq!(booru.score_min, Some(50));
         assert_eq!(booru.fav_count_min, Some(10));
+    }
+
+    #[test]
+    fn unsupported_fav_filter_message_only_for_unsupported_engines() {
+        let filter = BooruFilter::new(None, Some(10), vec![]);
+
+        assert_eq!(
+            unsupported_fav_filter_message("konachan", BooruEngineType::Moebooru, &filter),
+            Some("❌ konachan 不支持 fav 过滤".to_string())
+        );
+        assert_eq!(
+            unsupported_fav_filter_message("danbooru", BooruEngineType::Danbooru, &filter),
+            None
+        );
     }
 }

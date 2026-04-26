@@ -26,6 +26,10 @@ impl BooruEngineType {
             }
         }
     }
+
+    pub fn supports_fav_count(&self) -> bool {
+        matches!(self, BooruEngineType::Danbooru)
+    }
 }
 
 impl fmt::Display for BooruEngineType {

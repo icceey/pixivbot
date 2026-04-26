@@ -397,7 +397,7 @@ impl BooruEngine {
                 });
 
             let filtered: Vec<&booru_client::BooruPost> =
-                self.apply_booru_filters(sub, &chat, &post_refs);
+                self.apply_booru_filters(sub, &chat, &post_refs, site_ctx.config.engine_type);
             let new_posts: Vec<&booru_client::BooruPost> = filtered
                 .iter()
                 .copied()
@@ -630,10 +630,9 @@ impl BooruEngine {
             }
         }
 
-        let has_score_fav_filter = subscription
-            .booru_filter
-            .as_ref()
-            .is_some_and(|f| f.score_min.is_some() || f.fav_count_min.is_some());
+        let has_score_fav_filter = subscription.booru_filter.as_ref().is_some_and(|f| {
+            f.score_min.is_some() || (f.fav_count_min.is_some() && engine_type.supports_fav_count())
+        });
 
         let has_existing_state = sub_state.is_some();
         let prev_state = sub_state.unwrap_or_else(|| BooruTagState::cleared(0));
@@ -666,7 +665,7 @@ impl BooruEngine {
                 );
             }
 
-            let filtered = self.apply_booru_filters(subscription, chat, &new_posts);
+            let filtered = self.apply_booru_filters(subscription, chat, &new_posts, engine_type);
 
             if filtered.is_empty() {
                 return Ok(Some(BooruTagState::cleared(newest_id)));
@@ -775,7 +774,8 @@ impl BooruEngine {
                 .collect();
         }
 
-        let filtered_now = self.apply_booru_filters(subscription, chat, &candidate_posts);
+        let filtered_now =
+            self.apply_booru_filters(subscription, chat, &candidate_posts, engine_type);
         let filtered_set: HashSet<u64> = filtered_now.iter().map(|p| p.id).collect();
 
         // Precompute O(1) lookup sets to avoid O(n*m) scans of hot_posts
@@ -1056,6 +1056,7 @@ impl BooruEngine {
         subscription: &crate::db::entities::subscriptions::Model,
         chat: &crate::db::entities::chats::Model,
         posts: &[&'a booru_client::BooruPost],
+        engine_type: booru_client::BooruEngineType,
     ) -> Vec<&'a booru_client::BooruPost> {
         let chat_filter = crate::db::types::TagFilter::from_excluded_tags(&chat.excluded_tags);
         let combined_tag_filter = subscription.filter_tags.merged(&chat_filter);
@@ -1071,7 +1072,8 @@ impl BooruEngine {
                 }
 
                 if let Some(ref bf) = subscription.booru_filter {
-                    if !bf.matches(post.score, post.fav_count, &post.rating) {
+                    if !bf.matches_for_engine(post.score, post.fav_count, &post.rating, engine_type)
+                    {
                         return false;
                     }
                 }

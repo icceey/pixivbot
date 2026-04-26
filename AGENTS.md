@@ -1,262 +1,95 @@
-# PixivBot Copilot Instructions
+# PixivBot Agent Guide
 
-## ⚠️ HIGHEST PRIORITY: CI Verification
+## Checks
 
-**MANDATORY**: Before completing ANY code changes, you MUST run `make ci` to verify all checks pass:
+- Rust is pinned to 1.94 in `rust-toolchain.toml`; builds need FFmpeg development libraries plus `pkg-config` (`brew install ffmpeg pkg-config` on macOS, CI installs `libavcodec-dev libavformat-dev libavutil-dev libswscale-dev libswresample-dev pkg-config`).
+- Before completing Rust/code changes, run `make ci`; it runs `fmt-check -> clippy` with `RUSTFLAGS=-Dwarnings` `-> check -> test -> release build`.
+- Use `make quick` for a faster local loop, `make fmt` to format, and focused tests such as `cargo test -p pixivbot link_handler` or `cargo test -p booru_client <filter>`.
+- H.264/ugoira encoder tests are behind `--features ffmpeg-codec`; only run them when the local FFmpeg has a working H.264 encoder.
+- Markdown-only docs can be verified with `git diff --check -- <path>`; do not run the full Rust CI for docs-only edits unless code or generated files changed.
 
-```bash
-make ci  # Runs: fmt, clippy, check, test, build
-```
+## Source Of Truth
 
-- CI uses `RUSTFLAGS=-Dwarnings` - ALL warnings are treated as errors
-- Never mark a task as complete without successful `make ci` execution
-- If `make ci` fails, fix all issues before proceeding
+- Prefer executable files over prose when facts conflict: `Cargo.toml`, `rust-toolchain.toml`, `Makefile`, CI workflows, `Dockerfile`, and source code beat README-style summaries.
+- `config.toml.example` is the public config reference; local `/config.toml` may contain bot tokens, Pixiv credentials, and other secrets.
+- Do not read, print, copy, or commit `/config.toml`; `.gitignore` intentionally excludes it along with `/data`, `/logs`, and `target/`.
+- There are no repo-local OpenCode/Cursor/Copilot instruction files besides `AGENTS.md` and scoped `src/bot/notifier/AGENTS.md` as of the last audit.
 
-This requirement is NON-NEGOTIABLE and applies to every code modification.
+## Workspace
 
----
-
-## Project Overview
-
-A Rust-based Telegram bot for subscribing to Pixiv artists and rankings. When artists publish new works, the bot automatically downloads and pushes images to subscribers.
-
-**Tech Stack**: Rust 2021, teloxide (Telegram), SeaORM (SQLite), reqwest, tokio
-
-**Architecture Philosophy**: Layered architecture with clear separation between Pixiv API access (`pixiv_client/`), business logic (`pixiv/`, `scheduler/`), and presentation (`bot/`). Components communicate via `Arc`-wrapped shared state.
-
-## Architecture
-
-```
-src/
-├── main.rs              # Entry point, spawns all engines + bot
-├── config.rs            # Configuration (config.toml + env vars)
-├── bot/
-│   ├── mod.rs           # Dispatcher setup, handler tree
-│   ├── handler.rs       # BotHandler struct, command dispatch
-│   ├── handlers/        # Command handlers by category
-│   │   ├── admin.rs     # Owner/Admin commands
-│   │   ├── subscription.rs  # Subscribe/unsubscribe logic
-│   │   ├── settings.rs  # Chat settings (tags, filters)
-│   │   ├── info.rs      # Help, status commands
-│   │   └── download.rs  # /download command
-│   ├── middleware.rs    # UserChatContext injection, access control
-│   ├── commands.rs      # Command enum definitions
-│   ├── link_handler.rs  # Pixiv URL regex parsing
-│   └── notifier.rs      # ThrottledBot wrapper, image batching
-├── scheduler/           # Background task engines (run independently)
-│   ├── author_engine.rs    # Author subscription polling
-│   ├── ranking_engine.rs   # Daily ranking push
-│   ├── name_update_engine.rs # Author name sync
-│   └── helpers.rs       # Shared push logic, PushResult enum
-├── pixiv_client/        # Low-level Pixiv API (independent crate)
-├── pixiv/               # Business layer wrapping pixiv_client
-│   ├── client.rs        # PixivClient with auth management
-│   └── downloader.rs    # Image download with caching
-├── cache/               # FileCacheManager with hash-bucketing
-├── db/                  # SeaORM entities, Repo CRUD
-└── utils/               # Markdown escaping, tag formatting
-```
-
-## Key Patterns
-
-### Error Handling & User-Facing Messages
-
-**CRITICAL SECURITY PATTERN**: Never expose raw errors to users. Always separate internal logging from user-facing messages:
-
-```rust
-// ❌ WRONG - Exposes internal error details to user
-bot.send_message(chat_id, format!("❌ 失败: {:#}", e)).await?;
-
-// ✅ CORRECT - Log details internally, send friendly message
-error!("Failed to process request: {:#}", e);
-bot.send_message(chat_id, "❌ 操作失败").await?;
-```
-
-- Use `anyhow::Result<T>` everywhere, `.context()` for debugging
-- Log errors with `{:#}` to show full chain; never expose to users
-- `pixiv_client/` has its own `Error` type, auto-converts to anyhow
-
-### Shared State & Rate Limiting
-
-- Components use `Arc<T>` for sharing, `Arc<RwLock<T>>` when mutable
-- Bot uses `ThrottledBot` (teloxide's `Throttle<Bot>` adaptor) for automatic rate limiting
-- No manual `sleep()` needed for Telegram API calls
-
-### Middleware Pattern (bot/middleware.rs)
-
-The dispatcher uses filter middleware to inject context:
-```rust
-// filter_user_chat() → injects UserChatContext
-// filter_chat_accessible() → checks chat enabled + user role
-dptree::entry()
-    .branch(filter_user_chat().chain(filter_chat_accessible().chain(...)))
-```
-
-### Image Batching
-
-**Constant**: `MAX_PER_GROUP = 10` (Telegram limit for media groups)
-
-Caption strategy:
-- First batch: full caption with title, author, tags
-- Subsequent batches: `(continued 2/3)` format
-- Retry logic in `scheduler/helpers.rs` must match this pattern
-
-### Scheduler Engines
-
-Three independent engines run as separate tokio tasks:
-- `AuthorEngine`: Polls subscribed authors for new works
-- `RankingEngine`: Daily ranking push at configured time
-- `NameUpdateEngine`: Syncs author names with Pixiv profiles
-
-Each engine has its own `run()` loop with configurable intervals.
-
-## Adding Dependencies
-
-```bash
-cargo add serde --features derive  # Always use cargo add, never edit Cargo.toml manually
-```
-
-## Code Conventions
-
-**Logging & Output**:
-- Use `tracing::{info, warn, error}` for logging (NEVER `println!`)
-- Error logs: `error!("Operation failed: {:#}", e)` - shows full error chain
-- Info logs: `info!("Processing {} items", count)` - structured data preferred
-- User messages: Always escape with `markdown::escape()` for MarkdownV2
-
-**Type Safety & Async**:
-- All async functions return `anyhow::Result<T>` for consistency
-- Use `.context("Meaningful description")` on all `?` operations
-- Derive `Clone` for types shared across async contexts
-- Use `Arc<T>` for immutable shared state, `Arc<RwLock<T>>` for mutable
-
-**Performance Patterns**:
-- Use `LazyLock<Regex>` for compile-once regex patterns (see `link_handler.rs`)
-- Prefer `const` for compile-time constants (`MAX_PER_GROUP`, batch sizes)
-- Use `.div_ceil()` instead of manual ceiling division
-
-**Telegram Formatting**:
-- Always use `ParseMode::MarkdownV2` (not Markdown or HTML)
-- Escape all dynamic text: `markdown::escape(&user_input)`
-- Special chars needing escape: `_*[]()~`>#+-=|{}.!`
-- Format patterns: `*bold*`, `_italic_`, `` `code` ``, `[link](url)`
-
-**Intentional Patterns**:
-- Mark unused public APIs with `#[allow(dead_code)]` (not `#[allow(unused)]`)
-- Use `#[allow(clippy::too_many_arguments)]` only when unavoidable (e.g., `SchedulerEngine::new`)
-
-## Bot Command Filtering
-
-Commands use `filter_command::<Command>()` in the Dispatcher. For group @mention requirement on commands, use `filter_mention_command::<Command>()`:
-```rust
-// Commands work in any chat
-Update::filter_message().filter_command::<Command>()
-
-// Commands require @mention in groups
-Update::filter_message().filter_mention_command::<Command>()
-```
-
-## User Roles
-
-Three roles defined in `db/entities/role.rs`:
-- `Owner`: Full access, set via `config.telegram.owner_id`
-- `Admin`: Can enable/disable chats, set by owner via `/setadmin`
-- `User`: Standard user, basic commands only
-
-Role checks: `user_role.is_owner()`, `user_role.is_admin()`
+- Workspace crates are root `pixivbot` app, `pixiv_client` low-level Pixiv API client, `booru_client` booru API client, and `migration` SeaORM migrations.
+- Root `pixivbot` owns Telegram bot wiring, scheduler engines, persistence, Pixiv downloads, and booru integration.
+- `pixiv_client` is the low-level Pixiv API client; `booru_client` is the booru API client; keep protocol/client changes inside those crates when possible.
+- `migration` owns SeaORM migrations and is invoked from the app at startup, not by an external migration runner.
+- `src/main.rs` is the real wiring entrypoint: load config, run migrations, build `Repo`/Pixiv client/downloader/notifier, spawn author/ranking/name-update/optional booru engines, then start Telegram.
 
 ## Configuration
 
-Copy `config.toml.example` → `config.toml`. Key sections:
-- `[telegram]` - bot_token, owner_id, bot_mode (public/private)
-- `[pixiv]` - refresh_token
-- `[database]` - SQLite URL (default: `sqlite:data/pixivbot.db?mode=rwc`)
-- `[logging]` - level (info/debug/warn), dir (default: `data/logs`)
-- `[scheduler]` - tick_interval_sec (default: 30), min/max_task_interval_sec (2-3 hours), cache_retention_days (default: 7), cache_dir (default: `data/cache`)
-- `[content]` - sensitive_tags list (e.g., ["R-18", "R-18G", "NSFW"])
+- `Config::load()` reads optional `config.toml` and env overrides using prefix `PIX` with `__` separators, so `PIX__TELEGRAM__BOT_TOKEN` maps into nested config.
+- `telegram.owner_id` is optional; if absent, the first user to talk to the bot can become owner, so preserve the warning in `config.toml.example`.
+- `telegram.bot_mode` controls private/public access, `api_url` can point teloxide at a custom Telegram API, and `require_mention_in_group` is the global group default.
+- `download_threshold()` clamps configured values to `1..=10`; keep that aligned with user-facing config docs.
+- Config changes usually need `src/config.rs`, `config.toml.example`, and explicit threading through `src/main.rs`/constructors; this repo avoids global config lookups.
 
-Environment variables override config with prefix `PIX` and double underscores: `PIX__TELEGRAM__BOT_TOKEN`, `PIX__PIXIV__REFRESH_TOKEN`
+## Bot And Telegram
 
-## Bot Modes
+- `src/bot` owns Telegram commands, middleware, settings dialogue state, link parsing, callback handlers, and command routing.
+- `BotHandler` stores shared dependencies and routes commands after middleware injects `UserChatContext`; unauthorized commands are intentionally ignored.
+- `build_handler_tree()` has separate callback, command, link/message, settings-dialogue, and cancel branches; preserve branch ordering when adding handlers.
+- Admin enable/disable commands intentionally bypass normal chat-access and mention checks so admins can enable disabled chats.
+- Link/message handling still passes through mention and chat-access filters; do not weaken group gating accidentally.
+- User-visible booru commands are only exposed when a booru registry is configured.
 
-- `private`: New chats disabled by default, must be enabled by admin
-- `public`: New chats enabled by default
+## Telegram Safety
 
-## Feature Implementation Checklist
+- Log internal failures with `tracing` and `{:#}` error chains, but send short friendly user messages; do not expose raw `anyhow`, DB, Telegram, Pixiv, or booru errors to users.
+- User-visible formatted text usually uses `ParseMode::MarkdownV2`; escape dynamic text with `teloxide::utils::markdown` or existing helpers before interpolation.
+- Several tests assert exact MarkdownV2 strings, so treat escaping and punctuation changes as behavior changes.
+- `Owner` implies admin via `UserRole::is_admin()`; keep owner/admin private-chat behavior intact when changing access checks.
+- Group behavior is controlled by global `require_mention_in_group` plus per-chat `allow_without_mention`; admin enable/disable commands intentionally bypass the normal chat-access branch.
 
-When adding new features:
-1. **Understand before coding** - Read existing logic in related files completely before changes
-2. **Design then implement** - Sketch solution architecture, identify affected components
-3. **Configuration** - Load from `config.rs`, pass through component chain (NO globals)
-4. **Authorization** - Respect chat enabled/disabled status and user roles
-5. **Group behavior** - Check for @mention in groups when appropriate
-6. **Error handling** - Log details with `error!()`, send generic messages to users
-7. **User messages** - Use `MarkdownV2`, escape all dynamic content
-8. **Consistency** - Match existing patterns (e.g., batch caption format in retries)
-9. **Testing** - Add tests in `#[cfg(test)]` modules (see `link_handler.rs`)
-10. **Pre-commit** - Run `make ci` to catch all issues locally (see ⚠️ HIGHEST PRIORITY section)
+## Database And Migrations
 
-**Common Integration Points**:
-- Scheduler ↔ Notifier: Use `BatchSendResult` to track partial sends
-- Handler ↔ Repo: Always use `.context()` for database operations
-- Notifier ↔ Downloader: Check cache first with `cache.get()`, then download
-- Bot ↔ Pixiv: Wrap client in `Arc<RwLock<>>` for safe concurrent access
+- `src/db` owns SeaORM entities, custom DB types, and `Repo`; application code should use `Repo` methods instead of scattering SeaORM queries.
+- Schema changes require a new migration file in `migration/src` and registration in `migration/src/lib.rs` inside `MigratorTrait::migrations()`.
+- `subscriptions.latest_data` persists scheduler progress as `SubscriptionState` variants; update state transitions and tests together.
+- Repo unit tests often create in-memory SQLite schemas manually, so do not assume migrations have run inside unit tests.
 
-## Scheduler Architecture & Retry Logic
+## Pixiv And Booru
 
-**Orchestrator-Dispatcher-Worker Pattern** (see `scheduler/author_engine.rs`):
+- `src/pixiv` wraps `pixiv_client` for auth, cache-aware downloads, Pixiv referer handling, and ugoira ZIP to MP4 conversion.
+- Downloader paths should prefer cached files before network fetches and keep pximg referer behavior intact.
+- Ugoira/H.264 tests behind `ffmpeg-codec` require a working encoder; avoid enabling them in routine checks unless local FFmpeg supports it.
+- `src/booru` builds one shared `Arc<BooruSiteRegistry>` from configured sites; empty registries disable booru scheduler work and user-visible booru commands.
+- `BooruSiteRegistry` lowercases lookup keys and applies per-site auth plus optional bypass/FlareSolverr configuration.
+- `BooruTaskKey` encodes values as `site:tags|o=...|r=...|i=...|f=...`; filter signatures encode which filters exist, not threshold values.
 
-```
-execute_author_task (Orchestrator)
-  ├─ Fetches illusts from Pixiv once
-  ├─ Iterates all subscriptions for task
-  └─ For each subscription:
-      └─ process_single_author_sub (Dispatcher)
-          ├─ Checks for pending retry → handle_existing_pending (Worker)
-          └─ Processes new illusts → handle_new_illusts (Worker)
-```
+## Notifier And Batching
 
-**Retry State Machine**:
-- `PushResult::Success` → Update `latest_illust_id`, clear `pending_illust`
-- `PushResult::Partial` → Store `PendingIllust{sent_pages, retry_count++}`
-- `PushResult::Failure` → Increment `retry_count`, retry next tick OR abandon if `max_retry_count` reached
+- Read `src/bot/notifier/AGENTS.md` before changing notifier internals; it documents invariants for captioning and continuation numbering.
+- Telegram media groups cap at `utils::caption::MAX_PER_GROUP = 10`; scheduler retry math, `ContinuationNumbering`, and notifier chunking must stay aligned with that constant.
+- All send paths, including the single-image path during resumed sends, must go through notifier caption helpers so partial retries use `\(continued N/M\)` consistently.
+- `BatchSendResult` drives scheduler retry state; preserve succeeded/failed indices and `first_message_id` semantics when touching send code.
+- Bot API calls use teloxide `Throttle<Bot>` via `ThrottledBot`; do not add manual Telegram rate-limit sleeps unless a non-Telegram backoff is being modeled.
 
-**Key Constants**:
-- `MAX_PER_GROUP = 10` - Pages per batch (MUST match `notifier.rs`)
-- `max_retry_count` - Configurable retry limit (default: 3)
-- Polling intervals: Randomized between `min_task_interval_sec` and `max_task_interval_sec`
+## Scheduler State
 
-**Critical Pattern**: When resuming partial sends, calculate batch numbers to match normal flow:
-```rust
-let total_batches = total_pages.div_ceil(MAX_PER_GROUP);
-let current_batch = (already_sent_pages.len() / MAX_PER_GROUP) + 1;
-```
+- `src/scheduler` owns `AuthorEngine`, `RankingEngine`, `NameUpdateEngine`, and optional `BooruEngine`; scheduler decisions should not move into Telegram handlers.
+- `get_chat_if_should_notify()` skips disabled chats except admin/owner private chats; reuse it for scheduler notification eligibility.
+- Author tasks fetch one Pixiv author list once, then process each subscription independently; pending `PendingIllust { sent_pages, retry_count }` is retried before new work.
+- Ranking tasks run at configured local `HH:MM` and process all ranking tasks, not just currently pending DB tasks.
+- Booru engine caps grace/ranking sends per tick and uses short drain polls for pending queues; do not simplify this into sending every pending post in one tick.
+- Keep `INTER_SUBSCRIPTION_DELAY_MS`, pending retry counts, and `first_message_id` semantics aligned with persisted scheduler state.
 
-## Crate Usage Guidelines
+## Testing Notes
 
-**When unsure about crate APIs, ALWAYS verify first:**
+- Add small colocated `#[cfg(test)]` tests for parsing, state transitions, caption/Markdown output, and repo behavior; several tests assert exact MarkdownV2 strings.
+- Link parser tests cover Pixiv ordering and booru engine-specific URL support; update them when changing supported URL forms.
+- `BooruTaskKey` tests cover task-value encoding and filter signatures; adjust tests when task sharing semantics change.
+- For config or access-control changes, prefer focused unit tests around parsing, role checks, middleware filters, or command visibility instead of broad integration tests.
 
-```bash
-# Generate and open local documentation
-cargo doc --open
+## Release And Runtime
 
-# Generate docs for a specific crate
-cargo doc -p teloxide --open
-```
-
-Or check [docs.rs](https://docs.rs) for published crate documentation.
-
-**Never guess API usage** - incorrect assumptions about crate behavior can lead to subtle bugs. Common crates to verify:
-- `teloxide` - Telegram bot framework, check dispatcher patterns and filter methods
-- `sea-orm` - Database ORM, verify entity relationships and query builders
-- `tokio` - Async runtime, understand spawn/select/channel patterns
-- `regex` - Pattern matching, test patterns before using
-
-## Testing Patterns
-
-Tests are co-located with code in `#[cfg(test)]` modules. Run with:
-```bash
-make test                              # All tests
-cargo test -p pixivbot -- --nocapture  # With output
-cargo test link_handler                # Specific module
-```
+- `Dockerfile` uses Rust 1.94 cargo-chef, builds with `--locked`, and installs FFmpeg development/runtime libraries; keep dependency changes compatible with container builds.
+- `docker-compose.yml` mounts `./config.toml:/app/config.toml:ro` and `./data:/app/data`, with `TZ=Asia/Shanghai` by default.
+- Release workflow builds Linux, macOS, and Windows targets; Windows FFmpeg comes from vcpkg while Linux/macOS install FFmpeg dev packages.
