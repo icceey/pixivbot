@@ -1,4 +1,5 @@
 use crate::db::types::BooruFilter;
+use crate::utils::duration::parse_duration_key;
 pub use booru_client::PopularScale;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,9 +79,9 @@ impl BooruTaskKey {
                 s.push_str("|r=");
                 s.push_str(scale.as_str());
             }
-            Some(BooruRankingMode::Interval(iso)) => {
+            Some(BooruRankingMode::Interval(interval_key)) => {
                 s.push_str("|i=");
-                s.push_str(iso);
+                s.push_str(interval_key);
             }
         }
         if !self.filter_sig.is_empty() {
@@ -116,11 +117,12 @@ impl BooruTaskKey {
                     }
                     let s = PopularScale::from_str(scale)?;
                     ranking = Some(BooruRankingMode::Popular(s));
-                } else if let Some(iso) = segment.strip_prefix("i=") {
+                } else if let Some(interval) = segment.strip_prefix("i=") {
                     if ranking.is_some() {
                         return None;
                     }
-                    ranking = Some(BooruRankingMode::Interval(iso.to_string()));
+                    parse_duration_key(interval)?;
+                    ranking = Some(BooruRankingMode::Interval(interval.to_string()));
                 } else {
                     return None;
                 }
@@ -212,10 +214,10 @@ mod tests {
         let k = BooruTaskKey::new_ranking(
             "konachan",
             "landscape",
-            BooruRankingMode::Interval("PT1H".into()),
+            BooruRankingMode::Interval("3600s".into()),
             &BooruFilter::default(),
         );
-        assert_eq!(k.to_task_value(), "konachan:landscape|i=PT1H");
+        assert_eq!(k.to_task_value(), "konachan:landscape|i=3600s");
     }
 
     #[test]
@@ -258,8 +260,16 @@ mod tests {
 
     #[test]
     fn parse_ranking_interval() {
-        let k = BooruTaskKey::parse("konachan:|i=PT30M").unwrap();
-        assert!(matches!(k.ranking, Some(BooruRankingMode::Interval(ref s)) if s == "PT30M"));
+        let k = BooruTaskKey::parse("konachan:|i=1800s").unwrap();
+        assert!(matches!(k.ranking, Some(BooruRankingMode::Interval(ref s)) if s == "1800s"));
+    }
+
+    #[test]
+    fn parse_ranking_interval_requires_valid_duration() {
+        assert!(BooruTaskKey::parse("konachan:|i=abc").is_none());
+        assert!(BooruTaskKey::parse("konachan:|i=0s").is_none());
+        assert!(BooruTaskKey::parse("konachan:|i=1h").is_none());
+        assert!(BooruTaskKey::parse("konachan:|i=60m").is_none());
     }
 
     #[test]
@@ -286,8 +296,8 @@ mod tests {
         // Two ranking modes — last would silently win, hiding malformed data.
         assert!(BooruTaskKey::parse("site:|o=score|r=day").is_none());
         assert!(BooruTaskKey::parse("site:|o=score|o=fav").is_none());
-        assert!(BooruTaskKey::parse("site:|i=PT1H|r=day").is_none());
-        assert!(BooruTaskKey::parse("site:|r=day|i=PT1H").is_none());
+        assert!(BooruTaskKey::parse("site:|i=1h|r=day").is_none());
+        assert!(BooruTaskKey::parse("site:|r=day|i=1h").is_none());
         // Two filter sigs — should also reject.
         assert!(BooruTaskKey::parse("site:tags|f=s|f=r").is_none());
     }
