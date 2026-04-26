@@ -123,83 +123,47 @@ impl BotHandler {
                 let mut message = header;
 
                 for (sub, task) in page_subscriptions {
-                    let type_emoji = match task.r#type {
-                        TaskType::Author => "🎨",
-                        TaskType::Ranking => "📊",
-                        TaskType::BooruTag => "🏷",
-                        TaskType::BooruPool => "📦",
-                        TaskType::BooruRanking => "🏆",
-                    };
-
-                    let display_info = if task.r#type == TaskType::Author {
-                        if let Some(ref name) = task.author_name {
-                            format!("{} \\| ID: `{}`", markdown::escape(name), task.value)
-                        } else {
-                            format!("ID: `{}`", task.value)
-                        }
-                    } else if task.r#type == TaskType::Ranking {
-                        match RankingMode::from_str(&task.value) {
-                            Some(mode) => {
-                                format!(
-                                    "排行榜 \\({}\\) \\| MODE: `{}`",
-                                    mode.display_name(),
-                                    mode.as_str()
-                                )
-                            }
-                            None => {
-                                format!(
-                                    "排行榜 \\({}\\) \\| MODE: `{}`",
-                                    task.value.replace('_', "\\_"),
-                                    task.value
-                                )
-                            }
-                        }
-                    } else if task.r#type == TaskType::BooruTag
-                        || task.r#type == TaskType::BooruPool
-                        || task.r#type == TaskType::BooruRanking
-                    {
-                        let label = if task.r#type == TaskType::BooruPool {
-                            "Pool"
-                        } else if task.r#type == TaskType::BooruRanking {
-                            "排行"
-                        } else {
-                            "标签"
-                        };
-                        let ranking_suffix = if task.r#type == TaskType::BooruRanking {
-                            BooruTaskKey::parse(&task.value)
-                                .and_then(|k| k.ranking)
-                                .map(|mode| match mode {
-                                    BooruRankingMode::Orderby(kind) => {
-                                        format!(" 🏆order={}", markdown::escape(kind.as_str()))
-                                    }
-                                    BooruRankingMode::Popular(scale) => {
-                                        format!(" 🏆{}榜", markdown::escape(scale.as_str()))
-                                    }
-                                    BooruRankingMode::Interval(interval_key) => {
-                                        format!(" 🎲每{}", markdown::escape(&interval_key))
-                                    }
-                                })
-                                .unwrap_or_default()
-                        } else {
-                            String::new()
-                        };
-                        if let Some(ref name) = task.author_name {
-                            format!(
-                                "{} \\| `{}`{}",
-                                markdown::escape(name),
-                                markdown::escape(&task.value),
-                                ranking_suffix
-                            )
-                        } else {
-                            format!(
-                                "{}: `{}`{}",
-                                label,
-                                markdown::escape(&task.value),
-                                ranking_suffix
-                            )
-                        }
+                    let (type_emoji, display_info) = if matches!(
+                        task.r#type,
+                        TaskType::BooruTag | TaskType::BooruPool | TaskType::BooruRanking
+                    ) {
+                        booru_list_display(task.r#type, task.author_name.as_deref(), &task.value)
                     } else {
-                        task.value.replace('_', "\\_")
+                        let type_emoji = match task.r#type {
+                            TaskType::Author => "🎨",
+                            TaskType::Ranking => "📊",
+                            TaskType::BooruTag | TaskType::BooruPool | TaskType::BooruRanking => {
+                                unreachable!("booru task types are handled above")
+                            }
+                        };
+
+                        let display_info = if task.r#type == TaskType::Author {
+                            if let Some(ref name) = task.author_name {
+                                format!("{} \\| ID: `{}`", markdown::escape(name), task.value)
+                            } else {
+                                format!("ID: `{}`", task.value)
+                            }
+                        } else if task.r#type == TaskType::Ranking {
+                            match RankingMode::from_str(&task.value) {
+                                Some(mode) => {
+                                    format!(
+                                        "排行榜 \\({}\\) \\| MODE: `{}`",
+                                        mode.display_name(),
+                                        mode.as_str()
+                                    )
+                                }
+                                None => {
+                                    format!(
+                                        "排行榜 \\({}\\) \\| MODE: `{}`",
+                                        task.value.replace('_', "\\_"),
+                                        task.value
+                                    )
+                                }
+                            }
+                        } else {
+                            task.value.replace('_', "\\_")
+                        };
+                        (type_emoji, display_info)
                     };
 
                     let filter_info = if !sub.filter_tags.is_empty() {
@@ -295,6 +259,45 @@ fn build_list_callback_data(page: usize, target_chat_id: ChatId, is_channel: boo
         target_chat_id.0,
         if is_channel { 1 } else { 0 }
     )
+}
+
+fn booru_list_display(
+    task_type: TaskType,
+    author_name: Option<&str>,
+    task_value: &str,
+) -> (&'static str, String) {
+    let type_emoji = match task_type {
+        TaskType::BooruTag => "🏷",
+        TaskType::BooruPool => "📦",
+        TaskType::BooruRanking => booru_ranking_list_emoji(task_value),
+        TaskType::Author | TaskType::Ranking => unreachable!("not a booru task type"),
+    };
+
+    let display_info = if let Some(name) = author_name {
+        format!(
+            "{} \\| `{}`",
+            markdown::escape(name),
+            markdown::escape(task_value)
+        )
+    } else {
+        let label = match task_type {
+            TaskType::BooruTag => "标签",
+            TaskType::BooruPool => "Pool",
+            TaskType::BooruRanking => "排行",
+            TaskType::Author | TaskType::Ranking => unreachable!("not a booru task type"),
+        };
+
+        format!("{}: `{}`", label, markdown::escape(task_value))
+    };
+
+    (type_emoji, display_info)
+}
+
+fn booru_ranking_list_emoji(task_value: &str) -> &'static str {
+    match BooruTaskKey::parse(task_value).and_then(|key| key.ranking) {
+        Some(BooruRankingMode::Interval(_)) => "🎲",
+        _ => "🏆",
+    }
 }
 
 pub fn parse_list_callback_data(callback_data: &str) -> Option<ListPaginationAction> {
