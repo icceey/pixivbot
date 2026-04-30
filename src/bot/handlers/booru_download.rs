@@ -3,7 +3,8 @@ use crate::bot::link_handler::BooruPostRef;
 use crate::bot::notifier::ThrottledBot;
 use crate::bot::BotHandler;
 use anyhow::{Context, Result};
-use std::path::PathBuf;
+use std::future::Future;
+use std::path::{Path, PathBuf};
 use teloxide::prelude::*;
 use teloxide::types::ChatAction;
 use teloxide::utils::markdown;
@@ -97,10 +98,12 @@ impl BotHandler {
                         files.len(),
                         chrono::Local::now().format("%Y%m%d_%H%M%S")
                     );
-                    if let Err(e) = self
-                        .send_document(&bot, chat_id, &zip_path, &zip_name, &caption)
-                        .await
-                    {
+                    let send_result = remove_file_after(
+                        &zip_path,
+                        self.send_document(&bot, chat_id, &zip_path, &zip_name, &caption),
+                    )
+                    .await;
+                    if let Err(e) = send_result {
                         warn!("Failed to send booru zip: {:#}", e);
                     }
                 }
@@ -165,6 +168,17 @@ impl BotHandler {
     }
 }
 
+async fn remove_file_after<T, E, Fut>(path: &Path, operation: Fut) -> std::result::Result<T, E>
+where
+    Fut: Future<Output = std::result::Result<T, E>>,
+{
+    let result = operation.await;
+    if let Err(e) = tokio::fs::remove_file(path).await {
+        warn!("Failed to remove temp ZIP file: {:#}", e);
+    }
+    result
+}
+
 fn build_booru_caption(titles: &[String], failed: &[String]) -> String {
     let mut s = String::from("📥 *下载完成*\n\n");
     if titles.len() == 1 {
@@ -179,4 +193,22 @@ fn build_booru_caption(titles: &[String], failed: &[String]) -> String {
         }
     }
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::remove_file_after;
+
+    #[tokio::test]
+    async fn remove_file_after_cleans_zip_after_successful_send() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let path = temp.into_temp_path().to_path_buf();
+        tokio::fs::write(&path, b"zip data").await.unwrap();
+
+        remove_file_after(&path, async { Ok::<_, anyhow::Error>(()) })
+            .await
+            .unwrap();
+
+        assert!(!path.exists());
+    }
 }
