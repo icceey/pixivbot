@@ -1,6 +1,8 @@
 use crate::bot::handlers::{BOORU_DOWNLOAD_CALLBACK_PREFIX, DOWNLOAD_CALLBACK_PREFIX};
 use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup};
 
+const TELEGRAM_CALLBACK_DATA_MAX_BYTES: usize = 64;
+
 #[derive(Clone, Debug)]
 pub enum DownloadTarget {
     Pixiv(u64),
@@ -74,6 +76,11 @@ impl DownloadButtonConfig {
                 BOORU_DOWNLOAD_CALLBACK_PREFIX, site_name, post_id
             ),
         };
+
+        if callback_data.len() > TELEGRAM_CALLBACK_DATA_MAX_BYTES {
+            return None;
+        }
+
         let button = InlineKeyboardButton::callback(super::DOWNLOAD_BUTTON_LABEL, callback_data);
         Some(InlineKeyboardMarkup::new(vec![vec![button]]))
     }
@@ -141,5 +148,13 @@ mod tests {
                 .build_keyboard()
                 .is_some()
         );
+    }
+
+    #[test]
+    fn booru_button_is_hidden_when_callback_data_exceeds_telegram_limit() {
+        let long_site_name = "a".repeat(61);
+        let cfg = DownloadButtonConfig::booru(long_site_name, 1);
+
+        assert!(cfg.build_keyboard().is_none());
     }
 }
