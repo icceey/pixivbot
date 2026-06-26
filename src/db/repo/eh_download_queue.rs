@@ -173,6 +173,30 @@ impl Repo {
 
         Ok(count as u64)
     }
+
+    /// Reset failed downloads back to pending if they haven't exceeded max_retry_count.
+    pub async fn retry_failed_eh_downloads(&self, max_retry_count: u8) -> Result<u64> {
+        let failed = eh_download_queue::Entity::find()
+            .filter(eh_download_queue::Column::Status.eq(STATUS_FAILED))
+            .filter(eh_download_queue::Column::RetryCount.lt(max_retry_count as i32))
+            .all(&self.db)
+            .await
+            .context("Failed to fetch failed eh downloads")?;
+
+        let count = failed.len();
+        for entry in failed {
+            let mut active: eh_download_queue::ActiveModel = entry.into();
+            active.status = Set(STATUS_PENDING.to_string());
+            active.started_at = Set(None);
+            active.completed_at = Set(None);
+            active
+                .update(&self.db)
+                .await
+                .context("Failed to reset failed eh download")?;
+        }
+
+        Ok(count as u64)
+    }
 }
 
 #[cfg(test)]

@@ -250,9 +250,7 @@ async fn main() -> Result<()> {
     let eh_engine_handle = if let Some(ref eh_client) = eh_client {
         let eh_engine = scheduler::EhEngine::new(
             repo.clone(),
-            notifier.clone(),
             std::sync::Arc::clone(eh_client),
-            telegraph_client.clone(),
             std::sync::Arc::new(config.ehentai.clone()),
             scheduler_config.tick_interval_sec,
             scheduler_config.max_retry_count,

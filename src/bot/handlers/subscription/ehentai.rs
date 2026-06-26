@@ -202,9 +202,44 @@ impl BotHandler {
                 return Ok(());
             }
         } else {
-            // Reconstruct task value from query (no filter)
-            let key = EhTaskKey::new(remaining, 0, &EhFilter::new());
-            key.to_task_value()
+            // List subscriptions and find one whose query matches
+            let subs = self.repo.list_subscriptions_by_chat(target_chat_id).await;
+            match subs {
+                Ok(subs) => {
+                    let matching: Vec<_> = subs
+                        .into_iter()
+                        .filter(|(_, task)| task.r#type == crate::db::types::TaskType::Ehentai)
+                        .filter_map(|(sub, task)| {
+                            EhTaskKey::parse(&task.value).map(|key| (sub, key))
+                        })
+                        .filter(|(_, key)| key.query == remaining)
+                        .collect();
+
+                    match matching.len() {
+                        0 => {
+                            let _ = bot.send_message(chat_id, "❌ 未找到对应的订阅").await;
+                            return Ok(());
+                        }
+                        1 => matching[0].1.to_task_value(),
+                        _ => {
+                            let _ = bot
+                                .send_message(
+                                    chat_id,
+                                    "❌ 找到多个匹配的订阅，请使用 /elist 查看完整标识后用 /eunsub <标识>",
+                                )
+                                .await;
+                            return Ok(());
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = bot
+                        .send_message(chat_id, format!("❌ {}", markdown::escape(&e.to_string())))
+                        .parse_mode(ParseMode::MarkdownV2)
+                        .await;
+                    return Ok(());
+                }
+            }
         };
 
         match self

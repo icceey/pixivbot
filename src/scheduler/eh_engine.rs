@@ -37,9 +37,7 @@ pub struct EhEngine {
 impl EhEngine {
     pub fn new(
         repo: Arc<Repo>,
-        _notifier: Notifier,
         client: Arc<EhClient>,
-        _telegraph: Option<Arc<TelegraphClient>>,
         config: Arc<EhentaiConfig>,
         tick_interval_sec: u64,
         max_retry_count: i32,
@@ -104,7 +102,6 @@ impl EhEngine {
             .context("Failed to list eh subscriptions")?;
 
         if subs.is_empty() {
-            // No subscriptions, schedule next poll
             self.schedule_next_poll(task.id).await;
             return Ok(());
         }
@@ -117,7 +114,6 @@ impl EhEngine {
         });
 
         if all_have_pending {
-            // Drain pending queues first
             for sub in &subs {
                 if let Err(e) = self.drain_pending_queue(sub).await {
                     warn!("Failed to drain pending queue for sub {}: {:#}", sub.id, e);
@@ -139,19 +135,17 @@ impl EhEngine {
             .min()
             .unwrap_or(0);
 
-        // Fetch galleries
-        let galleries = if agg_filter.has_rating_filter() {
-            // 48h scan mode: fetch all galleries within scan window
+        // Fetch gallery refs from search HTML (posted_ts is 0 from parser —
+        // we'll fetch metadata to get real timestamps before filtering).
+        let refs = if agg_filter.has_rating_filter() {
             self.fetch_galleries_48h(&key.query, key.category_bitmask, oldest_ts)
                 .await?
         } else {
-            // Normal mode: fetch newest galleries since last poll
             self.fetch_galleries_since(&key.query, key.category_bitmask, oldest_ts)
                 .await?
         };
 
-        if galleries.is_empty() {
-            // No new galleries, schedule next poll
+        if refs.is_empty() {
             for sub in &subs {
                 self.update_sub_state_no_new(sub, oldest_ts).await;
             }
@@ -159,11 +153,8 @@ impl EhEngine {
             return Ok(());
         }
 
-        // Batch fetch full metadata
-        let gidlist: Vec<(u64, &str)> = galleries
-            .iter()
-            .map(|g| (g.gid, g.token.as_str()))
-            .collect();
+        // Batch fetch full metadata (this gives us the real `posted` timestamp)
+        let gidlist: Vec<(u64, &str)> = refs.iter().map(|g| (g.gid, g.token.as_str())).collect();
 
         let mut all_metadata = Vec::new();
         for chunk in gidlist.chunks(MAX_METADATA_BATCH) {
@@ -173,16 +164,29 @@ impl EhEngine {
                 .await
                 .context("Failed to fetch gallery metadata")?;
             all_metadata.extend(metadata);
-
-            // Rate limit between metadata requests
             if chunk.len() == MAX_METADATA_BATCH {
                 tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
             }
         }
 
-        // Filter by aggregate filter
+        // Now filter by real posted timestamp + aggregate filter
+        let now_ts = Local::now().timestamp();
+        let scan_cutoff = now_ts - (self.config.scan_window_hours as i64 * 3600);
+
         let filtered: Vec<EhGallery> = all_metadata
             .into_iter()
+            .filter(|g| {
+                // Timestamp cursor: on first run (oldest_ts==0), include all.
+                // Normal mode: only newer than oldest_ts.
+                if oldest_ts > 0 && g.posted <= oldest_ts {
+                    return false;
+                }
+                // 48h scan mode: also enforce scan window cutoff.
+                if agg_filter.has_rating_filter() && g.posted < scan_cutoff.max(oldest_ts) {
+                    return false;
+                }
+                true
+            })
             .filter(|g| agg_filter.matches(g))
             .collect();
 
@@ -201,8 +205,6 @@ impl EhEngine {
             if let Err(e) = &result {
                 warn!("Failed to process eh sub {}: {:#}", sub.id, e);
             }
-
-            // Check if sub now has pending queue
             if let Some(state) = eh_tag_subscription_state(sub) {
                 if !state.pending_queue.is_empty() {
                     any_has_pending = true;
@@ -219,12 +221,13 @@ impl EhEngine {
         Ok(())
     }
 
-    /// Normal mode: fetch galleries newer than oldest_ts.
+    /// Fetch gallery refs from search. Returns all refs found (up to MAX_FETCH_PAGES).
+    /// Timestamp filtering is done later using metadata API's `posted` field.
     async fn fetch_galleries_since(
         &self,
         query: &str,
         cats: u32,
-        oldest_ts: i64,
+        _oldest_ts: i64,
     ) -> Result<Vec<eh_client::EhGalleryRef>> {
         let mut all_refs = Vec::new();
 
@@ -241,63 +244,21 @@ impl EhEngine {
                 break;
             }
 
-            // Stop if we've gone past the cursor
-            // On first run (oldest_ts == 0), include all results
-            let all_old = oldest_ts > 0 && refs.iter().all(|r| r.posted_ts <= oldest_ts);
             all_refs.extend(refs);
-            if all_old {
-                break;
-            }
         }
 
-        // Filter to only newer galleries (on first run with oldest_ts=0, include all)
-        let new_refs: Vec<eh_client::EhGalleryRef> = all_refs
-            .into_iter()
-            .filter(|r| oldest_ts == 0 || r.posted_ts > oldest_ts)
-            .collect();
-
-        Ok(new_refs)
+        Ok(all_refs)
     }
 
-    /// 48h scan mode: fetch all galleries within scan_window_hours.
+    /// 48h scan mode: fetch gallery refs (same as normal mode — timestamp
+    /// filtering against the scan window is done after metadata fetch).
     async fn fetch_galleries_48h(
         &self,
         query: &str,
         cats: u32,
-        oldest_ts: i64,
+        _oldest_ts: i64,
     ) -> Result<Vec<eh_client::EhGalleryRef>> {
-        let cutoff_ts = Local::now().timestamp() - (self.config.scan_window_hours as i64 * 3600);
-        let effective_cutoff = cutoff_ts.max(oldest_ts);
-
-        let mut all_refs = Vec::new();
-
-        for page in 0..MAX_FETCH_PAGES {
-            tokio::time::sleep(tokio::time::Duration::from_millis(SEARCH_RATE_LIMIT_MS)).await;
-
-            let refs = self
-                .client
-                .search(query, cats, page)
-                .await
-                .context("Failed to search eh galleries (48h scan)")?;
-
-            if refs.is_empty() {
-                break;
-            }
-
-            let all_old = refs.iter().all(|r| r.posted_ts < effective_cutoff);
-            all_refs.extend(refs);
-            if all_old {
-                break;
-            }
-        }
-
-        // Filter to galleries within scan window
-        let filtered: Vec<eh_client::EhGalleryRef> = all_refs
-            .into_iter()
-            .filter(|r| r.posted_ts >= effective_cutoff)
-            .collect();
-
-        Ok(filtered)
+        self.fetch_galleries_since(query, cats, 0).await
     }
 
     /// Process a single subscription: filter galleries, enqueue downloads, update state.
@@ -517,12 +478,32 @@ impl EhDownloadProcessor {
     }
 
     pub async fn run(self) {
+        // On startup, reset stale and retry eligible failed downloads
+        if let Err(e) = self.repo.reset_stale_eh_downloads().await {
+            warn!("Failed to reset stale eh downloads: {:#}", e);
+        }
+        if let Err(e) = self
+            .repo
+            .retry_failed_eh_downloads(self.config.max_retry_count)
+            .await
+        {
+            warn!("Failed to retry failed eh downloads: {:#}", e);
+        }
+
         let poll_interval = self.config.download_poll_interval_sec.max(10);
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(poll_interval));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
             interval.tick().await;
+            // Periodically retry failed downloads
+            if let Err(e) = self
+                .repo
+                .retry_failed_eh_downloads(self.config.max_retry_count)
+                .await
+            {
+                warn!("Failed to retry failed eh downloads: {:#}", e);
+            }
             if let Err(e) = self.tick().await {
                 error!("EhDownloadProcessor tick error: {:#}", e);
             }
@@ -664,56 +645,52 @@ impl EhDownloadProcessor {
             .as_ref()
             .context("Telegraph client not configured")?;
 
-        // Extract images from ZIP
-        let zip_file = std::fs::File::open(zip_path).context("Failed to open zip")?;
-        let mut archive = zip::ZipArchive::new(zip_file).context("Failed to read zip archive")?;
+        // Extract images from ZIP in a blocking task to avoid blocking async executor
+        let zip_path = zip_path.to_path_buf();
+        let image_data_list: Vec<(String, Vec<u8>)> = tokio::task::spawn_blocking(move || {
+            let zip_file = std::fs::File::open(&zip_path).context("Failed to open zip")?;
+            let mut archive =
+                zip::ZipArchive::new(zip_file).context("Failed to read zip archive")?;
 
+            let mut images = Vec::new();
+            for i in 0..archive.len() {
+                let mut file = archive.by_index(i).context("Failed to read zip entry")?;
+                let name = file.name().to_lowercase();
+                if !name.ends_with(".jpg")
+                    && !name.ends_with(".jpeg")
+                    && !name.ends_with(".png")
+                    && !name.ends_with(".gif")
+                    && !name.ends_with(".webp")
+                {
+                    continue;
+                }
+
+                let mut data = Vec::new();
+                std::io::Read::read_to_end(&mut file, &mut data)
+                    .context("Failed to read image from zip")?;
+
+                if data.len() > 6 * 1024 * 1024 {
+                    continue;
+                }
+
+                let filename = std::path::Path::new(file.name())
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("image.jpg")
+                    .to_string();
+                images.push((filename, data));
+            }
+            Ok::<_, anyhow::Error>(images)
+        })
+        .await
+        .context("spawn_blocking failed")??;
+
+        // Upload images to Telegraph (async)
         let mut image_urls = Vec::new();
-
-        for i in 0..archive.len() {
-            let mut file = archive.by_index(i).context("Failed to read zip entry")?;
-
-            let name = file.name().to_lowercase();
-            if !name.ends_with(".jpg")
-                && !name.ends_with(".jpeg")
-                && !name.ends_with(".png")
-                && !name.ends_with(".gif")
-                && !name.ends_with(".webp")
-            {
-                continue;
-            }
-
-            let mut data = Vec::new();
-            std::io::Read::read_to_end(&mut file, &mut data)
-                .context("Failed to read image from zip")?;
-
-            // Skip files larger than 6MB (Telegraph limit)
-            if data.len() > 6 * 1024 * 1024 {
-                warn!(
-                    "Skipping image {} (too large: {} bytes)",
-                    file.name(),
-                    data.len()
-                );
-                continue;
-            }
-
-            let filename = std::path::Path::new(file.name())
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("image.jpg")
-                .to_string();
-
+        for (filename, data) in image_data_list {
             match telegraph.upload_image(&data, &filename).await {
-                Ok(url) => {
-                    image_urls.push(url);
-                }
-                Err(e) => {
-                    warn!(
-                        "Failed to upload image {} to telegraph: {:#}",
-                        file.name(),
-                        e
-                    );
-                }
+                Ok(url) => image_urls.push(url),
+                Err(e) => warn!("Failed to upload image to telegraph: {:#}", e),
             }
         }
 
@@ -820,30 +797,14 @@ mod tests {
 #[cfg(test)]
 mod integration_tests {
     use super::*;
-    use crate::bot::notifier::Notifier;
-    use crate::cache::FileCacheManager;
     use crate::config::EhentaiConfig;
     use crate::db::repo::tests_helpers;
     use crate::db::types::{
         EhFilter, EhTagState, EhTaskKey, SubscriptionState, TagFilter, TaskType,
     };
-    use crate::pixiv::downloader::Downloader;
     use eh_client::EhClientBuilder;
-    use reqwest::Client;
-    use teloxide::requests::RequesterExt;
-    use teloxide::Bot;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
-
-    /// Build a dummy Notifier (the EhEngine doesn't use it).
-    fn dummy_notifier() -> Notifier {
-        let bot = Bot::new("0:fake_token_for_tests");
-        let throttled = bot.throttle(teloxide::adaptors::throttle::Limits::default());
-        let http = Client::new();
-        let cache = FileCacheManager::new("data/test_cache", 7);
-        let downloader = Arc::new(Downloader::new(http, cache));
-        Notifier::new(throttled, downloader)
-    }
 
     /// Build a test EhEngine pointing at the given mock server.
     fn make_engine(
@@ -869,15 +830,7 @@ mod integration_tests {
         config.scan_window_hours = 48;
         config.pushed_cap = 100;
 
-        EhEngine::new(
-            repo,
-            dummy_notifier(),
-            client,
-            None,
-            Arc::new(config),
-            30,
-            3,
-        )
+        EhEngine::new(repo, client, Arc::new(config), 30, 3)
     }
 
     fn search_html(gid: u64, token: &str, title: &str) -> String {
@@ -1120,21 +1073,19 @@ mod integration_tests {
         };
         let (_, task_id, _) = setup_subscription(&repo, Some(filter)).await;
 
-        // Mock search: return one gallery with posted_ts=0 (which is < effective_cutoff in 48h mode,
-        // but since 0 < effective_cutoff, it should be filtered OUT in 48h mode).
-        // Wait — in 48h scan mode, galleries with posted_ts >= effective_cutoff are included.
-        // posted_ts=0 is very old, so it will be excluded.
-        // Let's use a recent timestamp instead.
-        let recent_ts = Local::now().timestamp() - 3600; // 1 hour ago
-        let search_html = search_html(999999, "token1234", "Recent Gallery");
+        // Mock search: return one gallery (posted_ts from search HTML is 0, but
+        // metadata API will provide the real posted timestamp).
+        let token = "abcdef0123";
+        let search_html = search_html(999999, token, "Recent Gallery");
         Mock::given(method("GET"))
             .and(path("/"))
             .respond_with(ResponseTemplate::new(200).set_body_string(search_html))
             .mount(&server)
             .await;
 
-        // Mock metadata with rating=4.5 (passes min_rating=4)
-        let meta = metadata_json(999999, "token1234", "Recent Gallery", recent_ts, "4.5", 20);
+        // Mock metadata with rating=4.5 (passes min_rating=4) and recent timestamp
+        let recent_ts = Local::now().timestamp() - 3600; // 1 hour ago
+        let meta = metadata_json(999999, token, "Recent Gallery", recent_ts, "4.5", 20);
         Mock::given(method("POST"))
             .and(path("/api.php"))
             .respond_with(ResponseTemplate::new(200).set_body_json(meta))
@@ -1148,21 +1099,13 @@ mod integration_tests {
 
         engine.tick().await.unwrap();
 
-        // The gallery has posted_ts=0 (from search HTML), which is < effective_cutoff.
-        // So in 48h scan mode, it should be filtered out and NOT enqueued.
-        // Wait — the search HTML doesn't parse posted_ts (it's 0 from parser).
-        // The 48h scan filters on posted_ts from search results (which is 0).
-        // So 0 < effective_cutoff → filtered out.
-        // But then metadata is fetched for galleries that passed the filter...
-        // Actually, looking at the code: fetch_galleries_48h filters refs by posted_ts >= effective_cutoff.
-        // Since parser sets posted_ts=0, all refs will be 0 < effective_cutoff → filtered out.
-        // So no galleries, no metadata fetch, no enqueue.
-        // This is a known limitation of the parser (posted_ts is always 0 from search HTML).
-        // The test verifies this behavior: with rating filter and parser limitation, nothing is enqueued.
+        // With the fix, metadata is fetched first, then timestamp filtering
+        // uses the real posted timestamp from the API. The gallery is 1h old,
+        // which is within the 48h scan window, so it should be enqueued.
         let pending = repo.count_pending_eh_downloads().await.unwrap();
         assert_eq!(
-            pending, 0,
-            "galleries with posted_ts=0 are outside 48h window"
+            pending, 1,
+            "gallery within 48h scan window should be enqueued"
         );
     }
 
@@ -1942,9 +1885,7 @@ mod download_processor_tests {
         engine_config.max_interval_sec = 2;
         let engine = EhEngine::new(
             Arc::clone(&repo),
-            make_notifier(&tg_server),
             Arc::clone(&engine_client),
-            None,
             Arc::new(engine_config),
             30,
             3,

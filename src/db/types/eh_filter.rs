@@ -59,7 +59,7 @@ impl EhFilter {
     /// Check if a gallery matches all filter criteria.
     pub fn matches(&self, gallery: &EhGallery) -> bool {
         if let Some(min_rating) = self.min_rating {
-            if (gallery.rating as u8) < min_rating {
+            if gallery.rating < min_rating as f64 {
                 return false;
             }
         }
