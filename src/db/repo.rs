@@ -21,6 +21,12 @@ impl Repo {
     pub async fn ping(&self) -> Result<()> {
         self.db.ping().await.context("Database ping failed")
     }
+
+    /// Get a reference to the underlying DB connection (for tests).
+    #[cfg(test)]
+    pub(crate) fn db(&self) -> &DatabaseConnection {
+        &self.db
+    }
 }
 
 /// Shared test helpers for repo unit tests.

@@ -1331,3 +1331,673 @@ mod integration_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod download_processor_tests {
+    use super::*;
+    use crate::bot::notifier::Notifier;
+    use crate::cache::FileCacheManager;
+    use crate::config::EhentaiConfig;
+    use crate::db::entities::eh_download_queue;
+    use crate::db::repo::tests_helpers;
+    use crate::db::types::{EhFilter, EhTaskKey, TagFilter, TaskType};
+    use crate::pixiv::downloader::Downloader;
+    use eh_client::{EhClientBuilder, TelegraphClient};
+    use reqwest::Client;
+    use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter};
+    use std::io::Write;
+    use teloxide::requests::RequesterExt;
+    use teloxide::Bot;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// Build a Notifier whose Bot points at the given mock server (Telegram API mock).
+    fn make_notifier(tg_server: &MockServer) -> Notifier {
+        let url = url::Url::parse(&tg_server.uri()).unwrap();
+        let bot = Bot::new("fake_token").set_api_url(url);
+        let throttled = bot.throttle(teloxide::adaptors::throttle::Limits::default());
+        let http = Client::new();
+        let cache = FileCacheManager::new("data/test_cache", 7);
+        let downloader = Arc::new(Downloader::new(http, cache));
+        Notifier::new(throttled, downloader)
+    }
+
+    /// Build an EhClient pointing at the given mock server (e-hentai API mock).
+    fn make_eh_client(eh_server: &MockServer) -> Arc<EhClient> {
+        Arc::new(
+            EhClientBuilder::new()
+                .base_url(&eh_server.uri())
+                .api_url(&format!("{}/api.php", eh_server.uri()))
+                .build(),
+        )
+    }
+
+    /// Build a TelegraphClient pointing at the given mock server.
+    fn make_telegraph_client(tg_server: &MockServer) -> Arc<TelegraphClient> {
+        Arc::new(TelegraphClient::new_with_urls(
+            "test_token".to_string(),
+            format!("{}/telegraph/upload", tg_server.uri()),
+            tg_server.uri(),
+        ))
+    }
+
+    fn make_config() -> EhentaiConfig {
+        EhentaiConfig {
+            download_rate_limit_gb: 10,
+            download_rate_window_hours: 24,
+            download_poll_interval_sec: 60,
+            max_push_per_tick: 3,
+            max_retry_count: 3,
+            ..Default::default()
+        }
+    }
+
+    /// Create a ZIP file containing image entries for testing.
+    fn create_test_zip(path: &std::path::Path, image_count: usize) {
+        let file = std::fs::File::create(path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        for i in 0..image_count {
+            let name = format!("page{:03}.jpg", i);
+            let options = zip::write::SimpleFileOptions::default();
+            zip.start_file(name, options).unwrap();
+            // Write minimal JPEG header + dummy data
+            let data = format!("fake_image_data_{}", i);
+            zip.write_all(data.as_bytes()).unwrap();
+        }
+        zip.finish().unwrap();
+    }
+
+    /// Mock the Telegram sendDocument endpoint.
+    async fn mock_tg_send_document(server: &MockServer) {
+        let body = serde_json::json!({
+            "ok": true,
+            "result": {
+                "message_id": 42,
+                "date": 1700000000,
+                "chat": {"id": -100, "type": "private"}
+            }
+        });
+        Mock::given(method("POST"))
+            .and(path("/botfake_token/SendDocument"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(server)
+            .await;
+    }
+
+    /// Mock the Telegram sendMessage endpoint.
+    async fn mock_tg_send_message(server: &MockServer) {
+        let body = serde_json::json!({
+            "ok": true,
+            "result": {
+                "message_id": 43,
+                "date": 1700000000,
+                "chat": {"id": -100, "type": "private"}
+            }
+        });
+        Mock::given(method("POST"))
+            .and(path("/botfake_token/SendMessage"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(server)
+            .await;
+    }
+
+    /// Mock the e-hentai gallery page (contains archiver_key).
+    async fn mock_eh_gallery_page(server: &MockServer, gid: u64, token: &str) {
+        let archiver_key = format!("{}--abc123def456", gid);
+        let html = format!(
+            r#"<html><body>
+            <a href="/archiver.php?gid={}&token={}&or={}">Archive Download</a>
+            </body></html>"#,
+            gid, token, archiver_key
+        );
+        Mock::given(method("GET"))
+            .and(path(format!("/g/{}/{}/", gid, token)))
+            .respond_with(ResponseTemplate::new(200).set_body_string(html))
+            .mount(server)
+            .await;
+    }
+
+    /// Mock the archiver.php POST endpoint (returns JS redirect HTML).
+    async fn mock_eh_archiver_post(server: &MockServer, download_url: &str) {
+        let html = format!(
+            r#"<html><script>
+            function gotonext() {{
+                document.location = "{}?autostart=1";
+            }}
+            </script></html>"#,
+            download_url
+        );
+        Mock::given(method("POST"))
+            .and(path("/archiver.php"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(html))
+            .mount(server)
+            .await;
+    }
+
+    /// Mock the archive download URL (returns ZIP bytes).
+    async fn mock_eh_archive_download(server: &MockServer, zip_bytes: Vec<u8>) {
+        Mock::given(method("GET"))
+            .and(path("/archive/123456/token/0"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(zip_bytes))
+            .mount(server)
+            .await;
+    }
+
+    /// Mock the Telegraph upload endpoint.
+    async fn mock_telegraph_upload(server: &MockServer) {
+        let body = serde_json::json!([{"src": "/file/abc123.jpg"}]);
+        Mock::given(method("POST"))
+            .and(path("/telegraph/upload"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(server)
+            .await;
+    }
+
+    /// Mock the Telegraph createPage endpoint.
+    async fn mock_telegraph_create_page(server: &MockServer) {
+        let body = serde_json::json!({
+            "ok": true,
+            "result": {"url": "https://telegra.ph/Test-Gallery-01-01"}
+        });
+        Mock::given(method("POST"))
+            .and(path("/createPage"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(server)
+            .await;
+    }
+
+    /// Set up a test DB with a chat, task, subscription, and enqueued download.
+    async fn setup_download_entry(repo: &Repo, telegraph: bool) -> i32 {
+        let chat_id: i64 = -100;
+        repo.upsert_chat(chat_id, "private".into(), None, true, Default::default())
+            .await
+            .unwrap();
+
+        // Create task + subscription
+        let eh_filter = EhFilter {
+            min_rating: None,
+            min_pages: None,
+            max_pages: None,
+            telegraph,
+        };
+        let key = EhTaskKey::new("female:elf", 0, &eh_filter);
+        let task = repo
+            .get_or_create_task(TaskType::Ehentai, key.to_task_value(), None)
+            .await
+            .unwrap();
+        repo.upsert_eh_subscription(chat_id, task.id, TagFilter::default(), Some(eh_filter))
+            .await
+            .unwrap();
+
+        // Enqueue a download
+        let entry = repo
+            .enqueue_eh_download(
+                chat_id,
+                123456,
+                "abcdef0123",
+                "Test Gallery",
+                telegraph,
+                SOURCE_SUBSCRIPTION,
+            )
+            .await
+            .unwrap();
+        entry.id
+    }
+
+    #[tokio::test]
+    async fn test_download_processor_full_flow_without_telegraph() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        let eh_server = MockServer::start().await;
+        let tg_server = MockServer::start().await;
+
+        let entry_id = setup_download_entry(&repo, false).await;
+
+        // Mock e-hentai: gallery page → archiver.php → archive download
+        mock_eh_gallery_page(&eh_server, 123456, "abcdef0123").await;
+        let download_url = format!("{}/archive/123456/token/0", eh_server.uri());
+        mock_eh_archiver_post(&eh_server, &download_url).await;
+
+        // Create a real ZIP file and serve it
+        let temp = tempfile::tempdir().unwrap();
+        let zip_path = temp.path().join("test.zip");
+        create_test_zip(&zip_path, 3);
+        let zip_bytes = std::fs::read(&zip_path).unwrap();
+        mock_eh_archive_download(&eh_server, zip_bytes).await;
+
+        // Mock Telegram sendDocument
+        mock_tg_send_document(&tg_server).await;
+
+        let processor = EhDownloadProcessor::new(
+            Arc::clone(&repo),
+            make_notifier(&tg_server),
+            make_eh_client(&eh_server),
+            None,
+            Arc::new(make_config()),
+        );
+
+        processor.tick().await.unwrap();
+
+        // Verify download is marked as done
+        let entry = eh_download_queue::Entity::find_by_id(entry_id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(entry.status, "done");
+        assert!(entry.file_size > 0);
+    }
+
+    #[tokio::test]
+    async fn test_download_processor_full_flow_with_telegraph() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        let eh_server = MockServer::start().await;
+        let tg_server = MockServer::start().await;
+
+        let entry_id = setup_download_entry(&repo, true).await;
+
+        // Mock e-hentai: gallery page → archiver.php → archive download
+        mock_eh_gallery_page(&eh_server, 123456, "abcdef0123").await;
+        let download_url = format!("{}/archive/123456/token/0", eh_server.uri());
+        mock_eh_archiver_post(&eh_server, &download_url).await;
+
+        // Create a real ZIP file and serve it
+        let temp = tempfile::tempdir().unwrap();
+        let zip_path = temp.path().join("test.zip");
+        create_test_zip(&zip_path, 5);
+        let zip_bytes = std::fs::read(&zip_path).unwrap();
+        mock_eh_archive_download(&eh_server, zip_bytes).await;
+
+        // Mock Telegram: sendDocument + sendMessage (for telegraph link)
+        mock_tg_send_document(&tg_server).await;
+        mock_tg_send_message(&tg_server).await;
+
+        // Mock Telegraph: upload + createPage
+        mock_telegraph_upload(&tg_server).await;
+        mock_telegraph_create_page(&tg_server).await;
+
+        let telegraph = make_telegraph_client(&tg_server);
+        let processor = EhDownloadProcessor::new(
+            Arc::clone(&repo),
+            make_notifier(&tg_server),
+            make_eh_client(&eh_server),
+            Some(telegraph),
+            Arc::new(make_config()),
+        );
+
+        processor.tick().await.unwrap();
+
+        // Verify download is marked as done
+        let entry = eh_download_queue::Entity::find_by_id(entry_id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(entry.status, "done");
+        assert!(entry.file_size > 0);
+
+        // Verify Telegram received: sendDocument + sendMessage (telegraph link)
+        let received = tg_server.received_requests().await.unwrap();
+        let has_send_document = received
+            .iter()
+            .any(|r| r.url.path().ends_with("/SendDocument"));
+        let has_send_message = received
+            .iter()
+            .any(|r| r.url.path().ends_with("/SendMessage"));
+        assert!(has_send_document, "should have called sendDocument");
+        assert!(
+            has_send_message,
+            "should have called sendMessage for telegraph link"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_download_processor_rate_limit_skips() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        let eh_server = MockServer::start().await;
+        let tg_server = MockServer::start().await;
+
+        let entry_id = setup_download_entry(&repo, false).await;
+
+        // Pre-fill a completed download to hit rate limit
+        let now = Local::now().naive_local();
+        let big_entry = eh_download_queue::ActiveModel {
+            chat_id: sea_orm::Set(-100),
+            gid: sea_orm::Set(999999),
+            token: sea_orm::Set("dummy".into()),
+            title: sea_orm::Set("Big Download".into()),
+            telegraph: sea_orm::Set(false),
+            source: sea_orm::Set(SOURCE_SUBSCRIPTION.into()),
+            status: sea_orm::Set("done".into()),
+            file_size: sea_orm::Set(11_000_000_000), // 11 GB > 10 GB limit
+            error: sea_orm::Set(None),
+            retry_count: sea_orm::Set(0),
+            created_at: sea_orm::Set(now),
+            started_at: sea_orm::Set(Some(now)),
+            completed_at: sea_orm::Set(Some(now)),
+            ..Default::default()
+        };
+        big_entry.insert(repo.db()).await.unwrap();
+
+        let mut config = make_config();
+        config.download_rate_limit_gb = 10; // 10 GB limit
+
+        let processor = EhDownloadProcessor::new(
+            Arc::clone(&repo),
+            make_notifier(&tg_server),
+            make_eh_client(&eh_server),
+            None,
+            Arc::new(config),
+        );
+
+        processor.tick().await.unwrap();
+
+        // Entry should still be pending (not processed)
+        let entry = eh_download_queue::Entity::find_by_id(entry_id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            entry.status, "pending",
+            "download should remain pending due to rate limit"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_download_processor_download_failure_marks_failed() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        let eh_server = MockServer::start().await;
+        let tg_server = MockServer::start().await;
+
+        let entry_id = setup_download_entry(&repo, false).await;
+
+        // Mock gallery page but archiver.php returns 500
+        mock_eh_gallery_page(&eh_server, 123456, "abcdef0123").await;
+        Mock::given(method("POST"))
+            .and(path("/archiver.php"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&eh_server)
+            .await;
+
+        let processor = EhDownloadProcessor::new(
+            Arc::clone(&repo),
+            make_notifier(&tg_server),
+            make_eh_client(&eh_server),
+            None,
+            Arc::new(make_config()),
+        );
+
+        processor.tick().await.unwrap();
+
+        // Entry should be marked as failed
+        let entry = eh_download_queue::Entity::find_by_id(entry_id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(entry.status, "failed");
+        assert!(entry.error.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_download_processor_empty_zip_no_images() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        let eh_server = MockServer::start().await;
+        let tg_server = MockServer::start().await;
+
+        // Create entry with telegraph=true
+        let entry_id = setup_download_entry(&repo, true).await;
+
+        mock_eh_gallery_page(&eh_server, 123456, "abcdef0123").await;
+        let download_url = format!("{}/archive/123456/token/0", eh_server.uri());
+        mock_eh_archiver_post(&eh_server, &download_url).await;
+
+        // Create a ZIP with NO image files
+        let temp = tempfile::tempdir().unwrap();
+        let zip_path = temp.path().join("empty.zip");
+        {
+            let file = std::fs::File::create(&zip_path).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            zip.start_file("readme.txt", zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(b"no images here").unwrap();
+            zip.finish().unwrap();
+        }
+        let zip_bytes = std::fs::read(&zip_path).unwrap();
+        mock_eh_archive_download(&eh_server, zip_bytes).await;
+
+        // Mock Telegram
+        mock_tg_send_document(&tg_server).await;
+        mock_tg_send_message(&tg_server).await; // for error message
+
+        let telegraph = make_telegraph_client(&tg_server);
+        let processor = EhDownloadProcessor::new(
+            Arc::clone(&repo),
+            make_notifier(&tg_server),
+            make_eh_client(&eh_server),
+            Some(telegraph),
+            Arc::new(make_config()),
+        );
+
+        processor.tick().await.unwrap();
+
+        // Download should still be marked as done (the archive was downloaded successfully)
+        // Telegraph upload failed, but that's a non-fatal error
+        let entry = eh_download_queue::Entity::find_by_id(entry_id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            entry.status, "done",
+            "archive download should succeed even if telegraph fails"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_download_processor_no_pending_downloads() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        let eh_server = MockServer::start().await;
+        let tg_server = MockServer::start().await;
+
+        // No downloads enqueued
+        let processor = EhDownloadProcessor::new(
+            Arc::clone(&repo),
+            make_notifier(&tg_server),
+            make_eh_client(&eh_server),
+            None,
+            Arc::new(make_config()),
+        );
+
+        // Should complete without error
+        processor.tick().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_download_processor_telegraph_failure_sends_error_message() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        let eh_server = MockServer::start().await;
+        let tg_server = MockServer::start().await;
+
+        let entry_id = setup_download_entry(&repo, true).await;
+
+        mock_eh_gallery_page(&eh_server, 123456, "abcdef0123").await;
+        let download_url = format!("{}/archive/123456/token/0", eh_server.uri());
+        mock_eh_archiver_post(&eh_server, &download_url).await;
+
+        // Create ZIP with images
+        let temp = tempfile::tempdir().unwrap();
+        let zip_path = temp.path().join("test.zip");
+        create_test_zip(&zip_path, 2);
+        let zip_bytes = std::fs::read(&zip_path).unwrap();
+        mock_eh_archive_download(&eh_server, zip_bytes).await;
+
+        // Mock Telegram
+        mock_tg_send_document(&tg_server).await;
+        mock_tg_send_message(&tg_server).await;
+
+        // Mock Telegraph upload to FAIL
+        Mock::given(method("POST"))
+            .and(path("/telegraph/upload"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&tg_server)
+            .await;
+
+        let telegraph = make_telegraph_client(&tg_server);
+        let processor = EhDownloadProcessor::new(
+            Arc::clone(&repo),
+            make_notifier(&tg_server),
+            make_eh_client(&eh_server),
+            Some(telegraph),
+            Arc::new(make_config()),
+        );
+
+        processor.tick().await.unwrap();
+
+        // Download should still be marked done (telegraph failure is non-fatal)
+        let entry = eh_download_queue::Entity::find_by_id(entry_id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(entry.status, "done");
+
+        // Verify error message was sent to Telegram
+        let received = tg_server.received_requests().await.unwrap();
+        let has_error_message = received
+            .iter()
+            .any(|r| r.url.path().ends_with("/SendMessage"));
+        assert!(has_error_message, "should have sent error message to chat");
+    }
+
+    /// Full pipeline test: EhEngine tick → enqueue → EhDownloadProcessor tick → send document
+    #[tokio::test]
+    async fn test_full_pipeline_engine_to_processor() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        let eh_server = MockServer::start().await;
+        let tg_server = MockServer::start().await;
+
+        // Set up subscription (no telegraph for simplicity)
+        let chat_id: i64 = -100;
+        repo.upsert_chat(chat_id, "private".into(), None, true, Default::default())
+            .await
+            .unwrap();
+
+        let eh_filter = EhFilter::default();
+        let key = EhTaskKey::new("female:elf", 0, &eh_filter);
+        let task_value = key.to_task_value();
+        let task = repo
+            .get_or_create_task(TaskType::Ehentai, task_value, None)
+            .await
+            .unwrap();
+        repo.upsert_eh_subscription(chat_id, task.id, TagFilter::default(), None)
+            .await
+            .unwrap();
+
+        // Make task pending
+        let now = Local::now() - chrono::Duration::seconds(60);
+        repo.update_task_after_poll(task.id, now).await.unwrap();
+
+        // Mock e-hentai search
+        let search_html = r#"<div class="gl1t">
+  <a href="https://e-hentai.org/g/777888/abcdef0123">
+    <img src="https://ehgt.org/t/777888.jpg" />
+  </a>
+  <div class="gl3t"><div class="glink">Pipeline Test Gallery</div></div>
+</div>"#;
+        Mock::given(method("GET"))
+            .and(path("/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(search_html))
+            .mount(&eh_server)
+            .await;
+
+        // Mock metadata API
+        let meta = serde_json::json!({
+            "gmetadata": [{
+                "gid": 777888,
+                "token": "abcdef0123",
+                "title": "Pipeline Test Gallery",
+                "title_jpn": null,
+                "category": "Doujinshi",
+                "thumb": "https://ehgt.org/t/thumb.jpg",
+                "uploader": "testuser",
+                "posted": "1700000000",
+                "filecount": "10",
+                "filesize": 1000000,
+                "expunged": false,
+                "rating": "4.5",
+                "tags": ["parody:test"]
+            }]
+        });
+        Mock::given(method("POST"))
+            .and(path("/api.php"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(meta))
+            .mount(&eh_server)
+            .await;
+
+        // Step 1: Run EhEngine tick to search and enqueue download
+        let engine_client = make_eh_client(&eh_server);
+        let mut engine_config = make_config();
+        engine_config.min_interval_sec = 1;
+        engine_config.max_interval_sec = 2;
+        let engine = EhEngine::new(
+            Arc::clone(&repo),
+            make_notifier(&tg_server),
+            Arc::clone(&engine_client),
+            None,
+            Arc::new(engine_config),
+            30,
+            3,
+        );
+        engine.tick().await.unwrap();
+
+        // Verify download was enqueued
+        let pending_count = repo.count_pending_eh_downloads().await.unwrap();
+        assert_eq!(pending_count, 1, "EhEngine should have enqueued 1 download");
+
+        // Step 2: Mock remaining e-hentai endpoints for download
+        mock_eh_gallery_page(&eh_server, 777888, "abcdef0123").await;
+        let download_url = format!("{}/archive/777888/token/0", eh_server.uri());
+        mock_eh_archiver_post(&eh_server, &download_url).await;
+
+        let temp = tempfile::tempdir().unwrap();
+        let zip_path = temp.path().join("gallery.zip");
+        create_test_zip(&zip_path, 3);
+        let zip_bytes = std::fs::read(&zip_path).unwrap();
+
+        // Need a separate mock for the archive download path
+        Mock::given(method("GET"))
+            .and(path("/archive/777888/token/0"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(zip_bytes))
+            .mount(&eh_server)
+            .await;
+
+        // Mock Telegram sendDocument
+        mock_tg_send_document(&tg_server).await;
+
+        // Step 3: Run EhDownloadProcessor tick to download and send
+        let processor = EhDownloadProcessor::new(
+            Arc::clone(&repo),
+            make_notifier(&tg_server),
+            engine_client,
+            None,
+            Arc::new(make_config()),
+        );
+        processor.tick().await.unwrap();
+
+        // Verify: download should be done
+        let done_count = eh_download_queue::Entity::find()
+            .filter(eh_download_queue::Column::Status.eq("done"))
+            .count(repo.db())
+            .await
+            .unwrap();
+        assert_eq!(done_count, 1, "download should be marked done");
+
+        // Verify: Telegram received sendDocument
+        let received = tg_server.received_requests().await.unwrap();
+        let has_send_document = received
+            .iter()
+            .any(|r| r.url.path().ends_with("/SendDocument"));
+        assert!(has_send_document, "should have sent document to Telegram");
+    }
+}

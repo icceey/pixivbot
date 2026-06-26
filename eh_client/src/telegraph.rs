@@ -96,16 +96,29 @@ struct UploadResult {
 pub struct TelegraphClient {
     http: reqwest::Client,
     access_token: String,
+    upload_url: String,
+    api_url: String,
 }
 
 impl TelegraphClient {
     pub fn new(access_token: String) -> Self {
+        Self::new_with_urls(
+            access_token,
+            "https://telegra.ph/upload".to_string(),
+            "https://api.telegra.ph".to_string(),
+        )
+    }
+
+    /// Constructor with configurable endpoint URLs (for testing).
+    pub fn new_with_urls(access_token: String, upload_url: String, api_url: String) -> Self {
         Self {
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(60))
                 .build()
                 .expect("failed to build telegraph http client"),
             access_token,
+            upload_url,
+            api_url,
         }
     }
 
@@ -119,7 +132,7 @@ impl TelegraphClient {
 
         let resp = self
             .http
-            .post("https://telegra.ph/upload")
+            .post(&self.upload_url)
             .multipart(form)
             .send()
             .await?;
@@ -154,7 +167,7 @@ impl TelegraphClient {
 
         let resp = self
             .http
-            .post("https://api.telegra.ph/createPage")
+            .post(format!("{}/createPage", self.api_url))
             .form(&form)
             .send()
             .await?;
