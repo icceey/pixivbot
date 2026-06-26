@@ -78,7 +78,7 @@ pub enum EhCategory {
 }
 
 impl EhCategory {
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse_str(s: &str) -> Option<Self> {
         match s.to_ascii_lowercase().as_str() {
             "doujinshi" => Some(Self::Doujinshi),
             "manga" => Some(Self::Manga),
@@ -97,7 +97,7 @@ impl EhCategory {
     /// Parse a comma-separated list of category names into a bitmask.
     pub fn bitmask_from_str(s: &str) -> u32 {
         s.split(',')
-            .filter_map(|c| Self::from_str(c.trim()))
+            .filter_map(|c| Self::parse_str(c.trim()))
             .map(|c| c as u32)
             .sum()
     }
