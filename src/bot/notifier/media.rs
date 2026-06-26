@@ -100,4 +100,37 @@ impl Notifier {
         let message = req.await.context("Send animation failed")?;
         Ok(message.id.0)
     }
+
+    /// 发送文档 (ZIP/文件) 并返回消息ID
+    ///
+    /// 用于 e-hentai 归档下载发送。caption 使用 MarkdownV2 格式。
+    pub async fn send_document(
+        &self,
+        chat_id: ChatId,
+        path: &Path,
+        filename: &str,
+        caption: &str,
+    ) -> Result<i32> {
+        let mut req = self
+            .bot
+            .send_document(chat_id, InputFile::file(path).file_name(filename));
+        req = req.caption(caption).parse_mode(ParseMode::MarkdownV2);
+        let message = req.await.context("Send document failed")?;
+        Ok(message.id.0)
+    }
+
+    /// 发送纯文本消息并返回消息ID
+    ///
+    /// 用于发送 Telegraph 链接等。text 使用 MarkdownV2 格式。
+    pub async fn send_text(&self, chat_id: ChatId, text: &str, silent: bool) -> Result<i32> {
+        let mut req = self
+            .bot
+            .send_message(chat_id, text)
+            .parse_mode(ParseMode::MarkdownV2);
+        if silent {
+            req = req.disable_notification(true);
+        }
+        let message = req.await.context("Send text failed")?;
+        Ok(message.id.0)
+    }
 }
