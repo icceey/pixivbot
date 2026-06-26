@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "migration", "pixiv_client", "booru_client"]
+members = [".", "migration", "pixiv_client", "booru_client", "eh_client"]
 
 [workspace.package]
 version = "0.2.0"
@@ -30,6 +30,7 @@ image = { version = "0.25.10", default-features = false, features = ["png", "jpe
 md5 = "0.8.0"
 migration = { path = "migration" }
 booru_client = { path = "booru_client" }
+eh_client = { path = "eh_client" }
 pixiv_client = { path = "pixiv_client" }
 rand = "0.10.1"
 regex = "1.12.3"
