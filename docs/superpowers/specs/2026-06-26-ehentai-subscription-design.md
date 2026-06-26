@@ -10,6 +10,8 @@ Add e-hentai/exhentai gallery subscription support to pixivbot. Users subscribe 
 2. **On update** — download archive ZIP at specified resolution, send to chat as document
 3. **Optional Telegraph** — per-subscription toggle; when enabled, extract images from ZIP, upload to Telegraph, create page, send link
 4. **Rating filter → 48h scan** — when subscription has a `min_rating` filter, scan all galleries from the last 48h (not just new ones since last poll), download undownloaded ones and send
+5. **Direct download command** — `/edl <url|gid>` downloads a specific gallery by URL or GID and sends it immediately
+6. **Download rate limiting** — max 10GB per 24h; excess download tasks are persisted as a queue in the database and drained when budget allows
 
 ## Architecture
 
@@ -28,26 +30,31 @@ eh_client/              ← new workspace crate (low-level eh API client)
 migration/              ← new migration m20260626_add_ehentai
 
 src/
-  config.rs             ← EhentaiConfig section
+  config.rs             ← EhentaiConfig section (includes rate_limit_gb, rate_limit_window_hours)
   db/
     entities/           ← reuse existing tasks/subscriptions entities
+      eh_download_queue.rs  ← NEW: EhDownloadQueue entity (persistent download queue)
     types/
       task_type.rs      ← add TaskType::Ehentai
       state.rs          ← add SubscriptionState::EhTag(EhTagState)
       eh_filter.rs      ← NEW: EhFilter (rating, pages, telegraph toggle)
       eh_task_key.rs    ← NEW: EhTaskKey (task value encoding)
+      eh_download.rs    ← NEW: EhDownloadRequest (queued download with chat_id, gid, token, source)
       mod.rs            ← register new types
     repo/
       subscriptions.rs  ← add upsert_eh_subscription
+      eh_download_queue.rs  ← NEW: queue CRUD + rate-limit accounting
   scheduler/
-    eh_engine.rs       ← NEW: EhEngine (poll, filter, download, send)
+    eh_engine.rs       ← NEW: EhEngine (poll, filter, download via queue, send)
+    eh_download_processor.rs ← NEW: drains queue, enforces rate limit, downloads+sends
     mod.rs              ← register EhEngine
   bot/
-    commands.rs         ← add ESub/EUnsub/EList commands
+    commands.rs         ← add ESub/EUnsub/EList/EDl commands
     handler.rs          ← add eh field to BotHandler, dispatch
     handlers/
       subscription/
         ehentai.rs     ← NEW: handle_esub/handle_eunsub/handle_elist
+        eh_download.rs ← NEW: handle_edl (direct gallery download)
         mod.rs          ← register ehentai module
     notifier.rs         ← add notify_with_document, notify_with_text
     mod.rs              ← add has_ehentai flag, callback prefix
@@ -162,6 +169,9 @@ telegraph_access_token = ""       # optional, for Telegraph uploads
 max_push_per_tick = 3             # max galleries to send per tick
 max_retry_count = 3
 scan_window_hours = 48            # 48h scan window for rating filters
+download_rate_limit_gb = 10       # max GB downloaded per 24h window
+download_rate_window_hours = 24   # rate-limit window duration
+download_poll_interval_sec = 60   # how often the download processor drains the queue
 ```
 
 ```rust
@@ -177,6 +187,9 @@ pub struct EhentaiConfig {
     pub max_push_per_tick: usize,          // default 3
     pub max_retry_count: u8,               // default 3
     pub scan_window_hours: u64,            // default 48
+    pub download_rate_limit_gb: u64,       // default 10
+    pub download_rate_window_hours: u64,  // default 24
+    pub download_poll_interval_sec: u64,  // default 60
 }
 
 impl Default for EhentaiConfig {
@@ -193,6 +206,9 @@ impl Default for EhentaiConfig {
             max_push_per_tick: 3,
             max_retry_count: 3,
             scan_window_hours: 48,
+            download_rate_limit_gb: 10,
+            download_rate_window_hours: 24,
+            download_poll_interval_sec: 60,
         }
     }
 }
@@ -205,7 +221,28 @@ impl Default for EhentaiConfig {
 #### Migration `m20260626_add_ehentai`
 
 - Add column `eh_filter` (JSON, nullable) to `subscriptions` table — stores `Option<EhFilter>`
-- No new tables needed; reuses `tasks` and `subscriptions` tables
+- Create new table `eh_download_queue` for persistent download queue:
+
+```sql
+CREATE TABLE eh_download_queue (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id INTEGER NOT NULL,           -- destination chat
+    gid INTEGER NOT NULL,               -- gallery id
+    token TEXT NOT NULL,                -- gallery token
+    title TEXT NOT NULL,                -- gallery title (for caption)
+    telegraph INTEGER NOT NULL DEFAULT 0,  -- bool: do Telegraph upload?
+    source TEXT NOT NULL,              -- "subscription" or "direct" or "subscription:<sub_id>"
+    status TEXT NOT NULL DEFAULT 'pending',  -- pending | downloading | done | failed
+    file_size INTEGER,                  -- actual downloaded bytes (for rate accounting)
+    error TEXT,                         -- last error message if failed
+    retry_count INTEGER NOT NULL DEFAULT 0,
+    created_at TIMESTAMP NOT NULL,
+    started_at TIMESTAMP,               -- when download began
+    completed_at TIMESTAMP              -- when download finished (for rate window)
+)
+CREATE INDEX idx_eh_dlq_status ON eh_download_queue(status);
+CREATE INDEX idx_eh_dlq_completed ON eh_download_queue(completed_at);
+```
 
 #### `TaskType::Ehentai`
 
@@ -260,7 +297,7 @@ SubscriptionState::EhTag(EhTagState)
 pub struct EhTagState {
     pub pushed_gids: Vec<u64>,              // galleries already sent (dedup)
     pub latest_posted_ts: i64,             // cursor for non-rating-filtered mode
-    pub pending_queue: Vec<QueuedEhGallery>, // pending galleries to send
+    pub pending_queue: Vec<QueuedEhGallery>, // pending galleries to queue for download
     pub retry_count: u8,
 }
 
@@ -280,6 +317,30 @@ pub struct QueuedEhGallery {
 }
 ```
 
+#### `EhDownloadRequest` entity
+
+```rust
+// src/db/entities/eh_download_queue.rs
+pub enum Status { Pending, Downloading, Done, Failed }
+
+pub struct Model {
+    pub id: i32,
+    pub chat_id: i64,
+    pub gid: u64,
+    pub token: String,
+    pub title: String,
+    pub telegraph: bool,
+    pub source: String,         // "subscription" or "direct"
+    pub status: String,          // pending|downloading|done|failed
+    pub file_size: Option<u64>,
+    pub error: Option<String>,
+    pub retry_count: u8,
+    pub created_at: DateTime,
+    pub started_at: Option<DateTime>,
+    pub completed_at: Option<DateTime>,
+}
+```
+
 #### Repo Methods
 
 ```rust
@@ -288,21 +349,30 @@ pub async fn upsert_eh_subscription(
     &self, chat_id: i64, task_id: i32,
     filter_tags: TagFilter, eh_filter: Option<EhFilter>,
 ) -> Result<subscriptions::Model>;
+
+// in src/db/repo/eh_download_queue.rs (NEW)
+pub async fn enqueue_download(&self, chat_id: i64, gid: u64, token: &str, title: &str, telegraph: bool, source: &str) -> Result<()>;
+pub async fn get_next_pending_download(&self) -> Result<Option<Model>>;
+pub async fn mark_download_started(&self, id: i32) -> Result<()>;
+pub async fn mark_download_done(&self, id: i32, file_size: u64) -> Result<()>;
+pub async fn mark_download_failed(&self, id: i32, error: &str) -> Result<()>;
+pub async fn get_downloaded_bytes_in_window(&self, window_start: DateTime) -> Result<u64>;
+pub async fn count_pending_downloads(&self) -> Result<u64>;
+pub async fn reset_stale_downloading(&self) -> Result<u64>;  // crash recovery: downloading→pending
 ```
 
-### 4. EhEngine (`src/scheduler/eh_engine.rs`)
+### 4. EhEngine (`src/scheduler/eh_engine.rs`) — search & enqueue
 
 ```rust
 pub struct EhEngine {
     repo: Arc<Repo>,
-    notifier: Arc<Notifier>,
     client: Arc<EhClient>,
-    telegraph: Option<Arc<TelegraphClient>>,
     config: Arc<EhentaiConfig>,
     tick_interval_sec: u64,
-    max_retry_count: u8,
 }
 ```
+
+The EhEngine is now **search-only**. It polls for new galleries and enqueues download requests into `eh_download_queue`. A separate `EhDownloadProcessor` drains the queue with rate limiting.
 
 #### Engine Flow (per tick)
 
@@ -322,32 +392,62 @@ pub struct EhEngine {
       - Stop when gallery.posted_ts <= latest_posted_ts (oldest across subs)
 6. Batch fetch metadata via api.php (max 25 per request)
 7. Filter galleries through aggregate EhFilter (rating, pages)
-8. Queue filtered galleries into pending_queue
-9. Drain pending_queue (max_push_per_tick per tick):
-   For each gallery:
-     a. Download archive ZIP (tempfile)
-     b. Send ZIP to all subscribed chats as document
-     c. If telegraph enabled (sub-level): extract images, upload, create page, send link
-     d. Add gid to pushed_gids
-     e. Update latest_posted_ts if newer
-10. Update subscription states (pushed_gids, latest_posted_ts, pending_queue, retry_count)
-11. Schedule next poll: random in [min_interval_sec, max_interval_sec]
-    If pending_queue non-empty: schedule_drain_poll (+10s, like booru)
+8. For each new gallery, for each subscribed chat:
+   - Enqueue EhDownloadRequest into eh_download_queue
+   - Add gid to pushed_gids
+   - Update latest_posted_ts if newer
+9. Update subscription states (pushed_gids, latest_posted_ts, pending_queue)
+10. Schedule next poll: random in [min_interval_sec, max_interval_sec]
+```
+
+### 4b. EhDownloadProcessor (`src/scheduler/eh_download_processor.rs`) — drain queue
+
+```rust
+pub struct EhDownloadProcessor {
+    repo: Arc<Repo>,
+    notifier: Arc<Notifier>,
+    client: Arc<EhClient>,
+    telegraph: Option<Arc<TelegraphClient>>,
+    config: Arc<EhentaiConfig>,
+    poll_interval_sec: u64,
+}
+```
+
+#### Processor Flow (per poll)
+
+```
+1. Crash recovery: reset_stale_downloading() (any download stuck in "downloading" → "pending")
+2. Check rate limit:
+   - window_start = now - download_rate_window_hours
+   - downloaded_bytes = repo.get_downloaded_bytes_in_window(window_start)
+   - budget_remaining = (download_rate_limit_gb * 1_000_000_000) - downloaded_bytes
+   - If budget_remaining <= 0: skip this poll, wait for next
+3. Get next pending download: repo.get_next_pending_download()
+   - If none: skip
+4. Mark as "downloading" (started_at = now)
+5. Fetch gallery metadata (for archiver_key + filesize estimate)
+6. Download archive ZIP to tempfile
+7. If downloaded_size > budget_remaining:
+   - Mark as "failed" with error "rate limit exceeded"
+   - Re-queue will happen on next poll when budget replenishes
+   - Actually: check filesize from metadata BEFORE downloading; if > budget, skip and wait
+8. Send ZIP to chat via notifier.notify_with_document()
+9. If telegraph: extract images, upload, create page, send link
+10. Mark as "done" (completed_at = now, file_size = actual bytes)
+11. If send failed: mark_download_failed, increment retry_count, if retry_count < max → stays pending
 ```
 
 #### Constants
 
 ```rust
 const MAX_FETCH_PAGES: u32 = 5;          // safety cap for 48h scan
-const MAX_PUSH_PER_TICK: usize = 3;      // from config
-const MAX_RETRY_COUNT: u8 = 3;           // from config
 const MAX_METADATA_BATCH: usize = 25;    // api.php limit
 const SEARCH_RATE_LIMIT_MS: u64 = 3500;  // 3s + buffer
 ```
 
 #### Send Logic
 
-The engine sends via Notifier:
+The processor sends via Notifier:
 - `notifier.notify_with_document(chat_id, zip_path, filename, caption)` — sends ZIP file
 - `notifier.notify_with_text(chat_id, telegraph_url)` — sends Telegraph link
 
@@ -365,6 +465,7 @@ Caption format (MarkdownV2):
 /esub <query> [filter_args] [telegraph=on]
 /eunsub <query>
 /elist
+/edl <url|gid> [telegraph=on]
 ```
 
 #### `/esub` — Subscribe
@@ -403,6 +504,28 @@ Supports:
 #### `/elist` — List
 
 Lists all eh subscriptions for the chat, showing query, filters, and telegraph status.
+
+#### `/edl` — Direct Download
+
+Download a specific gallery and send it immediately (enqueued into the download queue, processed when budget allows).
+
+Examples:
+```
+/edl https://e-hentai.org/g/123456/abcdef0123/
+/edl 123456/abcdef0123
+/edl 123456 telegraph=on
+```
+
+Parsing flow:
+1. Parse args: extract `telegraph=on/off` flag (default: off), `ch=<channel>` target
+2. Extract gallery URL or `gid/token` from the first remaining arg
+3. URL regex: `https?://(?:e-hentai|exhentai)\.org/g/(\d+)/([0-9a-f]+)/?`
+4. If numeric `gid/token` format: split on `/`
+5. Fetch gallery metadata via api.php to get title, category, rating, filecount, filesize, tags
+6. Enqueue download request into `eh_download_queue` with source="direct"
+7. Reply with confirmation: gallery title, estimated size, queue position, and rate-limit status
+
+The actual download+send happens asynchronously via `EhDownloadProcessor`.
 
 ### 6. Notifier Extensions
 
@@ -458,14 +581,22 @@ let telegraph_client = config.ehentai.telegraph_access_token.as_ref()
 if let Some(ref client) = eh_client {
     let eh_engine = EhEngine::new(
         Arc::clone(&repo),
+        Arc::clone(client),
+        Arc::new(config.ehentai.clone()),
+        config.scheduler.tick_interval_sec,
+    );
+    let handle = tokio::spawn(async move { eh_engine.run().await });
+    task_handles.push(handle);
+
+    let eh_processor = EhDownloadProcessor::new(
+        Arc::clone(&repo),
         Arc::clone(&notifier),
         Arc::clone(client),
         telegraph_client.clone(),
         Arc::new(config.ehentai.clone()),
-        config.scheduler.tick_interval_sec,
-        config.scheduler.max_retry_count,
+        config.ehentai.download_poll_interval_sec,
     );
-    let handle = tokio::spawn(async move { eh_engine.run().await });
+    let handle = tokio::spawn(async move { eh_processor.run().await });
     task_handles.push(handle);
 }
 ```
@@ -481,7 +612,7 @@ Pass `eh_client` to `bot::run` (like `booru_registry`).
 #### `src/bot/handler.rs`
 
 - Add `eh_client: Option<Arc<EhClient>>` field to `BotHandler`
-- Add dispatch for `Command::ESub/EUnsub/EList` → `handle_esub/handle_eunsub/handle_elist`
+- Add dispatch for `Command::ESub/EUnsub/EList/EDl` → `handle_esub/handle_eunsub/handle_elist/handle_edl`
 
 ## Data Flow Summary
 
@@ -493,8 +624,14 @@ User: /esub female:elf rating>=4 telegraph=on
   → repo.upsert_eh_subscription(chat, task, TagFilter::default(), EhFilter { min_rating: 4, telegraph: true })
   → Confirmation message
 
-Scheduler tick:
-  → EhEngine::tick
+User: /edl https://e-hentai.org/g/123456/abcdef0123/ telegraph=on
+  → BotHandler::handle_edl
+  → Parse URL → gid=123456, token="abcdef0123"
+  → client.get_metadata(123456, "abcdef0123") → EhGallery
+  → repo.enqueue_download(chat_id, 123456, "abcdef0123", title, true, "direct")
+  → Reply with title, size estimate, queue position
+
+Scheduler EhEngine tick:
   → repo.get_pending_tasks_by_type(Ehentai, 1)
   → EhTaskKey::parse(task.value) → query="female:elf", filter_sig="r4"
   → List subs → aggregate EhFilter (min_rating=4)
@@ -503,23 +640,39 @@ Scheduler tick:
   → Dedup against pushed_gids
   → client.get_metadata(new_galleries) → Vec<EhGallery>
   → Filter by rating >= 4
-  → Queue into pending_queue
-  → Drain (max 3 per tick):
-    → client.get_archiver_key(gid, token)
-    → client.download_archive(gid, token, key, tempfile)
-    → notifier.notify_with_document(chat, zip_path, "title.zip", caption)
-    → If telegraph: extract images, telegraph.upload_image each, telegraph.create_gallery_page, notify_with_text(chat, page_url)
-    → Update pushed_gids
+  → For each new gallery, for each sub:
+    → repo.enqueue_download(chat_id, gid, token, title, sub.telegraph, "subscription")
+    → Update pushed_gids, latest_posted_ts
   → repo.update_subscription_latest_data
   → repo.update_task_after_poll(next_poll)
+
+Scheduler EhDownloadProcessor poll:
+  → reset_stale_downloading() (crash recovery)
+  → window_start = now - 24h
+  → downloaded_bytes = repo.get_downloaded_bytes_in_window(window_start)
+  → budget_remaining = 10GB - downloaded_bytes
+  → if budget_remaining <= 0: skip, wait for next poll
+  → download = repo.get_next_pending_download()
+  → if none: skip
+  → mark_download_started(id)
+  → client.get_metadata(gid, token) → check filesize vs budget
+  → if filesize > budget_remaining: skip, wait
+  → client.get_archiver_key(gid, token)
+  → client.download_archive(gid, token, key, tempfile)
+  → notifier.notify_with_document(chat, zip_path, "title.zip", caption)
+  → If telegraph: extract images, telegraph.upload_image each, telegraph.create_gallery_page, notify_with_text(chat, page_url)
+  → mark_download_done(id, actual_bytes)
+  → On failure: mark_download_failed(id, error), retry_count++, abandon if >= max
 ```
 
 ## Error Handling
 
 - **Search/parse failures**: log with tracing, skip tick, reschedule
 - **Metadata API errors**: skip individual galleries with error in response, continue with rest
-- **Archive download failures**: increment retry_count, re-queue, abandon after max_retry_count
-- **Telegram send failures**: reuse `BatchSendResult` pattern — track succeeded/failed, retry failed on next tick
+- **Archive download failures**: mark download as "failed", increment retry_count, stays pending for retry; abandon after max_retry_count (status → "failed" permanently)
+- **Telegram send failures**: mark download as "failed", will be retried on next processor poll
+- **Rate limit exceeded**: download stays "pending", processor waits for budget to replenish
+- **Crash recovery**: any download stuck in "downloading" state on startup is reset to "pending"
 - **Telegraph upload failures**: skip individual images, create page with available images, log failures
 - **User-facing messages**: short friendly text, never expose raw errors (per AGENTS.md Telegram Safety)
 
@@ -543,9 +696,11 @@ Images are uploaded to Telegraph's `/upload` endpoint directly (not Catbox.moe).
 - `eh_client::telegraph`: mock Telegraph API (unit tests)
 - `EhTaskKey`: to_task_value/parse roundtrip, filter_sig encoding
 - `EhFilter`: matches, aggregate, has_rating_filter, task_value_signature
-- `EhTagState`: pushed_gids dedup, pending_queue pop, retry increment, should_abandon_queue
-- `EhEngine`: tick logic with mocked client (pending queue drain, 48h scan, state transitions)
-- Bot command parsing: `/esub` filter arg parsing, `/eunsub` internal key resolution
+- `EhTagState`: pushed_gids dedup, latest_posted_ts update
+- `EhDownloadQueue` repo: enqueue, get_next_pending, mark_started/done/failed, rate-window accounting, reset_stale
+- `EhEngine`: tick logic with mocked client (48h scan, enqueue, state transitions)
+- `EhDownloadProcessor`: drain logic with mocked client (rate limit check, download, send, state transitions)
+- Bot command parsing: `/esub` filter arg parsing, `/eunsub` internal key resolution, `/edl` URL/GID parsing
 
 ## Constraints
 
@@ -556,3 +711,4 @@ Images are uploaded to Telegraph's `/upload` endpoint directly (not Catbox.moe).
 - **Telegram document size**: 50MB bot limit. Large archives (>50MB) will fail to send — log and skip, rely on Telegraph fallback if enabled
 - **Telegraph content limit**: 64KB serialized JSON per page — split into multiple pages if needed
 - **CloudFlare**: both sites use CF; proper User-Agent and cookie headers required; exhentai may need IPv4
+- **Download rate limit**: configurable (default 10GB/24h). Downloads exceeding budget are queued, not rejected. Budget calculated from `completed_at` timestamps in the rolling window.
