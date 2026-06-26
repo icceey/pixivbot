@@ -1,6 +1,6 @@
 use super::Repo;
 use crate::db::entities::{subscriptions, tasks};
-use crate::db::types::{BooruFilter, SubscriptionState, TagFilter};
+use crate::db::types::{BooruFilter, EhFilter, SubscriptionState, TagFilter};
 use anyhow::{Context, Result};
 use chrono::Local;
 use sea_orm::{
@@ -173,6 +173,52 @@ impl Repo {
             .ok_or_else(|| {
                 anyhow::anyhow!(
                     "Booru subscription for chat {} task {} not found after upsert",
+                    chat_id,
+                    task_id
+                )
+            })
+    }
+
+    pub async fn upsert_eh_subscription(
+        &self,
+        chat_id: i64,
+        task_id: i32,
+        filter_tags: TagFilter,
+        eh_filter: Option<EhFilter>,
+    ) -> Result<subscriptions::Model> {
+        let now = Local::now().naive_local();
+
+        let new_sub = subscriptions::ActiveModel {
+            chat_id: Set(chat_id),
+            task_id: Set(task_id),
+            filter_tags: Set(filter_tags),
+            eh_filter: Set(eh_filter),
+            created_at: Set(now),
+            ..Default::default()
+        };
+
+        subscriptions::Entity::insert(new_sub)
+            .on_conflict(
+                OnConflict::columns([subscriptions::Column::ChatId, subscriptions::Column::TaskId])
+                    .update_columns([
+                        subscriptions::Column::FilterTags,
+                        subscriptions::Column::EhFilter,
+                    ])
+                    .to_owned(),
+            )
+            .exec(&self.db)
+            .await
+            .context("Failed to upsert eh subscription")?;
+
+        subscriptions::Entity::find()
+            .filter(subscriptions::Column::ChatId.eq(chat_id))
+            .filter(subscriptions::Column::TaskId.eq(task_id))
+            .one(&self.db)
+            .await
+            .context("Failed to fetch upserted eh subscription")?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "EH subscription for chat {} task {} not found after upsert",
                     chat_id,
                     task_id
                 )

@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use sea_orm::DatabaseConnection;
 
 mod chats;
+mod eh_download_queue;
 mod messages;
 mod stats;
 mod subscriptions;
@@ -22,14 +23,14 @@ impl Repo {
     }
 }
 
+/// Shared test helpers for repo unit tests.
 #[cfg(test)]
-mod tests {
+pub mod tests_helpers {
     use super::Repo;
-    use crate::db::types::{Tags, UserRole};
     use anyhow::Result;
     use sea_orm::{ConnectionTrait, Database, DbBackend, Statement};
 
-    async fn setup_test_db() -> Result<Repo> {
+    pub async fn setup_test_db() -> Result<Repo> {
         let db = Database::connect("sqlite::memory:").await?;
 
         db.execute(Statement::from_string(
@@ -89,10 +90,34 @@ mod tests {
                 filter_tags TEXT NOT NULL DEFAULT '{"include":[],"exclude":[]}',
                 latest_data TEXT,
                 booru_filter TEXT,
+                eh_filter TEXT,
                 created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (chat_id) REFERENCES chats(id) ON DELETE CASCADE ON UPDATE CASCADE,
                 FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE ON UPDATE CASCADE,
                 UNIQUE(chat_id, task_id)
+            )
+            "#,
+        ))
+        .await?;
+
+        db.execute(Statement::from_string(
+            DbBackend::Sqlite,
+            r#"
+            CREATE TABLE eh_download_queue (
+                id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                chat_id INTEGER NOT NULL,
+                gid INTEGER NOT NULL,
+                token TEXT NOT NULL,
+                title TEXT NOT NULL,
+                telegraph BOOLEAN NOT NULL DEFAULT 0,
+                source TEXT NOT NULL DEFAULT 'subscription',
+                status TEXT NOT NULL DEFAULT 'pending',
+                file_size INTEGER NOT NULL DEFAULT 0,
+                error TEXT,
+                retry_count INTEGER NOT NULL DEFAULT 0,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                started_at TIMESTAMP,
+                completed_at TIMESTAMP
             )
             "#,
         ))
@@ -115,6 +140,12 @@ mod tests {
 
         Ok(Repo::new(db))
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tests_helpers::setup_test_db;
+    use crate::db::types::{Tags, UserRole};
 
     #[tokio::test]
     async fn test_migrate_chat_success() {

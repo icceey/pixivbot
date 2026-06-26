@@ -1,7 +1,7 @@
 use sea_orm::entity::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use crate::db::types::{BooruFilter, SubscriptionState, TagFilter};
+use crate::db::types::{BooruFilter, EhFilter, SubscriptionState, TagFilter};
 
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Deserialize, Serialize)]
 #[sea_orm(table_name = "subscriptions")]
@@ -14,6 +14,8 @@ pub struct Model {
     pub filter_tags: TagFilter,
     #[serde(default)]
     pub booru_filter: Option<BooruFilter>,
+    #[serde(default)]
+    pub eh_filter: Option<EhFilter>,
     pub latest_data: Option<SubscriptionState>,
     pub created_at: DateTime,
 }

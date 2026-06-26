@@ -103,7 +103,10 @@ mod tests {
 
     #[test]
     fn test_parse_search_results_empty() {
-        let results = parse_search_results("<html><body>No results</body></html>", "https://e-hentai.org");
+        let results = parse_search_results(
+            "<html><body>No results</body></html>",
+            "https://e-hentai.org",
+        );
         assert!(results.is_empty());
     }
 
@@ -135,7 +138,10 @@ mod tests {
         </script>
         "#;
         let url = parse_archive_redirect(html).expect("should find redirect URL");
-        assert_eq!(url, "http://123.45.67.89/archive/123456/abcdef0123/abcdef0123/0?start=1");
+        assert_eq!(
+            url,
+            "http://123.45.67.89/archive/123456/abcdef0123/abcdef0123/0?start=1"
+        );
     }
 
     #[test]

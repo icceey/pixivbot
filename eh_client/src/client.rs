@@ -62,7 +62,12 @@ impl EhClient {
     /// Search for galleries. Returns gallery references parsed from HTML.
     pub async fn search(&self, query: &str, cats: u32, page: u32) -> Result<Vec<EhGalleryRef>> {
         let url = self.build_search_url(query, cats, page);
-        let resp = self.http.get(&url).header(COOKIE, self.cookies.to_header()).send().await?;
+        let resp = self
+            .http
+            .get(&url)
+            .header(COOKIE, self.cookies.to_header())
+            .send()
+            .await?;
         let status = resp.status();
         if !status.is_success() {
             return Err(Error::Api {
@@ -81,14 +86,14 @@ impl EhClient {
             return Ok(Vec::new());
         }
         if gidlist.len() > 25 {
-            return Err(Error::Other("get_metadata: max 25 galleries per request".into()));
+            return Err(Error::Other(
+                "get_metadata: max 25 galleries per request".into(),
+            ));
         }
 
         let gidlist_json: Vec<serde_json::Value> = gidlist
             .iter()
-            .map(|(gid, token)| {
-                serde_json::json!([gid, token])
-            })
+            .map(|(gid, token)| serde_json::json!([gid, token]))
             .collect();
 
         let body = serde_json::json!({
@@ -97,12 +102,14 @@ impl EhClient {
             "namespace": 1
         });
 
-        let resp = self.http
+        let resp = self
+            .http
             .post(&self.api_url)
             .header(COOKIE, self.cookies.to_header())
             .header("Content-Type", "application/json")
             .json(&body)
-            .send().await?;
+            .send()
+            .await?;
 
         let status = resp.status();
         if !status.is_success() {
@@ -113,13 +120,22 @@ impl EhClient {
         }
 
         let raw: RawApiResponse = resp.json().await?;
-        Ok(raw.gmetadata.into_iter().map(|m| m.into_gallery()).collect())
+        Ok(raw
+            .gmetadata
+            .into_iter()
+            .map(|m| m.into_gallery())
+            .collect())
     }
 
     /// Get the archiver_key for a gallery by scraping its HTML page.
     pub async fn get_archiver_key(&self, gid: u64, token: &str) -> Result<String> {
         let url = format!("{}/g/{}/{}/", self.base_url, gid, token);
-        let resp = self.http.get(&url).header(COOKIE, self.cookies.to_header()).send().await?;
+        let resp = self
+            .http
+            .get(&url)
+            .header(COOKIE, self.cookies.to_header())
+            .send()
+            .await?;
         let status = resp.status();
         if !status.is_success() {
             return Err(Error::Api {
@@ -152,11 +168,13 @@ impl EhClient {
             vec![("dlcheck", "Download Resample Archive")]
         };
 
-        let resp = self.http
+        let resp = self
+            .http
             .post(&archiver_url)
             .header(COOKIE, self.cookies.to_header())
             .form(&form_data)
-            .send().await?;
+            .send()
+            .await?;
 
         let status = resp.status();
         if !status.is_success() {
@@ -173,10 +191,12 @@ impl EhClient {
             .ok_or_else(|| Error::Parse("archive redirect URL not found".into()))?;
 
         // Step 3: Download the ZIP file
-        let resp = self.http
+        let resp = self
+            .http
             .get(&download_url)
             .header(COOKIE, self.cookies.to_header())
-            .send().await?;
+            .send()
+            .await?;
 
         let status = resp.status();
         if !status.is_success() {
@@ -216,21 +236,43 @@ impl Default for EhClientBuilder {
         Self {
             base_url: "https://e-hentai.org".into(),
             api_url: "https://api.e-hentai.org/api.php".into(),
-            cookies: EhCookies { nw: true, ..Default::default() },
+            cookies: EhCookies {
+                nw: true,
+                ..Default::default()
+            },
             image_resolution: "780x".into(),
         }
     }
 }
 
 impl EhClientBuilder {
-    pub fn new() -> Self { Self::default() }
-    pub fn base_url(mut self, url: &str) -> Self { self.base_url = url.into(); self }
-    pub fn api_url(mut self, url: &str) -> Self { self.api_url = url.into(); self }
-    pub fn cookies(mut self, c: EhCookies) -> Self { self.cookies = c; self }
-    pub fn image_resolution(mut self, r: &str) -> Self { self.image_resolution = r.into(); self }
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn base_url(mut self, url: &str) -> Self {
+        self.base_url = url.into();
+        self
+    }
+    pub fn api_url(mut self, url: &str) -> Self {
+        self.api_url = url.into();
+        self
+    }
+    pub fn cookies(mut self, c: EhCookies) -> Self {
+        self.cookies = c;
+        self
+    }
+    pub fn image_resolution(mut self, r: &str) -> Self {
+        self.image_resolution = r.into();
+        self
+    }
     pub fn build(self) -> EhClient {
-        EhClient::new(&self.base_url, &self.api_url, self.cookies, &self.image_resolution)
-            .expect("failed to build EhClient")
+        EhClient::new(
+            &self.base_url,
+            &self.api_url,
+            self.cookies,
+            &self.image_resolution,
+        )
+        .expect("failed to build EhClient")
     }
 }
 
@@ -244,7 +286,10 @@ mod tests {
             .base_url("https://e-hentai.org")
             .build();
         let url = client.build_search_url("female:elf", 0, 0);
-        assert_eq!(url, "https://e-hentai.org/?f_search=female%3Aelf&f_cats=0&page=0");
+        assert_eq!(
+            url,
+            "https://e-hentai.org/?f_search=female%3Aelf&f_cats=0&page=0"
+        );
     }
 
     #[test]
@@ -272,6 +317,9 @@ mod tests {
             .base_url("https://e-hentai.org")
             .build();
         let url = client.build_archiver_url(123456, "abcdef0123", "780x");
-        assert_eq!(url, "https://e-hentai.org/archiver.php?gid=123456&token=abcdef0123&or=780x");
+        assert_eq!(
+            url,
+            "https://e-hentai.org/archiver.php?gid=123456&token=abcdef0123&or=780x"
+        );
     }
 }

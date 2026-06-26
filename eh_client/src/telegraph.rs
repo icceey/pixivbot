@@ -117,10 +117,12 @@ impl TelegraphClient {
             .map_err(|e| Error::Other(format!("mime error: {e}")))?;
         let form = reqwest::multipart::Form::new().part("file", part);
 
-        let resp = self.http
+        let resp = self
+            .http
             .post("https://telegra.ph/upload")
             .multipart(form)
-            .send().await?;
+            .send()
+            .await?;
 
         let status = resp.status();
         if !status.is_success() {
@@ -150,10 +152,12 @@ impl TelegraphClient {
             ("return_content", "false"),
         ];
 
-        let resp = self.http
+        let resp = self
+            .http
             .post("https://api.telegra.ph/createPage")
             .form(&form)
-            .send().await?;
+            .send()
+            .await?;
 
         let status = resp.status();
         if !status.is_success() {
@@ -170,7 +174,9 @@ impl TelegraphClient {
             }
         }
         Err(Error::Api {
-            message: telegraph_resp.error.unwrap_or_else(|| "unknown error".into()),
+            message: telegraph_resp
+                .error
+                .unwrap_or_else(|| "unknown error".into()),
             status: 0,
         })
     }
@@ -220,7 +226,10 @@ mod tests {
     fn test_build_image_node() {
         let node = Node::img("https://telegra.ph/file/abc.jpg");
         assert_eq!(node.tag, "img");
-        assert_eq!(node.attrs.unwrap()["src"], "https://telegra.ph/file/abc.jpg");
+        assert_eq!(
+            node.attrs.unwrap()["src"],
+            "https://telegra.ph/file/abc.jpg"
+        );
     }
 
     #[test]
@@ -244,7 +253,9 @@ mod tests {
 
     #[test]
     fn test_split_image_urls_for_pages() {
-        let urls: Vec<String> = (0..50).map(|i| format!("https://telegra.ph/file/{}.jpg", i)).collect();
+        let urls: Vec<String> = (0..50)
+            .map(|i| format!("https://telegra.ph/file/{}.jpg", i))
+            .collect();
         let chunks = split_for_pages(&urls, 1024); // 1KB limit for testing
         assert!(chunks.len() > 1);
         assert!(chunks.iter().all(|c| !c.is_empty()));

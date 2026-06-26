@@ -30,9 +30,7 @@ impl EhCookies {
 
     /// True if this is an exhentai-capable cookie set (all three required).
     pub fn is_exhentai_capable(&self) -> bool {
-        self.ipb_member_id.is_some()
-            && self.ipb_pass_hash.is_some()
-            && self.igneous.is_some()
+        self.ipb_member_id.is_some() && self.ipb_pass_hash.is_some() && self.igneous.is_some()
     }
 }
 
