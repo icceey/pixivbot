@@ -90,12 +90,13 @@ license.workspace = true
 rust-version = "1.94"
 
 [dependencies]
-chrono = { workspace = true }
-regex = { workspace = true }
-reqwest = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
-tracing = { workspace = true }
+chrono = { version = "0.4.44", features = ["serde"] }
+regex = "1.11.1"
+reqwest = { version = "0.12.28", default-features = false, features = ["json", "rustls-tls", "multipart"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+tracing = "0.1.44"
+urlencoding = "2.1.3"
 ```
 
 - [ ] **Step 2: Create `eh_client/src/error.rs`**
@@ -914,12 +915,14 @@ impl EhClientBuilder {
 }
 ```
 
-- [ ] **Step 4: Add `urlencoding` dependency to `eh_client/Cargo.toml`**
+- [ ] **Step 4: Verify `multipart` feature is already in `eh_client/Cargo.toml`**
 
+The `eh_client/Cargo.toml` created in Task 1 already includes `multipart` in the reqwest features:
 ```toml
-[dependencies]
-urlencoding = "2"
+reqwest = { version = "0.12.28", default-features = false, features = ["json", "rustls-tls", "multipart"] }
 ```
+
+No additional changes needed.
 
 - [ ] **Step 5: Run tests to verify they pass**
 
@@ -1209,18 +1212,9 @@ impl TelegraphClient {
 }
 ```
 
-- [ ] **Step 4: Add `reqwest` multipart feature to `eh_client/Cargo.toml`**
+- [ ] **Step 4: Verify `multipart` feature is included**
 
-```toml
-[dependencies]
-reqwest = { workspace = true, features = ["multipart"] }
-```
-
-Note: Check root `Cargo.toml` to see if `multipart` is already in the reqwest features. If the root uses `reqwest = { version = "...", default-features = false, features = ["json", "rustls-tls"] }`, then the eh_client crate must add `multipart` itself:
-
-```toml
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "multipart"] }
-```
+The `eh_client/Cargo.toml` already includes `multipart` in the reqwest features from Task 1. No changes needed.
 
 - [ ] **Step 5: Run tests to verify they pass**
 
