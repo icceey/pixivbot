@@ -115,11 +115,12 @@ impl Repo {
             .ok_or_else(|| anyhow::anyhow!("EH download {} not found", id))?;
 
         let now = Local::now().naive_local();
+        let new_retry_count = entry.retry_count + 1;
         let mut active: eh_download_queue::ActiveModel = entry.into();
         active.status = Set(STATUS_FAILED.to_string());
         active.error = Set(Some(error.to_string()));
         active.completed_at = Set(Some(now));
-        active.retry_count = Set(entry.retry_count + 1);
+        active.retry_count = Set(new_retry_count);
         active
             .update(&self.db)
             .await
@@ -142,6 +143,7 @@ impl Repo {
     }
 
     /// Count pending downloads in the queue.
+    #[allow(dead_code)]
     pub async fn count_pending_eh_downloads(&self) -> Result<u64> {
         eh_download_queue::Entity::find()
             .filter(eh_download_queue::Column::Status.eq(STATUS_PENDING))

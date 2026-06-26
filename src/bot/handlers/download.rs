@@ -248,25 +248,37 @@ impl BotHandler {
 
         // For ugoira works, download as MP4 instead of static images
         if illust.is_ugoira() {
-            let metadata = pixiv
-                .get_ugoira_metadata(illust_id)
-                .await
-                .context("Failed to fetch ugoira metadata")?;
-            drop(pixiv);
+            #[cfg(feature = "ffmpeg-codec")]
+            {
+                let metadata = pixiv
+                    .get_ugoira_metadata(illust_id)
+                    .await
+                    .context("Failed to fetch ugoira metadata")?;
+                drop(pixiv);
 
-            let title = illust.title.clone();
-            let artist = illust.user.name.clone();
-            let downloader = self.notifier.get_downloader();
+                let title = illust.title.clone();
+                let artist = illust.user.name.clone();
+                let downloader = self.notifier.get_downloader();
 
-            let mp4_path = downloader
-                .download_ugoira_mp4(&metadata.zip_urls.medium, metadata.frames)
-                .await
-                .context("Failed to download ugoira MP4")?;
+                let mp4_path = downloader
+                    .download_ugoira_mp4(&metadata.zip_urls.medium, metadata.frames)
+                    .await
+                    .context("Failed to download ugoira MP4")?;
 
-            let sanitized_title = sanitize_filename(&title);
-            let filename = format!("{}_{}.mp4", sanitized_title, illust_id);
+                let sanitized_title = sanitize_filename(&title);
+                let filename = format!("{}_{}.mp4", sanitized_title, illust_id);
 
-            return Ok((vec![(mp4_path, filename)], title, artist));
+                return Ok((vec![(mp4_path, filename)], title, artist));
+            }
+
+            #[cfg(not(feature = "ffmpeg-codec"))]
+            {
+                drop(pixiv);
+                anyhow::bail!(
+                    "Ugoira MP4 download requires the ffmpeg-codec feature, \
+                     which is not enabled in this build"
+                );
+            }
         }
 
         drop(pixiv);

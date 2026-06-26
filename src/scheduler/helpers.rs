@@ -366,6 +366,7 @@ mod tests {
             task_id: 1,
             filter_tags,
             booru_filter: None,
+            eh_filter: None,
             latest_data,
             created_at: chrono::Utc::now().naive_utc(),
         }

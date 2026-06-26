@@ -135,6 +135,7 @@ impl BotHandler {
                             TaskType::BooruTag | TaskType::BooruPool | TaskType::BooruRanking => {
                                 unreachable!("booru task types are handled above")
                             }
+                            TaskType::Ehentai => "📖",
                         };
 
                         let display_info = if task.r#type == TaskType::Author {
@@ -270,7 +271,9 @@ fn booru_list_display(
         TaskType::BooruTag => "🏷",
         TaskType::BooruPool => "📦",
         TaskType::BooruRanking => booru_ranking_list_emoji(task_value),
-        TaskType::Author | TaskType::Ranking => unreachable!("not a booru task type"),
+        TaskType::Author | TaskType::Ranking | TaskType::Ehentai => {
+            unreachable!("not a booru task type")
+        }
     };
 
     let display_info = if let Some(name) = author_name {
@@ -284,7 +287,9 @@ fn booru_list_display(
             TaskType::BooruTag => "标签",
             TaskType::BooruPool => "Pool",
             TaskType::BooruRanking => "排行",
-            TaskType::Author | TaskType::Ranking => unreachable!("not a booru task type"),
+            TaskType::Author | TaskType::Ranking | TaskType::Ehentai => {
+                unreachable!("not a booru task type")
+            }
         };
 
         format!("{}: `{}`", label, markdown::escape(task_value))

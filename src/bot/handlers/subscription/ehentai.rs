@@ -1,14 +1,13 @@
 use crate::bot::notifier::ThrottledBot;
 use crate::bot::BotHandler;
 use crate::db::repo::eh_download_queue::SOURCE_DIRECT;
-use crate::db::types::{EhCategory, EhFilter, EhTaskKey, TagFilter, TaskType};
+use crate::db::types::{EhFilter, EhTaskKey, TagFilter, TaskType};
 use crate::utils::args;
+use eh_client::EhCategory;
 use teloxide::prelude::*;
 use teloxide::types::{ChatId, ParseMode, UserId};
 use teloxide::utils::markdown;
 use tracing::{error, warn};
-
-type ResponseResult<T> = Result<T, ()>;
 
 impl BotHandler {
     pub async fn handle_esub(
@@ -116,7 +115,7 @@ impl BotHandler {
         // Parse category bitmask
         let cats = cat_str
             .as_deref()
-            .map(|s| EhCategory::bitmask_from_str(s))
+            .map(EhCategory::bitmask_from_str)
             .unwrap_or(0);
 
         // Build task key

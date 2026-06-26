@@ -351,6 +351,7 @@ pub struct EhentaiConfig {
     #[serde(default = "default_eh_max_push_per_tick")]
     pub max_push_per_tick: usize,
     #[serde(default = "default_eh_max_retry_count")]
+    #[allow(dead_code)]
     pub max_retry_count: u8,
     #[serde(default = "default_eh_scan_window_hours")]
     pub scan_window_hours: u64,

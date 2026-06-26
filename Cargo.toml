@@ -17,15 +17,15 @@ rust-version = "1.94"
 
 [features]
 default = []
-# Enable tests that require a working ffmpeg H.264 encoder (libx264).
-# Off by default because many environments (e.g. vcpkg ffmpeg without x264) cannot run them.
-ffmpeg-codec = []
+# Enable ffmpeg-dependent ugoira MP4 encoding (requires ffmpeg dev libs + pkg-config).
+# Off by default because many environments cannot build ffmpeg-sys-next.
+ffmpeg-codec = ["dep:ffmpeg-next"]
 
 [dependencies]
 anyhow = "1.0.102"
 chrono = { version = "0.4.44", features = ["serde"] }
 config = { version = "0.15.23", features = ["toml"], default-features = false }
-ffmpeg-next = { version = "8.1.0", default-features = false, features = ["codec", "format", "software-scaling"] }
+ffmpeg-next = { version = "8.1.0", default-features = false, features = ["codec", "format", "software-scaling"], optional = true }
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
 md5 = "0.8.0"
 migration = { path = "migration" }

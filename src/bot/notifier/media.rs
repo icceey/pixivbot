@@ -79,6 +79,7 @@ impl Notifier {
     }
 
     /// 发送动画 (MP4/GIF) 文件并返回消息ID
+    #[cfg(feature = "ffmpeg-codec")]
     pub(super) async fn send_animation_file(
         &self,
         chat_id: ChatId,
@@ -111,9 +112,10 @@ impl Notifier {
         filename: &str,
         caption: &str,
     ) -> Result<i32> {
-        let mut req = self
-            .bot
-            .send_document(chat_id, InputFile::file(path).file_name(filename));
+        let mut req = self.bot.send_document(
+            chat_id,
+            InputFile::file(path).file_name(filename.to_string()),
+        );
         req = req.caption(caption).parse_mode(ParseMode::MarkdownV2);
         let message = req.await.context("Send document failed")?;
         Ok(message.id.0)

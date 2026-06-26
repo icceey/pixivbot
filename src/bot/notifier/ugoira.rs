@@ -1,11 +1,15 @@
 use super::{BatchSendResult, DownloadButtonConfig, Notifier};
 use pixiv_client::UgoiraFrame;
 use teloxide::prelude::*;
+#[cfg(feature = "ffmpeg-codec")]
 use teloxide::types::ChatAction;
-use tracing::{error, warn};
+use tracing::error;
+#[cfg(feature = "ffmpeg-codec")]
+use tracing::warn;
 
 impl Notifier {
     /// 发送 Ugoira (动图) 作品为 MP4 动画
+    #[cfg(feature = "ffmpeg-codec")]
     pub async fn notify_ugoira(
         &self,
         chat_id: ChatId,
@@ -53,5 +57,26 @@ impl Notifier {
                 BatchSendResult::all_failed(1)
             }
         }
+    }
+
+    /// Ugoira 发送的存根实现（未启用 ffmpeg-codec feature）。
+    ///
+    /// 返回全失败结果，调用方应记录错误并跳过。
+    #[cfg(not(feature = "ffmpeg-codec"))]
+    pub async fn notify_ugoira(
+        &self,
+        chat_id: ChatId,
+        _zip_url: &str,
+        _frames: Vec<UgoiraFrame>,
+        _caption: Option<&str>,
+        _has_spoiler: bool,
+        _download_config: &DownloadButtonConfig,
+    ) -> BatchSendResult {
+        error!(
+            "Cannot send ugoira to chat {}: ffmpeg-codec feature is not enabled, \
+             MP4 encoding is unavailable. Build with --features ffmpeg-codec to enable.",
+            chat_id
+        );
+        BatchSendResult::all_failed(1)
     }
 }

@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::db::types::{BooruFilter, EhFilter, SubscriptionState, TagFilter};
 
-#[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, DeriveEntityModel, Deserialize, Serialize)]
 #[sea_orm(table_name = "subscriptions")]
 pub struct Model {
     #[sea_orm(primary_key)]

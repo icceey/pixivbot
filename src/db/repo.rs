@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use sea_orm::DatabaseConnection;
 
 mod chats;
-mod eh_download_queue;
+pub mod eh_download_queue;
 mod messages;
 mod stats;
 mod subscriptions;

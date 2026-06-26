@@ -10,7 +10,7 @@ use crate::scheduler::helpers::{eh_tag_subscription_state, get_chat_if_should_no
 use anyhow::{Context, Result};
 use chrono::Local;
 use eh_client::{EhClient, EhGallery, TelegraphClient};
-use rand::Rng;
+use rand::RngExt;
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
@@ -28,9 +28,7 @@ const SEARCH_RATE_LIMIT_MS: u64 = 3500;
 
 pub struct EhEngine {
     repo: Arc<Repo>,
-    notifier: Arc<Notifier>,
     client: Arc<EhClient>,
-    telegraph: Option<Arc<TelegraphClient>>,
     config: Arc<EhentaiConfig>,
     tick_interval_sec: u64,
     max_retry_count: i32,
@@ -39,18 +37,16 @@ pub struct EhEngine {
 impl EhEngine {
     pub fn new(
         repo: Arc<Repo>,
-        notifier: Arc<Notifier>,
+        _notifier: Notifier,
         client: Arc<EhClient>,
-        telegraph: Option<Arc<TelegraphClient>>,
+        _telegraph: Option<Arc<TelegraphClient>>,
         config: Arc<EhentaiConfig>,
         tick_interval_sec: u64,
         max_retry_count: i32,
     ) -> Self {
         Self {
             repo,
-            notifier,
             client,
-            telegraph,
             config,
             tick_interval_sec,
             max_retry_count,
@@ -87,7 +83,7 @@ impl EhEngine {
             if let Err(e) = self.execute_eh_task(&task).await {
                 error!("Failed to execute eh task {}: {:#}", task.id, e);
                 // Backoff 1 hour on error
-                let backoff = Local::now().naive_local() + chrono::Duration::hours(1);
+                let backoff = Local::now() + chrono::Duration::hours(1);
                 if let Err(e2) = self.repo.update_task_after_poll(task.id, backoff).await {
                     error!("Failed to backoff eh task {}: {:#}", task.id, e2);
                 }
@@ -384,7 +380,7 @@ impl EhEngine {
 
     /// Drain pending queue: send one gallery's download per call.
     async fn drain_pending_queue(&self, sub: &subscriptions::Model) -> Result<()> {
-        let mut state = match eh_tag_subscription_state(sub) {
+        let state = match eh_tag_subscription_state(sub) {
             Some(s) if !s.pending_queue.is_empty() => s,
             _ => return Ok(()),
         };
@@ -446,15 +442,14 @@ impl EhEngine {
         } else {
             max
         };
-        let next = Local::now().naive_local() + chrono::Duration::seconds(delay as i64);
+        let next = Local::now() + chrono::Duration::seconds(delay as i64);
         if let Err(e) = self.repo.update_task_after_poll(task_id, next).await {
             error!("Failed to schedule next eh poll: {:#}", e);
         }
     }
 
     async fn schedule_drain_poll(&self, task_id: i32) {
-        let next =
-            Local::now().naive_local() + chrono::Duration::seconds(DRAIN_POLL_INTERVAL_SEC as i64);
+        let next = Local::now() + chrono::Duration::seconds(DRAIN_POLL_INTERVAL_SEC as i64);
         if let Err(e) = self.repo.update_task_after_poll(task_id, next).await {
             error!("Failed to schedule eh drain poll: {:#}", e);
         }
@@ -486,7 +481,7 @@ fn gallery_to_queued(g: &EhGallery) -> QueuedEhGallery {
 /// creates Telegraph pages.
 pub struct EhDownloadProcessor {
     repo: Arc<Repo>,
-    notifier: Arc<Notifier>,
+    notifier: Notifier,
     client: Arc<EhClient>,
     telegraph: Option<Arc<TelegraphClient>>,
     config: Arc<EhentaiConfig>,
@@ -495,7 +490,7 @@ pub struct EhDownloadProcessor {
 impl EhDownloadProcessor {
     pub fn new(
         repo: Arc<Repo>,
-        notifier: Arc<Notifier>,
+        notifier: Notifier,
         client: Arc<EhClient>,
         telegraph: Option<Arc<TelegraphClient>>,
         config: Arc<EhentaiConfig>,
@@ -594,7 +589,7 @@ impl EhDownloadProcessor {
         let chat = get_chat_if_should_notify(&self.repo, entry.chat_id).await?;
         let chat_id = teloxide::types::ChatId(entry.chat_id);
 
-        if let Some(chat) = &chat {
+        if let Some(_chat) = &chat {
             match self
                 .notifier
                 .send_document(chat_id, &zip_path, &filename, &caption)

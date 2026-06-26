@@ -125,11 +125,12 @@ pub fn build_booru_caption(
 /// Build a MarkdownV2 caption for an e-hentai gallery.
 ///
 /// Format: `📕 {title}\n{category} | ⭐ {rating} | {filecount}p | {filesize} | 🔗 [来源]({url})\n\n{tags}`
+#[allow(dead_code)]
 pub fn build_eh_caption(gallery: &eh_client::EhGallery, base_url: &str) -> String {
     let clean_base = base_url.trim_end_matches('/');
     let gallery_url = format!("{}/g/{}/{}", clean_base, gallery.gid, gallery.token);
 
-    let tag_list: Vec<&str> = gallery.tags.iter().take(10).collect();
+    let tag_list: Vec<&str> = gallery.tags.iter().take(10).map(|s| s.as_str()).collect();
     let tags_display = if tag_list.is_empty() {
         String::new()
     } else {
@@ -140,11 +141,11 @@ pub fn build_eh_caption(gallery: &eh_client::EhGallery, base_url: &str) -> Strin
         format!("\n\n{}", formatted.join("  "))
     };
 
-    let filesize_mb = gallery.filesize as f64 / (1024.0 * 1024.0);
-    let filesize_display = if filesize_mb >= 1.0 {
-        format!("{:.1} MB", filesize_mb)
+    let filesize_kb = gallery.filesize as f64 / 1024.0;
+    let filesize_display = if filesize_kb >= 1024.0 {
+        format!("{:.1} MB", filesize_kb / 1024.0)
     } else {
-        format!("{:.0} KB", gallery.filesize as f64 / 1024.0)
+        format!("{:.1} KB", filesize_kb)
     };
 
     format!(
@@ -472,7 +473,7 @@ mod tests {
         assert!(caption.contains("4\\.6"));
         assert!(caption.contains("20p"));
         assert!(caption.contains("4\\.9 MB"));
-        assert!(caption.contains("e\\-hentai\\.org"));
+        assert!(caption.contains("e-hentai.org/g/12345/abcdef0123"));
         assert!(caption.contains("\\#parody:touhou"));
         assert!(caption.contains("\\#artist:test"));
     }

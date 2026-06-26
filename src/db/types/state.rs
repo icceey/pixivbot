@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use sea_orm::FromJsonQueryResult;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, FromJsonQueryResult)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, FromJsonQueryResult)]
 #[serde(tag = "type", content = "state")]
 pub enum SubscriptionState {
     Author(AuthorState),
@@ -150,7 +150,7 @@ impl BooruRankingState {
 ///
 /// Tracks which gallery GIDs have been sent (dedup) and the latest posted
 /// timestamp for cursor-based polling.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EhTagState {
     /// GIDs that have already been pushed to the chat.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
