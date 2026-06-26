@@ -1383,8 +1383,8 @@ mod download_processor_tests {
 
     fn make_config() -> EhentaiConfig {
         EhentaiConfig {
-            download_rate_limit_gb: 10,
-            download_rate_window_hours: 24,
+            download_rate_limit_gb: 7,
+            download_rate_window_hours: 168,
             download_poll_interval_sec: 60,
             max_push_per_tick: 3,
             max_retry_count: 3,
@@ -1679,7 +1679,7 @@ mod download_processor_tests {
         big_entry.insert(repo.db()).await.unwrap();
 
         let mut config = make_config();
-        config.download_rate_limit_gb = 10; // 10 GB limit
+        config.download_rate_limit_gb = 7; // 7 GB limit
 
         let processor = EhDownloadProcessor::new(
             Arc::clone(&repo),

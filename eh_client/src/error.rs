@@ -23,7 +23,16 @@ impl fmt::Display for Error {
     }
 }
 
-impl std::error::Error for Error {}
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Error::Http(e) => Some(e),
+            Error::Json(e) => Some(e),
+            Error::Io(e) => Some(e),
+            _ => None,
+        }
+    }
+}
 
 impl From<reqwest::Error> for Error {
     fn from(err: reqwest::Error) -> Self {

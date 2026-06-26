@@ -3,6 +3,7 @@ use crate::models::{EhCookies, EhGallery, EhGalleryRef, RawApiResponse};
 use crate::parser;
 use reqwest::header::COOKIE;
 use std::path::Path;
+use tokio::io::AsyncWriteExt;
 
 const USER_AGENT_STR: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
@@ -23,7 +24,7 @@ impl EhClient {
     ) -> Result<Self> {
         let mut builder = reqwest::Client::builder()
             .user_agent(USER_AGENT_STR)
-            .timeout(std::time::Duration::from_secs(30));
+            .timeout(std::time::Duration::from_secs(60));
 
         // For exhentai, bind to IPv4 to avoid CloudFlare blocks
         if base_url.contains("exhentai") {
@@ -149,8 +150,9 @@ impl EhClient {
     }
 
     /// Download a gallery archive ZIP to the specified path.
-    /// `archiver_key_or_resolution` can be an archiver_key (from gallery page) or
-    /// a resolution key like "780x", "980x", "1280x", "original".
+    /// `archiver_key` is obtained from `get_archiver_key`.
+    /// If `image_resolution` is not "original", a resampled archive is requested
+    /// using the configured resolution (e.g. "780x", "980x", "1280x").
     pub async fn download_archive(
         &self,
         gid: u64,
@@ -160,11 +162,13 @@ impl EhClient {
     ) -> Result<u64> {
         // Step 1: POST to archiver.php to initiate download
         let archiver_url = self.build_archiver_url(gid, token, archiver_key);
-        let form_data = if archiver_key.contains("--") {
-            // It's a real archiver_key → download original
+
+        // Determine whether to download original or resampled archive
+        let want_original = self.image_resolution == "original" || self.image_resolution.is_empty();
+
+        let form_data = if want_original {
             vec![("dlcheck", "Download Original Archive")]
         } else {
-            // It's a resolution key → download resampled
             vec![("dlcheck", "Download Resample Archive")]
         };
 
@@ -190,11 +194,11 @@ impl EhClient {
         let download_url = parser::parse_archive_redirect(&html)
             .ok_or_else(|| Error::Parse("archive redirect URL not found".into()))?;
 
-        // Step 3: Download the ZIP file
-        let resp = self
+        // Step 3: Download the ZIP file — stream to disk, no cookies to H@H server
+        let mut resp = self
             .http
             .get(&download_url)
-            .header(COOKIE, self.cookies.to_header())
+            .timeout(std::time::Duration::from_secs(300))
             .send()
             .await?;
 
@@ -206,10 +210,15 @@ impl EhClient {
             });
         }
 
-        // Step 4: Save to file
-        let bytes = resp.bytes().await?;
-        std::fs::write(dest, &bytes)?;
-        Ok(bytes.len() as u64)
+        // Step 4: Stream to file (avoids loading entire archive into memory)
+        let mut file = tokio::fs::File::create(dest).await?;
+        let mut total: u64 = 0;
+        while let Some(chunk) = resp.chunk().await? {
+            file.write_all(&chunk).await?;
+            total += chunk.len() as u64;
+        }
+        file.flush().await?;
+        Ok(total)
     }
 
     /// Get the configured image resolution key.

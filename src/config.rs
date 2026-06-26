@@ -443,11 +443,11 @@ fn default_eh_scan_window_hours() -> u64 {
 }
 
 fn default_eh_download_rate_limit_gb() -> u64 {
-    10
+    7
 }
 
 fn default_eh_download_rate_window_hours() -> u64 {
-    24
+    168
 }
 
 fn default_eh_download_poll_interval_sec() -> u64 {

@@ -21,7 +21,7 @@ fn archiver_key_re() -> &'static Regex {
 fn archive_redirect_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        Regex::new(r#"document\.location\s*=\s*"(https?://[^"]+/archive/[^"]+)"#)
+        Regex::new(r#"document\.location\s*=\s*["'](https?://[^"']+/archive/[^"']+)["']"#)
             .expect("invalid archive_redirect regex")
     })
 }

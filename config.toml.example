@@ -107,9 +107,9 @@ download_original_threshold = 1
 # max_retry_count = 3
 # # 48h scan window for rating-filtered subscriptions (default: 48)
 # scan_window_hours = 48
-# # Download rate limiting (default: 10 GB per 24 hours)
-# download_rate_limit_gb = 10
-# download_rate_window_hours = 24
+# # Download rate limiting (default: 7 GB per 7 days / 168 hours)
+# download_rate_limit_gb = 7
+# download_rate_window_hours = 168
 # # Poll interval for download processor (seconds, default: 60)
 # download_poll_interval_sec = 60
 # # Max pushed GIDs to remember per subscription (default: 500)

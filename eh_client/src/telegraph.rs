@@ -207,9 +207,12 @@ impl TelegraphClient {
             return self.create_page(title, &nodes).await;
         }
 
-        // Multi-page: create in reverse order, linking to the next page
+        // Multi-page: create in reverse order, linking to the next page.
+        // The first page (created last in the loop) gets the original title;
+        // subsequent pages get "(continued)".
+        let total_pages = chunks.len();
         let mut next_url: Option<String> = None;
-        for chunk in chunks.iter().rev() {
+        for (idx, chunk) in chunks.iter().rev().enumerate() {
             let mut nodes: Vec<Node> = Vec::new();
             if let Some(ref next) = next_url {
                 nodes.push(Node::link(next, "Next Page →"));
@@ -217,10 +220,11 @@ impl TelegraphClient {
             for url in chunk {
                 nodes.push(Node::img(url));
             }
-            let page_title = if next_url.is_some() {
-                format!("{} (continued)", title)
-            } else {
+            // idx == total_pages - 1 is the first page (created last) → original title.
+            let page_title = if idx == total_pages - 1 {
                 title.to_string()
+            } else {
+                format!("{} (continued)", title)
             };
             let url = self.create_page(&page_title, &nodes).await?;
             next_url = Some(url);
