@@ -415,3 +415,6 @@ mod tests {
         assert_eq!(owner_updated.username, Some("owner_updated".to_string()));
     }
 }
+
+#[cfg(test)]
+mod eh_integration_tests;
