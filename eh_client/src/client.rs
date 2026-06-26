@@ -12,16 +12,10 @@ pub struct EhClient {
     base_url: String,
     pub(crate) api_url: String,
     cookies: EhCookies,
-    image_resolution: String,
 }
 
 impl EhClient {
-    pub fn new(
-        base_url: &str,
-        api_url: &str,
-        cookies: EhCookies,
-        image_resolution: &str,
-    ) -> Result<Self> {
+    pub fn new(base_url: &str, api_url: &str, cookies: EhCookies) -> Result<Self> {
         let mut builder = reqwest::Client::builder()
             .user_agent(USER_AGENT_STR)
             .timeout(std::time::Duration::from_secs(60));
@@ -37,7 +31,6 @@ impl EhClient {
             base_url: base_url.to_string(),
             api_url: api_url.to_string(),
             cookies,
-            image_resolution: image_resolution.to_string(),
         })
     }
 
@@ -151,20 +144,21 @@ impl EhClient {
 
     /// Download a gallery archive ZIP to the specified path.
     /// `archiver_key` is obtained from `get_archiver_key`.
-    /// If `image_resolution` is not "original", a resampled archive is requested
-    /// using the configured resolution (e.g. "780x", "980x", "1280x").
+    /// `resolution` controls quality: "780x"/"980x"/"1280x" (free resamples),
+    /// "1600x"/"2400x" (donors), "original" (costs GP).
     pub async fn download_archive(
         &self,
         gid: u64,
         token: &str,
         archiver_key: &str,
+        resolution: &str,
         dest: &Path,
     ) -> Result<u64> {
         // Step 1: POST to archiver.php to initiate download
         let archiver_url = self.build_archiver_url(gid, token, archiver_key);
 
         // Determine whether to download original or resampled archive
-        let want_original = self.image_resolution == "original" || self.image_resolution.is_empty();
+        let want_original = resolution == "original" || resolution.is_empty();
 
         let form_data = if want_original {
             vec![("dlcheck", "Download Original Archive")]
@@ -221,11 +215,6 @@ impl EhClient {
         Ok(total)
     }
 
-    /// Get the configured image resolution key.
-    pub fn image_resolution(&self) -> &str {
-        &self.image_resolution
-    }
-
     /// Get the base URL.
     pub fn base_url(&self) -> &str {
         &self.base_url
@@ -237,7 +226,6 @@ pub struct EhClientBuilder {
     base_url: String,
     api_url: String,
     cookies: EhCookies,
-    image_resolution: String,
 }
 
 impl Default for EhClientBuilder {
@@ -249,7 +237,6 @@ impl Default for EhClientBuilder {
                 nw: true,
                 ..Default::default()
             },
-            image_resolution: "780x".into(),
         }
     }
 }
@@ -270,18 +257,9 @@ impl EhClientBuilder {
         self.cookies = c;
         self
     }
-    pub fn image_resolution(mut self, r: &str) -> Self {
-        self.image_resolution = r.into();
-        self
-    }
     pub fn build(self) -> EhClient {
-        EhClient::new(
-            &self.base_url,
-            &self.api_url,
-            self.cookies,
-            &self.image_resolution,
-        )
-        .expect("failed to build EhClient")
+        EhClient::new(&self.base_url, &self.api_url, self.cookies)
+            .expect("failed to build EhClient")
     }
 }
 

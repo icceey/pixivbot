@@ -217,12 +217,7 @@ async fn main() -> Result<()> {
             let api_url = "https://api.e-hentai.org/api.php";
             let cookies = config.ehentai.to_cookies();
 
-            match eh_client::EhClient::new(
-                base_url,
-                api_url,
-                cookies,
-                &config.ehentai.image_resolution,
-            ) {
+            match eh_client::EhClient::new(base_url, api_url, cookies) {
                 Ok(client) => {
                     info!(
                         "✅ E-Hentai client initialized (site: {})",

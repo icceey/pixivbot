@@ -224,7 +224,7 @@ async fn test_download_archive_full_flow() {
     let dest = tmp.path();
 
     let bytes = client
-        .download_archive(123456, "abcdef0123", "780x", dest)
+        .download_archive(123456, "abcdef0123", "123456--abc123def456", "780x", dest)
         .await
         .expect("download should succeed");
 
@@ -246,7 +246,7 @@ async fn test_download_archive_no_redirect() {
     let client = client_at(&server);
     let tmp = tempfile::NamedTempFile::new().expect("failed to create tempfile");
     let result = client
-        .download_archive(123, "tok", "780x", tmp.path())
+        .download_archive(123, "tok", "123--abc123def456", "780x", tmp.path())
         .await;
     assert!(result.is_err());
 }
@@ -263,7 +263,7 @@ async fn test_download_archive_archiver_error() {
     let client = client_at(&server);
     let tmp = tempfile::NamedTempFile::new().expect("failed to create tempfile");
     let result = client
-        .download_archive(123, "tok", "780x", tmp.path())
+        .download_archive(123, "tok", "123--abc123def456", "780x", tmp.path())
         .await;
     assert!(result.is_err());
 }

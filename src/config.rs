@@ -339,9 +339,19 @@ pub struct EhentaiConfig {
     pub ipb_pass_hash: Option<String>,
     #[serde(default)]
     pub igneous: Option<String>,
-    /// Image resolution for archive downloads: "780x", "980x", "1280x", "1600x", "2400x", "original"
-    #[serde(default = "default_eh_image_resolution")]
-    pub image_resolution: String,
+    /// Resolution for subscription downloads: "780x", "980x", "1280x" (free),
+    /// "1600x"/"2400x" (donors), "original" (costs GP). Default: "1280x" (free max).
+    #[serde(default = "default_eh_subscription_resolution")]
+    pub subscription_resolution: String,
+    /// Resolution for /edl direct downloads. Default: "1280x".
+    #[serde(default = "default_eh_download_resolution")]
+    pub download_resolution: String,
+    /// Whether subscription updates send the archive ZIP (default: true).
+    #[serde(default = "default_eh_send_archive")]
+    pub send_archive: bool,
+    /// Whether subscription updates upload to Telegraph (default: false).
+    #[serde(default)]
+    pub upload_telegraph: bool,
     #[serde(default = "default_eh_min_interval_sec")]
     pub min_interval_sec: u64,
     #[serde(default = "default_eh_max_interval_sec")]
@@ -371,7 +381,10 @@ impl Default for EhentaiConfig {
             ipb_member_id: None,
             ipb_pass_hash: None,
             igneous: None,
-            image_resolution: default_eh_image_resolution(),
+            subscription_resolution: default_eh_subscription_resolution(),
+            download_resolution: default_eh_download_resolution(),
+            send_archive: default_eh_send_archive(),
+            upload_telegraph: false,
             min_interval_sec: default_eh_min_interval_sec(),
             max_interval_sec: default_eh_max_interval_sec(),
             telegraph_access_token: None,
@@ -417,8 +430,16 @@ fn default_eh_site() -> String {
     "e-hentai".to_string()
 }
 
-fn default_eh_image_resolution() -> String {
-    "780x".to_string()
+fn default_eh_subscription_resolution() -> String {
+    "1280x".to_string()
+}
+
+fn default_eh_download_resolution() -> String {
+    "1280x".to_string()
+}
+
+fn default_eh_send_archive() -> bool {
+    true
 }
 
 fn default_eh_min_interval_sec() -> u64 {

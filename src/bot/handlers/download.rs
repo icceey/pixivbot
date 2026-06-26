@@ -42,18 +42,47 @@ impl BotHandler {
 
         let (illust_ids, booru_refs) = self.extract_targets(&msg, &args).await;
 
-        if illust_ids.is_empty() && booru_refs.is_empty() {
+        // Check for e-hentai/exhentai gallery links
+        let eh_gallery = self.extract_eh_gallery(&msg, &args);
+
+        if illust_ids.is_empty() && booru_refs.is_empty() && eh_gallery.is_none() {
             bot.send_message(
                 chat_id,
                 "❌ 请提供作品 ID 或 URL，或回复包含作品链接的消息\n\n例如：\n\
                  • `/download 123456789`\n\
                  • `/download https://www.pixiv.net/artworks/123456789`\n\
+                 • `/download https://e-hentai.org/g/12345/token/`\n\
                  • `/download https://yande.re/post/show/123456`（需先在配置中启用）\n\
                  • 回复包含链接的消息并使用 `/download`",
             )
             .parse_mode(ParseMode::MarkdownV2)
             .await?;
             return Ok(());
+        }
+
+        // Handle eh gallery download via the download queue
+        if let Some((gid, token)) = &eh_gallery {
+            if let Some(eh_client) = &self.eh_client {
+                let metadata = eh_client.get_metadata(&[(*gid, token)]).await;
+                let title = match &metadata {
+                    Ok(m) if !m.is_empty() => m[0].title.clone(),
+                    _ => format!("gallery_{}", gid),
+                };
+                let _ = self
+                    .repo
+                    .enqueue_eh_download(
+                        chat_id.0,
+                        *gid as i64,
+                        token,
+                        &title,
+                        false,
+                        crate::db::repo::eh_download_queue::SOURCE_DIRECT,
+                    )
+                    .await;
+                bot.send_message(chat_id, "⏳ 已加入 E-Hentai 下载队列")
+                    .await?;
+                return Ok(());
+            }
         }
 
         info!(
@@ -154,6 +183,42 @@ impl BotHandler {
         }
 
         (ids.into_iter().collect(), booru_refs)
+    }
+
+    /// Extract e-hentai/exhentai gallery URL from args or replied message.
+    fn extract_eh_gallery(&self, msg: &Message, args: &str) -> Option<(u64, String)> {
+        self.eh_client.as_ref()?;
+
+        let check_text = |text: &str| -> Option<(u64, String)> {
+            for word in text.split_whitespace() {
+                if word.contains("e-hentai.org/g/") || word.contains("exhentai.org/g/") {
+                    let after_g = word.split("/g/").nth(1)?;
+                    let parts: Vec<&str> = after_g.split('/').take(2).collect();
+                    if parts.len() == 2 {
+                        let gid: u64 = parts[0].parse().ok()?;
+                        let token = parts[1].to_string();
+                        if token.len() >= 8 {
+                            return Some((gid, token));
+                        }
+                    }
+                }
+            }
+            None
+        };
+
+        if !args.trim().is_empty() {
+            if let Some(g) = check_text(args) {
+                return Some(g);
+            }
+        }
+
+        if let Some(reply_msg) = msg.reply_to_message() {
+            if let Some(text) = reply_msg.text().or_else(|| reply_msg.caption()) {
+                return check_text(text);
+            }
+        }
+
+        None
     }
 
     /// Process downloads for multiple illusts

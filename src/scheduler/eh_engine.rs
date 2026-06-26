@@ -567,9 +567,16 @@ impl EhDownloadProcessor {
         let temp_dir = tempfile::tempdir().context("Failed to create temp dir")?;
         let zip_path = temp_dir.path().join(format!("{}.zip", gid));
 
+        // Select resolution based on download source
+        let resolution = if entry.source == "direct" {
+            &self.config.download_resolution
+        } else {
+            &self.config.subscription_resolution
+        };
+
         let file_size = self
             .client
-            .download_archive(gid, token, &archiver_key, &zip_path)
+            .download_archive(gid, token, &archiver_key, resolution, &zip_path)
             .await
             .context("Failed to download archive")?;
 
@@ -582,33 +589,43 @@ impl EhDownloadProcessor {
         let chat = get_chat_if_should_notify(&self.repo, entry.chat_id).await?;
         let chat_id = teloxide::types::ChatId(entry.chat_id);
 
-        if let Some(_chat) = &chat {
-            match self
-                .notifier
-                .send_document(chat_id, &zip_path, &filename, &caption)
-                .await
-            {
-                Ok(msg_id) => {
-                    info!(
-                        "Sent eh archive to chat {} msg_id={}",
-                        entry.chat_id, msg_id
-                    );
-                }
-                Err(e) => {
-                    warn!(
-                        "Failed to send eh archive to chat {}: {:#}",
-                        entry.chat_id, e
-                    );
-                    // Don't fail the whole download — mark as done but log the send failure
+        // Conditionally send the archive ZIP based on config
+        if self.config.send_archive {
+            if let Some(_chat) = &chat {
+                match self
+                    .notifier
+                    .send_document(chat_id, &zip_path, &filename, &caption)
+                    .await
+                {
+                    Ok(msg_id) => {
+                        info!(
+                            "Sent eh archive to chat {} msg_id={}",
+                            entry.chat_id, msg_id
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Failed to send eh archive to chat {}: {:#}",
+                            entry.chat_id, e
+                        );
+                    }
                 }
             }
+        } else if chat.is_some() {
+            // send_archive is off — send just the caption as a text message
+            let _ = self.notifier.send_text(chat_id, &caption, false).await;
         }
 
-        // Optional Telegraph upload
-        if entry.telegraph {
+        // Optional Telegraph upload (config-level for subscriptions, entry-level for direct)
+        let do_telegraph = if entry.source == "direct" {
+            entry.telegraph
+        } else {
+            self.config.upload_telegraph
+        };
+
+        if do_telegraph {
             if let Err(e) = self.process_telegraph(entry, &zip_path).await {
                 warn!("Telegraph upload failed for gid={}: {:#}", gid, e);
-                // Send error message to chat
                 if chat.is_some() {
                     let escaped_err = teloxide::utils::markdown::escape(&e.to_string());
                     let _ = self
@@ -1331,6 +1348,8 @@ mod download_processor_tests {
             download_poll_interval_sec: 60,
             max_push_per_tick: 3,
             max_retry_count: 3,
+            send_archive: true,
+            upload_telegraph: true,
             ..Default::default()
         }
     }

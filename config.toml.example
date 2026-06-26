@@ -92,10 +92,16 @@ download_original_threshold = 1
 # # ipb_member_id = "12345"
 # # ipb_pass_hash = "abcdef0123456789abcdef0123456789"
 # # igneous = "abcdef"           # Required for exhentai only
-# # Image resolution for archive downloads:
+# # Image resolution for subscription archive downloads:
 # #   "780x", "980x", "1280x" (free resamples), "1600x"/"2400x" (donors),
-# #   "original" (logged-in with Original Images enabled)
-# image_resolution = "780x"
+# #   "original" (logged-in, costs GP/credits)
+# subscription_resolution = "1280x"
+# # Image resolution for /edl direct downloads (default: "1280x")
+# download_resolution = "1280x"
+# # Send archive ZIP to chat (default: true)
+# send_archive = true
+# # Upload to Telegraph and send link for subscription updates (default: false)
+# upload_telegraph = false
 # # Poll interval range (seconds) for subscription checks
 # min_interval_sec = 1800        # default: 30 min
 # max_interval_sec = 3600        # default: 1 hour

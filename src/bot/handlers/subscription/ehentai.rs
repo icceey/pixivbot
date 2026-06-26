@@ -50,8 +50,7 @@ impl BotHandler {
                      • rating>=N — 最低评分 (2-5, 触发48h扫描)\n\
                      • pages>=N — 最低页数\n\
                      • pages<=N — 最高页数\n\
-                     • cat=<类别> — 分类筛选 (逗号分隔)\n\
-                     • telegraph=on — 启用 Telegraph 上传",
+                     • cat=<类别> — 分类筛选 (逗号分隔)",
                 )
                 .await;
             return Ok(());
@@ -62,7 +61,6 @@ impl BotHandler {
         let mut query_parts = Vec::new();
         let mut filter_args = Vec::new();
         let mut cat_str: Option<String> = None;
-        let mut telegraph = false;
 
         for part in &parts {
             if let Some(val) = part.strip_prefix("rating>=") {
@@ -86,8 +84,6 @@ impl BotHandler {
                 }
             } else if let Some(val) = part.strip_prefix("cat=") {
                 cat_str = Some(val.to_string());
-            } else if let Some(val) = part.strip_prefix("telegraph=") {
-                telegraph = val.eq_ignore_ascii_case("on") || val == "true" || val == "1";
             } else {
                 query_parts.push(*part);
             }
@@ -101,7 +97,7 @@ impl BotHandler {
         let query = query_parts.join(" ");
 
         // Parse filter
-        let eh_filter = match parse_eh_filter(&filter_args, telegraph) {
+        let eh_filter = match parse_eh_filter(&filter_args) {
             Ok(f) => f,
             Err(e) => {
                 let _ = bot
@@ -268,6 +264,7 @@ impl BotHandler {
     pub async fn handle_edl(
         &self,
         bot: ThrottledBot,
+        msg: teloxide::types::Message,
         chat_id: ChatId,
         _user_id: Option<UserId>,
         args_str: String,
@@ -283,18 +280,34 @@ impl BotHandler {
         let parsed = args::parse_args(&args_str);
         let remaining = parsed.remaining.trim();
 
-        if remaining.is_empty() {
-            let _ = bot
-                .send_message(
-                    chat_id,
-                    "用法: /edl <url|gid> [telegraph=on]\n\n\
-                     支持:\n\
-                     • 画廊 URL: https://e-hentai.org/g/12345/token/\n\
-                     • 画廊 GID: 12345",
-                )
-                .await;
-            return Ok(());
-        }
+        // If no args, check if replying to a message containing a gallery URL
+        let input = if remaining.is_empty() {
+            // Try to extract from replied message
+            if let Some(reply) = msg.reply_to_message() {
+                let reply_text = reply.text().unwrap_or("");
+                extract_gallery_url_from_text(reply_text)
+            } else {
+                None
+            }
+        } else {
+            Some(remaining.to_string())
+        };
+
+        let input = match input {
+            Some(s) => s,
+            None => {
+                let _ = bot
+                    .send_message(
+                        chat_id,
+                        "用法: /edl <画廊URL> [telegraph=on]\n\n\
+                         支持:\n\
+                         • 画廊 URL: https://e-hentai.org/g/12345/token/\n\
+                         • 回复包含画廊链接的消息使用 /edl",
+                    )
+                    .await;
+                return Ok(());
+            }
+        };
 
         // Check telegraph param
         let telegraph = parsed
@@ -302,12 +315,12 @@ impl BotHandler {
             .map(|v| v.eq_ignore_ascii_case("on") || v == "true" || v == "1")
             .unwrap_or(false);
 
-        // Parse gallery URL or GID
-        let (gid, token) = match parse_gallery_ref(remaining) {
+        // Parse gallery URL
+        let (gid, token) = match parse_gallery_ref(&input) {
             Some(g) => g,
             None => {
                 let _ = bot
-                    .send_message(chat_id, "❌ 无法解析画廊标识。请提供 URL 或 GID。")
+                    .send_message(chat_id, "❌ 无法解析画廊标识。请提供画廊 URL。")
                     .await;
                 return Ok(());
             }
@@ -373,9 +386,8 @@ impl BotHandler {
 }
 
 /// Parse filter args into EhFilter.
-fn parse_eh_filter(args: &[String], telegraph: bool) -> Result<EhFilter, String> {
+fn parse_eh_filter(args: &[String]) -> Result<EhFilter, String> {
     let mut filter = EhFilter::new();
-    filter.telegraph = telegraph;
 
     for arg in args {
         if let Some(val) = arg.strip_prefix("rating>=") {
@@ -419,43 +431,57 @@ fn parse_gallery_ref(s: &str) -> Option<(u64, String)> {
     None
 }
 
+/// Extract the first e-hentai/exhentai gallery URL from a text message.
+fn extract_gallery_url_from_text(text: &str) -> Option<String> {
+    for word in text.split_whitespace() {
+        if (word.contains("e-hentai.org/g/") || word.contains("exhentai.org/g/"))
+            && parse_gallery_ref(word).is_some()
+        {
+            return Some(
+                word.trim_matches(|c| {
+                    !char::is_alphanumeric(c) && c != '/' && c != ':' && c != '-' && c != '.'
+                })
+                .to_string(),
+            );
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn test_parse_eh_filter_basic() {
-        let filter = parse_eh_filter(&["rating>=4".to_string()], false).unwrap();
+        let filter = parse_eh_filter(&["rating>=4".to_string()]).unwrap();
         assert_eq!(filter.min_rating, Some(4));
         assert!(!filter.telegraph);
     }
 
     #[test]
     fn test_parse_eh_filter_pages() {
-        let filter = parse_eh_filter(
-            &[
-                "rating>=3".to_string(),
-                "pages>=20".to_string(),
-                "pages<=500".to_string(),
-            ],
-            true,
-        )
+        let filter = parse_eh_filter(&[
+            "rating>=3".to_string(),
+            "pages>=20".to_string(),
+            "pages<=500".to_string(),
+        ])
         .unwrap();
         assert_eq!(filter.min_rating, Some(3));
         assert_eq!(filter.min_pages, Some(20));
         assert_eq!(filter.max_pages, Some(500));
-        assert!(filter.telegraph);
+        assert!(!filter.telegraph);
     }
 
     #[test]
     fn test_parse_eh_filter_invalid_rating() {
-        let result = parse_eh_filter(&["rating>=1".to_string()], false);
+        let result = parse_eh_filter(&["rating>=1".to_string()]);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_parse_eh_filter_rating_out_of_range() {
-        let result = parse_eh_filter(&["rating>=6".to_string()], false);
+        let result = parse_eh_filter(&["rating>=6".to_string()]);
         assert!(result.is_err());
     }
 
