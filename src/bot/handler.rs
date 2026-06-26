@@ -35,6 +35,7 @@ pub struct BotHandler {
     /// 日志目录路径 (用于管理员查看磁盘占用)
     pub(crate) log_dir: String,
     pub(crate) booru_registry: Arc<BooruSiteRegistry>,
+    pub(crate) eh_client: Option<Arc<eh_client::EhClient>>,
 }
 
 impl BotHandler {
@@ -56,6 +57,7 @@ impl BotHandler {
         cache_dir: String,
         log_dir: String,
         booru_registry: Arc<BooruSiteRegistry>,
+        eh_client: Option<Arc<eh_client::EhClient>>,
     ) -> Self {
         Self {
             repo,
@@ -70,6 +72,7 @@ impl BotHandler {
             cache_dir,
             log_dir,
             booru_registry,
+            eh_client,
         }
     }
 
@@ -157,6 +160,11 @@ impl BotHandler {
                     .await
             }
             Command::BRand(args) => self.handle_brand(bot, msg.chat.id, user_id, args).await,
+
+            // E-Hentai commands (defined in handlers/subscription/ehentai.rs)
+            Command::ESub(args) => self.handle_esub(bot, chat_id, user_id, args).await,
+            Command::EUnsub(args) => self.handle_eunsub(bot, chat_id, user_id, args).await,
+            Command::EDl(args) => self.handle_edl(bot, chat_id, user_id, args).await,
 
             // Admin commands (require admin or owner role, defined in handlers/admin.rs)
             Command::EnableChat(args) if user_role.is_admin() => {

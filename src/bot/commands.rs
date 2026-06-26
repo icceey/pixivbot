@@ -46,13 +46,19 @@ pub enum Command {
     BRankMonth(String),
     #[command(description = "订阅 Booru 随机推送: <站点:间隔> [过滤条件]  间隔格式: 1h/2h30m/30m")]
     BRand(String),
+    #[command(description = "订阅 E-Hentai 画廊\n  用法: /esub [ch=<频道ID>] <搜索词> [过滤条件]")]
+    ESub(String),
+    #[command(description = "取消 E-Hentai 订阅\n  用法: /eunsub [ch=<频道ID>] <搜索词>")]
+    EUnsub(String),
+    #[command(description = "直接下载 E-Hentai 画廊\n  用法: /edl <url|gid> [telegraph=on]")]
+    EDl(String),
     #[command(description = "取消当前设置操作")]
     Cancel,
 }
 
 impl Command {
     /// 获取普通用户可见的命令列表
-    pub fn user_commands(has_booru: bool) -> Vec<BotCommand> {
+    pub fn user_commands(has_booru: bool, has_ehentai: bool) -> Vec<BotCommand> {
         let mut commands = vec![
             BotCommand::new("sub", "订阅作者 - /sub [ch=<频道ID>] <id,...>"),
             BotCommand::new("subrank", "订阅排行榜 - /subrank [ch=<频道ID>] <mode>"),
@@ -91,14 +97,22 @@ impl Command {
             ]);
         }
 
+        if has_ehentai {
+            commands.extend([
+                BotCommand::new("esub", "订阅EH画廊 - /esub <搜索词> [过滤条件]"),
+                BotCommand::new("eunsub", "取消EH订阅 - /eunsub <搜索词>"),
+                BotCommand::new("edl", "下载EH画廊 - /edl <url|gid> [telegraph=on]"),
+            ]);
+        }
+
         commands.push(BotCommand::new("help", "显示帮助信息"));
 
         commands
     }
 
     /// 获取管理员可见的命令列表（包含普通命令 + 管理员命令）
-    pub fn admin_commands(has_booru: bool) -> Vec<BotCommand> {
-        let mut cmds = Self::user_commands(has_booru);
+    pub fn admin_commands(has_booru: bool, has_ehentai: bool) -> Vec<BotCommand> {
+        let mut cmds = Self::user_commands(has_booru, has_ehentai);
         cmds.extend([
             BotCommand::new("info", "[Admin] 查看 Bot 状态信息"),
             BotCommand::new("enablechat", "[Admin] 启用聊天 - /enablechat [chat_id]"),
@@ -108,8 +122,8 @@ impl Command {
     }
 
     /// 获取 Owner 可见的完整命令列表（包含所有命令）
-    pub fn owner_commands(has_booru: bool) -> Vec<BotCommand> {
-        let mut cmds = Self::admin_commands(has_booru);
+    pub fn owner_commands(has_booru: bool, has_ehentai: bool) -> Vec<BotCommand> {
+        let mut cmds = Self::admin_commands(has_booru, has_ehentai);
         cmds.extend([
             BotCommand::new("setadmin", "[Owner] 设置管理员 - /setadmin <user_id>"),
             BotCommand::new("unsetadmin", "[Owner] 移除管理员 - /unsetadmin <user_id>"),
@@ -131,7 +145,7 @@ mod tests {
 
     #[test]
     fn user_commands_omit_booru_entries_when_not_configured() {
-        let commands = command_names(Command::user_commands(false));
+        let commands = command_names(Command::user_commands(false, false));
 
         for name in [
             "bsub",
@@ -151,7 +165,7 @@ mod tests {
 
     #[test]
     fn user_commands_include_booru_entries_when_configured() {
-        let commands = command_names(Command::user_commands(true));
+        let commands = command_names(Command::user_commands(true, false));
 
         for name in [
             "bsub",
@@ -170,9 +184,33 @@ mod tests {
     }
 
     #[test]
+    fn user_commands_include_ehentai_entries_when_configured() {
+        let commands = command_names(Command::user_commands(false, true));
+
+        for name in ["esub", "eunsub", "edl"] {
+            assert!(
+                commands.iter().any(|command| command == name),
+                "expected {name} to be visible when ehentai is configured"
+            );
+        }
+    }
+
+    #[test]
+    fn user_commands_omit_ehentai_entries_when_not_configured() {
+        let commands = command_names(Command::user_commands(false, false));
+
+        for name in ["esub", "eunsub", "edl"] {
+            assert!(
+                !commands.iter().any(|command| command == name),
+                "expected {name} to be hidden when ehentai is not configured"
+            );
+        }
+    }
+
+    #[test]
     fn admin_and_owner_commands_follow_booru_visibility() {
-        let admin_commands = command_names(Command::admin_commands(false));
-        let owner_commands = command_names(Command::owner_commands(false));
+        let admin_commands = command_names(Command::admin_commands(false, false));
+        let owner_commands = command_names(Command::owner_commands(false, false));
 
         assert!(admin_commands.iter().any(|command| command == "info"));
         assert!(owner_commands.iter().any(|command| command == "setadmin"));

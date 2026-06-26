@@ -7,6 +7,6 @@ mod ranking_engine;
 
 pub use author_engine::AuthorEngine;
 pub use booru_engine::BooruEngine;
-pub use eh_engine::EhEngine;
+pub use eh_engine::{EhDownloadProcessor, EhEngine};
 pub use name_update_engine::NameUpdateEngine;
 pub use ranking_engine::RankingEngine;
