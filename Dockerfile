@@ -12,11 +12,11 @@ WORKDIR /app
 COPY --from=planner /app/recipe.json recipe.json
 ARG TARGETPLATFORM
 RUN --mount=type=cache,target=/usr/local/cargo/registry,id=registry-$TARGETPLATFORM,sharing=locked \
-    cargo chef cook --release --recipe-path recipe.json
+    cargo chef cook --release --features ffmpeg-codec --recipe-path recipe.json
 COPY . .
 ARG TARGETPLATFORM
 RUN --mount=type=cache,target=/usr/local/cargo/registry,id=registry-$TARGETPLATFORM,sharing=locked \
-    cargo build --release --locked && \
+    cargo build --release --locked --features ffmpeg-codec && \
     cp target/release/pixivbot /app/pixivbot
 
 FROM debian:bookworm-slim AS runtime
