@@ -4,7 +4,8 @@ use crate::bot::notifier::{
 use crate::db::entities::{chats, subscriptions};
 use crate::db::repo::Repo;
 use crate::db::types::{
-    AuthorState, BooruRankingState, BooruTagState, RankingState, SubscriptionState, TagFilter,
+    AuthorState, BooruRankingState, BooruTagState, EhTagState, RankingState, SubscriptionState,
+    TagFilter,
 };
 use crate::pixiv::client::PixivClient;
 use crate::utils::{caption, sensitive};
@@ -76,6 +77,13 @@ pub fn booru_ranking_subscription_state(
 ) -> Option<BooruRankingState> {
     match &subscription.latest_data {
         Some(SubscriptionState::BooruRanking(state)) => Some(state.clone()),
+        _ => None,
+    }
+}
+
+pub fn eh_tag_subscription_state(subscription: &subscriptions::Model) -> Option<EhTagState> {
+    match &subscription.latest_data {
+        Some(SubscriptionState::EhTag(state)) => Some(state.clone()),
         _ => None,
     }
 }

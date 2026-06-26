@@ -1,7 +1,7 @@
 use super::Repo;
 use crate::db::entities::eh_download_queue;
 use anyhow::{Context, Result};
-use chrono::{Local, NaiveDateTime};
+use chrono::Local;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, EntityTrait, Order, PaginatorTrait, QueryFilter, QueryOrder, Set,
 };
