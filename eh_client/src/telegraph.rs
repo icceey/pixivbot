@@ -199,6 +199,19 @@ impl TelegraphClient {
             .await?;
 
         let status = resp.status();
+
+        // Detect 429 rate limiting
+        if status.as_u16() == 429 {
+            let retry_after = resp
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok());
+            return Err(Error::RateLimited {
+                retry_after_secs: retry_after,
+            });
+        }
+
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
             return Err(Error::Api {
@@ -218,6 +231,37 @@ impl TelegraphClient {
             }
         }
         Err(Error::Parse("pixi.mg upload returned no urls".into()))
+    }
+
+    /// Upload images with automatic 429 backoff. Retries up to `max_retries` times
+    /// on HTTP 429, waiting exponentially longer each time (40s, 80s, 160s).
+    /// Returns the uploaded URLs (all images in one batch).
+    pub async fn upload_images_with_retry(
+        &self,
+        images: &[&[u8]],
+        max_retries: u32,
+    ) -> Result<Vec<String>> {
+        let mut attempt = 0u32;
+        loop {
+            match self.upload_images_batch(images).await {
+                Ok(urls) => return Ok(urls),
+                Err(Error::RateLimited { retry_after_secs }) => {
+                    if attempt >= max_retries {
+                        return Err(Error::RateLimited { retry_after_secs });
+                    }
+                    let wait = retry_after_secs.unwrap_or_else(|| 40 * 2u64.pow(attempt));
+                    tracing::warn!(
+                        "pixi.mg returned 429, waiting {}s before retry (attempt {}/{})",
+                        wait,
+                        attempt + 1,
+                        max_retries
+                    );
+                    tokio::time::sleep(tokio::time::Duration::from_secs(wait)).await;
+                    attempt += 1;
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     /// Create a Telegraph page. Returns the page URL.

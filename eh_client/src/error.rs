@@ -8,6 +8,8 @@ pub enum Error {
     Parse(String),
     Io(std::io::Error),
     Zip(String),
+    /// HTTP 429 Too Many Requests. `retry_after_secs` is parsed from Retry-After header.
+    RateLimited { retry_after_secs: Option<u64> },
     Other(String),
 }
 
@@ -20,6 +22,9 @@ impl fmt::Display for Error {
             Error::Parse(msg) => write!(f, "Parse error: {}", msg),
             Error::Io(e) => write!(f, "IO error: {}", e),
             Error::Zip(msg) => write!(f, "ZIP error: {}", msg),
+            Error::RateLimited { retry_after_secs } => {
+                write!(f, "Rate limited (429), retry after {:?}", retry_after_secs)
+            }
             Error::Other(msg) => write!(f, "{}", msg),
         }
     }
