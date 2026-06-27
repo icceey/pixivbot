@@ -67,6 +67,58 @@ pub fn parse_archive_redirect(html: &str) -> Option<String> {
         .map(|url| url.replace("autostart=1", "start=1"))
 }
 
+fn image_page_urls_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r#"<a\s+href="(https?://(?:e-hentai|exhentai)\.org/s/[^"]+)""#)
+            .expect("invalid image_page_urls regex")
+    })
+}
+
+fn image_src_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r#"<img\s+id="img"\s+src="(https?://[^"]+)""#).expect("invalid image_src regex")
+    })
+}
+
+fn page_count_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r#"<table[^>]*class="ptt"[^>]*>[\s\S]*?<td>(\d+)</td>\s*</tr>"#)
+            .expect("invalid page_count regex")
+    })
+}
+
+/// Extract image page URLs from gallery HTML.
+/// Gallery pages use `/?p=0`, `?p=1`, etc. Each page has image page links
+/// in the form `<a href="https://e-hentai.org/s/{hash}/{gid}-{n}">`.
+pub fn parse_image_page_urls(html: &str) -> Vec<String> {
+    let re = image_page_urls_re();
+    let mut urls: Vec<String> = re
+        .captures_iter(html)
+        .map(|cap| cap.get(1).unwrap().as_str().to_string())
+        .collect();
+    urls.dedup();
+    urls
+}
+
+/// Extract the image src URL from an image page HTML.
+/// The image is in `<img id="img" src="...">`.
+pub fn parse_image_src(html: &str) -> Option<String> {
+    let re = image_src_re();
+    re.captures(html)
+        .and_then(|cap| cap.get(1).map(|m| m.as_str().to_string()))
+}
+
+/// Extract the total number of gallery pages from gallery HTML.
+/// Returns None if the page count cannot be determined.
+pub fn parse_page_count(html: &str) -> Option<u32> {
+    let re = page_count_re();
+    re.captures(html)
+        .and_then(|cap| cap.get(1)?.as_str().parse::<u32>().ok())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -148,5 +200,59 @@ mod tests {
     fn test_parse_archive_redirect_not_found() {
         let html = "<html><body>No redirect</body></html>";
         assert!(parse_archive_redirect(html).is_none());
+    }
+
+    #[test]
+    fn test_parse_image_page_urls() {
+        let html = r#"
+        <div class="gdtm">
+          <a href="https://e-hentai.org/s/abc123/123456-01">1</a>
+        </div>
+        <div class="gdtm">
+          <a href="https://e-hentai.org/s/def456/123456-02">2</a>
+        </div>
+        "#;
+        let urls = parse_image_page_urls(html);
+        assert_eq!(urls.len(), 2);
+        assert!(urls[0].contains("/s/abc123/123456-01"));
+        assert!(urls[1].contains("/s/def456/123456-02"));
+    }
+
+    #[test]
+    fn test_parse_image_page_urls_empty() {
+        let urls = parse_image_page_urls("<html></html>");
+        assert!(urls.is_empty());
+    }
+
+    #[test]
+    fn test_parse_image_src() {
+        let html = r#"
+        <div>
+          <img id="img" src="https://123.45.67.89/h/abc123.jpg" />
+        </div>
+        "#;
+        let src = parse_image_src(html).expect("should find image src");
+        assert_eq!(src, "https://123.45.67.89/h/abc123.jpg");
+    }
+
+    #[test]
+    fn test_parse_image_src_not_found() {
+        assert!(parse_image_src("<html></html>").is_none());
+    }
+
+    #[test]
+    fn test_parse_page_count() {
+        let html = r#"
+        <table class="ptt">
+          <tr><td>1</td><td>2</td><td>3</td><td>10</td></tr>
+        </table>
+        "#;
+        // The regex captures the last td before </tr>
+        assert_eq!(parse_page_count(html), Some(10));
+    }
+
+    #[test]
+    fn test_parse_page_count_not_found() {
+        assert!(parse_page_count("<html></html>").is_none());
     }
 }

@@ -219,6 +219,137 @@ impl EhClient {
     pub fn base_url(&self) -> &str {
         &self.base_url
     }
+
+    /// Returns true if the client has authentication cookies (logged in).
+    pub fn is_logged_in(&self) -> bool {
+        self.cookies.ipb_member_id.is_some() && self.cookies.ipb_pass_hash.is_some()
+    }
+
+    /// Download gallery images directly by scraping image pages.
+    /// Used as a fallback when archive download is not available (no login).
+    /// Downloads all images and packages them into a ZIP at `dest`.
+    /// Returns total bytes written.
+    pub async fn download_gallery_images(&self, gid: u64, token: &str, dest: &Path) -> Result<u64> {
+        // Step 1: Fetch gallery page to get image page URLs and page count
+        let gallery_url = format!("{}/g/{}/{}/", self.base_url, gid, token);
+        let resp = self
+            .http
+            .get(&gallery_url)
+            .header(COOKIE, self.cookies.to_header())
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(Error::Api {
+                message: format!("gallery page returned {}", status),
+                status: status.as_u16(),
+            });
+        }
+        let gallery_html = resp.text().await?;
+
+        // Determine total pages (galleries split across multiple HTML pages)
+        let total_pages = parser::parse_page_count(&gallery_html).unwrap_or(1);
+
+        // Step 2: Collect all image page URLs from all gallery pages
+        let mut all_image_urls: Vec<String> = parser::parse_image_page_urls(&gallery_html);
+
+        for page_num in 1..total_pages {
+            // Rate limit between page fetches
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            let page_url = format!("{}/g/{}/{}/?p={}", self.base_url, gid, token, page_num);
+            let resp = self
+                .http
+                .get(&page_url)
+                .header(COOKIE, self.cookies.to_header())
+                .send()
+                .await?;
+            if !resp.status().is_success() {
+                break;
+            }
+            let html = resp.text().await?;
+            let urls = parser::parse_image_page_urls(&html);
+            if urls.is_empty() {
+                break;
+            }
+            all_image_urls.extend(urls);
+        }
+
+        all_image_urls.dedup();
+
+        if all_image_urls.is_empty() {
+            return Err(Error::Parse("no image page URLs found".into()));
+        }
+
+        // Step 3: Create ZIP and download each image into it
+        let zip_file = tokio::fs::File::create(dest).await?;
+        let mut zip_writer =
+            zip::ZipWriter::new(std::io::BufWriter::new(zip_file.into_std().await));
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+
+        let mut total_bytes: u64 = 0;
+
+        for (idx, image_page_url) in all_image_urls.iter().enumerate() {
+            // Rate limit between image fetches (e-hentai limits ~5000/day)
+            if idx > 0 {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+
+            // Fetch the image page to get the actual image URL
+            let resp = match self
+                .http
+                .get(image_page_url.as_str())
+                .header(COOKIE, self.cookies.to_header())
+                .send()
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    // Image page fetch failed, skip this image
+                    let _ = e;
+                    continue;
+                }
+            };
+
+            if !resp.status().is_success() {
+                continue;
+            }
+
+            let html = resp.text().await?;
+            let image_url = match parser::parse_image_src(&html) {
+                Some(u) => u,
+                None => continue,
+            };
+
+            // Download the actual image (no cookies to image CDN)
+            let img_resp = match self.http.get(&image_url).send().await {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+
+            if !img_resp.status().is_success() {
+                continue;
+            }
+
+            // Get image bytes
+            let img_bytes = img_resp.bytes().await?;
+
+            // Stream image into ZIP entry
+            let ext = image_url
+                .rsplit('.')
+                .next()
+                .filter(|e| e.len() <= 4)
+                .unwrap_or("jpg");
+            let entry_name = format!("{:04}.{}", idx + 1, ext);
+
+            zip_writer.start_file(&entry_name, options)?;
+            std::io::Write::write_all(&mut zip_writer, &img_bytes)?;
+            total_bytes += img_bytes.len() as u64;
+        }
+
+        zip_writer.finish()?;
+        Ok(total_bytes)
+    }
 }
 
 /// Builder for EhClient (useful for testing).

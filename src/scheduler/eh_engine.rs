@@ -556,31 +556,40 @@ impl EhDownloadProcessor {
         let gid = entry.gid as u64;
         let token = &entry.token;
 
-        // Get archiver key from gallery page
-        let archiver_key = self
-            .client
-            .get_archiver_key(gid, token)
-            .await
-            .context("Failed to get archiver key")?;
-
         // Download archive to temp file
         let temp_dir = tempfile::tempdir().context("Failed to create temp dir")?;
         let zip_path = temp_dir.path().join(format!("{}.zip", gid));
 
-        // Select resolution based on download source
-        let resolution = if entry.source == "direct" {
-            &self.config.download_resolution
+        // Choose download method: archive download requires login.
+        // If not logged in, fall back to direct image download (scrape image pages).
+        let file_size = if self.client.is_logged_in() {
+            // Archive download via archiver.php
+            let archiver_key = self
+                .client
+                .get_archiver_key(gid, token)
+                .await
+                .context("Failed to get archiver key")?;
+
+            let resolution = if entry.source == "direct" {
+                &self.config.download_resolution
+            } else {
+                &self.config.subscription_resolution
+            };
+
+            self.client
+                .download_archive(gid, token, &archiver_key, resolution, &zip_path)
+                .await
+                .context("Failed to download archive")?
         } else {
-            &self.config.subscription_resolution
+            // Direct image download (scrape gallery pages → download each image → ZIP)
+            info!("Not logged in, using direct image download for gid={}", gid);
+            self.client
+                .download_gallery_images(gid, token, &zip_path)
+                .await
+                .context("Failed to download gallery images")?
         };
 
-        let file_size = self
-            .client
-            .download_archive(gid, token, &archiver_key, resolution, &zip_path)
-            .await
-            .context("Failed to download archive")?;
-
-        info!("Downloaded eh archive gid={} size={} bytes", gid, file_size);
+        info!("Downloaded eh gallery gid={} size={} bytes", gid, file_size);
 
         // Send to Telegram chat
         let caption = self.build_download_caption(entry);
@@ -1302,7 +1311,7 @@ mod download_processor_tests {
     use crate::db::repo::tests_helpers;
     use crate::db::types::{EhFilter, EhTaskKey, TagFilter, TaskType};
     use crate::pixiv::downloader::Downloader;
-    use eh_client::{EhClientBuilder, TelegraphClient};
+    use eh_client::{EhClientBuilder, EhCookies, TelegraphClient};
     use reqwest::Client;
     use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter};
     use std::io::Write;
@@ -1323,11 +1332,18 @@ mod download_processor_tests {
     }
 
     /// Build an EhClient pointing at the given mock server (e-hentai API mock).
+    /// Includes login cookies so archive download path is used.
     fn make_eh_client(eh_server: &MockServer) -> Arc<EhClient> {
         Arc::new(
             EhClientBuilder::new()
                 .base_url(&eh_server.uri())
                 .api_url(&format!("{}/api.php", eh_server.uri()))
+                .cookies(EhCookies {
+                    ipb_member_id: Some("12345".into()),
+                    ipb_pass_hash: Some("abc".into()),
+                    igneous: None,
+                    nw: true,
+                })
                 .build(),
         )
     }

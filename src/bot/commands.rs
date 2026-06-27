@@ -52,6 +52,10 @@ pub enum Command {
     EUnsub(String),
     #[command(description = "直接下载 E-Hentai 画廊\n  用法: /edl <url|gid> [telegraph=on]")]
     EDl(String),
+    #[command(
+        description = "下载 E-Hentai 画廊并上传 Telegraph\n  用法: /telegraph <url> 或回复消息"
+    )]
+    Telegraph(String),
     #[command(description = "取消当前设置操作")]
     Cancel,
 }
@@ -102,6 +106,10 @@ impl Command {
                 BotCommand::new("esub", "订阅EH画廊 - /esub <搜索词> [过滤条件]"),
                 BotCommand::new("eunsub", "取消EH订阅 - /eunsub <搜索词>"),
                 BotCommand::new("edl", "下载EH画廊 - /edl <url|gid> [telegraph=on]"),
+                BotCommand::new(
+                    "telegraph",
+                    "下载EH画廊上传Telegraph - /telegraph <url> 或回复消息",
+                ),
             ]);
         }
 

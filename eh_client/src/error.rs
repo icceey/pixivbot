@@ -7,6 +7,7 @@ pub enum Error {
     Api { message: String, status: u16 },
     Parse(String),
     Io(std::io::Error),
+    Zip(String),
     Other(String),
 }
 
@@ -18,6 +19,7 @@ impl fmt::Display for Error {
             Error::Api { message, status } => write!(f, "API error ({}): {}", status, message),
             Error::Parse(msg) => write!(f, "Parse error: {}", msg),
             Error::Io(e) => write!(f, "IO error: {}", e),
+            Error::Zip(msg) => write!(f, "ZIP error: {}", msg),
             Error::Other(msg) => write!(f, "{}", msg),
         }
     }
@@ -49,6 +51,12 @@ impl From<serde_json::Error> for Error {
 impl From<std::io::Error> for Error {
     fn from(err: std::io::Error) -> Self {
         Error::Io(err)
+    }
+}
+
+impl From<zip::result::ZipError> for Error {
+    fn from(err: zip::result::ZipError) -> Self {
+        Error::Zip(err.to_string())
     }
 }
 

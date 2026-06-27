@@ -383,6 +383,123 @@ impl BotHandler {
 
         Ok(())
     }
+
+    /// /telegraph command: download gallery and upload to Telegraph, send link.
+    /// Like /edl but always uploads to Telegraph (uses free 1280x resolution).
+    pub async fn handle_telegraph(
+        &self,
+        bot: ThrottledBot,
+        msg: teloxide::types::Message,
+        chat_id: ChatId,
+        _user_id: Option<UserId>,
+        args_str: String,
+    ) -> ResponseResult<()> {
+        let eh_client = match &self.eh_client {
+            Some(c) => c.clone(),
+            None => {
+                let _ = bot.send_message(chat_id, "E-Hentai 功能未启用").await;
+                return Ok(());
+            }
+        };
+
+        let parsed = args::parse_args(&args_str);
+        let remaining = parsed.remaining.trim();
+
+        // If no args, check if replying to a message containing a gallery URL
+        let input = if remaining.is_empty() {
+            if let Some(reply) = msg.reply_to_message() {
+                let reply_text = reply.text().unwrap_or("");
+                extract_gallery_url_from_text(reply_text)
+            } else {
+                None
+            }
+        } else {
+            Some(remaining.to_string())
+        };
+
+        let input = match input {
+            Some(s) => s,
+            None => {
+                let _ = bot
+                    .send_message(
+                        chat_id,
+                        "用法: /telegraph <画廊URL>\n\n\
+                         下载画廊并上传 Telegraph，发送阅读链接。\n\
+                         也可回复包含画廊链接的消息使用 /telegraph",
+                    )
+                    .await;
+                return Ok(());
+            }
+        };
+
+        // Parse gallery URL
+        let (gid, token) = match parse_gallery_ref(&input) {
+            Some(g) => g,
+            None => {
+                let _ = bot
+                    .send_message(chat_id, "❌ 无法解析画廊标识。请提供画廊 URL。")
+                    .await;
+                return Ok(());
+            }
+        };
+
+        // Send "processing" message
+        let status_msg = bot
+            .send_message(chat_id, "⏳ 正在获取画廊信息...")
+            .await
+            .ok();
+
+        // Fetch metadata
+        let metadata = match eh_client.get_metadata(&[(gid, &token)]).await {
+            Ok(m) if !m.is_empty() => m.into_iter().next().unwrap(),
+            Ok(_) => {
+                let _ = bot.send_message(chat_id, "❌ 未找到画廊").await;
+                return Ok(());
+            }
+            Err(e) => {
+                warn!("Failed to fetch eh metadata: {:#}", e);
+                let _ = bot.send_message(chat_id, "❌ 获取画廊信息失败").await;
+                return Ok(());
+            }
+        };
+
+        // Enqueue download with telegraph=true (processor handles upload)
+        if let Err(e) = self
+            .repo
+            .enqueue_eh_download(
+                chat_id.0,
+                gid as i64,
+                &token,
+                &metadata.title,
+                true, // always telegraph
+                SOURCE_DIRECT,
+            )
+            .await
+        {
+            error!("Failed to enqueue eh download: {:#}", e);
+            let _ = bot.send_message(chat_id, "❌ 加入下载队列失败").await;
+            return Ok(());
+        }
+
+        // Delete status message
+        if let Some(msg) = status_msg {
+            let _ = bot.delete_message(chat_id, msg.id).await;
+        }
+
+        let _ = bot
+            .send_message(
+                chat_id,
+                format!(
+                    "✅ 已加入 Telegraph 下载队列: {}\n_gid: {}_",
+                    markdown::escape(&metadata.title),
+                    gid
+                ),
+            )
+            .parse_mode(ParseMode::MarkdownV2)
+            .await;
+
+        Ok(())
+    }
 }
 
 /// Parse filter args into EhFilter.
