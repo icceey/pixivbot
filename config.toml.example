@@ -101,11 +101,13 @@ download_original_threshold = 1
 # # Send archive ZIP to chat (default: true)
 # send_archive = true
 # # Upload to Telegraph and send link for subscription updates (default: false)
+# # Requires telegraph_access_token. Images are uploaded to pixi.mg (no auth needed).
 # upload_telegraph = false
 # # Poll interval range (seconds) for subscription checks
 # min_interval_sec = 1800        # default: 30 min
 # max_interval_sec = 3600        # default: 1 hour
-# # Optional: Telegraph access token for Telegraph upload feature
+# # Telegraph access token (auto-created, or create at api.telegra.ph/createAccount)
+# # Required for Telegraph upload feature
 # # telegraph_access_token = "your_telegraph_token"
 # # Max galleries to push per tick (default: 3)
 # max_push_per_tick = 3

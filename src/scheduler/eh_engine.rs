@@ -1359,7 +1359,7 @@ mod download_processor_tests {
     fn make_telegraph_client(tg_server: &MockServer) -> Arc<TelegraphClient> {
         Arc::new(TelegraphClient::new_with_urls(
             "test_token".to_string(),
-            format!("{}/telegraph/upload", tg_server.uri()),
+            format!("{}/pixi/upload", tg_server.uri()),
             tg_server.uri(),
         ))
     }
@@ -1482,11 +1482,14 @@ mod download_processor_tests {
             .await;
     }
 
-    /// Mock the Telegraph upload endpoint.
+    /// Mock the pixi.mg upload endpoint.
     async fn mock_telegraph_upload(server: &MockServer) {
-        let body = serde_json::json!([{"src": "/file/abc123.jpg"}]);
+        let body = serde_json::json!({
+            "success": true,
+            "direct_url": "https://i.pixi.mg/i/abc123.jpg"
+        });
         Mock::given(method("POST"))
-            .and(path("/telegraph/upload"))
+            .and(path("/pixi/upload"))
             .respond_with(ResponseTemplate::new(200).set_body_json(body))
             .mount(server)
             .await;
@@ -1835,9 +1838,9 @@ mod download_processor_tests {
         mock_tg_send_document(&tg_server).await;
         mock_tg_send_message(&tg_server).await;
 
-        // Mock Telegraph upload to FAIL
+        // Mock pixi.mg upload to FAIL
         Mock::given(method("POST"))
-            .and(path("/telegraph/upload"))
+            .and(path("/pixi/upload"))
             .respond_with(ResponseTemplate::new(500))
             .mount(&tg_server)
             .await;

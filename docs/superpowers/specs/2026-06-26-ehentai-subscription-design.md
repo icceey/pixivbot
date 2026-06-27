@@ -682,12 +682,27 @@ When Telegraph upload is enabled for a subscription, after downloading the archi
 
 1. Extract images from ZIP using the `zip` crate (already a dependency)
 2. Filter to image files only (`.jpg`, `.png`, `.gif`, `.webp` extensions)
-3. Upload each image via `telegraph.upload_image()` (max ~6MB per image)
+3. Upload each image to an image hosting service (see "Image Hosting" below)
 4. If content size would exceed 64KB, split into multiple pages with "Next Page" links
 5. Create page with `<img>` nodes pointing to uploaded URLs
 6. Send page URL to chat via `notifier.notify_with_text()`
 
-Images are uploaded to Telegraph's `/upload` endpoint directly (not Catbox.moe). If Telegraph upload fails for an image, that image is skipped and the page is created with remaining images.
+### Image Hosting
+
+**Telegraph `/upload` endpoint is NOT functional** — as of 2026-06-27, all upload attempts (regardless of format, User-Agent, Referer, or file size) return HTTP 400 with `"Unknown error"`. This affects both `https://telegra.ph/upload` and any known workaround. The endpoint appears to be deprecated or restricted to Telegraph's own web UI.
+
+**H@H direct URLs MUST NOT be used** in Telegraph pages. The image URLs from e-hentai's Hentai@Home servers (e.g. `https://gkpbqaw.umwqzgwvcvmi.hath.network:8440/h/...`) are time-limited and expire. Using them in Telegraph pages would result in broken images after the URL expires.
+
+**Alternative image hosting services** (under investigation):
+- **Catbox.moe** (`https://catbox.moe/user/api.php`): Free, no auth required for anonymous uploads, 200MB limit. Used by DojinGo. Multipart form: `reqtype=fileupload` + `fileToUpload`.
+- **imgbb** (`https://api.imgbb.com/1/upload`): Requires API key, 32MB limit.
+- **0x0.st** (`https://0x0.st`): Simple curl-based upload, no auth, 512MB limit.
+
+The selected service must:
+1. Accept image uploads via HTTP POST (multipart form)
+2. Return a persistent URL that does not expire
+3. Work without requiring per-user authentication (or use a shared API key in config)
+4. Be referenced in Telegraph `createPage` content as `<img src="persistent_url">`
 
 ## Testing
 

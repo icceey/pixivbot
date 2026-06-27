@@ -356,6 +356,8 @@ pub struct EhentaiConfig {
     pub min_interval_sec: u64,
     #[serde(default = "default_eh_max_interval_sec")]
     pub max_interval_sec: u64,
+    /// Telegraph access token for creating Telegraph pages.
+    /// Required for Telegraph upload feature. Images are uploaded to pixi.mg (no auth needed).
     #[serde(default)]
     pub telegraph_access_token: Option<String>,
     #[serde(default = "default_eh_max_push_per_tick")]

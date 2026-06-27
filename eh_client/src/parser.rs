@@ -119,7 +119,11 @@ fn page_count_re() -> &'static Regex {
 
 fn td_number_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r#"<td[^>]*>(\d+)</td>"#).expect("invalid td_number regex"))
+    RE.get_or_init(|| {
+        // Match numeric content inside <td> elements, including when wrapped in <a> tags
+        // e.g. <td class="ptds"><a href="...">2</a></td> or <td>1</td>
+        Regex::new(r#"<td[^>]*>(?:<a[^>]*>)?(\d+)(?:</a>)?</td>"#).expect("invalid td_number regex")
+    })
 }
 
 /// Extract image page URLs from gallery HTML.
@@ -309,22 +313,21 @@ mod tests {
     #[test]
     fn test_parse_page_count() {
         let html = r#"
-        <table class="ptt">
-          <tr><td>1</td><td>2</td><td>3</td><td>10</td></tr>
+        <table class="ptt" style="margin:2px auto 0px">
+          <tr><td class="ptdd">&lt;</td><td class="ptds"><a href=".../">1</a></td><td onclick="..."><a href=".../?p=1">2</a></td><td onclick="..."><a href=".../?p=1">&gt;</a></td></tr>
         </table>
         "#;
-        assert_eq!(parse_page_count(html), Some(10));
+        assert_eq!(parse_page_count(html), Some(2));
     }
 
     #[test]
-    fn test_parse_page_count_with_nav_arrow() {
-        // Galleries with >10 thumbnail pages have a navigation arrow cell
+    fn test_parse_page_count_many_pages() {
         let html = r#"
         <table class="ptt">
-          <tr><td>1</td><td>2</td>...<td>15</td><td><a href="?p=1">&gt;</a></td></tr>
+          <tr><td class="ptdd">&lt;</td><td class="ptds"><a href=".../">1</a></td><td><a href="?p=1">2</a></td><td><a href="?p=2">3</a></td><td><a href="?p=15">&gt;</a></td></tr>
         </table>
         "#;
-        assert_eq!(parse_page_count(html), Some(15));
+        assert_eq!(parse_page_count(html), Some(3));
     }
 
     #[test]

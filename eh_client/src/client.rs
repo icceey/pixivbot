@@ -270,6 +270,94 @@ impl EhClient {
         self.cookies.ipb_member_id.is_some() && self.cookies.ipb_pass_hash.is_some()
     }
 
+    /// Collect all image URLs from a gallery by scraping image pages.
+    /// Returns a list of direct image URLs (on H@H servers).
+    /// Used for Telegraph page creation without downloading images.
+    pub async fn get_gallery_image_urls(&self, gid: u64, token: &str) -> Result<Vec<String>> {
+        // Step 1: Fetch gallery page to get image page URLs and page count
+        let gallery_url = format!("{}/g/{}/{}/", self.base_url, gid, token);
+        let resp = self
+            .http
+            .get(&gallery_url)
+            .header(COOKIE, self.cookies.to_header())
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(Error::Api {
+                message: format!("gallery page returned {}", status),
+                status: status.as_u16(),
+            });
+        }
+        let gallery_html = resp.text().await?;
+
+        let total_pages = parser::parse_page_count(&gallery_html).unwrap_or(1);
+
+        // Step 2: Collect all image page URLs from all gallery pages
+        let mut all_page_urls: Vec<String> = parser::parse_image_page_urls(&gallery_html);
+
+        for page_num in 1..total_pages {
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            let page_url = format!("{}/g/{}/{}/?p={}", self.base_url, gid, token, page_num);
+            let resp = self
+                .http
+                .get(&page_url)
+                .header(COOKIE, self.cookies.to_header())
+                .send()
+                .await?;
+            if !resp.status().is_success() {
+                break;
+            }
+            let html = resp.text().await?;
+            let urls = parser::parse_image_page_urls(&html);
+            if urls.is_empty() {
+                break;
+            }
+            all_page_urls.extend(urls);
+        }
+
+        // Dedup preserving order
+        let mut seen = std::collections::HashSet::new();
+        all_page_urls.retain(|url| seen.insert(url.clone()));
+
+        if all_page_urls.is_empty() {
+            return Err(Error::Parse("no image page URLs found".into()));
+        }
+
+        // Step 3: Visit each image page and extract the direct image URL
+        let mut image_urls = Vec::new();
+        for (idx, page_url) in all_page_urls.iter().enumerate() {
+            if idx > 0 {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+            let resp = match self
+                .http
+                .get(page_url.as_str())
+                .header(COOKIE, self.cookies.to_header())
+                .send()
+                .await
+            {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            if !resp.status().is_success() {
+                continue;
+            }
+            let html = resp.text().await?;
+            if let Some(src) = parser::parse_image_src(&html) {
+                image_urls.push(src);
+            }
+        }
+
+        if image_urls.is_empty() {
+            return Err(Error::Parse(
+                "no image URLs extracted from image pages".into(),
+            ));
+        }
+
+        Ok(image_urls)
+    }
+
     /// Download gallery images directly by scraping image pages.
     /// Used as a fallback when archive download is not available (no login).
     /// Downloads all images and packages them into a ZIP at `dest`.
