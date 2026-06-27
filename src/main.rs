@@ -248,7 +248,6 @@ async fn main() -> Result<()> {
             std::sync::Arc::clone(eh_client),
             std::sync::Arc::new(config.ehentai.clone()),
             scheduler_config.tick_interval_sec,
-            scheduler_config.max_retry_count,
         );
         info!("✅ E-Hentai engine initialized");
         Some(tokio::spawn(async move {
@@ -258,18 +257,48 @@ async fn main() -> Result<()> {
         None
     };
 
-    let eh_download_processor_handle = if let Some(ref eh_client) = eh_client {
-        let processor = scheduler::EhDownloadProcessor::new(
+    let eh_cache_dir = std::path::PathBuf::from(&config.scheduler.cache_dir);
+
+    let eh_download_worker_handle = if let Some(ref eh_client) = eh_client {
+        let worker = scheduler::EhDownloadWorker::new(
+            repo.clone(),
+            std::sync::Arc::clone(eh_client),
+            std::sync::Arc::new(config.ehentai.clone()),
+            eh_cache_dir.clone(),
+        );
+        info!("✅ E-Hentai download worker initialized");
+        Some(tokio::spawn(async move { worker.run().await }))
+    } else {
+        None
+    };
+
+    let eh_upload_worker_handle = if eh_client.is_some() {
+        if let Some(ref telegraph) = telegraph_client {
+            let worker = scheduler::EhUploadWorker::new(
+                repo.clone(),
+                notifier.clone(),
+                std::sync::Arc::clone(telegraph),
+                std::sync::Arc::new(config.ehentai.clone()),
+            );
+            info!("✅ E-Hentai upload worker initialized");
+            Some(tokio::spawn(async move { worker.run().await }))
+        } else {
+            info!("E-Hentai upload worker disabled (no telegraph token)");
+            None
+        }
+    } else {
+        None
+    };
+
+    let eh_publish_worker_handle = if let Some(ref eh_client) = eh_client {
+        let worker = scheduler::EhPublishWorker::new(
             repo.clone(),
             notifier.clone(),
             std::sync::Arc::clone(eh_client),
-            telegraph_client.clone(),
             std::sync::Arc::new(config.ehentai.clone()),
         );
-        info!("✅ E-Hentai download processor initialized");
-        Some(tokio::spawn(async move {
-            processor.run().await;
-        }))
+        info!("✅ E-Hentai publish worker initialized");
+        Some(tokio::spawn(async move { worker.run().await }))
     } else {
         None
     };
@@ -330,7 +359,13 @@ async fn main() -> Result<()> {
     if let Some(handle) = eh_engine_handle {
         handle.abort();
     }
-    if let Some(handle) = eh_download_processor_handle {
+    if let Some(handle) = eh_download_worker_handle {
+        handle.abort();
+    }
+    if let Some(handle) = eh_upload_worker_handle {
+        handle.abort();
+    }
+    if let Some(handle) = eh_publish_worker_handle {
         handle.abort();
     }
 
