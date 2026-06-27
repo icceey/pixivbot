@@ -122,8 +122,6 @@ async fn test_update_subscription_latest_data_eh_tag() {
     let state = SubscriptionState::EhTag(EhTagState {
         pushed_gids: vec![100, 200],
         latest_posted_ts: 1700000000,
-        pending_queue: vec![],
-        retry_count: 0,
     });
 
     repo.update_subscription_latest_data(sub.id, Some(state.clone()))
@@ -140,7 +138,6 @@ async fn test_update_subscription_latest_data_eh_tag() {
         SubscriptionState::EhTag(s) => {
             assert_eq!(s.pushed_gids, vec![100, 200]);
             assert_eq!(s.latest_posted_ts, 1700000000);
-            assert!(s.pending_queue.is_empty());
         }
         _ => panic!("expected EhTag state"),
     }

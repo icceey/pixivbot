@@ -158,12 +158,6 @@ pub struct EhTagState {
     /// Unix timestamp of the newest gallery processed (cursor).
     #[serde(default)]
     pub latest_posted_ts: i64,
-    /// Queue of galleries waiting to be sent.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub pending_queue: Vec<QueuedEhGallery>,
-    /// Retry count for failed pushes.
-    #[serde(default)]
-    pub retry_count: u8,
 }
 
 impl EhTagState {
@@ -171,37 +165,7 @@ impl EhTagState {
         Self {
             pushed_gids: Vec::new(),
             latest_posted_ts,
-            pending_queue: Vec::new(),
-            retry_count: 0,
         }
-    }
-
-    /// Create state with the front item removed from the queue (successful send).
-    ///
-    /// Panics if the queue is empty.
-    pub fn popped_front(&self) -> Self {
-        Self {
-            pushed_gids: self.pushed_gids.clone(),
-            latest_posted_ts: self.latest_posted_ts,
-            pending_queue: self.pending_queue[1..].to_vec(),
-            retry_count: 0,
-        }
-    }
-
-    /// Create state with retry count incremented (failed send).
-    pub fn with_retry_increment(&self) -> Self {
-        Self {
-            pushed_gids: self.pushed_gids.clone(),
-            latest_posted_ts: self.latest_posted_ts,
-            pending_queue: self.pending_queue.clone(),
-            retry_count: self.retry_count.saturating_add(1),
-        }
-    }
-
-    /// Determine whether the pending queue should be abandoned.
-    /// Returns `true` if retry is disabled (`max_retry_count <= 0`) or retry limit is exhausted.
-    pub fn should_abandon_queue(&self, max_retry_count: i32) -> bool {
-        max_retry_count <= 0 || (self.retry_count as i32) >= max_retry_count
     }
 
     /// Add a GID to the pushed set (dedup, preserves insertion order).
@@ -218,26 +182,6 @@ impl EhTagState {
             self.pushed_gids.drain(0..drop);
         }
     }
-}
-
-/// A queued e-hentai gallery with full data for pending delivery.
-///
-/// Stores complete gallery data so we don't need to re-fetch from the API.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct QueuedEhGallery {
-    pub gid: u64,
-    pub token: String,
-    pub title: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub title_jpn: Option<String>,
-    pub category: String,
-    pub thumb: String,
-    pub uploader: String,
-    pub posted: i64,
-    pub filecount: u32,
-    pub filesize: u64,
-    pub rating: f64,
-    pub tags: Vec<String>,
 }
 
 /// A queued booru post with full data for pending delivery.
@@ -370,96 +314,11 @@ mod tests {
         assert!(!state.should_abandon_queue(2));
     }
 
-    fn make_queued_eh_gallery(gid: u64) -> QueuedEhGallery {
-        QueuedEhGallery {
-            gid,
-            token: "abc".to_string(),
-            title: format!("Gallery {gid}"),
-            title_jpn: None,
-            category: "Manga".to_string(),
-            thumb: "".to_string(),
-            uploader: "user".to_string(),
-            posted: 1000 + gid as i64,
-            filecount: 20,
-            filesize: 1000,
-            rating: 4.5,
-            tags: vec![],
-        }
-    }
-
     #[test]
     fn test_eh_tag_state_cleared() {
         let state = EhTagState::cleared(12345);
         assert_eq!(state.latest_posted_ts, 12345);
         assert!(state.pushed_gids.is_empty());
-        assert!(state.pending_queue.is_empty());
-        assert_eq!(state.retry_count, 0);
-    }
-
-    #[test]
-    fn test_eh_tag_state_popped_front() {
-        let state = EhTagState {
-            pushed_gids: vec![1],
-            latest_posted_ts: 100,
-            pending_queue: vec![
-                make_queued_eh_gallery(10),
-                make_queued_eh_gallery(20),
-                make_queued_eh_gallery(30),
-            ],
-            retry_count: 2,
-        };
-        let popped = state.popped_front();
-        assert_eq!(popped.latest_posted_ts, 100);
-        assert_eq!(popped.pending_queue.len(), 2);
-        assert_eq!(popped.pending_queue[0].gid, 20);
-        assert_eq!(popped.pending_queue[1].gid, 30);
-        assert_eq!(popped.retry_count, 0);
-    }
-
-    #[test]
-    fn test_eh_tag_state_with_retry_increment() {
-        let state = EhTagState {
-            pushed_gids: vec![1],
-            latest_posted_ts: 100,
-            pending_queue: vec![make_queued_eh_gallery(1)],
-            retry_count: 2,
-        };
-        let retried = state.with_retry_increment();
-        assert_eq!(retried.retry_count, 3);
-    }
-
-    #[test]
-    fn test_eh_tag_state_with_retry_increment_saturates() {
-        let state = EhTagState {
-            pushed_gids: vec![1],
-            latest_posted_ts: 100,
-            pending_queue: vec![make_queued_eh_gallery(1)],
-            retry_count: u8::MAX,
-        };
-        let retried = state.with_retry_increment();
-        assert_eq!(retried.retry_count, u8::MAX);
-    }
-
-    #[test]
-    fn test_eh_tag_state_should_abandon_queue() {
-        let state = EhTagState {
-            pushed_gids: vec![],
-            latest_posted_ts: 100,
-            pending_queue: vec![make_queued_eh_gallery(1)],
-            retry_count: 0,
-        };
-        // max_retry_count <= 0 means retry disabled
-        assert!(state.should_abandon_queue(0));
-        assert!(state.should_abandon_queue(-1));
-
-        let state = EhTagState {
-            pushed_gids: vec![],
-            latest_posted_ts: 100,
-            pending_queue: vec![make_queued_eh_gallery(1)],
-            retry_count: 3,
-        };
-        assert!(state.should_abandon_queue(3));
-        assert!(!state.should_abandon_queue(4));
     }
 
     #[test]
@@ -476,8 +335,6 @@ mod tests {
         let mut state = EhTagState {
             pushed_gids: vec![1, 2, 3, 4, 5],
             latest_posted_ts: 100,
-            pending_queue: vec![],
-            retry_count: 0,
         };
         state.trim_pushed(3);
         assert_eq!(state.pushed_gids, vec![3, 4, 5]);
