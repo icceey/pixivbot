@@ -160,11 +160,24 @@ impl EhClient {
         // Determine whether to download original or resampled archive
         let want_original = resolution == "original" || resolution.is_empty();
 
-        let form_data = if want_original {
-            vec![("dlcheck", "Download Original Archive")]
+        // Build form data with hathdl_xres to select resolution
+        let xres_val = if want_original {
+            "org".to_string()
         } else {
-            vec![("dlcheck", "Download Resample Archive")]
+            resolution.trim_end_matches('x').to_string()
         };
+
+        let form_data = vec![
+            (
+                "dlcheck",
+                if want_original {
+                    "Download Original Archive"
+                } else {
+                    "Download Resample Archive"
+                },
+            ),
+            ("hathdl_xres", xres_val.as_str()),
+        ];
 
         let resp = self
             .http
@@ -212,6 +225,11 @@ impl EhClient {
             total += chunk.len() as u64;
         }
         file.flush().await?;
+        drop(file);
+
+        // Step 5: Validate that we got a real ZIP (not an error HTML page)
+        validate_zip_magic(dest).await?;
+
         Ok(total)
     }
 
@@ -274,7 +292,9 @@ impl EhClient {
             all_image_urls.extend(urls);
         }
 
-        all_image_urls.dedup();
+        // Deduplicate image URLs (preserve order, remove non-consecutive dups)
+        let mut seen = std::collections::HashSet::new();
+        all_image_urls.retain(|url| seen.insert(url.clone()));
 
         if all_image_urls.is_empty() {
             return Err(Error::Parse("no image page URLs found".into()));
@@ -288,6 +308,7 @@ impl EhClient {
             .compression_method(zip::CompressionMethod::Stored);
 
         let mut total_bytes: u64 = 0;
+        let mut images_downloaded: usize = 0;
 
         for (idx, image_page_url) in all_image_urls.iter().enumerate() {
             // Rate limit between image fetches (e-hentai limits ~5000/day)
@@ -345,9 +366,17 @@ impl EhClient {
             zip_writer.start_file(&entry_name, options)?;
             std::io::Write::write_all(&mut zip_writer, &img_bytes)?;
             total_bytes += img_bytes.len() as u64;
+            images_downloaded += 1;
         }
 
         zip_writer.finish()?;
+
+        if images_downloaded == 0 {
+            return Err(Error::Other(
+                "all image downloads failed, no images in ZIP".into(),
+            ));
+        }
+
         Ok(total_bytes)
     }
 }
@@ -391,6 +420,31 @@ impl EhClientBuilder {
     pub fn build(self) -> EhClient {
         EhClient::new(&self.base_url, &self.api_url, self.cookies)
             .expect("failed to build EhClient")
+    }
+}
+
+/// Validate that a file starts with ZIP magic bytes (PK\x03\x04).
+/// Prevents error HTML pages from being sent as "archive" files.
+async fn validate_zip_magic(path: &Path) -> Result<()> {
+    use tokio::io::AsyncReadExt;
+    let mut file = tokio::fs::File::open(path).await?;
+    let mut header = [0u8; 4];
+    use std::io::ErrorKind;
+    match file.read(&mut header).await {
+        Ok(n) if n >= 4 => {
+            if &header == b"PK\x03\x04" {
+                Ok(())
+            } else {
+                Err(Error::Parse(
+                    "downloaded file is not a valid ZIP (invalid magic bytes)".into(),
+                ))
+            }
+        }
+        Ok(_) => Err(Error::Parse("downloaded file too small to be a ZIP".into())),
+        Err(e) if e.kind() == ErrorKind::UnexpectedEof => {
+            Err(Error::Parse("downloaded file too small to be a ZIP".into()))
+        }
+        Err(e) => Err(e.into()),
     }
 }
 

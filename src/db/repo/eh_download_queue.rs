@@ -178,7 +178,7 @@ impl Repo {
     pub async fn retry_failed_eh_downloads(&self, max_retry_count: u8) -> Result<u64> {
         let failed = eh_download_queue::Entity::find()
             .filter(eh_download_queue::Column::Status.eq(STATUS_FAILED))
-            .filter(eh_download_queue::Column::RetryCount.lt(max_retry_count as i32))
+            .filter(eh_download_queue::Column::RetryCount.lte(max_retry_count as i32))
             .all(&self.db)
             .await
             .context("Failed to fetch failed eh downloads")?;

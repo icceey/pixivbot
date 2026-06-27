@@ -85,9 +85,15 @@ fn image_src_re() -> &'static Regex {
 fn page_count_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        Regex::new(r#"<table[^>]*class="ptt"[^>]*>[\s\S]*?<td>(\d+)</td>\s*</tr>"#)
-            .expect("invalid page_count regex")
+        // Match all numeric <td> cells inside the ptt pagination table, take the max
+        Regex::new(r#"<table[^>]*class="ptt"[^>]*>([\s\S]*?)</table>"#)
+            .expect("invalid page_count table regex")
     })
+}
+
+fn td_number_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r#"<td[^>]*>(\d+)</td>"#).expect("invalid td_number regex"))
 }
 
 /// Extract image page URLs from gallery HTML.
@@ -114,9 +120,16 @@ pub fn parse_image_src(html: &str) -> Option<String> {
 /// Extract the total number of gallery pages from gallery HTML.
 /// Returns None if the page count cannot be determined.
 pub fn parse_page_count(html: &str) -> Option<u32> {
-    let re = page_count_re();
-    re.captures(html)
-        .and_then(|cap| cap.get(1)?.as_str().parse::<u32>().ok())
+    let table_re = page_count_re();
+    let td_re = td_number_re();
+    table_re.captures(html).and_then(|cap| {
+        let table_content = cap.get(1)?.as_str();
+        let max = td_re
+            .captures_iter(table_content)
+            .filter_map(|c| c.get(1)?.as_str().parse::<u32>().ok())
+            .max()?;
+        Some(max)
+    })
 }
 
 #[cfg(test)]
@@ -247,8 +260,18 @@ mod tests {
           <tr><td>1</td><td>2</td><td>3</td><td>10</td></tr>
         </table>
         "#;
-        // The regex captures the last td before </tr>
         assert_eq!(parse_page_count(html), Some(10));
+    }
+
+    #[test]
+    fn test_parse_page_count_with_nav_arrow() {
+        // Galleries with >10 thumbnail pages have a navigation arrow cell
+        let html = r#"
+        <table class="ptt">
+          <tr><td>1</td><td>2</td>...<td>15</td><td><a href="?p=1">&gt;</a></td></tr>
+        </table>
+        "#;
+        assert_eq!(parse_page_count(html), Some(15));
     }
 
     #[test]

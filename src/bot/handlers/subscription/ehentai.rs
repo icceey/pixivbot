@@ -221,7 +221,7 @@ impl BotHandler {
                             let _ = bot
                                 .send_message(
                                     chat_id,
-                                    "❌ 找到多个匹配的订阅，请使用 /elist 查看完整标识后用 /eunsub <标识>",
+                                    "❌ 找到多个匹配的订阅，请使用 /list 查看完整标识后用 /eunsub <标识>",
                                 )
                                 .await;
                             return Ok(());

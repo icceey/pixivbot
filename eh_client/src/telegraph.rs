@@ -214,11 +214,13 @@ impl TelegraphClient {
         let mut next_url: Option<String> = None;
         for (idx, chunk) in chunks.iter().rev().enumerate() {
             let mut nodes: Vec<Node> = Vec::new();
-            if let Some(ref next) = next_url {
-                nodes.push(Node::link(next, "Next Page →"));
-            }
+            // Images first
             for url in chunk {
                 nodes.push(Node::img(url));
+            }
+            // "Next Page" link at the bottom (after images)
+            if let Some(ref next) = next_url {
+                nodes.push(Node::link(next, "Next Page →"));
             }
             // idx == total_pages - 1 is the first page (created last) → original title.
             let page_title = if idx == total_pages - 1 {

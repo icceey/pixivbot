@@ -247,6 +247,10 @@ impl EhEngine {
             all_refs.extend(refs);
         }
 
+        // I11: Deduplicate search results by GID (pagination can overlap)
+        let mut seen_gids = std::collections::HashSet::new();
+        all_refs.retain(|r| seen_gids.insert(r.gid));
+
         Ok(all_refs)
     }
 
@@ -290,10 +294,29 @@ impl EhEngine {
             Vec::new()
         };
 
-        // Enqueue download requests for each gallery
+        // Update state FIRST (mark as pushed), THEN enqueue downloads.
+        // This prevents duplicates if enqueue succeeds but state persistence fails
+        // (the gallery is in pushed_gids so won't be re-enqueued next tick).
         for gallery in &to_enqueue {
-            let telegraph = sub_filter.map(|f| f.telegraph).unwrap_or(false);
+            state.add_pushed_gid(gallery.gid);
+            if gallery.posted > state.latest_posted_ts {
+                state.latest_posted_ts = gallery.posted;
+            }
+            state.pending_queue.push(gallery_to_queued(gallery));
+        }
 
+        // Trim pushed_gids to cap
+        state.trim_pushed(self.config.pushed_cap);
+
+        // Persist state before enqueuing downloads (C4: prevents duplicates)
+        self.repo
+            .update_subscription_latest_data(sub.id, Some(SubscriptionState::EhTag(state)))
+            .await
+            .context("Failed to update eh subscription state")?;
+
+        // Now enqueue download requests for each gallery
+        let telegraph_default = sub_filter.map(|f| f.telegraph).unwrap_or(false);
+        for gallery in &to_enqueue {
             if let Err(e) = self
                 .repo
                 .enqueue_eh_download(
@@ -301,7 +324,7 @@ impl EhEngine {
                     gallery.gid as i64,
                     &gallery.token,
                     &gallery.title,
-                    telegraph,
+                    telegraph_default,
                     SOURCE_SUBSCRIPTION,
                 )
                 .await
@@ -310,29 +333,9 @@ impl EhEngine {
                     "Failed to enqueue download for gallery {}: {:#}",
                     gallery.gid, e
                 );
-                continue;
+                // Gallery is already in pushed_gids — user can retry with /edl if needed
             }
-
-            // Add to pushed set
-            state.add_pushed_gid(gallery.gid);
-
-            // Update latest_posted_ts
-            if gallery.posted > state.latest_posted_ts {
-                state.latest_posted_ts = gallery.posted;
-            }
-
-            // Also add to pending_queue for state tracking
-            state.pending_queue.push(gallery_to_queued(gallery));
         }
-
-        // Trim pushed_gids to cap
-        state.trim_pushed(self.config.pushed_cap);
-
-        // Persist state
-        self.repo
-            .update_subscription_latest_data(sub.id, Some(SubscriptionState::EhTag(state)))
-            .await
-            .context("Failed to update eh subscription state")?;
 
         // Drain pending queue (send what we can)
         self.drain_pending_queue(sub).await?;
@@ -556,6 +559,17 @@ impl EhDownloadProcessor {
         let gid = entry.gid as u64;
         let token = &entry.token;
 
+        // I1: Check chat is enabled BEFORE downloading to avoid wasting rate-limit budget
+        let chat = get_chat_if_should_notify(&self.repo, entry.chat_id).await?;
+        if chat.is_none() {
+            info!(
+                "Skipping download for gid={} — chat {} not notifiable",
+                gid, entry.chat_id
+            );
+            return Ok(());
+        }
+        let chat_id = teloxide::types::ChatId(entry.chat_id);
+
         // Download archive to temp file
         let temp_dir = tempfile::tempdir().context("Failed to create temp dir")?;
         let zip_path = temp_dir.path().join(format!("{}.zip", gid));
@@ -595,32 +609,27 @@ impl EhDownloadProcessor {
         let caption = self.build_download_caption(entry);
         let filename = format!("{}.zip", sanitize_filename(&entry.title));
 
-        let chat = get_chat_if_should_notify(&self.repo, entry.chat_id).await?;
-        let chat_id = teloxide::types::ChatId(entry.chat_id);
-
         // Conditionally send the archive ZIP based on config
         if self.config.send_archive {
-            if let Some(_chat) = &chat {
-                match self
-                    .notifier
-                    .send_document(chat_id, &zip_path, &filename, &caption)
-                    .await
-                {
-                    Ok(msg_id) => {
-                        info!(
-                            "Sent eh archive to chat {} msg_id={}",
-                            entry.chat_id, msg_id
-                        );
-                    }
-                    Err(e) => {
-                        warn!(
-                            "Failed to send eh archive to chat {}: {:#}",
-                            entry.chat_id, e
-                        );
-                    }
+            match self
+                .notifier
+                .send_document(chat_id, &zip_path, &filename, &caption)
+                .await
+            {
+                Ok(msg_id) => {
+                    info!(
+                        "Sent eh archive to chat {} msg_id={}",
+                        entry.chat_id, msg_id
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to send eh archive to chat {}: {:#}",
+                        entry.chat_id, e
+                    );
                 }
             }
-        } else if chat.is_some() {
+        } else {
             // send_archive is off — send just the caption as a text message
             let _ = self.notifier.send_text(chat_id, &caption, false).await;
         }
@@ -635,17 +644,15 @@ impl EhDownloadProcessor {
         if do_telegraph {
             if let Err(e) = self.process_telegraph(entry, &zip_path).await {
                 warn!("Telegraph upload failed for gid={}: {:#}", gid, e);
-                if chat.is_some() {
-                    let escaped_err = teloxide::utils::markdown::escape(&e.to_string());
-                    let _ = self
-                        .notifier
-                        .send_text(
-                            chat_id,
-                            &format!("⚠️ Telegraph 上传失败: {}", escaped_err),
-                            false,
-                        )
-                        .await;
-                }
+                let escaped_err = teloxide::utils::markdown::escape(&e.to_string());
+                let _ = self
+                    .notifier
+                    .send_text(
+                        chat_id,
+                        &format!("⚠️ Telegraph 上传失败: {}", escaped_err),
+                        false,
+                    )
+                    .await;
             }
         }
 
