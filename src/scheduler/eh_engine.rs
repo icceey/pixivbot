@@ -811,3 +811,491 @@ mod tests {
         assert_eq!(Repo::backoff_delay_secs(99), 3600);
     }
 }
+
+#[cfg(test)]
+mod integration_tests {
+    use super::*;
+    use crate::bot::notifier::Notifier;
+    use crate::cache::FileCacheManager;
+    use crate::config::EhentaiConfig;
+    use crate::db::entities::eh_download_queue;
+    use crate::db::repo::eh_download_queue::{SOURCE_DIRECT, STATUS_DOWNLOADED, STATUS_UPLOADED};
+    use crate::db::repo::tests_helpers;
+    use crate::db::types::{EhFilter, EhTaskKey, TagFilter, TaskType};
+    use crate::pixiv::downloader::Downloader;
+    use eh_client::{EhClientBuilder, EhCookies, TelegraphClient};
+    use reqwest::Client;
+    use sea_orm::{ActiveModelTrait, EntityTrait, Set};
+    use std::io::Write;
+    use teloxide::requests::RequesterExt;
+    use teloxide::Bot;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn make_notifier(tg_server: &MockServer) -> Notifier {
+        let url = url::Url::parse(&tg_server.uri()).unwrap();
+        let bot = Bot::new("fake_token").set_api_url(url);
+        let throttled = bot.throttle(teloxide::adaptors::throttle::Limits::default());
+        let http = Client::new();
+        let cache = FileCacheManager::new("data/test_cache", 7);
+        let downloader = Arc::new(Downloader::new(http, cache));
+        Notifier::new(throttled, downloader)
+    }
+
+    fn make_eh_client(eh_server: &MockServer) -> Arc<EhClient> {
+        Arc::new(
+            EhClientBuilder::new()
+                .base_url(&eh_server.uri())
+                .api_url(&format!("{}/api.php", eh_server.uri()))
+                .cookies(EhCookies {
+                    ipb_member_id: Some("12345".into()),
+                    ipb_pass_hash: Some("abc".into()),
+                    igneous: None,
+                    nw: true,
+                })
+                .build(),
+        )
+    }
+
+    fn make_telegraph_client(tg_server: &MockServer) -> Arc<TelegraphClient> {
+        Arc::new(TelegraphClient::new_with_urls(
+            "test_token".to_string(),
+            format!("{}/pixi/upload", tg_server.uri()),
+            tg_server.uri(),
+        ))
+    }
+
+    fn make_config() -> EhentaiConfig {
+        EhentaiConfig {
+            download_rate_limit_gb: 7,
+            download_rate_window_hours: 168,
+            download_poll_interval_sec: 60,
+            max_push_per_tick: 3,
+            max_retry_count: 3,
+            send_archive: true,
+            upload_telegraph: true,
+            ..Default::default()
+        }
+    }
+
+    fn create_test_zip(path: &std::path::Path, image_count: usize) {
+        let file = std::fs::File::create(path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        for i in 0..image_count {
+            let name = format!("page{:03}.jpg", i);
+            let options = zip::write::SimpleFileOptions::default();
+            zip.start_file(name, options).unwrap();
+            let data = format!("fake_image_data_{}", i);
+            zip.write_all(data.as_bytes()).unwrap();
+        }
+        zip.finish().unwrap();
+    }
+
+    async fn mock_tg_send_document(server: &MockServer) {
+        let body = serde_json::json!({
+            "ok": true,
+            "result": {"message_id": 42, "date": 1700000000, "chat": {"id": -100, "type": "private"}}
+        });
+        Mock::given(method("POST"))
+            .and(path("/botfake_token/SendDocument"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(server)
+            .await;
+    }
+
+    async fn mock_tg_send_message(server: &MockServer) {
+        let body = serde_json::json!({
+            "ok": true,
+            "result": {"message_id": 43, "date": 1700000000, "chat": {"id": -100, "type": "private"}}
+        });
+        Mock::given(method("POST"))
+            .and(path("/botfake_token/SendMessage"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(server)
+            .await;
+    }
+
+    async fn mock_eh_gallery_page(server: &MockServer, gid: u64, token: &str) {
+        let archiver_key = format!("{}--abc123def456", gid);
+        let html = format!(
+            r#"<html><body>
+            <a onclick="return popUp('/archiver.php?gid={gid}&amp;token={token}',480,320)">Archive Download</a>
+            </body></html>"#,
+            gid = gid,
+            token = token
+        );
+        Mock::given(method("GET"))
+            .and(path(format!("/g/{}/{}/", gid, token)))
+            .respond_with(ResponseTemplate::new(200).set_body_string(html))
+            .mount(server)
+            .await;
+
+        let archiver_page_html = format!(
+            r#"<html><body><input type="hidden" name="or" value="{}" /></body></html>"#,
+            archiver_key
+        );
+        Mock::given(method("GET"))
+            .and(path("/archiver.php"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(archiver_page_html))
+            .mount(server)
+            .await;
+    }
+
+    async fn mock_eh_archiver_post(server: &MockServer, download_url: &str) {
+        let html = format!(
+            r#"<html><script>function gotonext() {{ document.location = "{}?autostart=1"; }}</script></html>"#,
+            download_url
+        );
+        Mock::given(method("POST"))
+            .and(path("/archiver.php"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(html))
+            .mount(server)
+            .await;
+    }
+
+    async fn mock_eh_archive_download(server: &MockServer, path_str: &str, zip_bytes: Vec<u8>) {
+        Mock::given(method("GET"))
+            .and(path(path_str))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(zip_bytes))
+            .mount(server)
+            .await;
+    }
+
+    async fn mock_telegraph_upload(server: &MockServer) {
+        let body = serde_json::json!({"success": true, "direct_url": "https://i.pixi.mg/i/abc123.jpg"});
+        Mock::given(method("POST"))
+            .and(path("/pixi/upload"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(server)
+            .await;
+    }
+
+    async fn mock_telegraph_create_page(server: &MockServer) {
+        let body = serde_json::json!({"ok": true, "result": {"url": "https://telegra.ph/Test-Gallery-01-01"}});
+        Mock::given(method("POST"))
+            .and(path("/createPage"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(server)
+            .await;
+    }
+
+    async fn setup_chat(repo: &Repo, chat_id: i64, enabled: bool) {
+        repo.upsert_chat(chat_id, "private".into(), None, enabled, Default::default())
+            .await
+            .unwrap();
+    }
+
+    async fn insert_queue_entry(
+        repo: &Repo,
+        chat_id: i64,
+        gid: i64,
+        token: &str,
+        title: &str,
+        telegraph: bool,
+        status: &str,
+        zip_path: Option<&str>,
+        telegraph_url: Option<&str>,
+    ) -> eh_download_queue::Model {
+        let now = Local::now().naive_local();
+        let active = eh_download_queue::ActiveModel {
+            chat_id: Set(chat_id),
+            gid: Set(gid),
+            token: Set(token.to_string()),
+            title: Set(title.to_string()),
+            telegraph: Set(telegraph),
+            source: Set(SOURCE_DIRECT.to_string()),
+            status: Set(status.to_string()),
+            file_size: Set(0),
+            error: Set(None),
+            retry_count: Set(0),
+            created_at: Set(now),
+            started_at: Set(None),
+            completed_at: Set(None),
+            zip_path: Set(zip_path.map(|s| s.to_string())),
+            telegraph_url: Set(telegraph_url.map(|s| s.to_string())),
+            next_retry_at: Set(None),
+            ..Default::default()
+        };
+        active.insert(repo.db()).await.unwrap()
+    }
+
+    // === Download Worker Tests ===
+
+    #[tokio::test]
+    async fn test_download_worker_downloads_archive() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        let eh_server = MockServer::start().await;
+        let temp = tempfile::tempdir().unwrap();
+
+        setup_chat(&repo, -100, true).await;
+        let entry = insert_queue_entry(&repo, -100, 123456, "abcdef0123", "Test Gallery", false, "pending", None, None).await;
+
+        mock_eh_gallery_page(&eh_server, 123456, "abcdef0123").await;
+        let download_url = format!("{}/archive/123456/token/0", eh_server.uri());
+        mock_eh_archiver_post(&eh_server, &download_url).await;
+
+        let zip_temp = tempfile::tempdir().unwrap();
+        let zip_path = zip_temp.path().join("test.zip");
+        create_test_zip(&zip_path, 3);
+        let zip_bytes = std::fs::read(&zip_path).unwrap();
+        mock_eh_archive_download(&eh_server, "/archive/123456/token/0", zip_bytes).await;
+
+        let worker = EhDownloadWorker::new(
+            Arc::clone(&repo),
+            make_eh_client(&eh_server),
+            Arc::new(make_config()),
+            temp.path().to_path_buf(),
+        );
+
+        worker.tick().await.unwrap();
+
+        let updated = eh_download_queue::Entity::find_by_id(entry.id)
+            .one(repo.db()).await.unwrap().unwrap();
+        assert_eq!(updated.status, STATUS_DOWNLOADED);
+        assert!(updated.zip_path.is_some());
+        assert!(updated.file_size > 0);
+        assert!(std::path::Path::new(updated.zip_path.as_ref().unwrap()).exists());
+    }
+
+    #[tokio::test]
+    async fn test_download_worker_rate_limit_skips() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        let eh_server = MockServer::start().await;
+        let temp = tempfile::tempdir().unwrap();
+
+        setup_chat(&repo, -100, true).await;
+
+        // Pre-fill a done entry to hit rate limit
+        let now = Local::now().naive_local();
+        let big = eh_download_queue::ActiveModel {
+            chat_id: Set(-100), gid: Set(999999), token: Set("x".into()), title: Set("Big".into()),
+            telegraph: Set(false), source: Set(SOURCE_DIRECT.into()), status: Set("done".into()),
+            file_size: Set(11_000_000_000), error: Set(None), retry_count: Set(0),
+            created_at: Set(now), started_at: Set(Some(now)), completed_at: Set(Some(now)),
+            zip_path: Set(None), telegraph_url: Set(None), next_retry_at: Set(None),
+            ..Default::default()
+        };
+        big.insert(repo.db()).await.unwrap();
+
+        let entry = insert_queue_entry(&repo, -100, 123456, "abcdef0123", "Test", false, "pending", None, None).await;
+
+        let worker = EhDownloadWorker::new(
+            Arc::clone(&repo), make_eh_client(&eh_server), Arc::new(make_config()),
+            temp.path().to_path_buf(),
+        );
+        worker.tick().await.unwrap();
+
+        let updated = eh_download_queue::Entity::find_by_id(entry.id)
+            .one(repo.db()).await.unwrap().unwrap();
+        assert_eq!(updated.status, "pending", "should remain pending due to rate limit");
+    }
+
+    #[tokio::test]
+    async fn test_download_worker_chat_disabled_marks_done() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        let eh_server = MockServer::start().await;
+        let temp = tempfile::tempdir().unwrap();
+
+        setup_chat(&repo, -100, false).await; // disabled
+        let entry = insert_queue_entry(&repo, -100, 123456, "abcdef0123", "Test", false, "pending", None, None).await;
+
+        let worker = EhDownloadWorker::new(
+            Arc::clone(&repo), make_eh_client(&eh_server), Arc::new(make_config()),
+            temp.path().to_path_buf(),
+        );
+        worker.tick().await.unwrap();
+
+        let updated = eh_download_queue::Entity::find_by_id(entry.id)
+            .one(repo.db()).await.unwrap().unwrap();
+        assert_eq!(updated.status, "done", "should be marked done without downloading");
+    }
+
+    #[tokio::test]
+    async fn test_download_worker_failure_schedules_retry() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        let eh_server = MockServer::start().await;
+        let temp = tempfile::tempdir().unwrap();
+
+        setup_chat(&repo, -100, true).await;
+        let entry = insert_queue_entry(&repo, -100, 123456, "abcdef0123", "Test", false, "pending", None, None).await;
+
+        mock_eh_gallery_page(&eh_server, 123456, "abcdef0123").await;
+        // archiver.php POST returns 500
+        Mock::given(method("POST"))
+            .and(path("/archiver.php"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&eh_server).await;
+
+        let worker = EhDownloadWorker::new(
+            Arc::clone(&repo), make_eh_client(&eh_server), Arc::new(make_config()),
+            temp.path().to_path_buf(),
+        );
+        worker.tick().await.unwrap();
+
+        let updated = eh_download_queue::Entity::find_by_id(entry.id)
+            .one(repo.db()).await.unwrap().unwrap();
+        assert_eq!(updated.status, "pending", "should be back to pending for retry");
+        assert_eq!(updated.retry_count, 1);
+        assert!(updated.next_retry_at.is_some(), "should have next_retry_at set");
+    }
+
+    // === Upload Worker Tests ===
+
+    #[tokio::test]
+    async fn test_upload_worker_full_flow() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        let tg_server = MockServer::start().await;
+
+        setup_chat(&repo, -100, true).await;
+
+        // Create a real ZIP with images
+        let temp = tempfile::tempdir().unwrap();
+        let zip_path = temp.path().join("gallery.zip");
+        create_test_zip(&zip_path, 3);
+        let zip_path_str = zip_path.to_string_lossy().to_string();
+
+        let entry = insert_queue_entry(&repo, -100, 123456, "abcdef0123", "Test Gallery", true, STATUS_DOWNLOADED, Some(&zip_path_str), None).await;
+
+        mock_telegraph_upload(&tg_server).await;
+        mock_telegraph_create_page(&tg_server).await;
+
+        let worker = EhUploadWorker::new(
+            Arc::clone(&repo), make_notifier(&tg_server), make_telegraph_client(&tg_server),
+            Arc::new(make_config()),
+        );
+        worker.tick().await.unwrap();
+
+        let updated = eh_download_queue::Entity::find_by_id(entry.id)
+            .one(repo.db()).await.unwrap().unwrap();
+        assert_eq!(updated.status, STATUS_UPLOADED);
+        assert!(updated.telegraph_url.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_upload_worker_no_images_fails() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        let tg_server = MockServer::start().await;
+
+        setup_chat(&repo, -100, true).await;
+
+        // Create ZIP with only .txt files
+        let temp = tempfile::tempdir().unwrap();
+        let zip_path = temp.path().join("no_images.zip");
+        {
+            let file = std::fs::File::create(&zip_path).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            zip.start_file("readme.txt", zip::write::SimpleFileOptions::default()).unwrap();
+            zip.write_all(b"no images").unwrap();
+            zip.finish().unwrap();
+        }
+        let zip_path_str = zip_path.to_string_lossy().to_string();
+
+        let entry = insert_queue_entry(&repo, -100, 123456, "abcdef0123", "Test", true, STATUS_DOWNLOADED, Some(&zip_path_str), None).await;
+
+        let worker = EhUploadWorker::new(
+            Arc::clone(&repo), make_notifier(&tg_server), make_telegraph_client(&tg_server),
+            Arc::new(make_config()),
+        );
+        worker.tick().await.unwrap();
+
+        let updated = eh_download_queue::Entity::find_by_id(entry.id)
+            .one(repo.db()).await.unwrap().unwrap();
+        assert_eq!(updated.status, STATUS_DOWNLOADED, "should be back to downloaded for retry");
+        assert_eq!(updated.retry_count, 1);
+    }
+
+    // === Publish Worker Tests ===
+
+    #[tokio::test]
+    async fn test_publish_worker_no_telegraph() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        let tg_server = MockServer::start().await;
+
+        setup_chat(&repo, -100, true).await;
+
+        let temp = tempfile::tempdir().unwrap();
+        let zip_path = temp.path().join("gallery.zip");
+        create_test_zip(&zip_path, 2);
+        let zip_path_str = zip_path.to_string_lossy().to_string();
+
+        let entry = insert_queue_entry(&repo, -100, 123456, "abcdef0123", "Test Gallery", false, STATUS_DOWNLOADED, Some(&zip_path_str), None).await;
+
+        mock_tg_send_document(&tg_server).await;
+
+        let eh_server = MockServer::start().await;
+        let worker = EhPublishWorker::new(
+            Arc::clone(&repo), make_notifier(&tg_server), make_eh_client(&eh_server),
+            Arc::new(make_config()),
+        );
+        worker.tick().await.unwrap();
+
+        let updated = eh_download_queue::Entity::find_by_id(entry.id)
+            .one(repo.db()).await.unwrap().unwrap();
+        assert_eq!(updated.status, "done");
+        // ZIP should be deleted
+        assert!(!zip_path.exists(), "ZIP should be deleted after publish");
+    }
+
+    #[tokio::test]
+    async fn test_publish_worker_with_telegraph() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        let tg_server = MockServer::start().await;
+
+        setup_chat(&repo, -100, true).await;
+
+        let temp = tempfile::tempdir().unwrap();
+        let zip_path = temp.path().join("gallery.zip");
+        create_test_zip(&zip_path, 2);
+        let zip_path_str = zip_path.to_string_lossy().to_string();
+
+        let entry = insert_queue_entry(
+            &repo, -100, 123456, "abcdef0123", "Test Gallery", true, STATUS_UPLOADED,
+            Some(&zip_path_str), Some("https://telegra.ph/Test-01-01"),
+        ).await;
+
+        mock_tg_send_document(&tg_server).await;
+        mock_tg_send_message(&tg_server).await;
+
+        let eh_server = MockServer::start().await;
+        let worker = EhPublishWorker::new(
+            Arc::clone(&repo), make_notifier(&tg_server), make_eh_client(&eh_server),
+            Arc::new(make_config()),
+        );
+        worker.tick().await.unwrap();
+
+        let updated = eh_download_queue::Entity::find_by_id(entry.id)
+            .one(repo.db()).await.unwrap().unwrap();
+        assert_eq!(updated.status, "done");
+
+        // Verify TG received both sendDocument and sendMessage
+        let received = tg_server.received_requests().await.unwrap();
+        assert!(received.iter().any(|r| r.url.path().ends_with("/SendDocument")));
+        assert!(received.iter().any(|r| r.url.path().ends_with("/SendMessage")));
+    }
+
+    #[tokio::test]
+    async fn test_publish_worker_chat_disabled() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        let tg_server = MockServer::start().await;
+
+        setup_chat(&repo, -100, false).await; // disabled
+
+        let temp = tempfile::tempdir().unwrap();
+        let zip_path = temp.path().join("gallery.zip");
+        create_test_zip(&zip_path, 2);
+        let zip_path_str = zip_path.to_string_lossy().to_string();
+
+        let entry = insert_queue_entry(&repo, -100, 123456, "abcdef0123", "Test", false, STATUS_DOWNLOADED, Some(&zip_path_str), None).await;
+
+        let eh_server = MockServer::start().await;
+        let worker = EhPublishWorker::new(
+            Arc::clone(&repo), make_notifier(&tg_server), make_eh_client(&eh_server),
+            Arc::new(make_config()),
+        );
+        worker.tick().await.unwrap();
+
+        let updated = eh_download_queue::Entity::find_by_id(entry.id)
+            .one(repo.db()).await.unwrap().unwrap();
+        assert_eq!(updated.status, "done", "should be done without sending");
+    }
+}
