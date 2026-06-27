@@ -1426,18 +1426,32 @@ mod download_processor_tests {
             .await;
     }
 
-    /// Mock the e-hentai gallery page (contains archiver_key).
+    /// Mock the e-hentai gallery page (contains archiver URL in onclick).
     async fn mock_eh_gallery_page(server: &MockServer, gid: u64, token: &str) {
         let archiver_key = format!("{}--abc123def456", gid);
         let html = format!(
             r#"<html><body>
-            <a href="/archiver.php?gid={}&token={}&or={}">Archive Download</a>
+            <a onclick="return popUp('/archiver.php?gid={gid}&amp;token={token}',480,320)">Archive Download</a>
             </body></html>"#,
-            gid, token, archiver_key
+            gid = gid,
+            token = token
         );
         Mock::given(method("GET"))
             .and(path(format!("/g/{}/{}/", gid, token)))
             .respond_with(ResponseTemplate::new(200).set_body_string(html))
+            .mount(server)
+            .await;
+
+        // Also mock the archiver.php GET page (returns archiver_key)
+        let archiver_page_html = format!(
+            r#"<html><body>
+            <input type="hidden" name="or" value="{}" />
+            </body></html>"#,
+            archiver_key
+        );
+        Mock::given(method("GET"))
+            .and(path("/archiver.php"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(archiver_page_html))
             .mount(server)
             .await;
     }

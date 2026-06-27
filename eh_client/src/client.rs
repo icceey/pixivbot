@@ -121,12 +121,15 @@ impl EhClient {
             .collect())
     }
 
-    /// Get the archiver_key for a gallery by scraping its HTML page.
+    /// Get the archiver_key for a gallery.
+    /// Step 1: Scrape gallery page for archiver.php URL (in onclick attribute).
+    /// Step 2: GET the archiver.php URL and parse the response for the archiver_key.
     pub async fn get_archiver_key(&self, gid: u64, token: &str) -> Result<String> {
-        let url = format!("{}/g/{}/{}/", self.base_url, gid, token);
+        // Step 1: Fetch gallery page to find archiver.php URL
+        let gallery_url = format!("{}/g/{}/{}/", self.base_url, gid, token);
         let resp = self
             .http
-            .get(&url)
+            .get(&gallery_url)
             .header(COOKIE, self.cookies.to_header())
             .send()
             .await?;
@@ -137,9 +140,33 @@ impl EhClient {
                 status: status.as_u16(),
             });
         }
-        let html = resp.text().await?;
-        parser::parse_archiver_key(&html)
-            .ok_or_else(|| Error::Parse("archiver_key not found in gallery page".into()))
+        let gallery_html = resp.text().await?;
+
+        // Extract archiver.php URL from onclick attribute
+        let (_archiver_gid, _archiver_token) = parser::parse_archiver_url(&gallery_html)
+            .ok_or_else(|| Error::Parse("archiver URL not found in gallery page".into()))?;
+
+        // Step 2: GET archiver.php to get the actual archiver_key
+        let archiver_page_url =
+            format!("{}/archiver.php?gid={}&token={}", self.base_url, gid, token);
+        let resp = self
+            .http
+            .get(&archiver_page_url)
+            .header(COOKIE, self.cookies.to_header())
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(Error::Api {
+                message: format!("archiver.php returned {}", status),
+                status: status.as_u16(),
+            });
+        }
+        let archiver_html = resp.text().await?;
+
+        // Parse the archiver_key from the response
+        parser::parse_archiver_key(&archiver_html)
+            .ok_or_else(|| Error::Parse("archiver_key not found in archiver.php response".into()))
     }
 
     /// Download a gallery archive ZIP to the specified path.

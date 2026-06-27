@@ -10,11 +10,22 @@ fn search_re() -> &'static Regex {
     })
 }
 
+fn archiver_url_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        // Match archiver.php URL in onclick="popUp('...')" or href="..."
+        // Handles &amp; HTML entities
+        Regex::new(r#"(?:https?://(?:e-hentai|exhentai)\.org)?/archiver\.php\?gid=(\d+)&amp;token=([0-9a-f]+)"#)
+            .expect("invalid archiver_url regex")
+    })
+}
+
 fn archiver_key_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        Regex::new(r#"archiver\.php\?gid=\d+&token=[0-9a-f]+&or=([0-9]+--[0-9a-f]+)"#)
-            .expect("invalid archiver_key regex")
+        // Match archiver_key pattern: {numeric}--{hex} (at least 8 hex chars)
+        // Found in URL params (or=...) or hidden form fields (value="...")
+        Regex::new(r#"([0-9]+)--([0-9a-f]{8,})"#).expect("invalid archiver_key regex")
     })
 }
 
@@ -49,12 +60,27 @@ pub fn parse_search_results(html: &str, _base_url: &str) -> Vec<EhGalleryRef> {
         .collect()
 }
 
-/// Extract the archiver_key from a gallery HTML page.
-/// Returns None if no archiver link is found.
+/// Extract the archiver.php URL from a gallery HTML page.
+/// The URL is in `onclick="popUp('...archiver.php?gid=X&token=Y',...)"`.
+/// Returns the (gid, token) pair so the caller can build the full URL.
+pub fn parse_archiver_url(html: &str) -> Option<(u64, String)> {
+    let re = archiver_url_re();
+    let cap = re.captures(html)?;
+    let gid: u64 = cap.get(1)?.as_str().parse().ok()?;
+    let token = cap.get(2)?.as_str().to_string();
+    Some((gid, token))
+}
+
+/// Extract the archiver_key from an archiver.php HTML response page.
+/// The key format is {numeric}--{hex}, found in URL params or hidden form fields.
+/// Returns None if no archiver key is found.
 pub fn parse_archiver_key(html: &str) -> Option<String> {
     let re = archiver_key_re();
-    re.captures(html)
-        .and_then(|cap| cap.get(1).map(|m| m.as_str().to_string()))
+    let cap = re.captures(html)?;
+    // Combine the two groups back into the full key
+    let numeric = cap.get(1)?.as_str();
+    let hex = cap.get(2)?.as_str();
+    Some(format!("{}--{}", numeric, hex))
 }
 
 /// Extract the archive download URL from the archiver.php HTML response.
@@ -176,11 +202,38 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_archiver_url() {
+        let html = r#"
+        <div id="gdd">
+          <td><a onclick="return popUp('https://e-hentai.org/archiver.php?gid=4006958&amp;token=586ff41111',480,320)">Archive Download</a></td>
+        </div>
+        "#;
+        let (gid, token) = parse_archiver_url(html).expect("should find archiver URL");
+        assert_eq!(gid, 4006958);
+        assert_eq!(token, "586ff41111");
+    }
+
+    #[test]
+    fn test_parse_archiver_url_not_found() {
+        let html = "<html><body>No archiver link</body></html>";
+        assert!(parse_archiver_url(html).is_none());
+    }
+
+    #[test]
     fn test_parse_archiver_key() {
         let html = r#"
-        <a href="https://e-hentai.org/archiver.php?gid=123456&token=abcdef0123&or=470592--63bbddc729b849100ec24ab920ffdb84b6542b23">
-          Archive Download
-        </a>
+        <form>
+          <input type="hidden" name="or" value="470592--63bbddc729b849100ec24ab920ffdb84b6542b23" />
+        </form>
+        "#;
+        let key = parse_archiver_key(html).expect("should find archiver key");
+        assert_eq!(key, "470592--63bbddc729b849100ec24ab920ffdb84b6542b23");
+    }
+
+    #[test]
+    fn test_parse_archiver_key_in_url() {
+        let html = r#"
+        <a href="archiver.php?gid=123&token=abc&or=470592--63bbddc729b849100ec24ab920ffdb84b6542b23">Download</a>
         "#;
         let key = parse_archiver_key(html).expect("should find archiver key");
         assert_eq!(key, "470592--63bbddc729b849100ec24ab920ffdb84b6542b23");
@@ -188,7 +241,7 @@ mod tests {
 
     #[test]
     fn test_parse_archiver_key_not_found() {
-        let html = "<html><body>No archiver link</body></html>";
+        let html = "<html><body>No archiver key</body></html>";
         assert!(parse_archiver_key(html).is_none());
     }
 
