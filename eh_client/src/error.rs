@@ -4,12 +4,17 @@ use std::fmt;
 pub enum Error {
     Http(reqwest::Error),
     Json(serde_json::Error),
-    Api { message: String, status: u16 },
+    Api {
+        message: String,
+        status: u16,
+    },
     Parse(String),
     Io(std::io::Error),
     Zip(String),
     /// HTTP 429 Too Many Requests. `retry_after_secs` is parsed from Retry-After header.
-    RateLimited { retry_after_secs: Option<u64> },
+    RateLimited {
+        retry_after_secs: Option<u64>,
+    },
     Other(String),
 }
 

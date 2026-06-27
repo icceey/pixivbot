@@ -226,8 +226,7 @@ impl EhEngine {
         sub: &crate::db::entities::subscriptions::Model,
         galleries: &[EhGallery],
     ) -> Result<()> {
-        let mut state =
-            eh_tag_subscription_state(sub).unwrap_or_else(|| EhTagState::cleared(0));
+        let mut state = eh_tag_subscription_state(sub).unwrap_or_else(|| EhTagState::cleared(0));
 
         let sub_filter = sub.eh_filter.as_ref();
         let max_push = self.config.max_push_per_tick;
@@ -254,8 +253,10 @@ impl EhEngine {
             .await
             .context("Failed to update eh subscription state")?;
 
-        // Enqueue download requests
-        let telegraph_default = sub_filter.map(|f| f.telegraph).unwrap_or(false);
+        // Enqueue download requests.
+        // telegraph is enabled only if both the global config and the sub filter allow it.
+        let telegraph_default = self.config.upload_telegraph
+            && sub_filter.map(|f| f.telegraph).unwrap_or(false);
         for gallery in &to_enqueue {
             if let Err(e) = self
                 .repo
@@ -280,7 +281,11 @@ impl EhEngine {
     }
 
     /// Update state when no new galleries were found.
-    async fn update_sub_state_no_new(&self, sub: &crate::db::entities::subscriptions::Model, latest_ts: i64) {
+    async fn update_sub_state_no_new(
+        &self,
+        sub: &crate::db::entities::subscriptions::Model,
+        latest_ts: i64,
+    ) {
         let state =
             eh_tag_subscription_state(sub).unwrap_or_else(|| EhTagState::cleared(latest_ts));
         if state.latest_posted_ts == latest_ts {
@@ -395,10 +400,7 @@ impl EhDownloadWorker {
                 )
                 .await?;
             if permanent {
-                warn!(
-                    "Permanent download failure for gid={}: {}",
-                    entry.gid, e
-                );
+                warn!("Permanent download failure for gid={}: {}", entry.gid, e);
             }
         }
 
@@ -452,10 +454,7 @@ impl EhDownloadWorker {
                 .context("Failed to download gallery images")?
         };
 
-        info!(
-            "Downloaded eh gallery gid={} size={} bytes",
-            gid, file_size
-        );
+        info!("Downloaded eh gallery gid={} size={} bytes", gid, file_size);
 
         self.repo
             .mark_eh_download_downloaded(entry.id, file_size as i64, &zip_path_str)
@@ -615,10 +614,7 @@ impl EhUploadWorker {
             .await
             .context("Failed to create telegraph page")?;
 
-        info!(
-            "Created telegraph page for gid={}: {}",
-            entry.gid, page_url
-        );
+        info!("Created telegraph page for gid={}: {}", entry.gid, page_url);
 
         self.repo
             .mark_eh_download_uploaded(entry.id, &page_url)
@@ -821,7 +817,6 @@ mod integration_tests {
     use crate::db::entities::eh_download_queue;
     use crate::db::repo::eh_download_queue::{SOURCE_DIRECT, STATUS_DOWNLOADED, STATUS_UPLOADED};
     use crate::db::repo::tests_helpers;
-    use crate::db::types::{EhFilter, EhTaskKey, TagFilter, TaskType};
     use crate::pixiv::downloader::Downloader;
     use eh_client::{EhClientBuilder, EhCookies, TelegraphClient};
     use reqwest::Client;
@@ -962,7 +957,8 @@ mod integration_tests {
     }
 
     async fn mock_telegraph_upload(server: &MockServer) {
-        let body = serde_json::json!({"success": true, "direct_url": "https://i.pixi.mg/i/abc123.jpg"});
+        let body =
+            serde_json::json!({"success": true, "direct_url": "https://i.pixi.mg/i/abc123.jpg"});
         Mock::given(method("POST"))
             .and(path("/pixi/upload"))
             .respond_with(ResponseTemplate::new(200).set_body_json(body))
@@ -985,6 +981,7 @@ mod integration_tests {
             .unwrap();
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn insert_queue_entry(
         repo: &Repo,
         chat_id: i64,
@@ -1028,7 +1025,18 @@ mod integration_tests {
         let temp = tempfile::tempdir().unwrap();
 
         setup_chat(&repo, -100, true).await;
-        let entry = insert_queue_entry(&repo, -100, 123456, "abcdef0123", "Test Gallery", false, "pending", None, None).await;
+        let entry = insert_queue_entry(
+            &repo,
+            -100,
+            123456,
+            "abcdef0123",
+            "Test Gallery",
+            false,
+            "pending",
+            None,
+            None,
+        )
+        .await;
 
         mock_eh_gallery_page(&eh_server, 123456, "abcdef0123").await;
         let download_url = format!("{}/archive/123456/token/0", eh_server.uri());
@@ -1050,7 +1058,10 @@ mod integration_tests {
         worker.tick().await.unwrap();
 
         let updated = eh_download_queue::Entity::find_by_id(entry.id)
-            .one(repo.db()).await.unwrap().unwrap();
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(updated.status, STATUS_DOWNLOADED);
         assert!(updated.zip_path.is_some());
         assert!(updated.file_size > 0);
@@ -1068,26 +1079,56 @@ mod integration_tests {
         // Pre-fill a done entry to hit rate limit
         let now = Local::now().naive_local();
         let big = eh_download_queue::ActiveModel {
-            chat_id: Set(-100), gid: Set(999999), token: Set("x".into()), title: Set("Big".into()),
-            telegraph: Set(false), source: Set(SOURCE_DIRECT.into()), status: Set("done".into()),
-            file_size: Set(11_000_000_000), error: Set(None), retry_count: Set(0),
-            created_at: Set(now), started_at: Set(Some(now)), completed_at: Set(Some(now)),
-            zip_path: Set(None), telegraph_url: Set(None), next_retry_at: Set(None),
+            chat_id: Set(-100),
+            gid: Set(999999),
+            token: Set("x".into()),
+            title: Set("Big".into()),
+            telegraph: Set(false),
+            source: Set(SOURCE_DIRECT.into()),
+            status: Set("done".into()),
+            file_size: Set(11_000_000_000),
+            error: Set(None),
+            retry_count: Set(0),
+            created_at: Set(now),
+            started_at: Set(Some(now)),
+            completed_at: Set(Some(now)),
+            zip_path: Set(None),
+            telegraph_url: Set(None),
+            next_retry_at: Set(None),
             ..Default::default()
         };
         big.insert(repo.db()).await.unwrap();
 
-        let entry = insert_queue_entry(&repo, -100, 123456, "abcdef0123", "Test", false, "pending", None, None).await;
+        let entry = insert_queue_entry(
+            &repo,
+            -100,
+            123456,
+            "abcdef0123",
+            "Test",
+            false,
+            "pending",
+            None,
+            None,
+        )
+        .await;
 
         let worker = EhDownloadWorker::new(
-            Arc::clone(&repo), make_eh_client(&eh_server), Arc::new(make_config()),
+            Arc::clone(&repo),
+            make_eh_client(&eh_server),
+            Arc::new(make_config()),
             temp.path().to_path_buf(),
         );
         worker.tick().await.unwrap();
 
         let updated = eh_download_queue::Entity::find_by_id(entry.id)
-            .one(repo.db()).await.unwrap().unwrap();
-        assert_eq!(updated.status, "pending", "should remain pending due to rate limit");
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            updated.status, "pending",
+            "should remain pending due to rate limit"
+        );
     }
 
     #[tokio::test]
@@ -1097,17 +1138,36 @@ mod integration_tests {
         let temp = tempfile::tempdir().unwrap();
 
         setup_chat(&repo, -100, false).await; // disabled
-        let entry = insert_queue_entry(&repo, -100, 123456, "abcdef0123", "Test", false, "pending", None, None).await;
+        let entry = insert_queue_entry(
+            &repo,
+            -100,
+            123456,
+            "abcdef0123",
+            "Test",
+            false,
+            "pending",
+            None,
+            None,
+        )
+        .await;
 
         let worker = EhDownloadWorker::new(
-            Arc::clone(&repo), make_eh_client(&eh_server), Arc::new(make_config()),
+            Arc::clone(&repo),
+            make_eh_client(&eh_server),
+            Arc::new(make_config()),
             temp.path().to_path_buf(),
         );
         worker.tick().await.unwrap();
 
         let updated = eh_download_queue::Entity::find_by_id(entry.id)
-            .one(repo.db()).await.unwrap().unwrap();
-        assert_eq!(updated.status, "done", "should be marked done without downloading");
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            updated.status, "done",
+            "should be marked done without downloading"
+        );
     }
 
     #[tokio::test]
@@ -1117,26 +1177,49 @@ mod integration_tests {
         let temp = tempfile::tempdir().unwrap();
 
         setup_chat(&repo, -100, true).await;
-        let entry = insert_queue_entry(&repo, -100, 123456, "abcdef0123", "Test", false, "pending", None, None).await;
+        let entry = insert_queue_entry(
+            &repo,
+            -100,
+            123456,
+            "abcdef0123",
+            "Test",
+            false,
+            "pending",
+            None,
+            None,
+        )
+        .await;
 
         mock_eh_gallery_page(&eh_server, 123456, "abcdef0123").await;
         // archiver.php POST returns 500
         Mock::given(method("POST"))
             .and(path("/archiver.php"))
             .respond_with(ResponseTemplate::new(500))
-            .mount(&eh_server).await;
+            .mount(&eh_server)
+            .await;
 
         let worker = EhDownloadWorker::new(
-            Arc::clone(&repo), make_eh_client(&eh_server), Arc::new(make_config()),
+            Arc::clone(&repo),
+            make_eh_client(&eh_server),
+            Arc::new(make_config()),
             temp.path().to_path_buf(),
         );
         worker.tick().await.unwrap();
 
         let updated = eh_download_queue::Entity::find_by_id(entry.id)
-            .one(repo.db()).await.unwrap().unwrap();
-        assert_eq!(updated.status, "pending", "should be back to pending for retry");
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            updated.status, "pending",
+            "should be back to pending for retry"
+        );
         assert_eq!(updated.retry_count, 1);
-        assert!(updated.next_retry_at.is_some(), "should have next_retry_at set");
+        assert!(
+            updated.next_retry_at.is_some(),
+            "should have next_retry_at set"
+        );
     }
 
     // === Upload Worker Tests ===
@@ -1154,19 +1237,35 @@ mod integration_tests {
         create_test_zip(&zip_path, 3);
         let zip_path_str = zip_path.to_string_lossy().to_string();
 
-        let entry = insert_queue_entry(&repo, -100, 123456, "abcdef0123", "Test Gallery", true, STATUS_DOWNLOADED, Some(&zip_path_str), None).await;
+        let entry = insert_queue_entry(
+            &repo,
+            -100,
+            123456,
+            "abcdef0123",
+            "Test Gallery",
+            true,
+            STATUS_DOWNLOADED,
+            Some(&zip_path_str),
+            None,
+        )
+        .await;
 
         mock_telegraph_upload(&tg_server).await;
         mock_telegraph_create_page(&tg_server).await;
 
         let worker = EhUploadWorker::new(
-            Arc::clone(&repo), make_notifier(&tg_server), make_telegraph_client(&tg_server),
+            Arc::clone(&repo),
+            make_notifier(&tg_server),
+            make_telegraph_client(&tg_server),
             Arc::new(make_config()),
         );
         worker.tick().await.unwrap();
 
         let updated = eh_download_queue::Entity::find_by_id(entry.id)
-            .one(repo.db()).await.unwrap().unwrap();
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(updated.status, STATUS_UPLOADED);
         assert!(updated.telegraph_url.is_some());
     }
@@ -1184,23 +1283,43 @@ mod integration_tests {
         {
             let file = std::fs::File::create(&zip_path).unwrap();
             let mut zip = zip::ZipWriter::new(file);
-            zip.start_file("readme.txt", zip::write::SimpleFileOptions::default()).unwrap();
+            zip.start_file("readme.txt", zip::write::SimpleFileOptions::default())
+                .unwrap();
             zip.write_all(b"no images").unwrap();
             zip.finish().unwrap();
         }
         let zip_path_str = zip_path.to_string_lossy().to_string();
 
-        let entry = insert_queue_entry(&repo, -100, 123456, "abcdef0123", "Test", true, STATUS_DOWNLOADED, Some(&zip_path_str), None).await;
+        let entry = insert_queue_entry(
+            &repo,
+            -100,
+            123456,
+            "abcdef0123",
+            "Test",
+            true,
+            STATUS_DOWNLOADED,
+            Some(&zip_path_str),
+            None,
+        )
+        .await;
 
         let worker = EhUploadWorker::new(
-            Arc::clone(&repo), make_notifier(&tg_server), make_telegraph_client(&tg_server),
+            Arc::clone(&repo),
+            make_notifier(&tg_server),
+            make_telegraph_client(&tg_server),
             Arc::new(make_config()),
         );
         worker.tick().await.unwrap();
 
         let updated = eh_download_queue::Entity::find_by_id(entry.id)
-            .one(repo.db()).await.unwrap().unwrap();
-        assert_eq!(updated.status, STATUS_DOWNLOADED, "should be back to downloaded for retry");
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            updated.status, STATUS_DOWNLOADED,
+            "should be back to downloaded for retry"
+        );
         assert_eq!(updated.retry_count, 1);
     }
 
@@ -1218,19 +1337,35 @@ mod integration_tests {
         create_test_zip(&zip_path, 2);
         let zip_path_str = zip_path.to_string_lossy().to_string();
 
-        let entry = insert_queue_entry(&repo, -100, 123456, "abcdef0123", "Test Gallery", false, STATUS_DOWNLOADED, Some(&zip_path_str), None).await;
+        let entry = insert_queue_entry(
+            &repo,
+            -100,
+            123456,
+            "abcdef0123",
+            "Test Gallery",
+            false,
+            STATUS_DOWNLOADED,
+            Some(&zip_path_str),
+            None,
+        )
+        .await;
 
         mock_tg_send_document(&tg_server).await;
 
         let eh_server = MockServer::start().await;
         let worker = EhPublishWorker::new(
-            Arc::clone(&repo), make_notifier(&tg_server), make_eh_client(&eh_server),
+            Arc::clone(&repo),
+            make_notifier(&tg_server),
+            make_eh_client(&eh_server),
             Arc::new(make_config()),
         );
         worker.tick().await.unwrap();
 
         let updated = eh_download_queue::Entity::find_by_id(entry.id)
-            .one(repo.db()).await.unwrap().unwrap();
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(updated.status, "done");
         // ZIP should be deleted
         assert!(!zip_path.exists(), "ZIP should be deleted after publish");
@@ -1249,28 +1384,45 @@ mod integration_tests {
         let zip_path_str = zip_path.to_string_lossy().to_string();
 
         let entry = insert_queue_entry(
-            &repo, -100, 123456, "abcdef0123", "Test Gallery", true, STATUS_UPLOADED,
-            Some(&zip_path_str), Some("https://telegra.ph/Test-01-01"),
-        ).await;
+            &repo,
+            -100,
+            123456,
+            "abcdef0123",
+            "Test Gallery",
+            true,
+            STATUS_UPLOADED,
+            Some(&zip_path_str),
+            Some("https://telegra.ph/Test-01-01"),
+        )
+        .await;
 
         mock_tg_send_document(&tg_server).await;
         mock_tg_send_message(&tg_server).await;
 
         let eh_server = MockServer::start().await;
         let worker = EhPublishWorker::new(
-            Arc::clone(&repo), make_notifier(&tg_server), make_eh_client(&eh_server),
+            Arc::clone(&repo),
+            make_notifier(&tg_server),
+            make_eh_client(&eh_server),
             Arc::new(make_config()),
         );
         worker.tick().await.unwrap();
 
         let updated = eh_download_queue::Entity::find_by_id(entry.id)
-            .one(repo.db()).await.unwrap().unwrap();
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(updated.status, "done");
 
         // Verify TG received both sendDocument and sendMessage
         let received = tg_server.received_requests().await.unwrap();
-        assert!(received.iter().any(|r| r.url.path().ends_with("/SendDocument")));
-        assert!(received.iter().any(|r| r.url.path().ends_with("/SendMessage")));
+        assert!(received
+            .iter()
+            .any(|r| r.url.path().ends_with("/SendDocument")));
+        assert!(received
+            .iter()
+            .any(|r| r.url.path().ends_with("/SendMessage")));
     }
 
     #[tokio::test]
@@ -1285,17 +1437,33 @@ mod integration_tests {
         create_test_zip(&zip_path, 2);
         let zip_path_str = zip_path.to_string_lossy().to_string();
 
-        let entry = insert_queue_entry(&repo, -100, 123456, "abcdef0123", "Test", false, STATUS_DOWNLOADED, Some(&zip_path_str), None).await;
+        let entry = insert_queue_entry(
+            &repo,
+            -100,
+            123456,
+            "abcdef0123",
+            "Test",
+            false,
+            STATUS_DOWNLOADED,
+            Some(&zip_path_str),
+            None,
+        )
+        .await;
 
         let eh_server = MockServer::start().await;
         let worker = EhPublishWorker::new(
-            Arc::clone(&repo), make_notifier(&tg_server), make_eh_client(&eh_server),
+            Arc::clone(&repo),
+            make_notifier(&tg_server),
+            make_eh_client(&eh_server),
             Arc::new(make_config()),
         );
         worker.tick().await.unwrap();
 
         let updated = eh_download_queue::Entity::find_by_id(entry.id)
-            .one(repo.db()).await.unwrap().unwrap();
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(updated.status, "done", "should be done without sending");
     }
 }

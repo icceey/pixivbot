@@ -60,6 +60,7 @@ impl Repo {
     /// Get the next pending download, atomically marking it as "downloading".
     ///
     /// Returns None if no pending downloads exist.
+    #[allow(dead_code)]
     pub async fn get_next_pending_eh_download(&self) -> Result<Option<eh_download_queue::Model>> {
         let entry = eh_download_queue::Entity::find()
             .filter(eh_download_queue::Column::Status.eq(STATUS_PENDING))
@@ -108,6 +109,7 @@ impl Repo {
     }
 
     /// Mark a download as failed.
+    #[allow(dead_code)]
     pub async fn mark_eh_download_failed(
         &self,
         id: i32,
@@ -180,6 +182,7 @@ impl Repo {
     }
 
     /// Reset failed downloads back to pending if they haven't exceeded max_retry_count.
+    #[allow(dead_code)]
     pub async fn retry_failed_eh_downloads(&self, max_retry_count: u8) -> Result<u64> {
         let failed = eh_download_queue::Entity::find()
             .filter(eh_download_queue::Column::Status.eq(STATUS_FAILED))
@@ -339,9 +342,9 @@ impl Repo {
             .filter(
                 sea_orm::Condition::any()
                     .add(
-                        eh_download_queue::Column::Status.eq(STATUS_DOWNLOADED).and(
-                            eh_download_queue::Column::Telegraph.eq(false),
-                        ),
+                        eh_download_queue::Column::Status
+                            .eq(STATUS_DOWNLOADED)
+                            .and(eh_download_queue::Column::Telegraph.eq(false)),
                     )
                     .add(eh_download_queue::Column::Status.eq(STATUS_UPLOADED)),
             )
@@ -417,14 +420,12 @@ impl Repo {
         }
 
         let active_paths: std::collections::HashSet<String> = eh_download_queue::Entity::find()
-            .filter(
-                eh_download_queue::Column::Status.is_in([
-                    STATUS_DOWNLOADED,
-                    STATUS_UPLOADING,
-                    STATUS_UPLOADED,
-                    STATUS_PUBLISHING,
-                ]),
-            )
+            .filter(eh_download_queue::Column::Status.is_in([
+                STATUS_DOWNLOADED,
+                STATUS_UPLOADING,
+                STATUS_UPLOADED,
+                STATUS_PUBLISHING,
+            ]))
             .all(&self.db)
             .await?
             .into_iter()
