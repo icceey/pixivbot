@@ -123,7 +123,10 @@ pub mod tests_helpers {
                 retry_count INTEGER NOT NULL DEFAULT 0,
                 created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 started_at TIMESTAMP,
-                completed_at TIMESTAMP
+                completed_at TIMESTAMP,
+                zip_path TEXT,
+                telegraph_url TEXT,
+                next_retry_at TIMESTAMP
             )
             "#,
         ))

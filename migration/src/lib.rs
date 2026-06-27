@@ -6,6 +6,7 @@ mod m20260116_000000_add_allow_without_mention;
 mod m20260410_000000_add_booru_filter;
 mod m20260421_000000_refactor_booru_task_value;
 mod m20260626_000000_add_ehentai;
+mod m20260628_000000_eh_pipeline_decouple;
 
 pub struct Migrator;
 
@@ -19,6 +20,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260410_000000_add_booru_filter::Migration),
             Box::new(m20260421_000000_refactor_booru_task_value::Migration),
             Box::new(m20260626_000000_add_ehentai::Migration),
+            Box::new(m20260628_000000_eh_pipeline_decouple::Migration),
         ]
     }
 }

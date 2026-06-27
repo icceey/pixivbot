@@ -32,6 +32,15 @@ pub struct Model {
     pub started_at: Option<DateTime>,
     #[sea_orm(nullable)]
     pub completed_at: Option<DateTime>,
+    /// Local path to the downloaded ZIP file (set by download stage).
+    #[sea_orm(nullable)]
+    pub zip_path: Option<String>,
+    /// Telegraph page URL (set by upload stage, only for telegraph=true entries).
+    #[sea_orm(nullable)]
+    pub telegraph_url: Option<String>,
+    /// Earliest time to retry this entry (for backoff).
+    #[sea_orm(nullable)]
+    pub next_retry_at: Option<DateTime>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
