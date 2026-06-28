@@ -2,6 +2,8 @@ use super::Repo;
 use crate::db::entities::eh_download_queue;
 use anyhow::{Context, Result};
 use chrono::Local;
+use sea_orm::prelude::DateTime;
+use sea_orm::sea_query::Expr;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, EntityTrait, Order, PaginatorTrait, QueryFilter, QueryOrder, Set,
 };
@@ -22,7 +24,11 @@ pub const SOURCE_SUBSCRIPTION: &str = "subscription";
 pub const SOURCE_DIRECT: &str = "direct";
 
 impl Repo {
-    /// Enqueue a download request. Returns the created model.
+    /// Enqueue a download request. Returns the created/updated model.
+    ///
+    /// If an entry for the same (chat_id, gid) already exists:
+    /// - If it's `done` or `failed`, reset to `pending` (re-download).
+    /// - Otherwise, return the existing entry (already in queue).
     pub async fn enqueue_eh_download(
         &self,
         chat_id: i64,
@@ -34,6 +40,40 @@ impl Repo {
     ) -> Result<eh_download_queue::Model> {
         let now = Local::now().naive_local();
 
+        // Check for existing entry
+        let existing = eh_download_queue::Entity::find()
+            .filter(eh_download_queue::Column::ChatId.eq(chat_id))
+            .filter(eh_download_queue::Column::Gid.eq(gid))
+            .one(&self.db)
+            .await?;
+
+        if let Some(model) = existing {
+            // If done or failed, reset to pending for re-download
+            if model.status == STATUS_DONE || model.status == STATUS_FAILED {
+                let mut active: eh_download_queue::ActiveModel = model.into();
+                active.status = Set(STATUS_PENDING.to_string());
+                active.token = Set(token.to_string()); // refresh token in case it changed
+                active.title = Set(title.to_string());
+                active.telegraph = Set(telegraph);
+                active.source = Set(source.to_string());
+                active.file_size = Set(0);
+                active.error = Set(None);
+                active.retry_count = Set(0);
+                active.started_at = Set(None);
+                active.completed_at = Set(None);
+                active.zip_path = Set(None);
+                active.telegraph_url = Set(None);
+                active.next_retry_at = Set(None);
+                return active
+                    .update(&self.db)
+                    .await
+                    .context("Failed to reset eh download for re-enqueue");
+            }
+            // Already in queue (pending/downloading/downloaded/etc.) — return as-is
+            return Ok(model);
+        }
+
+        // No existing entry — insert new
         let entry = eh_download_queue::ActiveModel {
             chat_id: Set(chat_id),
             gid: Set(gid),
@@ -159,26 +199,74 @@ impl Repo {
             .context("Failed to count pending eh downloads")
     }
 
-    /// Reset stale "downloading" entries back to "pending" (crash recovery).
+    /// Reset stale in-flight entries back to their pre-claim status (crash recovery).
+    ///
+    /// Resets ALL three transient statuses:
+    /// - `downloading` → `pending`
+    /// - `uploading`   → `downloaded`
+    /// - `publishing`  → `downloaded` (if telegraph=false) or `uploaded` (if telegraph_url is set)
+    ///
+    /// Should be called once at startup before any worker begins.
     pub async fn reset_stale_eh_downloads(&self) -> Result<u64> {
-        let stale = eh_download_queue::Entity::find()
+        let mut count = 0u64;
+
+        // downloading → pending
+        let stale_downloading = eh_download_queue::Entity::find()
             .filter(eh_download_queue::Column::Status.eq(STATUS_DOWNLOADING))
             .all(&self.db)
             .await
-            .context("Failed to fetch stale eh downloads")?;
-
-        let count = stale.len();
-        for entry in stale {
+            .context("Failed to fetch stale downloading entries")?;
+        for entry in stale_downloading {
             let mut active: eh_download_queue::ActiveModel = entry.into();
             active.status = Set(STATUS_PENDING.to_string());
             active.started_at = Set(None);
             active
                 .update(&self.db)
                 .await
-                .context("Failed to reset stale eh download")?;
+                .context("Failed to reset stale downloading entry")?;
+            count += 1;
         }
 
-        Ok(count as u64)
+        // uploading → downloaded
+        let stale_uploading = eh_download_queue::Entity::find()
+            .filter(eh_download_queue::Column::Status.eq(STATUS_UPLOADING))
+            .all(&self.db)
+            .await
+            .context("Failed to fetch stale uploading entries")?;
+        for entry in stale_uploading {
+            let mut active: eh_download_queue::ActiveModel = entry.into();
+            active.status = Set(STATUS_DOWNLOADED.to_string());
+            active.started_at = Set(None);
+            active
+                .update(&self.db)
+                .await
+                .context("Failed to reset stale uploading entry")?;
+            count += 1;
+        }
+
+        // publishing → downloaded (telegraph=false) or uploaded (telegraph_url set)
+        let stale_publishing = eh_download_queue::Entity::find()
+            .filter(eh_download_queue::Column::Status.eq(STATUS_PUBLISHING))
+            .all(&self.db)
+            .await
+            .context("Failed to fetch stale publishing entries")?;
+        for entry in stale_publishing {
+            let target = if entry.telegraph_url.is_some() {
+                STATUS_UPLOADED
+            } else {
+                STATUS_DOWNLOADED
+            };
+            let mut active: eh_download_queue::ActiveModel = entry.into();
+            active.status = Set(target.to_string());
+            active.started_at = Set(None);
+            active
+                .update(&self.db)
+                .await
+                .context("Failed to reset stale publishing entry")?;
+            count += 1;
+        }
+
+        Ok(count)
     }
 
     /// Reset failed downloads back to pending if they haven't exceeded max_retry_count.
@@ -271,7 +359,7 @@ impl Repo {
     }
 
     /// Get next entry for the download stage: status=pending, next_retry_at is NULL or <= now.
-    /// Atomically marks it as 'downloading'.
+    /// Uses a conditional UPDATE to atomically claim the entry.
     pub async fn get_next_for_download(&self) -> Result<Option<eh_download_queue::Model>> {
         let now = Local::now().naive_local();
         let entry = eh_download_queue::Entity::find()
@@ -286,24 +374,41 @@ impl Repo {
             .await
             .context("Failed to fetch next for download")?;
 
-        if let Some(model) = entry {
-            let now = Local::now().naive_local();
-            let mut active: eh_download_queue::ActiveModel = model.into();
-            active.status = Set(STATUS_DOWNLOADING.to_string());
-            active.started_at = Set(Some(now));
-            active.next_retry_at = Set(None);
-            let updated = active
-                .update(&self.db)
-                .await
-                .context("Failed to mark as downloading")?;
-            Ok(Some(updated))
-        } else {
-            Ok(None)
+        let Some(model) = entry else {
+            return Ok(None);
+        };
+
+        // Atomic claim: only flip if still pending (guards against concurrent workers)
+        let result = eh_download_queue::Entity::update_many()
+            .col_expr(
+                eh_download_queue::Column::Status,
+                Expr::value(STATUS_DOWNLOADING),
+            )
+            .col_expr(eh_download_queue::Column::StartedAt, Expr::value(now))
+            .col_expr(
+                eh_download_queue::Column::NextRetryAt,
+                Expr::value(None::<DateTime>),
+            )
+            .filter(eh_download_queue::Column::Id.eq(model.id))
+            .filter(eh_download_queue::Column::Status.eq(STATUS_PENDING))
+            .exec(&self.db)
+            .await
+            .context("Failed to atomically claim download entry")?;
+
+        if result.rows_affected == 0 {
+            return Ok(None); // someone else claimed it
         }
+
+        // Re-fetch the updated model
+        let updated = eh_download_queue::Entity::find_by_id(model.id)
+            .one(&self.db)
+            .await?
+            .context("Entry disappeared after claim")?;
+        Ok(Some(updated))
     }
 
     /// Get next entry for the upload stage: status=downloaded, telegraph=true, next_retry_at ok.
-    /// Atomically marks it as 'uploading'.
+    /// Uses a conditional UPDATE to atomically claim the entry.
     pub async fn get_next_for_upload(&self) -> Result<Option<eh_download_queue::Model>> {
         let now = Local::now().naive_local();
         let entry = eh_download_queue::Entity::find()
@@ -319,23 +424,39 @@ impl Repo {
             .await
             .context("Failed to fetch next for upload")?;
 
-        if let Some(model) = entry {
-            let mut active: eh_download_queue::ActiveModel = model.into();
-            active.status = Set(STATUS_UPLOADING.to_string());
-            active.started_at = Set(Some(now));
-            active.next_retry_at = Set(None);
-            let updated = active
-                .update(&self.db)
-                .await
-                .context("Failed to mark as uploading")?;
-            Ok(Some(updated))
-        } else {
-            Ok(None)
+        let Some(model) = entry else {
+            return Ok(None);
+        };
+
+        let result = eh_download_queue::Entity::update_many()
+            .col_expr(
+                eh_download_queue::Column::Status,
+                Expr::value(STATUS_UPLOADING),
+            )
+            .col_expr(eh_download_queue::Column::StartedAt, Expr::value(now))
+            .col_expr(
+                eh_download_queue::Column::NextRetryAt,
+                Expr::value(None::<DateTime>),
+            )
+            .filter(eh_download_queue::Column::Id.eq(model.id))
+            .filter(eh_download_queue::Column::Status.eq(STATUS_DOWNLOADED))
+            .exec(&self.db)
+            .await
+            .context("Failed to atomically claim upload entry")?;
+
+        if result.rows_affected == 0 {
+            return Ok(None);
         }
+
+        let updated = eh_download_queue::Entity::find_by_id(model.id)
+            .one(&self.db)
+            .await?
+            .context("Entry disappeared after claim")?;
+        Ok(Some(updated))
     }
 
     /// Get next entry for the publish stage: either (downloaded, telegraph=false) or (uploaded).
-    /// Atomically marks it as 'publishing'.
+    /// Uses a conditional UPDATE to atomically claim the entry.
     pub async fn get_next_for_publish(&self) -> Result<Option<eh_download_queue::Model>> {
         let now = Local::now().naive_local();
         let entry = eh_download_queue::Entity::find()
@@ -358,19 +479,37 @@ impl Repo {
             .await
             .context("Failed to fetch next for publish")?;
 
-        if let Some(model) = entry {
-            let mut active: eh_download_queue::ActiveModel = model.into();
-            active.status = Set(STATUS_PUBLISHING.to_string());
-            active.started_at = Set(Some(now));
-            active.next_retry_at = Set(None);
-            let updated = active
-                .update(&self.db)
-                .await
-                .context("Failed to mark as publishing")?;
-            Ok(Some(updated))
-        } else {
-            Ok(None)
+        let Some(model) = entry else {
+            return Ok(None);
+        };
+
+        // Atomically claim: only flip if status is still the original
+        let original_status = model.status.clone();
+        let result = eh_download_queue::Entity::update_many()
+            .col_expr(
+                eh_download_queue::Column::Status,
+                Expr::value(STATUS_PUBLISHING),
+            )
+            .col_expr(eh_download_queue::Column::StartedAt, Expr::value(now))
+            .col_expr(
+                eh_download_queue::Column::NextRetryAt,
+                Expr::value(None::<DateTime>),
+            )
+            .filter(eh_download_queue::Column::Id.eq(model.id))
+            .filter(eh_download_queue::Column::Status.eq(&original_status))
+            .exec(&self.db)
+            .await
+            .context("Failed to atomically claim publish entry")?;
+
+        if result.rows_affected == 0 {
+            return Ok(None);
         }
+
+        let updated = eh_download_queue::Entity::find_by_id(model.id)
+            .one(&self.db)
+            .await?
+            .context("Entry disappeared after claim")?;
+        Ok(Some(updated))
     }
 
     /// Schedule a retry for an entry: set status back to target_status, increment retry_count,

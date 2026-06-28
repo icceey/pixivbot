@@ -239,24 +239,12 @@ impl EhEngine {
 
         let to_enqueue: Vec<&EhGallery> = new_galleries.into_iter().take(max_push).collect();
 
-        // Update state FIRST (mark as pushed), THEN enqueue downloads.
-        for gallery in &to_enqueue {
-            state.add_pushed_gid(gallery.gid);
-            if gallery.posted > state.latest_posted_ts {
-                state.latest_posted_ts = gallery.posted;
-            }
-        }
-        state.trim_pushed(self.config.pushed_cap);
+        // Enqueue download requests FIRST, then update state with only successfully
+        // enqueued GIDs. This prevents silent gallery loss if enqueue fails — the GID
+        // won't be in pushed_gids, so it will be retried on the next tick.
+        let telegraph_default =
+            self.config.upload_telegraph || sub_filter.map(|f| f.telegraph).unwrap_or(false);
 
-        self.repo
-            .update_subscription_latest_data(sub.id, Some(SubscriptionState::EhTag(state)))
-            .await
-            .context("Failed to update eh subscription state")?;
-
-        // Enqueue download requests.
-        // telegraph is enabled only if both the global config and the sub filter allow it.
-        let telegraph_default = self.config.upload_telegraph
-            && sub_filter.map(|f| f.telegraph).unwrap_or(false);
         for gallery in &to_enqueue {
             if let Err(e) = self
                 .repo
@@ -274,8 +262,20 @@ impl EhEngine {
                     "Failed to enqueue download for gallery {}: {:#}",
                     gallery.gid, e
                 );
+                continue; // Skip this gallery — don't add to pushed_gids
+            }
+            // Only mark as pushed if enqueue succeeded
+            state.add_pushed_gid(gallery.gid);
+            if gallery.posted > state.latest_posted_ts {
+                state.latest_posted_ts = gallery.posted;
             }
         }
+        state.trim_pushed(self.config.pushed_cap);
+
+        self.repo
+            .update_subscription_latest_data(sub.id, Some(SubscriptionState::EhTag(state)))
+            .await
+            .context("Failed to update eh subscription state")?;
 
         Ok(())
     }
@@ -350,10 +350,7 @@ impl EhDownloadWorker {
     }
 
     pub async fn run(self) {
-        // Startup: reset stale + clean orphan cache files
-        if let Err(e) = self.repo.reset_stale_eh_downloads().await {
-            warn!("Failed to reset stale eh downloads: {:#}", e);
-        }
+        // Clean orphan cache files on startup (stale entry reset is done in main.rs)
         let eh_cache = self.cache_dir.join("eh_cache");
         if let Err(e) = self.repo.cleanup_eh_cache_orphans(&eh_cache).await {
             warn!("Failed to cleanup eh cache orphans: {:#}", e);
@@ -401,6 +398,8 @@ impl EhDownloadWorker {
                 .await?;
             if permanent {
                 warn!("Permanent download failure for gid={}: {}", entry.gid, e);
+                // Delete partial ZIP if it exists
+                self.cleanup_zip(&entry).await;
             }
         }
 
@@ -415,10 +414,19 @@ impl EhDownloadWorker {
         let chat = get_chat_if_should_notify(&self.repo, entry.chat_id).await?;
         if chat.is_none() {
             info!(
-                "Skipping download for gid={} — chat {} not notifiable",
+                "Skipping download for gid={} — chat {} not notifiable, will retry later",
                 gid, entry.chat_id
             );
-            self.repo.mark_eh_download_done(entry.id, 0).await?;
+            // Don't mark done — schedule a retry with backoff so the gallery isn't lost.
+            // The entry goes back to pending with a future next_retry_at.
+            self.repo
+                .schedule_eh_retry(
+                    entry.id,
+                    STATUS_PENDING,
+                    "chat not notifiable",
+                    self.config.max_retry_count,
+                )
+                .await?;
             return Ok(());
         }
 
@@ -461,6 +469,23 @@ impl EhDownloadWorker {
             .await?;
 
         Ok(())
+    }
+
+    /// Delete the ZIP file for an entry if it exists (used on permanent failure).
+    async fn cleanup_zip(&self, _entry: &eh_download_queue::Model) {
+        // Download worker's ZIP path is constructed from gid+token, not stored yet on failure.
+        // The ZIP may exist at the expected path if download started but failed mid-stream.
+        let gid = _entry.gid as u64;
+        let token = &_entry.token;
+        let zip_path = self
+            .cache_dir
+            .join("eh_cache")
+            .join(format!("{}_{}.zip", gid, token));
+        if zip_path.exists() {
+            if let Err(e) = tokio::fs::remove_file(&zip_path).await {
+                warn!("Failed to delete partial zip {}: {}", zip_path.display(), e);
+            }
+        }
     }
 }
 
@@ -521,6 +546,8 @@ impl EhUploadWorker {
                 )
                 .await?;
             if permanent {
+                // Delete ZIP on permanent failure to free disk space
+                self.cleanup_zip(&entry).await;
                 let escaped_err = teloxide::utils::markdown::escape(&e.to_string());
                 let title = teloxide::utils::markdown::escape(&entry.title);
                 let msg = format!("⚠️ Telegraph 上传失败: {}\n\n📦 {}", escaped_err, title);
@@ -535,6 +562,12 @@ impl EhUploadWorker {
     }
 
     async fn process(&self, entry: &eh_download_queue::Model) -> Result<()> {
+        // Check chat is enabled before doing upload work (avoid wasting pixi.mg quota)
+        let chat = get_chat_if_should_notify(&self.repo, entry.chat_id).await?;
+        if chat.is_none() {
+            anyhow::bail!("chat {} not notifiable", entry.chat_id);
+        }
+
         let zip_path = entry
             .zip_path
             .as_ref()
@@ -622,6 +655,18 @@ impl EhUploadWorker {
 
         Ok(())
     }
+
+    /// Delete the ZIP file for an entry if it exists (used on permanent failure).
+    async fn cleanup_zip(&self, entry: &eh_download_queue::Model) {
+        if let Some(ref zip_path) = entry.zip_path {
+            let path = std::path::Path::new(zip_path);
+            if path.exists() {
+                if let Err(e) = tokio::fs::remove_file(path).await {
+                    warn!("Failed to delete zip {}: {}", path.display(), e);
+                }
+            }
+        }
+    }
 }
 
 // ============================================================================
@@ -687,6 +732,8 @@ impl EhPublishWorker {
                 )
                 .await?;
             if permanent {
+                // Delete ZIP on permanent failure to free disk space
+                self.cleanup_zip(&entry).await;
                 let escaped = teloxide::utils::markdown::escape(&e.to_string());
                 let title = teloxide::utils::markdown::escape(&entry.title);
                 let msg = format!("⚠️ 发布失败: {}\n\n📦 {}", escaped, title);
@@ -703,12 +750,9 @@ impl EhPublishWorker {
     async fn process(&self, entry: &eh_download_queue::Model) -> Result<()> {
         let chat = get_chat_if_should_notify(&self.repo, entry.chat_id).await?;
         if chat.is_none() {
-            // Chat disabled — just mark done and clean up
-            self.cleanup_zip(entry).await;
-            self.repo
-                .mark_eh_download_done(entry.id, entry.file_size)
-                .await?;
-            return Ok(());
+            // Chat disabled — return error to trigger retry path.
+            // The gallery was already downloaded; don't silently mark done and lose it.
+            anyhow::bail!("chat {} not notifiable", entry.chat_id);
         }
         let chat_id = teloxide::types::ChatId(entry.chat_id);
 
@@ -1132,7 +1176,7 @@ mod integration_tests {
     }
 
     #[tokio::test]
-    async fn test_download_worker_chat_disabled_marks_done() {
+    async fn test_download_worker_chat_disabled_schedules_retry() {
         let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
         let eh_server = MockServer::start().await;
         let temp = tempfile::tempdir().unwrap();
@@ -1164,9 +1208,14 @@ mod integration_tests {
             .await
             .unwrap()
             .unwrap();
+        // Chat disabled → entry goes back to pending with retry scheduled (not silently done)
         assert_eq!(
-            updated.status, "done",
-            "should be marked done without downloading"
+            updated.status, "pending",
+            "should be pending for retry, not silently done"
+        );
+        assert!(
+            updated.next_retry_at.is_some(),
+            "should have next_retry_at set"
         );
     }
 
@@ -1426,7 +1475,7 @@ mod integration_tests {
     }
 
     #[tokio::test]
-    async fn test_publish_worker_chat_disabled() {
+    async fn test_publish_worker_chat_disabled_schedules_retry() {
         let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
         let tg_server = MockServer::start().await;
 
@@ -1464,6 +1513,14 @@ mod integration_tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(updated.status, "done", "should be done without sending");
+        // Chat disabled → entry goes back to downloaded with retry (not silently done)
+        assert_eq!(
+            updated.status, STATUS_DOWNLOADED,
+            "should be back to downloaded for retry"
+        );
+        assert!(
+            updated.next_retry_at.is_some(),
+            "should have next_retry_at set"
+        );
     }
 }

@@ -242,6 +242,13 @@ async fn main() -> Result<()> {
         .as_ref()
         .map(|token| std::sync::Arc::new(eh_client::TelegraphClient::new(token.clone())));
 
+    // Reset stale EH entries before spawning workers (crash recovery for all stages)
+    if eh_client.is_some() {
+        if let Err(e) = repo.reset_stale_eh_downloads().await {
+            tracing::warn!("Failed to reset stale EH entries: {:#}", e);
+        }
+    }
+
     let eh_engine_handle = if let Some(ref eh_client) = eh_client {
         let eh_engine = scheduler::EhEngine::new(
             repo.clone(),

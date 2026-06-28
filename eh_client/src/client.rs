@@ -407,7 +407,7 @@ impl EhClient {
             all_image_urls.extend(urls);
         }
 
-        // Deduplicate image URLs (preserve order, remove non-consecutive dups)
+        // Deduplicate image URLs (preserve order)
         let mut seen = std::collections::HashSet::new();
         all_image_urls.retain(|url| seen.insert(url.clone()));
 
@@ -415,18 +415,11 @@ impl EhClient {
             return Err(Error::Parse("no image page URLs found".into()));
         }
 
-        // Step 3: Create ZIP and download each image into it
-        let zip_file = tokio::fs::File::create(dest).await?;
-        let mut zip_writer =
-            zip::ZipWriter::new(std::io::BufWriter::new(zip_file.into_std().await));
-        let options = zip::write::SimpleFileOptions::default()
-            .compression_method(zip::CompressionMethod::Stored);
-
-        let mut total_bytes: u64 = 0;
-        let mut images_downloaded: usize = 0;
+        // Step 3: Download each image (async HTTP), collect bytes
+        let mut image_data: Vec<(String, Vec<u8>)> = Vec::new();
 
         for (idx, image_page_url) in all_image_urls.iter().enumerate() {
-            // Rate limit between image fetches (e-hentai limits ~5000/day)
+            // Rate limit between image fetches
             if idx > 0 {
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             }
@@ -440,11 +433,7 @@ impl EhClient {
                 .await
             {
                 Ok(r) => r,
-                Err(e) => {
-                    // Image page fetch failed, skip this image
-                    let _ = e;
-                    continue;
-                }
+                Err(_) => continue,
             };
 
             if !resp.status().is_success() {
@@ -467,10 +456,8 @@ impl EhClient {
                 continue;
             }
 
-            // Get image bytes
             let img_bytes = img_resp.bytes().await?;
 
-            // Stream image into ZIP entry
             let ext = image_url
                 .rsplit('.')
                 .next()
@@ -478,19 +465,35 @@ impl EhClient {
                 .unwrap_or("jpg");
             let entry_name = format!("{:04}.{}", idx + 1, ext);
 
-            zip_writer.start_file(&entry_name, options)?;
-            std::io::Write::write_all(&mut zip_writer, &img_bytes)?;
-            total_bytes += img_bytes.len() as u64;
-            images_downloaded += 1;
+            image_data.push((entry_name, img_bytes.to_vec()));
         }
 
-        zip_writer.finish()?;
-
-        if images_downloaded == 0 {
+        if image_data.is_empty() {
             return Err(Error::Other(
                 "all image downloads failed, no images in ZIP".into(),
             ));
         }
+
+        // Step 4: Write ZIP in a blocking task to avoid blocking async executor
+        let dest = dest.to_path_buf();
+        let total_bytes = tokio::task::spawn_blocking(move || -> Result<u64> {
+            let file = std::fs::File::create(&dest)?;
+            let buf_writer = std::io::BufWriter::new(file);
+            let mut zip_writer = zip::ZipWriter::new(buf_writer);
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+
+            let mut total: u64 = 0;
+            for (name, data) in &image_data {
+                zip_writer.start_file(name, options)?;
+                std::io::Write::write_all(&mut zip_writer, data)?;
+                total += data.len() as u64;
+            }
+            zip_writer.finish()?;
+            Ok(total)
+        })
+        .await
+        .map_err(|e| Error::Other(format!("spawn_blocking failed: {}", e)))??;
 
         Ok(total_bytes)
     }

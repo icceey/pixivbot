@@ -50,7 +50,8 @@ impl BotHandler {
                      • rating>=N — 最低评分 (2-5, 触发48h扫描)\n\
                      • pages>=N — 最低页数\n\
                      • pages<=N — 最高页数\n\
-                     • cat=<类别> — 分类筛选 (逗号分隔)",
+                     • cat=<类别> — 分类筛选 (逗号分隔)\n\
+                     • telegraph=on — 启用 Telegraph 上传",
                 )
                 .await;
             return Ok(());
@@ -61,6 +62,7 @@ impl BotHandler {
         let mut query_parts = Vec::new();
         let mut filter_args = Vec::new();
         let mut cat_str: Option<String> = None;
+        let mut telegraph_on = false;
 
         for part in &parts {
             if let Some(val) = part.strip_prefix("rating>=") {
@@ -84,6 +86,8 @@ impl BotHandler {
                 }
             } else if let Some(val) = part.strip_prefix("cat=") {
                 cat_str = Some(val.to_string());
+            } else if *part == "telegraph=on" {
+                telegraph_on = true;
             } else {
                 query_parts.push(*part);
             }
@@ -97,7 +101,7 @@ impl BotHandler {
         let query = query_parts.join(" ");
 
         // Parse filter
-        let eh_filter = match parse_eh_filter(&filter_args) {
+        let mut eh_filter = match parse_eh_filter(&filter_args) {
             Ok(f) => f,
             Err(e) => {
                 let _ = bot
@@ -107,6 +111,7 @@ impl BotHandler {
                 return Ok(());
             }
         };
+        eh_filter.telegraph = telegraph_on;
 
         // Parse category bitmask
         let cats = cat_str

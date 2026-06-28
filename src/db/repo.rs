@@ -126,7 +126,8 @@ pub mod tests_helpers {
                 completed_at TIMESTAMP,
                 zip_path TEXT,
                 telegraph_url TEXT,
-                next_retry_at TIMESTAMP
+                next_retry_at TIMESTAMP,
+                UNIQUE(chat_id, gid)
             )
             "#,
         ))

@@ -170,8 +170,8 @@ impl TelegraphClient {
         if images.is_empty() {
             return Ok(Vec::new());
         }
-        if images.len() > 10 {
-            return Err(Error::Other("pixi.mg max 10 files per upload".into()));
+        if images.len() > 5 {
+            return Err(Error::Other("pixi.mg max 5 files per upload".into()));
         }
 
         let mut form = reqwest::multipart::Form::new();
