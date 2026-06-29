@@ -310,6 +310,10 @@ async fn test_download_archive_invalid_zip_response_cleans_up() {
         .await;
     assert!(result.is_err());
     assert!(!dest.exists(), "dest should not exist after invalid ZIP");
+    assert!(
+        !dest.with_extension("zip.part").exists(),
+        "temp zip should not exist after invalid ZIP"
+    );
 }
 
 #[tokio::test]
