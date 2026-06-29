@@ -353,6 +353,10 @@ async fn test_download_gallery_images_fails_when_one_page_fetch_fails() {
         .to_string()
         .contains("failed to download all gallery images"));
     assert!(!dest.exists(), "dest should not exist after error");
+    assert!(
+        !dest.with_extension("zip.part").exists(),
+        "temp zip should not exist after error"
+    );
 }
 
 #[tokio::test]
@@ -404,4 +408,40 @@ async fn test_download_gallery_images_fails_when_one_image_fetch_fails() {
         .to_string()
         .contains("failed to download all gallery images"));
     assert!(!dest.exists(), "dest should not exist after error");
+    assert!(
+        !dest.with_extension("zip.part").exists(),
+        "temp zip should not exist after error"
+    );
+}
+
+#[tokio::test]
+async fn test_download_gallery_images_fails_when_image_src_missing() {
+    let server = MockServer::start().await;
+    let client = client_at(&server);
+    Mock::given(method("GET"))
+        .and(path("/g/123/abc/"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(r#"<a href="/s/1/123-1">1</a>"#))
+        .mount(&server)
+        .await;
+    // Image page returns HTML without <img id="img">
+    Mock::given(method("GET"))
+        .and(path("/s/1/123-1"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("<html>no image here</html>"))
+        .mount(&server)
+        .await;
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let dest = temp_dir.path().join("gallery.zip");
+    let err = client
+        .download_gallery_images(123, "abc", &dest)
+        .await
+        .unwrap_err();
+    assert!(err
+        .to_string()
+        .contains("failed to download all gallery images"));
+    assert!(!dest.exists(), "dest should not exist after error");
+    assert!(
+        !dest.with_extension("zip.part").exists(),
+        "temp zip should not exist after error"
+    );
 }

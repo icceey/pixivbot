@@ -421,31 +421,60 @@ impl EhClient {
         }
         let gallery_html = resp.text().await?;
 
-        // Determine total pages (galleries split across multiple HTML pages)
         let total_pages = parser::parse_page_count(&gallery_html).unwrap_or(1);
 
-        // Step 2: Collect all image page URLs from all gallery pages
+        // Step 2: Collect all image page URLs from all gallery pages.
+        // Once any URL has been found, later gallery page failures are hard errors.
         let mut all_image_urls: Vec<String> = parser::parse_image_page_urls(&gallery_html);
+        let mut has_urls = !all_image_urls.is_empty();
 
         for page_num in 1..total_pages {
-            // Rate limit between page fetches (skip on first iteration)
             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
             let page_url = format!("{}/g/{}/{}/?p={}", self.base_url, gid, token, page_num);
-            let resp = self
+
+            let resp = match self
                 .http
                 .get(&page_url)
                 .header(COOKIE, self.cookies.to_header())
                 .send()
-                .await?;
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    if has_urls {
+                        return Err(fallback_error(format!(
+                            "gallery page {page_num} fetch error: {e}"
+                        )));
+                    }
+                    break;
+                }
+            };
             if !resp.status().is_success() {
+                if has_urls {
+                    return Err(fallback_error(format!(
+                        "gallery page {page_num} returned {}",
+                        resp.status()
+                    )));
+                }
                 break;
             }
-            let html = resp.text().await?;
+            let html = match resp.text().await {
+                Ok(h) => h,
+                Err(e) => {
+                    if has_urls {
+                        return Err(fallback_error(format!(
+                            "gallery page {page_num} read error: {e}"
+                        )));
+                    }
+                    return Err(e.into());
+                }
+            };
             let urls = parser::parse_image_page_urls(&html);
             if urls.is_empty() {
                 break;
             }
             all_image_urls.extend(urls);
+            has_urls = true;
         }
 
         // Deduplicate image URLs (preserve order)
@@ -468,19 +497,16 @@ impl EhClient {
             })
             .collect();
 
-        let total_pages_count = image_page_urls.len();
+        let total_images = image_page_urls.len();
 
-        // Step 3: Write ZIP incrementally to a temp path. Only rename to dest on success.
+        // Step 3: Write ZIP incrementally to a temp path. Rename on success;
+        // clean up both temp and dest on any error. The zip_writer is explicitly
+        // dropped before every cleanup to avoid Windows file-locking issues.
         let temp_path = dest.with_extension("zip.part");
-        let _ = tokio::fs::remove_file(&temp_path).await;
+        let _ = std::fs::remove_file(&temp_path);
 
-        // Create the temp file and start the ZIP writer
-        let temp_file = std::fs::File::create(&temp_path).map_err(|e| {
-            Error::Other(format!(
-                "failed to download all gallery images: cannot create temp file: {}",
-                e
-            ))
-        })?;
+        let temp_file = std::fs::File::create(&temp_path)
+            .map_err(|e| fallback_error(format!("cannot create temp file: {e}")))?;
         let buf_writer = std::io::BufWriter::new(temp_file);
         let mut zip_writer = zip::ZipWriter::new(buf_writer);
         let options = zip::write::SimpleFileOptions::default()
@@ -488,85 +514,103 @@ impl EhClient {
 
         let mut total_bytes: u64 = 0;
 
-        // Helper: on any error, clean up temp and dest
-        let cleanup = |temp: &Path, final_dest: &Path| {
-            let _ = std::fs::remove_file(temp);
-            let _ = std::fs::remove_file(final_dest);
-        };
-
         for (idx, image_page_url) in image_page_urls.iter().enumerate() {
             if idx > 0 {
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             }
 
-            let resp = self
+            // Fetch image page
+            let resp = match self
                 .http
                 .get(image_page_url.as_str())
                 .header(COOKIE, self.cookies.to_header())
                 .send()
                 .await
-                .map_err(|e| {
-                    Error::Other(format!(
-                        "failed to download all gallery images: page {}/{} request error: {}",
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    drop(zip_writer);
+                    cleanup_paths(&temp_path, dest);
+                    return Err(fallback_error(format!(
+                        "page {}/{} request error: {e}",
                         idx + 1,
-                        total_pages_count,
-                        e
-                    ))
-                })?;
-
+                        total_images
+                    )));
+                }
+            };
             if !resp.status().is_success() {
-                cleanup(&temp_path, dest);
-                return Err(Error::Other(format!(
-                    "failed to download all gallery images: page {}/{} returned {}",
+                drop(zip_writer);
+                cleanup_paths(&temp_path, dest);
+                return Err(fallback_error(format!(
+                    "page {}/{} returned {}",
                     idx + 1,
-                    total_pages_count,
+                    total_images,
                     resp.status()
                 )));
             }
 
-            let html = resp.text().await.map_err(|e| {
-                Error::Other(format!(
-                    "failed to download all gallery images: page {}/{} read error: {}",
-                    idx + 1,
-                    total_pages_count,
-                    e
-                ))
-            })?;
-            let image_url = parser::parse_image_src(&html).ok_or_else(|| {
-                Error::Parse(format!(
-                    "failed to download all gallery images: no image src on page {}/{}",
-                    idx + 1,
-                    total_pages_count
-                ))
-            })?;
+            let html = match resp.text().await {
+                Ok(h) => h,
+                Err(e) => {
+                    drop(zip_writer);
+                    cleanup_paths(&temp_path, dest);
+                    return Err(fallback_error(format!(
+                        "page {}/{} read error: {e}",
+                        idx + 1,
+                        total_images
+                    )));
+                }
+            };
 
-            let img_resp = self.http.get(&image_url).send().await.map_err(|e| {
-                Error::Other(format!(
-                    "failed to download all gallery images: image {}/{} request error: {}",
-                    idx + 1,
-                    total_pages_count,
-                    e
-                ))
-            })?;
+            let image_url = match parser::parse_image_src(&html) {
+                Some(u) => u,
+                None => {
+                    drop(zip_writer);
+                    cleanup_paths(&temp_path, dest);
+                    return Err(fallback_error(format!(
+                        "no image src on page {}/{}",
+                        idx + 1,
+                        total_images
+                    )));
+                }
+            };
 
+            // Download the actual image
+            let img_resp = match self.http.get(&image_url).send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    drop(zip_writer);
+                    cleanup_paths(&temp_path, dest);
+                    return Err(fallback_error(format!(
+                        "image {}/{} request error: {e}",
+                        idx + 1,
+                        total_images
+                    )));
+                }
+            };
             if !img_resp.status().is_success() {
-                cleanup(&temp_path, dest);
-                return Err(Error::Other(format!(
-                    "failed to download all gallery images: image {}/{} returned {}",
+                drop(zip_writer);
+                cleanup_paths(&temp_path, dest);
+                return Err(fallback_error(format!(
+                    "image {}/{} returned {}",
                     idx + 1,
-                    total_pages_count,
+                    total_images,
                     img_resp.status()
                 )));
             }
 
-            let img_bytes = img_resp.bytes().await.map_err(|e| {
-                Error::Other(format!(
-                    "failed to download all gallery images: image {}/{} read error: {}",
-                    idx + 1,
-                    total_pages_count,
-                    e
-                ))
-            })?;
+            let img_bytes = match img_resp.bytes().await {
+                Ok(b) => b,
+                Err(e) => {
+                    drop(zip_writer);
+                    cleanup_paths(&temp_path, dest);
+                    return Err(fallback_error(format!(
+                        "image {}/{} read error: {e}",
+                        idx + 1,
+                        total_images
+                    )));
+                }
+            };
 
             let ext = image_url
                 .rsplit('.')
@@ -575,44 +619,61 @@ impl EhClient {
                 .unwrap_or("jpg");
             let entry_name = format!("{:04}.{}", idx + 1, ext);
 
-            // Write to ZIP immediately
-            zip_writer.start_file(&entry_name, options).map_err(|e| {
-                cleanup(&temp_path, dest);
-                Error::Other(format!(
-                    "failed to download all gallery images: zip start_file error: {}",
-                    e
-                ))
-            })?;
-            std::io::Write::write_all(&mut zip_writer, &img_bytes).map_err(|e| {
-                cleanup(&temp_path, dest);
-                Error::Other(format!(
-                    "failed to download all gallery images: zip write error: {}",
-                    e
-                ))
-            })?;
+            // Write to ZIP
+            match zip_writer.start_file(&entry_name, options) {
+                Ok(()) => {}
+                Err(e) => {
+                    drop(zip_writer);
+                    cleanup_paths(&temp_path, dest);
+                    return Err(fallback_error(format!("zip start_file error: {e}")));
+                }
+            }
+            match std::io::Write::write_all(&mut zip_writer, &img_bytes) {
+                Ok(()) => {}
+                Err(e) => {
+                    drop(zip_writer);
+                    cleanup_paths(&temp_path, dest);
+                    return Err(fallback_error(format!("zip write error: {e}")));
+                }
+            }
             total_bytes += img_bytes.len() as u64;
         }
 
         // Finish the ZIP
-        zip_writer.finish().map_err(|e| {
-            cleanup(&temp_path, dest);
-            Error::Other(format!(
-                "failed to download all gallery images: zip finish error: {}",
-                e
-            ))
-        })?;
+        match zip_writer.finish() {
+            Ok(_inner_writer) => {}
+            Err(e) => {
+                // zip_writer has been consumed by finish(); just clean up paths
+                cleanup_paths(&temp_path, dest);
+                return Err(fallback_error(format!("zip finish error: {e}")));
+            }
+        }
 
         // Atomically rename temp to final dest
-        std::fs::rename(&temp_path, dest).map_err(|e| {
-            cleanup(&temp_path, dest);
-            Error::Other(format!(
-                "failed to download all gallery images: rename error: {}",
-                e
-            ))
-        })?;
+        match std::fs::rename(&temp_path, dest) {
+            Ok(()) => {}
+            Err(e) => {
+                cleanup_paths(&temp_path, dest);
+                return Err(fallback_error(format!("rename error: {e}")));
+            }
+        }
 
         Ok(total_bytes)
     }
+}
+
+/// Helper: construct an `Error::Other` with the required fallback prefix.
+fn fallback_error(message: impl Into<String>) -> Error {
+    Error::Other(format!(
+        "failed to download all gallery images: {}",
+        message.into()
+    ))
+}
+
+/// Best-effort remove both temp and dest paths.
+fn cleanup_paths(temp: &Path, dest: &Path) {
+    let _ = std::fs::remove_file(temp);
+    let _ = std::fs::remove_file(dest);
 }
 
 /// Builder for EhClient (useful for testing).
