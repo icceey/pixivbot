@@ -325,7 +325,8 @@ fn default_booru_page_limit() -> u32 {
 
 /// Configuration for e-hentai/exhentai subscription feature.
 ///
-/// Omit the `[ehentai]` section to disable the feature.
+/// EH is enabled by default. Set `enabled = false` to explicitly disable.
+/// Uncomment `[ehentai]` to customize site, credentials, and resolutions.
 /// For e-hentai, no auth cookies are required (public galleries).
 /// For exhentai, `ipb_member_id`, `ipb_pass_hash`, and `igneous` are all required.
 #[derive(Debug, Deserialize, Clone)]
