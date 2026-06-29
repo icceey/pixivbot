@@ -25,9 +25,13 @@ impl EhFilter {
         Self::default()
     }
 
-    /// True when no filtering criteria are set (telegraph is a delivery preference).
+    /// True when no filtering criteria are set (telegraph is a delivery preference,
+    /// but `telegraph=true` is treated as non-empty to preserve telegraph-only preferences).
     pub fn is_empty(&self) -> bool {
-        self.min_rating.is_none() && self.min_pages.is_none() && self.max_pages.is_none()
+        self.min_rating.is_none()
+            && self.min_pages.is_none()
+            && self.max_pages.is_none()
+            && !self.telegraph
     }
 
     /// Task-value filter-key signature using value-encoding (not just presence).
@@ -313,5 +317,14 @@ mod tests {
         assert!(display.contains("rating≥4"));
         assert!(display.contains("pages≥20"));
         assert!(display.contains("telegraph=on"));
+    }
+
+    #[test]
+    fn test_telegraph_only_filter_is_not_empty() {
+        let filter = EhFilter {
+            telegraph: true,
+            ..Default::default()
+        };
+        assert!(!filter.is_empty());
     }
 }

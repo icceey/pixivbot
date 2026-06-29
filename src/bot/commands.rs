@@ -50,7 +50,7 @@ pub enum Command {
     ESub(String),
     #[command(description = "取消 E-Hentai 订阅\n  用法: /eunsub [ch=<频道ID>] <搜索词>")]
     EUnsub(String),
-    #[command(description = "直接下载 E-Hentai 画廊\n  用法: /edl <url|gid> [telegraph=on]")]
+    #[command(description = "直接下载 E-Hentai 画廊\n  用法: /edl <url> [telegraph=on]")]
     EDl(String),
     #[command(
         description = "下载 E-Hentai 画廊并上传 Telegraph\n  用法: /telegraph <url> 或回复消息"
@@ -105,7 +105,7 @@ impl Command {
             commands.extend([
                 BotCommand::new("esub", "订阅EH画廊 - /esub <搜索词> [过滤条件]"),
                 BotCommand::new("eunsub", "取消EH订阅 - /eunsub <搜索词>"),
-                BotCommand::new("edl", "下载EH画廊 - /edl <url|gid> [telegraph=on]"),
+                BotCommand::new("edl", "下载EH画廊 - /edl <url> [telegraph=on]"),
                 BotCommand::new(
                     "telegraph",
                     "下载EH画廊上传Telegraph - /telegraph <url> 或回复消息",
@@ -224,5 +224,24 @@ mod tests {
         assert!(owner_commands.iter().any(|command| command == "setadmin"));
         assert!(!admin_commands.iter().any(|command| command == "bsub"));
         assert!(!owner_commands.iter().any(|command| command == "bunsub"));
+    }
+
+    #[test]
+    fn edl_help_is_url_only() {
+        let commands = Command::user_commands(true, true);
+        let edl = commands
+            .into_iter()
+            .find(|cmd| cmd.command == "edl")
+            .unwrap();
+        assert!(
+            edl.description.contains("<url>"),
+            "expected edl description to contain '<url>', got: {}",
+            edl.description
+        );
+        assert!(
+            !edl.description.contains("url|gid"),
+            "expected edl description NOT to contain 'url|gid', got: {}",
+            edl.description
+        );
     }
 }

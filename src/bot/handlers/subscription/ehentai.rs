@@ -113,6 +113,17 @@ impl BotHandler {
         };
         eh_filter.telegraph = telegraph_on;
 
+        // Reject telegraph=on when Telegraph is not configured
+        if telegraph_on && !self.has_telegraph {
+            let _ = bot
+                .send_message(
+                    chat_id,
+                    "❌ Telegraph 未配置，无法启用 telegraph=on。请配置 ehentai.telegraph_access_token 后重试。",
+                )
+                .await;
+            return Ok(());
+        }
+
         // Parse category bitmask
         let cats = cat_str
             .as_deref()
@@ -143,7 +154,11 @@ impl BotHandler {
         }
 
         // Build success message
-        let mut msg = format!("✅ 已订阅 E-Hentai: {}\n", markdown::escape(&query));
+        let mut msg = format!(
+            "✅ 已订阅 {}: {}\n",
+            markdown::escape("E-Hentai"),
+            markdown::escape(&query)
+        );
         if cats > 0 {
             msg.push_str(&format!("分类: {}\n", markdown::escape(&cat_str.unwrap())));
         }
@@ -320,6 +335,17 @@ impl BotHandler {
             .map(|v| v.eq_ignore_ascii_case("on") || v == "true" || v == "1")
             .unwrap_or(false);
 
+        // Reject telegraph=on when Telegraph is not configured
+        if telegraph && !self.has_telegraph {
+            let _ = bot
+                .send_message(
+                    chat_id,
+                    "❌ Telegraph 未配置，无法启用 telegraph=on。请配置 ehentai.telegraph_access_token 后重试。",
+                )
+                .await;
+            return Ok(());
+        }
+
         // Parse gallery URL
         let (gid, token) = match parse_gallery_ref(&input) {
             Some(g) => g,
@@ -406,6 +432,17 @@ impl BotHandler {
                 return Ok(());
             }
         };
+
+        // Reject Telegraph request when no token is configured
+        if !self.has_telegraph {
+            let _ = bot
+                .send_message(
+                    chat_id,
+                    "❌ Telegraph 未配置。请配置 ehentai.telegraph_access_token 后重试。",
+                )
+                .await;
+            return Ok(());
+        }
 
         let parsed = args::parse_args(&args_str);
         let remaining = parsed.remaining.trim();
@@ -631,5 +668,11 @@ mod tests {
     fn test_parse_gallery_ref_invalid() {
         assert!(parse_gallery_ref("not a url").is_none());
         assert!(parse_gallery_ref("https://example.com/other/123").is_none());
+    }
+
+    #[test]
+    fn test_esub_success_label_is_markdown_safe() {
+        let label = markdown::escape("E-Hentai");
+        assert_eq!(label, "E\\-Hentai");
     }
 }

@@ -11,6 +11,7 @@ use crate::bot::notifier::ThrottledBot;
 use crate::bot::BotHandler;
 use anyhow::{Context, Result};
 use chrono::Local;
+use regex::Regex;
 use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -43,9 +44,29 @@ impl BotHandler {
         let (illust_ids, booru_refs) = self.extract_targets(&msg, &args).await;
 
         // Check for e-hentai/exhentai gallery links
-        let eh_gallery = self.extract_eh_gallery(&msg, &args);
+        let eh_galleries = self.extract_eh_galleries(&msg, &args);
 
-        if illust_ids.is_empty() && booru_refs.is_empty() && eh_gallery.is_none() {
+        // Reject multiple EH gallery links
+        if eh_galleries.len() > 1 {
+            bot.send_message(
+                chat_id,
+                "❌ 一次只能处理一个 E-Hentai 链接，请使用 /edl <url>。",
+            )
+            .await?;
+            return Ok(());
+        }
+
+        // Reject mixed EH + Pixiv/Booru targets
+        if eh_galleries.len() == 1 && (!illust_ids.is_empty() || !booru_refs.is_empty()) {
+            bot.send_message(
+                chat_id,
+                "❌ 请不要把 E-Hentai 链接和 Pixiv/Booru 链接混在同一次 /download 中；E-Hentai 请使用 /edl <url>。",
+            )
+            .await?;
+            return Ok(());
+        }
+
+        if illust_ids.is_empty() && booru_refs.is_empty() && eh_galleries.is_empty() {
             bot.send_message(
                 chat_id,
                 "❌ 请提供作品 ID 或 URL，或回复包含作品链接的消息\n\n例如：\n\
@@ -61,26 +82,32 @@ impl BotHandler {
         }
 
         // Handle eh gallery download via the download queue
-        if let Some((gid, token)) = &eh_gallery {
+        if let Some((gid, token)) = eh_galleries.into_iter().next() {
             if let Some(eh_client) = &self.eh_client {
-                let metadata = eh_client.get_metadata(&[(*gid, token)]).await;
+                let metadata = eh_client.get_metadata(&[(gid, &token)]).await;
                 let title = match &metadata {
                     Ok(m) if !m.is_empty() => m[0].title.clone(),
                     _ => format!("gallery_{}", gid),
                 };
-                let _ = self
+                if let Err(e) = self
                     .repo
                     .enqueue_eh_download(
                         chat_id.0,
-                        *gid as i64,
-                        token,
+                        gid as i64,
+                        &token,
                         &title,
                         false,
                         crate::db::repo::eh_download_queue::SOURCE_DIRECT,
                     )
-                    .await;
-                bot.send_message(chat_id, "⏳ 已加入 E-Hentai 下载队列")
-                    .await?;
+                    .await
+                {
+                    error!("Failed to enqueue eh download from /download: {:#}", e);
+                    bot.send_message(chat_id, "❌ 加入 E-Hentai 下载队列失败")
+                        .await?;
+                } else {
+                    bot.send_message(chat_id, "⏳ 已加入 E-Hentai 下载队列")
+                        .await?;
+                }
                 return Ok(());
             }
         }
@@ -185,40 +212,28 @@ impl BotHandler {
         (ids.into_iter().collect(), booru_refs)
     }
 
-    /// Extract e-hentai/exhentai gallery URL from args or replied message.
-    fn extract_eh_gallery(&self, msg: &Message, args: &str) -> Option<(u64, String)> {
-        self.eh_client.as_ref()?;
+    /// Extract all e-hentai/exhentai gallery URLs from args or replied message.
+    fn extract_eh_galleries(&self, msg: &Message, args: &str) -> Vec<(u64, String)> {
+        if self.eh_client.is_none() {
+            return Vec::new();
+        }
 
-        let check_text = |text: &str| -> Option<(u64, String)> {
-            for word in text.split_whitespace() {
-                if word.contains("e-hentai.org/g/") || word.contains("exhentai.org/g/") {
-                    let after_g = word.split("/g/").nth(1)?;
-                    let parts: Vec<&str> = after_g.split('/').take(2).collect();
-                    if parts.len() == 2 {
-                        let gid: u64 = parts[0].parse().ok()?;
-                        let token = parts[1].to_string();
-                        if token.len() >= 8 {
-                            return Some((gid, token));
-                        }
-                    }
-                }
-            }
-            None
-        };
-
+        let mut text = String::new();
         if !args.trim().is_empty() {
-            if let Some(g) = check_text(args) {
-                return Some(g);
-            }
+            text.push_str(args);
+            text.push(' ');
         }
-
         if let Some(reply_msg) = msg.reply_to_message() {
-            if let Some(text) = reply_msg.text().or_else(|| reply_msg.caption()) {
-                return check_text(text);
+            if let Some(reply_text) = reply_msg.text().or_else(|| reply_msg.caption()) {
+                text.push_str(reply_text);
             }
         }
 
-        None
+        if text.is_empty() {
+            return Vec::new();
+        }
+
+        extract_eh_galleries_from_text(&text)
     }
 
     /// Process downloads for multiple illusts
@@ -532,6 +547,19 @@ pub(super) fn sanitize_filename(name: &str) -> String {
         .collect()
 }
 
+/// Extract all E-Hentai/ExHentai gallery URLs from text, returning (gid, token) pairs.
+fn extract_eh_galleries_from_text(text: &str) -> Vec<(u64, String)> {
+    let re = Regex::new(r"https?://(?:e-|ex)hentai\.org/g/(\d+)/([A-Za-z0-9_-]+)/?")
+        .expect("valid EH gallery regex");
+    re.captures_iter(text)
+        .filter_map(|cap| {
+            let gid = cap.get(1)?.as_str().parse::<u64>().ok()?;
+            let token = cap.get(2)?.as_str().to_string();
+            Some((gid, token))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -545,5 +573,14 @@ mod tests {
             sanitize_filename("title|with?many*bad\\chars"),
             "title_with_many_bad_chars"
         );
+    }
+
+    #[test]
+    fn test_extract_eh_galleries_finds_multiple_links() {
+        let text = "https://e-hentai.org/g/1/aaaaaaaaaa/ https://e-hentai.org/g/2/bbbbbbbbbb/";
+        let galleries = extract_eh_galleries_from_text(text);
+        assert_eq!(galleries.len(), 2);
+        assert_eq!(galleries[0], (1, "aaaaaaaaaa".to_string()));
+        assert_eq!(galleries[1], (2, "bbbbbbbbbb".to_string()));
     }
 }

@@ -36,6 +36,7 @@ pub struct BotHandler {
     pub(crate) log_dir: String,
     pub(crate) booru_registry: Arc<BooruSiteRegistry>,
     pub(crate) eh_client: Option<Arc<eh_client::EhClient>>,
+    pub(crate) has_telegraph: bool,
 }
 
 impl BotHandler {
@@ -58,6 +59,7 @@ impl BotHandler {
         log_dir: String,
         booru_registry: Arc<BooruSiteRegistry>,
         eh_client: Option<Arc<eh_client::EhClient>>,
+        has_telegraph: bool,
     ) -> Self {
         Self {
             repo,
@@ -73,6 +75,7 @@ impl BotHandler {
             log_dir,
             booru_registry,
             eh_client,
+            has_telegraph,
         }
     }
 

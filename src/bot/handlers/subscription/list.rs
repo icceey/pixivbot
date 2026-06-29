@@ -162,7 +162,7 @@ impl BotHandler {
                                 }
                             }
                         } else {
-                            task.value.replace('_', "\\_")
+                            markdown::escape(&task.value)
                         };
                         (type_emoji, display_info)
                     };

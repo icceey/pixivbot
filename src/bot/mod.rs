@@ -47,6 +47,7 @@ pub async fn run(
     log_dir: String,
     booru_registry: Arc<BooruSiteRegistry>,
     eh_client: Option<Arc<eh_client::EhClient>>,
+    has_telegraph: bool,
 ) -> Result<()> {
     info!("Starting Telegram Bot...");
 
@@ -84,6 +85,7 @@ pub async fn run(
         log_dir,
         booru_registry,
         eh_client,
+        has_telegraph,
     );
 
     info!("✅ Bot initialized, starting command handler");

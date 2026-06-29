@@ -330,6 +330,7 @@ async fn main() -> Result<()> {
     let log_dir_for_bot = config.logging.dir.clone();
     let booru_registry_for_bot = booru_registry.clone();
     let eh_client_for_bot = eh_client.clone();
+    let has_telegraph_for_bot = telegraph_client.is_some();
     let bot_handle = tokio::spawn(async move {
         if let Err(e) = bot::run(
             bot,
@@ -344,6 +345,7 @@ async fn main() -> Result<()> {
             log_dir_for_bot,
             booru_registry_for_bot,
             eh_client_for_bot,
+            has_telegraph_for_bot,
         )
         .await
         {
