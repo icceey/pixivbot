@@ -1,6 +1,6 @@
 use crate::bot::notifier::Notifier;
 use crate::config::EhentaiConfig;
-use crate::db::entities::eh_download_queue;
+use crate::db::entities::{eh_download_queue, subscriptions};
 use crate::db::repo::eh_download_queue::SOURCE_SUBSCRIPTION;
 use crate::db::repo::Repo;
 use crate::db::types::{
@@ -98,15 +98,44 @@ impl EhEngine {
             return Ok(());
         }
 
-        // Compute aggregate filter across subs
-        let eh_filters: Vec<Option<&EhFilter>> =
-            subs.iter().map(|s| s.eh_filter.as_ref()).collect();
+        let mut prepared_subs = Vec::new();
+        for sub in subs {
+            let state = eh_tag_subscription_state(&sub).unwrap_or_else(EhTagState::cleared);
+            if state.pending_galleries.is_empty() {
+                prepared_subs.push((sub, self.config.max_push_per_tick));
+                continue;
+            }
+
+            let telegraph_default = self.telegraph_default(sub.eh_filter.as_ref());
+            let (updated_sub, updated_state, remaining_slots) = self
+                .drain_pending_backlog(
+                    &sub,
+                    state,
+                    self.config.max_push_per_tick,
+                    telegraph_default,
+                )
+                .await?;
+            if updated_state.pending_galleries.is_empty() && remaining_slots > 0 {
+                prepared_subs.push((updated_sub, remaining_slots));
+            }
+        }
+
+        if prepared_subs.is_empty() {
+            self.schedule_next_poll(task.id).await;
+            return Ok(());
+        }
+
+        // Compute aggregate filter across subs that still have per-tick capacity.
+        let eh_filters: Vec<Option<&EhFilter>> = prepared_subs
+            .iter()
+            .map(|(s, _)| s.eh_filter.as_ref())
+            .collect();
         let agg_filter = EhFilter::aggregate(&eh_filters);
 
         // Determine the oldest latest_posted_ts across subs (cursor)
-        let oldest_ts = subs
+        let oldest_ts = prepared_subs
             .iter()
-            .filter_map(|s| eh_tag_subscription_state(s).map(|st| st.latest_posted_ts))
+            .filter_map(|(s, _)| eh_tag_subscription_state(s).map(|st| st.latest_posted_ts))
             .min()
             .unwrap_or(0);
 
@@ -120,8 +149,8 @@ impl EhEngine {
         };
 
         if refs.is_empty() {
-            for sub in &subs {
-                self.process_eh_sub(sub, &[]).await?;
+            for (sub, _) in &prepared_subs {
+                self.update_sub_state_no_new(sub, oldest_ts).await;
             }
             self.schedule_next_poll(task.id).await;
             return Ok(());
@@ -162,16 +191,17 @@ impl EhEngine {
             .collect();
 
         if filtered.is_empty() {
-            for sub in &subs {
-                self.process_eh_sub(sub, &[]).await?;
+            for (sub, _) in &prepared_subs {
+                self.update_sub_state_no_new(sub, oldest_ts).await;
             }
             self.schedule_next_poll(task.id).await;
             return Ok(());
         }
 
         // Process each subscription
-        for sub in &subs {
-            self.process_eh_sub(sub, &filtered).await?;
+        for (sub, remaining_slots) in &prepared_subs {
+            self.process_eh_sub_with_slots(sub, &filtered, *remaining_slots)
+                .await?;
         }
 
         self.schedule_next_poll(task.id).await;
@@ -223,24 +253,18 @@ impl EhEngine {
         self.fetch_galleries_since(query, cats, 0).await
     }
 
-    /// Process a single subscription: filter galleries, enqueue downloads, update state.
-    async fn process_eh_sub(
+    fn telegraph_default(&self, sub_filter: Option<&EhFilter>) -> bool {
+        self.config.telegraph_access_token.is_some()
+            && (self.config.upload_telegraph || sub_filter.map(|f| f.telegraph).unwrap_or(false))
+    }
+
+    async fn drain_pending_backlog(
         &self,
-        sub: &crate::db::entities::subscriptions::Model,
-        galleries: &[EhGallery],
-    ) -> Result<()> {
-        let mut state = eh_tag_subscription_state(sub).unwrap_or_else(EhTagState::cleared);
-
-        let sub_filter = sub.eh_filter.as_ref();
-        let max_push = self.config.max_push_per_tick;
-        let mut remaining_slots = max_push;
-
-        // Telegraph gating: only set telegraph if upload token is configured.
-        let telegraph_available = self.config.telegraph_access_token.is_some();
-        let telegraph_default = telegraph_available
-            && (self.config.upload_telegraph || sub_filter.map(|f| f.telegraph).unwrap_or(false));
-
-        // Step 1: Consume pending backlog first (galleries from previous overflow).
+        sub: &subscriptions::Model,
+        mut state: EhTagState,
+        mut remaining_slots: usize,
+        telegraph_default: bool,
+    ) -> Result<(subscriptions::Model, EhTagState, usize)> {
         let mut still_pending = Vec::new();
         let backlog: Vec<_> = state.pending_galleries.drain(..).collect();
         let mut backlog_iter = backlog.into_iter();
@@ -276,17 +300,43 @@ impl EhEngine {
             state.add_pushed_gid(pending.gid);
             remaining_slots -= 1;
         }
-        state.pending_galleries = still_pending;
 
-        // If we still have pending backlog after consuming up to the cap, save state
-        // and return — do NOT advance cursor until all pending are drained.
+        state.pending_galleries = still_pending;
+        if state.pending_galleries.is_empty() && state.pending_high_water_ts > 0 {
+            state.latest_posted_ts = state.latest_posted_ts.max(state.pending_high_water_ts);
+            state.pending_high_water_ts = 0;
+        }
+        state.trim_pushed(self.config.pushed_cap);
+        let updated_sub = self
+            .repo
+            .update_subscription_latest_data(sub.id, Some(SubscriptionState::EhTag(state.clone())))
+            .await
+            .context("Failed to update eh subscription state")?;
+        Ok((updated_sub, state, remaining_slots))
+    }
+
+    async fn process_eh_sub_with_slots(
+        &self,
+        sub: &crate::db::entities::subscriptions::Model,
+        galleries: &[EhGallery],
+        max_push: usize,
+    ) -> Result<()> {
+        let mut state = eh_tag_subscription_state(sub).unwrap_or_else(EhTagState::cleared);
+
+        let sub_filter = sub.eh_filter.as_ref();
+        let mut remaining_slots = max_push;
+        let telegraph_default = self.telegraph_default(sub_filter);
+
+        // Step 1: Consume pending backlog first (galleries from previous overflow).
         if !state.pending_galleries.is_empty() {
-            state.trim_pushed(self.config.pushed_cap);
-            self.repo
-                .update_subscription_latest_data(sub.id, Some(SubscriptionState::EhTag(state)))
-                .await
-                .context("Failed to update eh subscription state")?;
-            return Ok(());
+            let (_updated_sub, updated_state, remaining) = self
+                .drain_pending_backlog(sub, state, remaining_slots, telegraph_default)
+                .await?;
+            state = updated_state;
+            remaining_slots = remaining;
+            if !state.pending_galleries.is_empty() || remaining_slots == 0 {
+                return Ok(());
+            }
         }
 
         // Step 2: Pending backlog drained. Now process new filtered galleries.
@@ -312,6 +362,7 @@ impl EhEngine {
         state.pending_high_water_ts = state.pending_high_water_ts.max(max_eligible_posted);
 
         let mut eligible_iter = eligible.into_iter();
+        let mut max_enqueued_posted = state.latest_posted_ts;
         while let Some(gallery) = eligible_iter.next() {
             if remaining_slots == 0 {
                 // Overflow: store in pending backlog for next tick.
@@ -343,13 +394,16 @@ impl EhEngine {
                 });
             }
             state.add_pushed_gid(gallery.gid);
-            state.latest_posted_ts = state.latest_posted_ts.max(gallery.posted);
+            max_enqueued_posted = max_enqueued_posted.max(gallery.posted);
             remaining_slots -= 1;
         }
 
         // Step 3: If no overflow, safely advance cursor past the entire batch.
         if state.pending_galleries.is_empty() {
-            state.latest_posted_ts = state.latest_posted_ts.max(state.pending_high_water_ts);
+            state.latest_posted_ts = state
+                .latest_posted_ts
+                .max(max_enqueued_posted)
+                .max(state.pending_high_water_ts);
             state.pending_high_water_ts = 0;
         }
 
@@ -953,7 +1007,7 @@ mod integration_tests {
     use crate::pixiv::downloader::Downloader;
     use eh_client::{EhClientBuilder, EhCookies, TelegraphClient};
     use reqwest::Client;
-    use sea_orm::{ActiveModelTrait, EntityTrait, Set};
+    use sea_orm::{ActiveModelTrait, ConnectionTrait, DbBackend, EntityTrait, Set, Statement};
     use std::io::Write;
     use teloxide::requests::RequesterExt;
     use teloxide::Bot;
@@ -1218,6 +1272,68 @@ mod integration_tests {
             queued_after_second, 4,
             "second tick should drain pending backlog: 4 total enqueued"
         );
+
+        let sub = repo
+            .list_subscriptions_by_task(task_id)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let state = eh_tag_subscription_state(&sub).unwrap();
+        assert!(state.pending_galleries.is_empty());
+        assert_eq!(state.latest_posted_ts, 400);
+        assert_eq!(state.pending_high_water_ts, 0);
+    }
+
+    #[tokio::test]
+    async fn test_collect_overflow_does_not_advance_cursor_until_pending_drained() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        setup_chat(&repo, -100, true).await;
+
+        let task_key =
+            crate::db::types::EhTaskKey::new("artist:test", 0, &crate::db::types::EhFilter::new());
+        let task_value = task_key.to_task_value();
+        let task = repo
+            .get_or_create_task(
+                crate::db::types::TaskType::Ehentai,
+                task_value.clone(),
+                None,
+            )
+            .await
+            .unwrap();
+        let task_id = task.id;
+        let mut active: tasks::ActiveModel = task.into();
+        active.next_poll_at =
+            Set(chrono::Local::now().naive_local() - chrono::Duration::seconds(1));
+        active.update(repo.db()).await.unwrap();
+
+        repo.upsert_eh_subscription(-100, task_id, crate::db::types::TagFilter::default(), None)
+            .await
+            .unwrap();
+
+        let eh_server = MockServer::start().await;
+        mock_eh_search_with_four_galleries(&eh_server).await;
+        mock_eh_metadata_for_four_galleries(&eh_server).await;
+
+        let engine = EhEngine::new(
+            Arc::clone(&repo),
+            make_eh_client(&eh_server),
+            Arc::new(make_config()),
+            60,
+        );
+        engine.tick().await.unwrap();
+
+        let sub = repo
+            .list_subscriptions_by_task(task_id)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let state = eh_tag_subscription_state(&sub).unwrap();
+        assert_eq!(state.latest_posted_ts, 0);
+        assert_eq!(state.pending_galleries.len(), 1);
+        assert_eq!(state.pending_galleries[0].gid, 1004);
+        assert_eq!(state.pending_high_water_ts, 400);
     }
 
     #[tokio::test]
@@ -1294,6 +1410,231 @@ mod integration_tests {
         assert!(state.pending_galleries.is_empty());
         assert_eq!(state.latest_posted_ts, 500);
         assert_eq!(state.pending_high_water_ts, 0);
+    }
+
+    #[tokio::test]
+    async fn test_collect_drains_pending_backlog_before_search_failure() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        setup_chat(&repo, -100, true).await;
+
+        let task_key =
+            crate::db::types::EhTaskKey::new("artist:test", 0, &crate::db::types::EhFilter::new());
+        let task_value = task_key.to_task_value();
+        let task = repo
+            .get_or_create_task(
+                crate::db::types::TaskType::Ehentai,
+                task_value.clone(),
+                None,
+            )
+            .await
+            .unwrap();
+        let task_id = task.id;
+        let mut active: tasks::ActiveModel = task.into();
+        active.next_poll_at =
+            Set(chrono::Local::now().naive_local() - chrono::Duration::seconds(1));
+        active.update(repo.db()).await.unwrap();
+
+        repo.upsert_eh_subscription(-100, task_id, crate::db::types::TagFilter::default(), None)
+            .await
+            .unwrap();
+        let sub = repo
+            .list_subscriptions_by_task(task_id)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        repo.update_subscription_latest_data(
+            sub.id,
+            Some(SubscriptionState::EhTag(EhTagState {
+                pushed_gids: Vec::new(),
+                latest_posted_ts: 0,
+                pending_galleries: vec![EhPendingGallery {
+                    gid: 2101,
+                    token: "ffffffffff".to_string(),
+                    title: "Pending Before Failure".to_string(),
+                    posted: 600,
+                }],
+                pending_high_water_ts: 600,
+            })),
+        )
+        .await
+        .unwrap();
+
+        let eh_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&eh_server)
+            .await;
+
+        let engine = EhEngine::new(
+            Arc::clone(&repo),
+            make_eh_client(&eh_server),
+            Arc::new(make_config()),
+            60,
+        );
+        engine.tick().await.unwrap();
+
+        assert_eq!(repo.count_pending_eh_downloads().await.unwrap(), 1);
+        let sub = repo
+            .list_subscriptions_by_task(task_id)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let state = eh_tag_subscription_state(&sub).unwrap();
+        assert!(state.pending_galleries.is_empty());
+        assert_eq!(state.latest_posted_ts, 600);
+        let task = repo
+            .get_task_by_type_value(crate::db::types::TaskType::Ehentai, &task_value)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(task.next_poll_at > chrono::Local::now().naive_local());
+    }
+
+    #[tokio::test]
+    async fn test_collect_empty_search_does_not_write_zero_state_for_fresh_sub() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        setup_chat(&repo, -100, true).await;
+        setup_chat(&repo, -200, true).await;
+
+        let task_key =
+            crate::db::types::EhTaskKey::new("artist:test", 0, &crate::db::types::EhFilter::new());
+        let task_value = task_key.to_task_value();
+        let task = repo
+            .get_or_create_task(
+                crate::db::types::TaskType::Ehentai,
+                task_value.clone(),
+                None,
+            )
+            .await
+            .unwrap();
+        let task_id = task.id;
+        let mut active: tasks::ActiveModel = task.into();
+        active.next_poll_at =
+            Set(chrono::Local::now().naive_local() - chrono::Duration::seconds(1));
+        active.update(repo.db()).await.unwrap();
+
+        repo.upsert_eh_subscription(-100, task_id, crate::db::types::TagFilter::default(), None)
+            .await
+            .unwrap();
+        repo.upsert_eh_subscription(-200, task_id, crate::db::types::TagFilter::default(), None)
+            .await
+            .unwrap();
+        let subs = repo.list_subscriptions_by_task(task_id).await.unwrap();
+        let existing = subs.iter().find(|s| s.chat_id == -100).unwrap();
+        repo.update_subscription_latest_data(
+            existing.id,
+            Some(SubscriptionState::EhTag(EhTagState {
+                pushed_gids: vec![999],
+                latest_posted_ts: 500,
+                pending_galleries: Vec::new(),
+                pending_high_water_ts: 0,
+            })),
+        )
+        .await
+        .unwrap();
+
+        let eh_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(""))
+            .mount(&eh_server)
+            .await;
+
+        let engine = EhEngine::new(
+            Arc::clone(&repo),
+            make_eh_client(&eh_server),
+            Arc::new(make_config()),
+            60,
+        );
+        engine.tick().await.unwrap();
+
+        let fresh = repo
+            .list_subscriptions_by_task(task_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|s| s.chat_id == -200)
+            .unwrap();
+        let state = eh_tag_subscription_state(&fresh).unwrap();
+        assert_eq!(state.latest_posted_ts, 500);
+    }
+
+    #[tokio::test]
+    async fn test_collect_enqueue_failure_persists_failed_and_remaining_backlog() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        setup_chat(&repo, -100, true).await;
+
+        repo.db()
+            .execute(Statement::from_string(
+                DbBackend::Sqlite,
+                r#"
+                CREATE TRIGGER fail_eh_enqueue_1002
+                BEFORE INSERT ON eh_download_queue
+                WHEN NEW.gid = 1002
+                BEGIN
+                    SELECT RAISE(FAIL, 'injected enqueue failure');
+                END
+                "#,
+            ))
+            .await
+            .unwrap();
+
+        let task_key =
+            crate::db::types::EhTaskKey::new("artist:test", 0, &crate::db::types::EhFilter::new());
+        let task_value = task_key.to_task_value();
+        let task = repo
+            .get_or_create_task(
+                crate::db::types::TaskType::Ehentai,
+                task_value.clone(),
+                None,
+            )
+            .await
+            .unwrap();
+        let task_id = task.id;
+        let mut active: tasks::ActiveModel = task.into();
+        active.next_poll_at =
+            Set(chrono::Local::now().naive_local() - chrono::Duration::seconds(1));
+        active.update(repo.db()).await.unwrap();
+
+        repo.upsert_eh_subscription(-100, task_id, crate::db::types::TagFilter::default(), None)
+            .await
+            .unwrap();
+
+        let eh_server = MockServer::start().await;
+        mock_eh_search_with_four_galleries(&eh_server).await;
+        mock_eh_metadata_for_four_galleries(&eh_server).await;
+
+        let engine = EhEngine::new(
+            Arc::clone(&repo),
+            make_eh_client(&eh_server),
+            Arc::new(make_config()),
+            60,
+        );
+        engine.tick().await.unwrap();
+
+        assert_eq!(repo.count_pending_eh_downloads().await.unwrap(), 1);
+        let sub = repo
+            .list_subscriptions_by_task(task_id)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let state = eh_tag_subscription_state(&sub).unwrap();
+        assert_eq!(state.latest_posted_ts, 0);
+        assert_eq!(state.pending_galleries.len(), 3);
+        assert_eq!(state.pending_galleries[0].gid, 1002);
+        assert_eq!(state.pending_galleries[1].gid, 1003);
+        assert_eq!(state.pending_galleries[2].gid, 1004);
+        assert_eq!(state.pending_high_water_ts, 400);
+        let task = repo
+            .get_task_by_type_value(crate::db::types::TaskType::Ehentai, &task_value)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(task.next_poll_at > chrono::Local::now().naive_local());
     }
 
     #[tokio::test]
