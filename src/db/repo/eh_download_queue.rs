@@ -267,6 +267,12 @@ impl Repo {
                     };
                     continue;
                 }
+
+                anyhow::bail!(
+                    "Failed to reset EH download {} after {} attempts: row changed too frequently",
+                    id,
+                    MAX_RETRIES
+                );
             }
 
             // Non-terminal: conditional update with CAS on expected status.
@@ -959,14 +965,41 @@ impl Repo {
     /// set next_retry_at to now + backoff. If retry_count exceeds max, set status=failed.
     /// Returns (model, is_permanent_failure).
     ///
-    /// CAS guard: only updates from the expected in-flight status for the given target:
-    /// - target `STATUS_PENDING`: current must be `STATUS_DOWNLOADING`.
-    /// - target `STATUS_DOWNLOADED`: current may be `STATUS_UPLOADING` or `STATUS_PUBLISHING`.
-    /// - target `STATUS_UPLOADED`: current must be `STATUS_PUBLISHING`.
-    /// - any other target is an error.
+    /// Compatibility wrapper for unambiguous retry targets.  Use
+    /// `schedule_eh_retry_from()` when multiple stages can retry to the same
+    /// target status.
+    #[allow(dead_code)]
     pub async fn schedule_eh_retry(
         &self,
         id: i32,
+        target_status: &str,
+        error: &str,
+        max_retry_count: u8,
+    ) -> Result<(eh_download_queue::Model, bool)> {
+        let expected_status = match target_status {
+            STATUS_PENDING => STATUS_DOWNLOADING,
+            STATUS_UPLOADED => STATUS_PUBLISHING,
+            STATUS_DOWNLOADED => anyhow::bail!(
+                "schedule_eh_retry target '{}' is ambiguous; use schedule_eh_retry_from with the claimed status",
+                target_status
+            ),
+            _ => anyhow::bail!(
+                "schedule_eh_retry: invalid target status '{}'",
+                target_status
+            ),
+        };
+        self.schedule_eh_retry_from(id, expected_status, target_status, error, max_retry_count)
+            .await
+    }
+
+    /// Schedule a retry from a specific in-flight status.  The explicit
+    /// `expected_status` is required because both upload and publish failures can
+    /// target `downloaded`; without it a stale worker could overwrite a newer
+    /// in-flight stage that happens to share the same retry target.
+    pub async fn schedule_eh_retry_from(
+        &self,
+        id: i32,
+        expected_status: &str,
         target_status: &str,
         error: &str,
         max_retry_count: u8,
@@ -981,14 +1014,24 @@ impl Repo {
         let is_permanent = new_retry_count > max_retry_count as i32;
         let now = Local::now().naive_local();
 
-        // Determine the valid current-status filter for the target (same for transient and permanent).
-        let current_filter = match target_status {
-            STATUS_PENDING => eh_download_queue::Column::Status.eq(STATUS_DOWNLOADING),
-            STATUS_DOWNLOADED => eh_download_queue::Column::Status
-                .is_in([STATUS_UPLOADING, STATUS_PUBLISHING]),
-            STATUS_UPLOADED => eh_download_queue::Column::Status.eq(STATUS_PUBLISHING),
+        // Determine the valid current-status filter for the expected stage and
+        // retry target (same for transient and permanent failure).
+        let current_filter = match (expected_status, target_status) {
+            (STATUS_DOWNLOADING, STATUS_PENDING) => {
+                eh_download_queue::Column::Status.eq(STATUS_DOWNLOADING)
+            }
+            (STATUS_UPLOADING, STATUS_DOWNLOADED) => {
+                eh_download_queue::Column::Status.eq(STATUS_UPLOADING)
+            }
+            (STATUS_PUBLISHING, STATUS_DOWNLOADED) => {
+                eh_download_queue::Column::Status.eq(STATUS_PUBLISHING)
+            }
+            (STATUS_PUBLISHING, STATUS_UPLOADED) => {
+                eh_download_queue::Column::Status.eq(STATUS_PUBLISHING)
+            }
             _ => anyhow::bail!(
-                "schedule_eh_retry: invalid target status '{}'",
+                "schedule_eh_retry_from: invalid transition from '{}' to '{}'",
+                expected_status,
                 target_status
             ),
         };
@@ -1644,6 +1687,52 @@ mod tests {
             .unwrap();
         assert_eq!(row.status, STATUS_PENDING);
         assert_ne!(row.status, STATUS_FAILED);
+    }
+
+    #[tokio::test]
+    async fn test_stale_upload_retry_does_not_overwrite_publishing_row() {
+        let repo = tests_helpers::setup_test_db().await.unwrap();
+        let model = repo
+            .enqueue_eh_download(-100, 61, "tok", "Title", true, SOURCE_DIRECT)
+            .await
+            .unwrap();
+
+        let download_claim = repo.get_next_for_download().await.unwrap().unwrap();
+        assert_eq!(download_claim.status, STATUS_DOWNLOADING);
+        repo.mark_eh_download_downloaded(model.id, 5000, "/tmp/61.zip")
+            .await
+            .unwrap();
+
+        let upload_claim = repo.get_next_for_upload().await.unwrap().unwrap();
+        assert_eq!(upload_claim.status, STATUS_UPLOADING);
+        repo.mark_eh_download_uploaded(model.id, "https://telegra.ph/61")
+            .await
+            .unwrap();
+
+        let publish_claim = repo.get_next_for_publish().await.unwrap().unwrap();
+        assert_eq!(publish_claim.status, STATUS_PUBLISHING);
+
+        let stale_upload_retry = repo
+            .schedule_eh_retry_from(
+                upload_claim.id,
+                STATUS_UPLOADING,
+                STATUS_DOWNLOADED,
+                "stale upload failure",
+                3,
+            )
+            .await;
+        assert!(
+            stale_upload_retry.is_err(),
+            "stale upload retry must not move a publishing row back to downloaded"
+        );
+
+        let row = Entity::find_by_id(model.id)
+            .one(&repo.db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, STATUS_PUBLISHING);
+        assert_eq!(row.retry_count, 0);
     }
 
     /// When merge runs on a row that was claimed by a publish worker between

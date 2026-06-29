@@ -394,8 +394,9 @@ impl EhDownloadWorker {
             error!("Download failed for entry {}: {:#}", entry.id, e);
             let (_, permanent) = self
                 .repo
-                .schedule_eh_retry(
+                .schedule_eh_retry_from(
                     entry.id,
+                    &entry.status,
                     STATUS_PENDING,
                     &e.to_string(),
                     self.config.max_retry_count,
@@ -425,8 +426,9 @@ impl EhDownloadWorker {
             // Don't mark done — schedule a retry with backoff so the gallery isn't lost.
             // The entry goes back to pending with a future next_retry_at.
             self.repo
-                .schedule_eh_retry(
+                .schedule_eh_retry_from(
                     entry.id,
+                    &entry.status,
                     STATUS_PENDING,
                     "chat not notifiable",
                     self.config.max_retry_count,
@@ -543,8 +545,9 @@ impl EhUploadWorker {
             error!("Upload failed for entry {}: {:#}", entry.id, e);
             let (_, permanent) = self
                 .repo
-                .schedule_eh_retry(
+                .schedule_eh_retry_from(
                     entry.id,
+                    &entry.status,
                     STATUS_DOWNLOADED,
                     &e.to_string(),
                     self.config.max_retry_count,
@@ -729,8 +732,9 @@ impl EhPublishWorker {
             };
             let (_, permanent) = self
                 .repo
-                .schedule_eh_retry(
+                .schedule_eh_retry_from(
                     entry.id,
+                    &entry.status,
                     target,
                     &e.to_string(),
                     self.config.max_retry_count,
