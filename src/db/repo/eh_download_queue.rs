@@ -666,7 +666,9 @@ impl Repo {
     }
 
     /// Fallback a permanently failed Telegraph upload to archive-only delivery.
-    /// Sets telegraph=false, status=downloaded, clears next_retry_at.
+    /// Sets telegraph=false, status=downloaded, clears next_retry_at,
+    /// telegraph_url, archive_sent_at, and telegraph_sent_at so publish
+    /// workers do not send stale Telegraph links.
     /// Only updates rows currently in `STATUS_UPLOADING`.
     pub async fn fallback_eh_upload_to_archive(
         &self,
@@ -688,6 +690,18 @@ impl Repo {
                 Expr::value(None::<DateTime>),
             )
             .col_expr(eh_download_queue::Column::RetryCount, Expr::value(0))
+            .col_expr(
+                eh_download_queue::Column::TelegraphUrl,
+                Expr::value(None::<String>),
+            )
+            .col_expr(
+                eh_download_queue::Column::ArchiveSentAt,
+                Expr::value(None::<DateTime>),
+            )
+            .col_expr(
+                eh_download_queue::Column::TelegraphSentAt,
+                Expr::value(None::<DateTime>),
+            )
             .filter(eh_download_queue::Column::Id.eq(id))
             .filter(eh_download_queue::Column::Status.eq(STATUS_UPLOADING))
             .exec(&self.db)
@@ -2019,5 +2033,74 @@ mod tests {
             chain.contains("Failed to enqueue eh download"),
             "context message should be present: {chain}"
         );
+    }
+
+    /// After fallback, stale Telegraph URL and sent markers must be cleared
+    /// so publish workers do not send stale Telegraph links.
+    #[tokio::test]
+    async fn test_fallback_clears_stale_telegraph_state() {
+        let repo = tests_helpers::setup_test_db().await.unwrap();
+
+        // Construct a STATUS_UPLOADING row with stale Telegraph state
+        let now = chrono::Local::now().naive_local();
+        let active = eh_download_queue::ActiveModel {
+            chat_id: Set(-100i64),
+            gid: Set(90i64),
+            token: Set("tok".to_string()),
+            title: Set("Title".to_string()),
+            telegraph: Set(true),
+            source: Set(SOURCE_DIRECT.to_string()),
+            status: Set(STATUS_UPLOADING.to_string()),
+            file_size: Set(0),
+            error: Set(None),
+            retry_count: Set(2),
+            created_at: Set(now),
+            started_at: Set(None),
+            completed_at: Set(Some(now)),
+            zip_path: Set(Some("/tmp/90.zip".to_string())),
+            telegraph_url: Set(Some("https://telegra.ph/stale".to_string())),
+            archive_sent_at: Set(Some(now)),
+            telegraph_sent_at: Set(Some(now)),
+            next_retry_at: Set(Some(now)),
+            ..Default::default()
+        };
+        let model = active.insert(&repo.db).await.unwrap();
+
+        // Perform fallback
+        let result = repo
+            .fallback_eh_upload_to_archive(model.id, "permanent upload failure")
+            .await
+            .unwrap();
+
+        // Assert: status downgraded to downloaded, telegraph cleared
+        assert_eq!(result.status, STATUS_DOWNLOADED);
+        assert!(!result.telegraph);
+
+        // Assert: stale Telegraph state cleared
+        assert!(
+            result.telegraph_url.is_none(),
+            "telegraph_url must be cleared after fallback"
+        );
+        assert!(
+            result.archive_sent_at.is_none(),
+            "archive_sent_at must be cleared after fallback"
+        );
+        assert!(
+            result.telegraph_sent_at.is_none(),
+            "telegraph_sent_at must be cleared after fallback"
+        );
+
+        // Assert: retry state reset
+        assert_eq!(result.retry_count, 0);
+        assert!(
+            result.next_retry_at.is_none(),
+            "next_retry_at must be cleared after fallback"
+        );
+
+        // Assert: error recorded
+        assert_eq!(result.error.as_deref(), Some("permanent upload failure"));
+
+        // Assert: ZIP path preserved
+        assert_eq!(result.zip_path.as_deref(), Some("/tmp/90.zip"));
     }
 }
