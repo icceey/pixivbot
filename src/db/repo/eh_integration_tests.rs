@@ -122,6 +122,8 @@ async fn test_update_subscription_latest_data_eh_tag() {
     let state = SubscriptionState::EhTag(EhTagState {
         pushed_gids: vec![100, 200],
         latest_posted_ts: 1700000000,
+        pending_galleries: Vec::new(),
+        pending_high_water_ts: 0,
     });
 
     repo.update_subscription_latest_data(sub.id, Some(state.clone()))

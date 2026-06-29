@@ -158,13 +158,34 @@ pub struct EhTagState {
     /// Unix timestamp of the newest gallery processed (cursor).
     #[serde(default)]
     pub latest_posted_ts: i64,
+    /// Galleries matched by subscription filters but not yet enqueued due to
+    /// per-tick cap. Consumed before new cursor-based fetching.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_galleries: Vec<EhPendingGallery>,
+    /// Max `posted` timestamp covered by the current overflow batch. Used to
+    /// safely advance `latest_posted_ts` once all pending galleries are drained.
+    #[serde(default)]
+    pub pending_high_water_ts: i64,
+}
+
+/// A gallery that matched a subscription but could not be enqueued in the
+/// current tick (e.g. per-tick cap). Stored durably so it can be picked up
+/// on the next tick without re-fetching.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct EhPendingGallery {
+    pub gid: u64,
+    pub token: String,
+    pub title: String,
+    pub posted: i64,
 }
 
 impl EhTagState {
-    pub fn cleared(latest_posted_ts: i64) -> Self {
+    pub fn cleared() -> Self {
         Self {
             pushed_gids: Vec::new(),
-            latest_posted_ts,
+            latest_posted_ts: 0,
+            pending_galleries: Vec::new(),
+            pending_high_water_ts: 0,
         }
     }
 
@@ -316,14 +337,14 @@ mod tests {
 
     #[test]
     fn test_eh_tag_state_cleared() {
-        let state = EhTagState::cleared(12345);
-        assert_eq!(state.latest_posted_ts, 12345);
+        let state = EhTagState::cleared();
+        assert_eq!(state.latest_posted_ts, 0);
         assert!(state.pushed_gids.is_empty());
     }
 
     #[test]
     fn test_eh_tag_state_add_pushed_gid_dedup() {
-        let mut state = EhTagState::cleared(100);
+        let mut state = EhTagState::cleared();
         state.add_pushed_gid(1);
         state.add_pushed_gid(2);
         state.add_pushed_gid(1); // duplicate
@@ -335,8 +356,36 @@ mod tests {
         let mut state = EhTagState {
             pushed_gids: vec![1, 2, 3, 4, 5],
             latest_posted_ts: 100,
+            pending_galleries: Vec::new(),
+            pending_high_water_ts: 0,
         };
         state.trim_pushed(3);
         assert_eq!(state.pushed_gids, vec![3, 4, 5]);
+    }
+
+    #[test]
+    fn test_eh_tag_state_pending_defaults_empty() {
+        let state = EhTagState::cleared();
+        assert!(state.pending_galleries.is_empty());
+        assert_eq!(state.pending_high_water_ts, 0);
+    }
+
+    #[test]
+    fn test_eh_pending_gallery_roundtrip() {
+        let state = EhTagState {
+            pushed_gids: vec![1],
+            latest_posted_ts: 100,
+            pending_galleries: vec![EhPendingGallery {
+                gid: 2,
+                token: "tok".to_string(),
+                title: "Title".to_string(),
+                posted: 200,
+            }],
+            pending_high_water_ts: 200,
+        };
+        let json = serde_json::to_string(&state).unwrap();
+        let decoded: EhTagState = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.pending_galleries[0].gid, 2);
+        assert_eq!(decoded.pending_high_water_ts, 200);
     }
 }

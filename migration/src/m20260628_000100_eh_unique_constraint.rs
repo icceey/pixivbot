@@ -7,13 +7,37 @@ pub struct Migration;
 impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         // Remove duplicate rows before adding unique index.
-        // Keep the oldest entry per (chat_id, gid) and delete the rest.
+        // Keep the highest-progress entry per (chat_id, gid) and delete the rest.
+        // Priority: publishing > uploaded > uploading > downloaded > downloading > pending > done > failed.
+        // Tie-break by newest COALESCE(completed_at, started_at, created_at), then highest id.
         manager
             .get_connection()
             .execute_unprepared(
-                "DELETE FROM eh_download_queue WHERE id NOT IN ( \
-                    SELECT MIN(id) FROM eh_download_queue GROUP BY chat_id, gid \
-                )",
+                "DELETE FROM eh_download_queue \
+                 WHERE id NOT IN ( \
+                     SELECT id FROM ( \
+                         SELECT id, \
+                                ROW_NUMBER() OVER ( \
+                                    PARTITION BY chat_id, gid \
+                                    ORDER BY \
+                                      CASE status \
+                                        WHEN 'publishing' THEN 1 \
+                                        WHEN 'uploaded' THEN 2 \
+                                        WHEN 'uploading' THEN 3 \
+                                        WHEN 'downloaded' THEN 4 \
+                                        WHEN 'downloading' THEN 5 \
+                                        WHEN 'pending' THEN 6 \
+                                        WHEN 'done' THEN 7 \
+                                        WHEN 'failed' THEN 8 \
+                                        ELSE 9 \
+                                      END, \
+                                      COALESCE(completed_at, started_at, created_at) DESC, \
+                                      id DESC \
+                                ) AS rn \
+                         FROM eh_download_queue \
+                     ) ranked \
+                     WHERE rn = 1 \
+                 )",
             )
             .await?;
 

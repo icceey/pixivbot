@@ -41,6 +41,12 @@ pub struct Model {
     /// Earliest time to retry this entry (for backoff).
     #[sea_orm(nullable)]
     pub next_retry_at: Option<DateTime>,
+    /// Timestamp when the archive ZIP was sent to the chat (publish stage).
+    #[sea_orm(nullable)]
+    pub archive_sent_at: Option<DateTime>,
+    /// Timestamp when the Telegraph link was sent to the chat (publish stage).
+    #[sea_orm(nullable)]
+    pub telegraph_sent_at: Option<DateTime>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

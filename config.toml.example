@@ -86,6 +86,10 @@ download_original_threshold = 1
 # gallery subscription and direct download features.
 # ----------------------------------------------------------------------------
 # [ehentai]
+# # Whether the E-Hentai / ExHentai feature is enabled (default: true).
+# # When set to false, all EH commands and subscription features are disabled.
+# # enabled = true
+# # enabled = false   # Explicitly disable EH features
 # # Site: "e-hentai" (public, no auth required) or "exhentai" (requires cookies)
 # site = "e-hentai"
 # # Required for exhentai, recommended for e-hentai:

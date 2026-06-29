@@ -229,7 +229,7 @@ impl EhEngine {
         sub: &crate::db::entities::subscriptions::Model,
         galleries: &[EhGallery],
     ) -> Result<()> {
-        let mut state = eh_tag_subscription_state(sub).unwrap_or_else(|| EhTagState::cleared(0));
+        let mut state = eh_tag_subscription_state(sub).unwrap_or_else(EhTagState::cleared);
 
         let sub_filter = sub.eh_filter.as_ref();
         let max_push = self.config.max_push_per_tick;
@@ -290,7 +290,7 @@ impl EhEngine {
         latest_ts: i64,
     ) {
         let state =
-            eh_tag_subscription_state(sub).unwrap_or_else(|| EhTagState::cleared(latest_ts));
+            eh_tag_subscription_state(sub).unwrap_or_else(EhTagState::cleared);
         if state.latest_posted_ts == latest_ts {
             return;
         }
@@ -301,6 +301,8 @@ impl EhEngine {
             } else {
                 state.latest_posted_ts
             },
+            pending_galleries: state.pending_galleries,
+            pending_high_water_ts: state.pending_high_water_ts,
         };
         if let Err(e) = self
             .repo

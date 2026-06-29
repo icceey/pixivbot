@@ -330,6 +330,10 @@ fn default_booru_page_limit() -> u32 {
 /// For exhentai, `ipb_member_id`, `ipb_pass_hash`, and `igneous` are all required.
 #[derive(Debug, Deserialize, Clone)]
 pub struct EhentaiConfig {
+    /// Whether the E-Hentai / ExHentai feature is enabled (default: true).
+    /// Set to `false` to explicitly disable EH regardless of site configuration.
+    #[serde(default = "default_eh_enabled")]
+    pub enabled: bool,
     /// "e-hentai" or "exhentai" (default: "e-hentai")
     #[serde(default = "default_eh_site")]
     pub site: String,
@@ -379,6 +383,7 @@ pub struct EhentaiConfig {
 impl Default for EhentaiConfig {
     fn default() -> Self {
         Self {
+            enabled: default_eh_enabled(),
             site: default_eh_site(),
             ipb_member_id: None,
             ipb_pass_hash: None,
@@ -417,15 +422,19 @@ impl EhentaiConfig {
         self.site == "exhentai" && self.to_cookies().is_exhentai_capable()
     }
 
-    /// Check if the feature is enabled (site is configured).
+    /// Check if the feature is enabled (explicit flag + supported site).
     pub fn is_enabled(&self) -> bool {
-        self.site == "exhentai" || self.site == "e-hentai"
+        self.enabled && matches!(self.site.as_str(), "exhentai" | "e-hentai")
     }
 
     /// Download rate limit in bytes.
     pub fn download_rate_limit_bytes(&self) -> u64 {
         self.download_rate_limit_gb * 1024 * 1024 * 1024
     }
+}
+
+fn default_eh_enabled() -> bool {
+    true
 }
 
 fn default_eh_site() -> String {
@@ -550,5 +559,22 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(config.download_threshold(), 10);
+    }
+
+    #[test]
+    fn test_eh_enabled_defaults_true() {
+        let cfg = EhentaiConfig::default();
+        assert!(cfg.enabled);
+        assert!(cfg.is_enabled());
+    }
+
+    #[test]
+    fn test_eh_enabled_false_disables_supported_site() {
+        let cfg = EhentaiConfig {
+            enabled: false,
+            site: "e-hentai".to_string(),
+            ..Default::default()
+        };
+        assert!(!cfg.is_enabled());
     }
 }

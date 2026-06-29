@@ -127,6 +127,8 @@ pub mod tests_helpers {
                 zip_path TEXT,
                 telegraph_url TEXT,
                 next_retry_at TIMESTAMP,
+                archive_sent_at TIMESTAMP NULL,
+                telegraph_sent_at TIMESTAMP NULL,
                 UNIQUE(chat_id, gid)
             )
             "#,

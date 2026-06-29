@@ -723,4 +723,15 @@ mod tests {
         let count = repo.count_pending_eh_downloads().await.unwrap();
         assert_eq!(count, 2);
     }
+
+    #[tokio::test]
+    async fn test_queue_schema_has_publish_marker_columns() {
+        let repo = tests_helpers::setup_test_db().await.unwrap();
+        let entry = repo
+            .enqueue_eh_download(-100, 42, "tok", "Title", false, SOURCE_DIRECT)
+            .await
+            .unwrap();
+        assert!(entry.archive_sent_at.is_none());
+        assert!(entry.telegraph_sent_at.is_none());
+    }
 }
