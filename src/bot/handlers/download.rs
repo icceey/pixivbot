@@ -48,10 +48,10 @@ impl BotHandler {
         // Check for e-hentai/exhentai gallery links
         let eh_galleries = self.extract_eh_galleries(&msg, &args);
 
-        let eh_decision = classify_eh_download_input(
-            &eh_galleries,
-            !illust_ids.is_empty() || !booru_refs.is_empty(),
-        );
+        let has_other_download_targets = !illust_ids.is_empty()
+            || !booru_refs.is_empty()
+            || args_have_bare_pixiv_ids_outside_eh_urls(&args);
+        let eh_decision = classify_eh_download_input(&eh_galleries, has_other_download_targets);
         match &eh_decision {
             EhDownloadInput::Multiple => {
                 bot.send_message(
@@ -601,6 +601,20 @@ fn classify_eh_download_input(
     }
 }
 
+fn args_have_bare_pixiv_ids_outside_eh_urls(args: &str) -> bool {
+    let trimmed = args.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    let eh_re = Regex::new(r"https?://(?:e-|ex)hentai\.org/g/\d+/[A-Za-z0-9_-]+/?")
+        .expect("valid EH gallery regex");
+    let without_eh = eh_re.replace_all(trimmed, " ");
+    without_eh
+        .split_whitespace()
+        .any(|token| token.chars().all(|c| c.is_ascii_digit()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -709,6 +723,23 @@ mod tests {
             classify_eh_download_input(&galleries, true),
             EhDownloadInput::Mixed
         );
+    }
+
+    #[test]
+    fn test_args_bare_pixiv_id_after_eh_url_is_mixed_target() {
+        let args = "https://e-hentai.org/g/1/aaaaaaaaaa/ 123456789";
+        assert!(args_have_bare_pixiv_ids_outside_eh_urls(args));
+        let galleries = extract_eh_galleries_from_sources(args, None);
+        assert_eq!(
+            classify_eh_download_input(&galleries, args_have_bare_pixiv_ids_outside_eh_urls(args),),
+            EhDownloadInput::Mixed
+        );
+    }
+
+    #[test]
+    fn test_args_eh_url_digits_do_not_count_as_bare_pixiv_id() {
+        let args = "https://e-hentai.org/g/123456789/aaaaaaaaaa/";
+        assert!(!args_have_bare_pixiv_ids_outside_eh_urls(args));
     }
 
     #[test]
