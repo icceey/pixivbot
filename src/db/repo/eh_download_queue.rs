@@ -722,6 +722,110 @@ impl Repo {
         Ok(model)
     }
 
+    /// Disable Telegraph delivery for rows that have not produced a Telegraph URL yet.
+    ///
+    /// This is used at startup when no Telegraph token is configured.  Rows with an
+    /// existing `telegraph_url` are left untouched because they are already publishable;
+    /// rows without a URL are downgraded to archive-only so they can be downloaded or
+    /// published without an upload worker.  Terminal rows have only their Telegraph flag
+    /// cleared so a later plain re-enqueue does not OR-merge the stale preference back in.
+    pub async fn disable_eh_telegraph_for_unuploaded_entries(&self) -> Result<u64> {
+        let mut changed = 0u64;
+
+        // Pre-download in-flight work should restart from the download queue.
+        let pending = eh_download_queue::Entity::update_many()
+            .col_expr(eh_download_queue::Column::Telegraph, Expr::value(false))
+            .col_expr(
+                eh_download_queue::Column::Status,
+                Expr::value(STATUS_PENDING),
+            )
+            .col_expr(
+                eh_download_queue::Column::TelegraphUrl,
+                Expr::value(None::<String>),
+            )
+            .col_expr(
+                eh_download_queue::Column::ArchiveSentAt,
+                Expr::value(None::<DateTime>),
+            )
+            .col_expr(
+                eh_download_queue::Column::TelegraphSentAt,
+                Expr::value(None::<DateTime>),
+            )
+            .col_expr(
+                eh_download_queue::Column::NextRetryAt,
+                Expr::value(None::<DateTime>),
+            )
+            .filter(eh_download_queue::Column::Telegraph.eq(true))
+            .filter(eh_download_queue::Column::TelegraphUrl.is_null())
+            .filter(eh_download_queue::Column::Status.is_in([STATUS_PENDING, STATUS_DOWNLOADING]))
+            .exec(&self.db)
+            .await
+            .context("Failed to disable unuploaded EH Telegraph pending entries")?;
+        changed += pending.rows_affected;
+
+        // ZIP already exists or should exist: publish as archive-only.
+        let downloaded = eh_download_queue::Entity::update_many()
+            .col_expr(eh_download_queue::Column::Telegraph, Expr::value(false))
+            .col_expr(
+                eh_download_queue::Column::Status,
+                Expr::value(STATUS_DOWNLOADED),
+            )
+            .col_expr(
+                eh_download_queue::Column::TelegraphUrl,
+                Expr::value(None::<String>),
+            )
+            .col_expr(
+                eh_download_queue::Column::ArchiveSentAt,
+                Expr::value(None::<DateTime>),
+            )
+            .col_expr(
+                eh_download_queue::Column::TelegraphSentAt,
+                Expr::value(None::<DateTime>),
+            )
+            .col_expr(
+                eh_download_queue::Column::NextRetryAt,
+                Expr::value(None::<DateTime>),
+            )
+            .filter(eh_download_queue::Column::Telegraph.eq(true))
+            .filter(eh_download_queue::Column::TelegraphUrl.is_null())
+            .filter(eh_download_queue::Column::Status.is_in([
+                STATUS_DOWNLOADED,
+                STATUS_UPLOADING,
+                STATUS_UPLOADED,
+                STATUS_PUBLISHING,
+            ]))
+            .exec(&self.db)
+            .await
+            .context("Failed to disable unuploaded EH Telegraph downloaded entries")?;
+        changed += downloaded.rows_affected;
+
+        // Terminal rows do not need status changes, but clearing the stale flag prevents
+        // future plain `/edl` re-enqueues from OR-merging Telegraph back to true.
+        let terminal = eh_download_queue::Entity::update_many()
+            .col_expr(eh_download_queue::Column::Telegraph, Expr::value(false))
+            .col_expr(
+                eh_download_queue::Column::TelegraphUrl,
+                Expr::value(None::<String>),
+            )
+            .col_expr(
+                eh_download_queue::Column::ArchiveSentAt,
+                Expr::value(None::<DateTime>),
+            )
+            .col_expr(
+                eh_download_queue::Column::TelegraphSentAt,
+                Expr::value(None::<DateTime>),
+            )
+            .filter(eh_download_queue::Column::Telegraph.eq(true))
+            .filter(eh_download_queue::Column::TelegraphUrl.is_null())
+            .filter(eh_download_queue::Column::Status.is_in([STATUS_DONE, STATUS_FAILED]))
+            .exec(&self.db)
+            .await
+            .context("Failed to disable unuploaded EH Telegraph terminal entries")?;
+        changed += terminal.rows_affected;
+
+        Ok(changed)
+    }
+
     /// Get next entry for the download stage: status=pending, next_retry_at is NULL or <= now.
     /// Uses a conditional UPDATE to atomically claim the entry.
     pub async fn get_next_for_download(&self) -> Result<Option<eh_download_queue::Model>> {
@@ -2102,5 +2206,110 @@ mod tests {
 
         // Assert: ZIP path preserved
         assert_eq!(result.zip_path.as_deref(), Some("/tmp/90.zip"));
+    }
+
+    #[tokio::test]
+    async fn test_disable_telegraph_without_token_downgrades_unuploaded_downloaded_rows() {
+        let repo = tests_helpers::setup_test_db().await.unwrap();
+        let model = repo
+            .enqueue_eh_download(-100, 91, "tok", "Title", true, SOURCE_DIRECT)
+            .await
+            .unwrap();
+        let claimed = repo.get_next_for_download().await.unwrap().unwrap();
+        assert_eq!(claimed.id, model.id);
+        repo.mark_eh_download_downloaded(model.id, 5000, "/tmp/91.zip")
+            .await
+            .unwrap();
+
+        let changed = repo
+            .disable_eh_telegraph_for_unuploaded_entries()
+            .await
+            .unwrap();
+        assert_eq!(changed, 1);
+
+        let row = Entity::find_by_id(model.id)
+            .one(&repo.db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, STATUS_DOWNLOADED);
+        assert!(!row.telegraph);
+        assert!(row.telegraph_url.is_none());
+
+        assert!(repo.get_next_for_upload().await.unwrap().is_none());
+        let publish = repo.get_next_for_publish().await.unwrap().unwrap();
+        assert_eq!(publish.id, model.id);
+        assert_eq!(publish.status, STATUS_PUBLISHING);
+    }
+
+    #[tokio::test]
+    async fn test_disable_telegraph_without_token_preserves_uploaded_rows_with_url() {
+        let repo = tests_helpers::setup_test_db().await.unwrap();
+        let model = repo
+            .enqueue_eh_download(-100, 92, "tok", "Title", true, SOURCE_DIRECT)
+            .await
+            .unwrap();
+        let claimed = repo.get_next_for_download().await.unwrap().unwrap();
+        assert_eq!(claimed.id, model.id);
+        repo.mark_eh_download_downloaded(model.id, 5000, "/tmp/92.zip")
+            .await
+            .unwrap();
+        let upload = repo.get_next_for_upload().await.unwrap().unwrap();
+        assert_eq!(upload.id, model.id);
+        repo.mark_eh_download_uploaded(model.id, "https://telegra.ph/92")
+            .await
+            .unwrap();
+
+        let changed = repo
+            .disable_eh_telegraph_for_unuploaded_entries()
+            .await
+            .unwrap();
+        assert_eq!(changed, 0);
+
+        let row = Entity::find_by_id(model.id)
+            .one(&repo.db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(row.telegraph);
+        assert_eq!(row.status, STATUS_UPLOADED);
+        assert_eq!(row.telegraph_url.as_deref(), Some("https://telegra.ph/92"));
+    }
+
+    #[tokio::test]
+    async fn test_disable_telegraph_without_token_clears_terminal_stale_flag() {
+        let repo = tests_helpers::setup_test_db().await.unwrap();
+        let model = repo
+            .enqueue_eh_download(-100, 93, "tok", "Title", true, SOURCE_DIRECT)
+            .await
+            .unwrap();
+        Entity::update_many()
+            .col_expr(Column::Status, Expr::value(STATUS_FAILED))
+            .col_expr(Column::Error, Expr::value(Some("old failure".to_string())))
+            .filter(Column::Id.eq(model.id))
+            .exec(&repo.db)
+            .await
+            .unwrap();
+
+        let changed = repo
+            .disable_eh_telegraph_for_unuploaded_entries()
+            .await
+            .unwrap();
+        assert_eq!(changed, 1);
+
+        let row = Entity::find_by_id(model.id)
+            .one(&repo.db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, STATUS_FAILED);
+        assert!(!row.telegraph);
+
+        let reenqueued = repo
+            .enqueue_eh_download(-100, 93, "new", "New", false, SOURCE_DIRECT)
+            .await
+            .unwrap();
+        assert_eq!(reenqueued.status, STATUS_PENDING);
+        assert!(!reenqueued.telegraph);
     }
 }
