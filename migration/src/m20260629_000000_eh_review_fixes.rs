@@ -15,6 +15,13 @@ impl MigrationTrait for Migration {
                             .timestamp()
                             .null(),
                     )
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(EhDownloadQueue::Table)
                     .add_column(
                         ColumnDef::new(EhDownloadQueue::TelegraphSentAt)
                             .timestamp()
@@ -31,6 +38,13 @@ impl MigrationTrait for Migration {
                 Table::alter()
                     .table(EhDownloadQueue::Table)
                     .drop_column(EhDownloadQueue::TelegraphSentAt)
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(EhDownloadQueue::Table)
                     .drop_column(EhDownloadQueue::ArchiveSentAt)
                     .to_owned(),
             )
