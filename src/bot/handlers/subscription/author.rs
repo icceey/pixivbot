@@ -312,7 +312,11 @@ impl BotHandler {
                 format!("Booru排行 `{}`", markdown::escape(&task_value))
             }
             TaskType::Ehentai => {
-                format!("E-Hentai `{}`", markdown::escape(&task_value))
+                format!(
+                    "{} `{}`",
+                    markdown::escape("E-Hentai"),
+                    markdown::escape(&task_value)
+                )
             }
         };
 

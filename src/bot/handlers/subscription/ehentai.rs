@@ -114,7 +114,7 @@ impl BotHandler {
         eh_filter.telegraph = telegraph_on;
 
         // Reject telegraph=on when Telegraph is not configured
-        if telegraph_on && !self.has_telegraph {
+        if should_reject_telegraph_request(telegraph_on, self.has_telegraph) {
             let _ = bot
                 .send_message(
                     chat_id,
@@ -298,7 +298,8 @@ impl BotHandler {
         };
 
         let parsed = args::parse_args(&args_str);
-        let remaining = parsed.remaining.trim();
+        let (remaining, trailing_telegraph) = split_edl_remaining_and_telegraph(&parsed.remaining);
+        let remaining = remaining.trim();
 
         // If no args, check if replying to a message containing a gallery URL
         let input = if remaining.is_empty() {
@@ -329,14 +330,16 @@ impl BotHandler {
             }
         };
 
-        // Check telegraph param
+        // Check telegraph param — check both leading parsed params and trailing in remaining text.
+        // parse_args() only extracts leading key=value, so trailing telegraph=on after a URL
+        // needs to be detected from the remaining text.
         let telegraph = parsed
             .get("telegraph")
-            .map(|v| v.eq_ignore_ascii_case("on") || v == "true" || v == "1")
-            .unwrap_or(false);
+            .map(is_telegraph_enabled_value)
+            .unwrap_or(trailing_telegraph);
 
         // Reject telegraph=on when Telegraph is not configured
-        if telegraph && !self.has_telegraph {
+        if should_reject_telegraph_request(telegraph, self.has_telegraph) {
             let _ = bot
                 .send_message(
                     chat_id,
@@ -434,7 +437,7 @@ impl BotHandler {
         };
 
         // Reject Telegraph request when no token is configured
-        if !self.has_telegraph {
+        if should_reject_telegraph_request(true, self.has_telegraph) {
             let _ = bot
                 .send_message(
                     chat_id,
@@ -578,7 +581,11 @@ fn parse_gallery_ref(s: &str) -> Option<(u64, String)> {
         if parts.len() == 2 {
             let gid: u64 = parts[0].parse().ok()?;
             let token = parts[1].to_string();
-            if token.len() >= 8 {
+            if token.len() >= 8
+                && token
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+            {
                 return Some((gid, token));
             }
         }
@@ -588,6 +595,31 @@ fn parse_gallery_ref(s: &str) -> Option<(u64, String)> {
     // Try GID only — need to make an API call to get token, but we can't here.
     // For GID-only, we'd need to use the gtoken API method. For now, require URL.
     None
+}
+
+fn is_telegraph_enabled_value(value: &str) -> bool {
+    value.eq_ignore_ascii_case("on") || value.eq_ignore_ascii_case("true") || value == "1"
+}
+
+fn should_reject_telegraph_request(telegraph_requested: bool, has_telegraph: bool) -> bool {
+    telegraph_requested && !has_telegraph
+}
+
+fn split_edl_remaining_and_telegraph(remaining: &str) -> (String, bool) {
+    let mut telegraph = false;
+    let gallery_parts = remaining
+        .split_whitespace()
+        .filter(|part| {
+            if let Some(value) = part.strip_prefix("telegraph=") {
+                telegraph = is_telegraph_enabled_value(value);
+                false
+            } else {
+                true
+            }
+        })
+        .collect::<Vec<_>>();
+
+    (gallery_parts.join(" "), telegraph)
 }
 
 /// Extract the first e-hentai/exhentai gallery URL from a text message.
@@ -674,6 +706,38 @@ mod tests {
     fn test_parse_gallery_ref_rejects_short_token() {
         // Token length < 8 should be rejected
         assert!(parse_gallery_ref("https://e-hentai.org/g/12345/abc/").is_none());
+    }
+
+    #[test]
+    fn test_parse_gallery_ref_rejects_token_with_spaces_from_trailing_option() {
+        assert!(
+            parse_gallery_ref("https://e-hentai.org/g/12345/abcdef0123 telegraph=on").is_none()
+        );
+    }
+
+    #[test]
+    fn test_split_edl_remaining_detects_trailing_telegraph_on() {
+        let (gallery, telegraph) = split_edl_remaining_and_telegraph(
+            "https://e-hentai.org/g/12345/abcdef0123/ telegraph=on",
+        );
+        assert_eq!(gallery, "https://e-hentai.org/g/12345/abcdef0123/");
+        assert!(telegraph);
+    }
+
+    #[test]
+    fn test_split_edl_remaining_keeps_telegraph_off_disabled() {
+        let (gallery, telegraph) = split_edl_remaining_and_telegraph(
+            "https://e-hentai.org/g/12345/abcdef0123/ telegraph=off",
+        );
+        assert_eq!(gallery, "https://e-hentai.org/g/12345/abcdef0123/");
+        assert!(!telegraph);
+    }
+
+    #[test]
+    fn test_should_reject_telegraph_request_only_when_requested_without_client() {
+        assert!(should_reject_telegraph_request(true, false));
+        assert!(!should_reject_telegraph_request(true, true));
+        assert!(!should_reject_telegraph_request(false, false));
     }
 
     #[test]
