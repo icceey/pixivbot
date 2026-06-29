@@ -24,6 +24,36 @@ pub const SOURCE_SUBSCRIPTION: &str = "subscription";
 pub const SOURCE_DIRECT: &str = "direct";
 
 impl Repo {
+    /// Recover from a failed insert in `enqueue_eh_download` by re-selecting
+    /// and merging into the existing row.  Extracted as a private helper so
+    /// tests can exercise the fallback logic deterministically without relying
+    /// on fragile concurrency.
+    async fn recover_eh_enqueue_after_insert_error(
+        &self,
+        chat_id: i64,
+        gid: i64,
+        token: &str,
+        title: &str,
+        telegraph: bool,
+        source: &str,
+        _db_err: &sea_orm::DbErr,
+    ) -> Result<eh_download_queue::Model> {
+        match eh_download_queue::Entity::find()
+            .filter(eh_download_queue::Column::ChatId.eq(chat_id))
+            .filter(eh_download_queue::Column::Gid.eq(gid))
+            .one(&self.db)
+            .await
+        {
+            Ok(Some(raced)) => {
+                self.merge_eh_download(raced, token, title, telegraph, source)
+                    .await
+            }
+            Ok(None) => anyhow::bail!("Row disappeared after insert conflict"),
+            Err(select_err) => Err(select_err)
+                .context("Failed to re-select after insert conflict"),
+        }
+    }
+
     /// Enqueue a download request. Returns the created/updated model.
     ///
     /// If an entry for the same (chat_id, gid) already exists:
@@ -76,20 +106,10 @@ impl Repo {
             Err(db_err) => {
                 // Race: another caller may have inserted the same (chat_id, gid).
                 // Re-select and merge instead of failing on unique constraint.
-                match eh_download_queue::Entity::find()
-                    .filter(eh_download_queue::Column::ChatId.eq(chat_id))
-                    .filter(eh_download_queue::Column::Gid.eq(gid))
-                    .one(&self.db)
-                    .await
-                {
-                    Ok(Some(raced)) => {
-                        self.merge_eh_download(raced, token, title, telegraph, source)
-                            .await
-                    }
-                    Ok(None) => Err(db_err).context("Failed to enqueue eh download"),
-                    Err(select_err) => Err(select_err)
-                        .context("Failed to re-select after insert conflict"),
-                }
+                self.recover_eh_enqueue_after_insert_error(
+                    chat_id, gid, token, title, telegraph, source, &db_err,
+                )
+                .await
             }
         }
     }
@@ -141,6 +161,7 @@ impl Repo {
                 // blindly overwrite a row that was changed by another worker.
                 let id = current.id;
                 let expected_status = current.status.clone();
+                let expected_source = current.source.clone();
 
                 let result = eh_download_queue::Entity::update_many()
                     .col_expr(
@@ -205,6 +226,7 @@ impl Repo {
                     )
                     .filter(eh_download_queue::Column::Id.eq(id))
                     .filter(eh_download_queue::Column::Status.eq(&expected_status))
+                    .filter(eh_download_queue::Column::Source.eq(&expected_source))
                     .exec(&self.db)
                     .await
                     .context("Failed to reset eh download for re-enqueue")?;
@@ -237,6 +259,7 @@ impl Repo {
             let id = current.id;
             let expected_status = current.status.clone();
             let expected_telegraph = current.telegraph;
+            let expected_source = current.source.clone();
 
             let result = eh_download_queue::Entity::update_many()
                 .col_expr(
@@ -258,6 +281,7 @@ impl Repo {
                 .filter(eh_download_queue::Column::Id.eq(id))
                 .filter(eh_download_queue::Column::Status.eq(&expected_status))
                 .filter(eh_download_queue::Column::Telegraph.eq(expected_telegraph))
+                .filter(eh_download_queue::Column::Source.eq(&expected_source))
                 .exec(&self.db)
                 .await
                 .context("Failed to update eh download in place")?;
@@ -1711,5 +1735,110 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(all.len(), 1);
+    }
+
+    /// When a stale subscription merge races with a direct-source upgrade,
+    /// the CAS source guard prevents the stale snapshot from overwriting
+    /// the direct upgrade.  The retry loop re-reads and recomputes so the
+    /// final source stays `SOURCE_DIRECT`.
+    #[tokio::test]
+    async fn test_merge_source_guard_preserves_direct_upgrade() {
+        let repo = tests_helpers::setup_test_db().await.unwrap();
+
+        // Insert a row with SOURCE_SUBSCRIPTION, status=pending
+        let model = repo
+            .enqueue_eh_download(-100, 80, "tok", "Title", false, SOURCE_SUBSCRIPTION)
+            .await
+            .unwrap();
+        assert_eq!(model.source, SOURCE_SUBSCRIPTION);
+        assert_eq!(model.status, STATUS_PENDING);
+
+        // Snapshot A: the old subscription row
+        let snap_a = Entity::find_by_id(model.id)
+            .one(&repo.db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(snap_a.source, SOURCE_SUBSCRIPTION);
+
+        // Apply a direct upgrade via enqueue (full reset path)
+        let upgraded = repo
+            .enqueue_eh_download(-100, 80, "direct_tok", "Direct Title", false, SOURCE_DIRECT)
+            .await
+            .unwrap();
+        assert_eq!(upgraded.id, model.id);
+        assert_eq!(upgraded.source, SOURCE_DIRECT);
+
+        // Snapshot B: the upgraded row (still pending after reset)
+        let snap_b = Entity::find_by_id(model.id)
+            .one(&repo.db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(snap_b.source, SOURCE_DIRECT);
+
+        // Apply stale subscription merge from snapshot A.
+        // The CAS guard must detect that source changed from SUBSCRIPTION to
+        // DIRECT, fail the update, re-read, and recompute -> source stays DIRECT.
+        let merged = repo
+            .merge_eh_download(snap_a, "stale_tok", "Stale Title", false, SOURCE_SUBSCRIPTION)
+            .await
+            .unwrap();
+        assert_eq!(merged.id, model.id);
+        assert_eq!(
+            merged.source, SOURCE_DIRECT,
+            "stale subscription merge must not overwrite direct upgrade"
+        );
+        // Token may be updated by the stale merge (normal in-place update after
+        // the CAS retry re-reads the row with the correct source).  The key
+        // invariant is that source stays SOURCE_DIRECT.
+        assert_eq!(merged.token, "stale_tok");
+    }
+
+    /// Verify that `recover_eh_enqueue_after_insert_error` reselects the
+    /// existing row and merges it when called after a simulated insert error.
+    /// The existing test only exercised the SELECT-found path before the
+    /// insert; this test exercises the fallback branch through the private
+    /// helper directly.
+    #[tokio::test]
+    async fn test_enqueue_insert_error_reselect_merge_fallback() {
+        let repo = tests_helpers::setup_test_db().await.unwrap();
+
+        // Pre-insert a row so the helper's re-select finds it
+        let now = chrono::Local::now().naive_local();
+        let conflict = eh_download_queue::ActiveModel {
+            chat_id: Set(-100i64),
+            gid: Set(71i64),
+            token: Set("other".to_string()),
+            title: Set("Other".to_string()),
+            telegraph: Set(false),
+            source: Set(SOURCE_SUBSCRIPTION.to_string()),
+            status: Set(STATUS_PENDING.to_string()),
+            file_size: Set(0),
+            error: Set(None),
+            retry_count: Set(0),
+            created_at: Set(now),
+            started_at: Set(None),
+            completed_at: Set(None),
+            ..Default::default()
+        };
+        conflict.insert(&repo.db).await.unwrap();
+
+        // Call the private helper with a synthetic DbErr — the error value
+        // is not inspected, only used for logging in production.
+        let synthetic_err = sea_orm::DbErr::Custom("simulated insert conflict".to_string());
+        let recovered = repo
+            .recover_eh_enqueue_after_insert_error(
+                -100, 71, "real_tok", "Real Title", true, SOURCE_DIRECT, &synthetic_err,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(recovered.chat_id, -100);
+        assert_eq!(recovered.gid, 71);
+        assert_eq!(recovered.token, "real_tok");
+        assert_eq!(recovered.title, "Real Title");
+        assert!(recovered.telegraph, "telegraph should be OR-merged");
+        assert_eq!(recovered.source, SOURCE_DIRECT, "source should be upgraded");
     }
 }
