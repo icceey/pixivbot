@@ -9,6 +9,17 @@ use sea_orm::{
 };
 use tracing::warn;
 
+/// Bundled enqueue request parameters to keep helper signatures manageable
+/// and avoid clippy `too_many_arguments`.
+struct EhEnqueueRequest<'a> {
+    chat_id: i64,
+    gid: i64,
+    token: &'a str,
+    title: &'a str,
+    telegraph: bool,
+    source: &'a str,
+}
+
 /// Status constants for eh_download_queue.
 pub const STATUS_PENDING: &str = "pending";
 pub const STATUS_DOWNLOADING: &str = "downloading";
@@ -30,25 +41,20 @@ impl Repo {
     /// on fragile concurrency.
     async fn recover_eh_enqueue_after_insert_error(
         &self,
-        chat_id: i64,
-        gid: i64,
-        token: &str,
-        title: &str,
-        telegraph: bool,
-        source: &str,
-        _db_err: &sea_orm::DbErr,
+        req: EhEnqueueRequest<'_>,
+        db_err: sea_orm::DbErr,
     ) -> Result<eh_download_queue::Model> {
         match eh_download_queue::Entity::find()
-            .filter(eh_download_queue::Column::ChatId.eq(chat_id))
-            .filter(eh_download_queue::Column::Gid.eq(gid))
+            .filter(eh_download_queue::Column::ChatId.eq(req.chat_id))
+            .filter(eh_download_queue::Column::Gid.eq(req.gid))
             .one(&self.db)
             .await
         {
             Ok(Some(raced)) => {
-                self.merge_eh_download(raced, token, title, telegraph, source)
+                self.merge_eh_download(raced, req.token, req.title, req.telegraph, req.source)
                     .await
             }
-            Ok(None) => anyhow::bail!("Row disappeared after insert conflict"),
+            Ok(None) => Err(db_err).context("Failed to enqueue eh download"),
             Err(select_err) => Err(select_err)
                 .context("Failed to re-select after insert conflict"),
         }
@@ -107,7 +113,15 @@ impl Repo {
                 // Race: another caller may have inserted the same (chat_id, gid).
                 // Re-select and merge instead of failing on unique constraint.
                 self.recover_eh_enqueue_after_insert_error(
-                    chat_id, gid, token, title, telegraph, source, &db_err,
+                    EhEnqueueRequest {
+                        chat_id,
+                        gid,
+                        token,
+                        title,
+                        telegraph,
+                        source,
+                    },
+                    db_err,
                 )
                 .await
             }
@@ -161,6 +175,7 @@ impl Repo {
                 // blindly overwrite a row that was changed by another worker.
                 let id = current.id;
                 let expected_status = current.status.clone();
+                let expected_telegraph = current.telegraph;
                 let expected_source = current.source.clone();
 
                 let result = eh_download_queue::Entity::update_many()
@@ -226,6 +241,7 @@ impl Repo {
                     )
                     .filter(eh_download_queue::Column::Id.eq(id))
                     .filter(eh_download_queue::Column::Status.eq(&expected_status))
+                    .filter(eh_download_queue::Column::Telegraph.eq(expected_telegraph))
                     .filter(eh_download_queue::Column::Source.eq(&expected_source))
                     .exec(&self.db)
                     .await
@@ -1829,7 +1845,15 @@ mod tests {
         let synthetic_err = sea_orm::DbErr::Custom("simulated insert conflict".to_string());
         let recovered = repo
             .recover_eh_enqueue_after_insert_error(
-                -100, 71, "real_tok", "Real Title", true, SOURCE_DIRECT, &synthetic_err,
+                EhEnqueueRequest {
+                    chat_id: -100,
+                    gid: 71,
+                    token: "real_tok",
+                    title: "Real Title",
+                    telegraph: true,
+                    source: SOURCE_DIRECT,
+                },
+                synthetic_err,
             )
             .await
             .unwrap();
@@ -1840,5 +1864,40 @@ mod tests {
         assert_eq!(recovered.title, "Real Title");
         assert!(recovered.telegraph, "telegraph should be OR-merged");
         assert_eq!(recovered.source, SOURCE_DIRECT, "source should be upgraded");
+    }
+
+    /// When re-select after insert conflict returns Ok(None) (row doesn't
+    /// exist at all), the helper must propagate the original insert DbErr
+    /// rather than a generic message.
+    #[tokio::test]
+    async fn test_enqueue_insert_error_reselect_none_preserves_original_error() {
+        let repo = tests_helpers::setup_test_db().await.unwrap();
+
+        // No row exists for (chat_id, gid) — re-select will return Ok(None).
+        let synthetic_err = sea_orm::DbErr::Custom("unique constraint violation".to_string());
+        let err = repo
+            .recover_eh_enqueue_after_insert_error(
+                EhEnqueueRequest {
+                    chat_id: -999,
+                    gid: 999,
+                    token: "tok",
+                    title: "Title",
+                    telegraph: false,
+                    source: SOURCE_DIRECT,
+                },
+                synthetic_err,
+            )
+            .await
+            .unwrap_err();
+
+        let chain = format!("{:#}", err);
+        assert!(
+            chain.contains("unique constraint violation"),
+            "original DbErr should appear in error chain: {chain}"
+        );
+        assert!(
+            chain.contains("Failed to enqueue eh download"),
+            "context message should be present: {chain}"
+        );
     }
 }
