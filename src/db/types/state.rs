@@ -371,6 +371,20 @@ mod tests {
     }
 
     #[test]
+    fn test_eh_tag_state_pending_prevents_cursor_advance() {
+        let mut state = EhTagState::cleared();
+        state.pending_galleries.push(EhPendingGallery {
+            gid: 4,
+            token: "tok4".to_string(),
+            title: "Fourth".to_string(),
+            posted: 400,
+        });
+        state.pending_high_water_ts = 400;
+        assert_eq!(state.latest_posted_ts, 0);
+        assert_eq!(state.pending_galleries.len(), 1);
+    }
+
+    #[test]
     fn test_eh_pending_gallery_roundtrip() {
         let state = EhTagState {
             pushed_gids: vec![1],

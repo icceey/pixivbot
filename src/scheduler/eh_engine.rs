@@ -3,7 +3,7 @@ use crate::config::EhentaiConfig;
 use crate::db::entities::eh_download_queue;
 use crate::db::repo::eh_download_queue::SOURCE_SUBSCRIPTION;
 use crate::db::repo::Repo;
-use crate::db::types::{EhFilter, EhTagState, EhTaskKey, SubscriptionState, TaskType};
+use crate::db::types::{EhFilter, EhPendingGallery, EhTagState, EhTaskKey, SubscriptionState, TaskType};
 use crate::scheduler::helpers::{eh_tag_subscription_state, get_chat_if_should_notify};
 use anyhow::{Context, Result};
 use chrono::Local;
@@ -233,22 +233,84 @@ impl EhEngine {
 
         let sub_filter = sub.eh_filter.as_ref();
         let max_push = self.config.max_push_per_tick;
+        let mut remaining_slots = max_push;
 
-        let new_galleries: Vec<&EhGallery> = galleries
+        // Telegraph gating: only set telegraph if upload token is configured.
+        let telegraph_available = self.config.telegraph_access_token.is_some();
+        let telegraph_default = telegraph_available
+            && (self.config.upload_telegraph
+                || sub_filter.map(|f| f.telegraph).unwrap_or(false));
+
+        // Step 1: Consume pending backlog first (galleries from previous overflow).
+        let mut still_pending = Vec::new();
+        let backlog: Vec<_> = state.pending_galleries.drain(..).collect();
+        for pending in backlog {
+            if remaining_slots == 0 {
+                still_pending.push(pending);
+                continue;
+            }
+            if let Err(e) = self
+                .repo
+                .enqueue_eh_download(
+                    sub.chat_id,
+                    pending.gid as i64,
+                    &pending.token,
+                    &pending.title,
+                    telegraph_default,
+                    SOURCE_SUBSCRIPTION,
+                )
+                .await
+            {
+                warn!(
+                    "Failed to enqueue pending gallery {}: {:#}",
+                    pending.gid, e
+                );
+                continue;
+            }
+            state.add_pushed_gid(pending.gid);
+            remaining_slots -= 1;
+        }
+        state.pending_galleries = still_pending;
+
+        // If we still have pending backlog after consuming up to the cap, save state
+        // and return — do NOT advance cursor until all pending are drained.
+        if !state.pending_galleries.is_empty() {
+            state.trim_pushed(self.config.pushed_cap);
+            self.repo
+                .update_subscription_latest_data(sub.id, Some(SubscriptionState::EhTag(state)))
+                .await
+                .context("Failed to update eh subscription state")?;
+            return Ok(());
+        }
+
+        // Step 2: Pending backlog drained. Now process new filtered galleries.
+        let eligible: Vec<EhPendingGallery> = galleries
             .iter()
             .filter(|g| !state.pushed_gids.contains(&g.gid))
             .filter(|g| sub_filter.map(|f| f.matches(g)).unwrap_or(true))
+            .map(|g| EhPendingGallery {
+                gid: g.gid,
+                token: g.token.clone(),
+                title: g.title.clone(),
+                posted: g.posted,
+            })
             .collect();
 
-        let to_enqueue: Vec<&EhGallery> = new_galleries.into_iter().take(max_push).collect();
+        // Record the high-water mark: max posted timestamp among eligible galleries
+        // this tick. If some overflow, this prevents cursor advance beyond unconsumed.
+        let max_eligible_posted = eligible
+            .iter()
+            .map(|g| g.posted)
+            .max()
+            .unwrap_or(state.pending_high_water_ts);
+        state.pending_high_water_ts = state.pending_high_water_ts.max(max_eligible_posted);
 
-        // Enqueue download requests FIRST, then update state with only successfully
-        // enqueued GIDs. This prevents silent gallery loss if enqueue fails — the GID
-        // won't be in pushed_gids, so it will be retried on the next tick.
-        let telegraph_default =
-            self.config.upload_telegraph || sub_filter.map(|f| f.telegraph).unwrap_or(false);
-
-        for gallery in &to_enqueue {
+        for gallery in eligible.into_iter() {
+            if remaining_slots == 0 {
+                // Overflow: store in pending backlog for next tick.
+                state.pending_galleries.push(gallery);
+                continue;
+            }
             if let Err(e) = self
                 .repo
                 .enqueue_eh_download(
@@ -265,14 +327,21 @@ impl EhEngine {
                     "Failed to enqueue download for gallery {}: {:#}",
                     gallery.gid, e
                 );
-                continue; // Skip this gallery — don't add to pushed_gids
+                continue;
             }
-            // Only mark as pushed if enqueue succeeded
             state.add_pushed_gid(gallery.gid);
-            if gallery.posted > state.latest_posted_ts {
-                state.latest_posted_ts = gallery.posted;
-            }
+            state.latest_posted_ts = state.latest_posted_ts.max(gallery.posted);
+            remaining_slots -= 1;
         }
+
+        // Step 3: If no overflow, safely advance cursor past the entire batch.
+        if state.pending_galleries.is_empty() {
+            state.latest_posted_ts = state
+                .latest_posted_ts
+                .max(state.pending_high_water_ts);
+            state.pending_high_water_ts = 0;
+        }
+
         state.trim_pushed(self.config.pushed_cap);
 
         self.repo
@@ -868,6 +937,7 @@ mod integration_tests {
     use crate::cache::FileCacheManager;
     use crate::config::EhentaiConfig;
     use crate::db::entities::eh_download_queue;
+    use crate::db::entities::tasks;
     use crate::db::repo::eh_download_queue::{SOURCE_DIRECT, STATUS_DOWNLOADED, STATUS_UPLOADED};
     use crate::db::repo::tests_helpers;
     use crate::pixiv::downloader::Downloader;
@@ -1067,6 +1137,115 @@ mod integration_tests {
             ..Default::default()
         };
         active.insert(repo.db()).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_collect_overflow_pending_enqueued_on_next_tick() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        setup_chat(&repo, -100, true).await;
+
+        // Create task and subscription
+        let task_key = crate::db::types::EhTaskKey::new(
+            "artist:test",
+            0,
+            &crate::db::types::EhFilter::new(),
+        );
+        let task_value = task_key.to_task_value();
+        let task = repo
+            .get_or_create_task(
+                crate::db::types::TaskType::Ehentai,
+                task_value.clone(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Make the task immediately available (get_or_create_task sets next_poll_at 60s in future)
+        let task_id = task.id;
+        let mut active: tasks::ActiveModel = task.into();
+        active.next_poll_at = Set(chrono::Local::now().naive_local() - chrono::Duration::seconds(1));
+        active
+            .update(repo.db())
+            .await
+            .unwrap();
+
+        repo.upsert_eh_subscription(
+            -100,
+            task_id,
+            crate::db::types::TagFilter::default(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let eh_server = MockServer::start().await;
+        let _tg_server = MockServer::start().await;
+
+        mock_eh_search_with_four_galleries(&eh_server).await;
+        mock_eh_metadata_for_four_galleries(&eh_server).await;
+
+        let config = Arc::new(make_config());
+        let engine = EhEngine::new(
+            Arc::clone(&repo),
+            make_eh_client(&eh_server),
+            Arc::clone(&config),
+            60,
+        );
+        engine.tick().await.unwrap();
+
+        let queued_after_first = repo.count_pending_eh_downloads().await.unwrap();
+        assert_eq!(
+            queued_after_first, 3,
+            "first tick should enqueue 3 galleries (max_push_per_tick=3)"
+        );
+
+        // Second tick: should consume the pending backlog (4th gallery) without re-fetching
+        // from cursor. The 4th gallery was overflow, not silently dropped.
+        // Reset next_poll_at to make the task available again.
+        let task_model = repo
+            .get_task_by_type_value(crate::db::types::TaskType::Ehentai, &task_value)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut active: tasks::ActiveModel = task_model.into();
+        active.next_poll_at = Set(chrono::Local::now().naive_local() - chrono::Duration::seconds(1));
+        active.update(repo.db()).await.unwrap();
+
+        engine.tick().await.unwrap();
+        let queued_after_second = repo.count_pending_eh_downloads().await.unwrap();
+        assert_eq!(
+            queued_after_second, 4,
+            "second tick should drain pending backlog: 4 total enqueued"
+        );
+    }
+
+    async fn mock_eh_search_with_four_galleries(server: &MockServer) {
+        let html = r#"
+        <div class="gl1t"><a href="https://e-hentai.org/g/1001/aaaaaaaaaa/"><div class="glink">Gallery 1</div></a></div>
+        <div class="gl1t"><a href="https://e-hentai.org/g/1002/bbbbbbbbbb/"><div class="glink">Gallery 2</div></a></div>
+        <div class="gl1t"><a href="https://e-hentai.org/g/1003/cccccccccc/"><div class="glink">Gallery 3</div></a></div>
+        <div class="gl1t"><a href="https://e-hentai.org/g/1004/dddddddddd/"><div class="glink">Gallery 4</div></a></div>
+        "#;
+        Mock::given(method("GET"))
+            .and(path("/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(html))
+            .mount(server)
+            .await;
+    }
+
+    async fn mock_eh_metadata_for_four_galleries(server: &MockServer) {
+        Mock::given(method("POST"))
+            .and(path("/api.php"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "gmetadata": [
+                    {"gid": 1001, "token": "aaaaaaaaaa", "title": "Gallery 1", "title_jpn": null, "category": "Doujinshi", "thumb": "https://ehgt.org/t/1.jpg", "uploader": "tester", "posted": "100", "filecount": "10", "filesize": 1000, "expunged": false, "rating": "4.0", "tags": ["artist:test"]},
+                    {"gid": 1002, "token": "bbbbbbbbbb", "title": "Gallery 2", "title_jpn": null, "category": "Doujinshi", "thumb": "https://ehgt.org/t/2.jpg", "uploader": "tester", "posted": "200", "filecount": "10", "filesize": 1000, "expunged": false, "rating": "4.0", "tags": ["artist:test"]},
+                    {"gid": 1003, "token": "cccccccccc", "title": "Gallery 3", "title_jpn": null, "category": "Doujinshi", "thumb": "https://ehgt.org/t/3.jpg", "uploader": "tester", "posted": "300", "filecount": "10", "filesize": 1000, "expunged": false, "rating": "4.0", "tags": ["artist:test"]},
+                    {"gid": 1004, "token": "dddddddddd", "title": "Gallery 4", "title_jpn": null, "category": "Doujinshi", "thumb": "https://ehgt.org/t/4.jpg", "uploader": "tester", "posted": "400", "filecount": "10", "filesize": 1000, "expunged": false, "rating": "4.0", "tags": ["artist:test"]}
+                ]
+            })))
+            .mount(server)
+            .await;
     }
 
     // === Download Worker Tests ===
