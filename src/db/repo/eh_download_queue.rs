@@ -1,7 +1,7 @@
 use super::Repo;
 use crate::db::entities::eh_download_queue;
 use anyhow::{Context, Result};
-use chrono::{Local, Utc};
+use chrono::Local;
 use sea_orm::prelude::DateTime;
 use sea_orm::sea_query::Expr;
 use sea_orm::{
@@ -189,9 +189,10 @@ impl Repo {
         }
     }
 
-    /// Mark a download as completed successfully.
+    /// Mark a publish as completed successfully (archive and/or Telegraph sent).
+    /// Only allowed when current status is `STATUS_PUBLISHING`.
     /// Preserves `completed_at` from the download stage if already set;
-    /// sets it to now only if it hasn't been set yet (e.g. direct pending→done path).
+    /// sets it to now only if it hasn't been set yet.
     pub async fn mark_eh_download_done(
         &self,
         id: i32,
@@ -205,15 +206,40 @@ impl Repo {
 
         let now = Local::now().naive_local();
         let completed_at = entry.completed_at.unwrap_or(now);
-        let mut active: eh_download_queue::ActiveModel = entry.into();
-        active.status = Set(STATUS_DONE.to_string());
-        active.file_size = Set(file_size);
-        active.completed_at = Set(Some(completed_at));
-        active.error = Set(None);
-        active
-            .update(&self.db)
+
+        let result = eh_download_queue::Entity::update_many()
+            .col_expr(
+                eh_download_queue::Column::Status,
+                Expr::value(STATUS_DONE),
+            )
+            .col_expr(eh_download_queue::Column::FileSize, Expr::value(file_size))
+            .col_expr(
+                eh_download_queue::Column::CompletedAt,
+                Expr::value(completed_at),
+            )
+            .col_expr(
+                eh_download_queue::Column::Error,
+                Expr::value(None::<String>),
+            )
+            .filter(eh_download_queue::Column::Id.eq(id))
+            .filter(eh_download_queue::Column::Status.eq(STATUS_PUBLISHING))
+            .exec(&self.db)
             .await
-            .context("Failed to mark eh download as done")
+            .context("Failed to mark eh download as done")?;
+
+        if result.rows_affected != 1 {
+            anyhow::bail!(
+                "Cannot mark EH download {} as done: expected status '{}', but it was changed by another worker",
+                id,
+                STATUS_PUBLISHING
+            );
+        }
+
+        let model = eh_download_queue::Entity::find_by_id(id)
+            .one(&self.db)
+            .await?
+            .context("Entry disappeared after mark done")?;
+        Ok(model)
     }
 
     /// Mark a download as failed.
@@ -383,54 +409,105 @@ impl Repo {
     }
 
     /// Mark a download as downloaded (ZIP saved to cache). Transitions to `downloaded` status.
+    /// Only allowed when current status is `STATUS_DOWNLOADING`.
     pub async fn mark_eh_download_downloaded(
         &self,
         id: i32,
         file_size: i64,
         zip_path: &str,
     ) -> Result<eh_download_queue::Model> {
-        let entry = eh_download_queue::Entity::find_by_id(id)
-            .one(&self.db)
-            .await
-            .context("Failed to fetch eh download")?
-            .ok_or_else(|| anyhow::anyhow!("EH download {} not found", id))?;
-
         let now = Local::now().naive_local();
-        let mut active: eh_download_queue::ActiveModel = entry.into();
-        active.status = Set(STATUS_DOWNLOADED.to_string());
-        active.file_size = Set(file_size);
-        active.zip_path = Set(Some(zip_path.to_string()));
-        active.completed_at = Set(Some(now));
-        active.started_at = Set(None);
-        active.error = Set(None);
-        active.next_retry_at = Set(None);
-        active
-            .update(&self.db)
+
+        let result = eh_download_queue::Entity::update_many()
+            .col_expr(
+                eh_download_queue::Column::Status,
+                Expr::value(STATUS_DOWNLOADED),
+            )
+            .col_expr(eh_download_queue::Column::FileSize, Expr::value(file_size))
+            .col_expr(
+                eh_download_queue::Column::ZipPath,
+                Expr::value(Some(zip_path.to_string())),
+            )
+            .col_expr(
+                eh_download_queue::Column::CompletedAt,
+                Expr::value(now),
+            )
+            .col_expr(
+                eh_download_queue::Column::StartedAt,
+                Expr::value(None::<DateTime>),
+            )
+            .col_expr(
+                eh_download_queue::Column::Error,
+                Expr::value(None::<String>),
+            )
+            .col_expr(
+                eh_download_queue::Column::NextRetryAt,
+                Expr::value(None::<DateTime>),
+            )
+            .filter(eh_download_queue::Column::Id.eq(id))
+            .filter(eh_download_queue::Column::Status.eq(STATUS_DOWNLOADING))
+            .exec(&self.db)
             .await
-            .context("Failed to mark eh download as downloaded")
+            .context("Failed to mark eh download as downloaded")?;
+
+        if result.rows_affected != 1 {
+            anyhow::bail!(
+                "Cannot mark EH download {} as downloaded: expected status '{}', but it was changed by another worker",
+                id,
+                STATUS_DOWNLOADING
+            );
+        }
+
+        let model = eh_download_queue::Entity::find_by_id(id)
+            .one(&self.db)
+            .await?
+            .context("Entry disappeared after mark downloaded")?;
+        Ok(model)
     }
 
     /// Mark a download as uploaded (Telegraph page created). Transitions to `uploaded` status.
+    /// Only allowed when current status is `STATUS_UPLOADING`.
     pub async fn mark_eh_download_uploaded(
         &self,
         id: i32,
         telegraph_url: &str,
     ) -> Result<eh_download_queue::Model> {
-        let entry = eh_download_queue::Entity::find_by_id(id)
-            .one(&self.db)
+        let result = eh_download_queue::Entity::update_many()
+            .col_expr(
+                eh_download_queue::Column::Status,
+                Expr::value(STATUS_UPLOADED),
+            )
+            .col_expr(
+                eh_download_queue::Column::TelegraphUrl,
+                Expr::value(Some(telegraph_url.to_string())),
+            )
+            .col_expr(
+                eh_download_queue::Column::Error,
+                Expr::value(None::<String>),
+            )
+            .col_expr(
+                eh_download_queue::Column::NextRetryAt,
+                Expr::value(None::<DateTime>),
+            )
+            .filter(eh_download_queue::Column::Id.eq(id))
+            .filter(eh_download_queue::Column::Status.eq(STATUS_UPLOADING))
+            .exec(&self.db)
             .await
-            .context("Failed to fetch eh download")?
-            .ok_or_else(|| anyhow::anyhow!("EH download {} not found", id))?;
+            .context("Failed to mark eh download as uploaded")?;
 
-        let mut active: eh_download_queue::ActiveModel = entry.into();
-        active.status = Set(STATUS_UPLOADED.to_string());
-        active.telegraph_url = Set(Some(telegraph_url.to_string()));
-        active.error = Set(None);
-        active.next_retry_at = Set(None);
-        active
-            .update(&self.db)
-            .await
-            .context("Failed to mark eh download as uploaded")
+        if result.rows_affected != 1 {
+            anyhow::bail!(
+                "Cannot mark EH download {} as uploaded: expected status '{}', but it was changed by another worker",
+                id,
+                STATUS_UPLOADING
+            );
+        }
+
+        let model = eh_download_queue::Entity::find_by_id(id)
+            .one(&self.db)
+            .await?
+            .context("Entry disappeared after mark uploaded")?;
+        Ok(model)
     }
 
     /// Get next entry for the download stage: status=pending, next_retry_at is NULL or <= now.
@@ -453,7 +530,8 @@ impl Repo {
             return Ok(None);
         };
 
-        // Atomic claim: only flip if still pending (guards against concurrent workers)
+        // Atomic claim: only flip if still pending with valid next_retry_at
+        // (guards against concurrent workers and defers)
         let result = eh_download_queue::Entity::update_many()
             .col_expr(
                 eh_download_queue::Column::Status,
@@ -466,6 +544,11 @@ impl Repo {
             )
             .filter(eh_download_queue::Column::Id.eq(model.id))
             .filter(eh_download_queue::Column::Status.eq(STATUS_PENDING))
+            .filter(
+                sea_orm::Condition::any()
+                    .add(eh_download_queue::Column::NextRetryAt.is_null())
+                    .add(eh_download_queue::Column::NextRetryAt.lte(now)),
+            )
             .exec(&self.db)
             .await
             .context("Failed to atomically claim download entry")?;
@@ -503,6 +586,7 @@ impl Repo {
             return Ok(None);
         };
 
+        // Atomic claim: only flip if still downloaded+telegraph with valid next_retry_at
         let result = eh_download_queue::Entity::update_many()
             .col_expr(
                 eh_download_queue::Column::Status,
@@ -515,6 +599,12 @@ impl Repo {
             )
             .filter(eh_download_queue::Column::Id.eq(model.id))
             .filter(eh_download_queue::Column::Status.eq(STATUS_DOWNLOADED))
+            .filter(eh_download_queue::Column::Telegraph.eq(true))
+            .filter(
+                sea_orm::Condition::any()
+                    .add(eh_download_queue::Column::NextRetryAt.is_null())
+                    .add(eh_download_queue::Column::NextRetryAt.lte(now)),
+            )
             .exec(&self.db)
             .await
             .context("Failed to atomically claim upload entry")?;
@@ -558,8 +648,23 @@ impl Repo {
             return Ok(None);
         };
 
-        // Atomically claim: only flip if status is still the original
+        // Atomically claim: only flip if status is still the original AND next_retry_at is valid.
+        // Also guard against row changes between select and update (telegraph toggle, re-enqueue).
         let original_status = model.status.clone();
+        let status_filter = if original_status == STATUS_DOWNLOADED {
+            // Must still be downloaded with telegraph=false (prevent claim of upgraded row)
+            sea_orm::Condition::all()
+                .add(eh_download_queue::Column::Status.eq(STATUS_DOWNLOADED))
+                .add(eh_download_queue::Column::Telegraph.eq(false))
+        } else {
+            // Must still be uploaded
+            sea_orm::Condition::all()
+                .add(eh_download_queue::Column::Status.eq(STATUS_UPLOADED))
+        };
+        let retry_filter = sea_orm::Condition::any()
+            .add(eh_download_queue::Column::NextRetryAt.is_null())
+            .add(eh_download_queue::Column::NextRetryAt.lte(now));
+
         let result = eh_download_queue::Entity::update_many()
             .col_expr(
                 eh_download_queue::Column::Status,
@@ -571,7 +676,8 @@ impl Repo {
                 Expr::value(None::<DateTime>),
             )
             .filter(eh_download_queue::Column::Id.eq(model.id))
-            .filter(eh_download_queue::Column::Status.eq(&original_status))
+            .filter(status_filter)
+            .filter(retry_filter)
             .exec(&self.db)
             .await
             .context("Failed to atomically claim publish entry")?;
@@ -588,55 +694,107 @@ impl Repo {
     }
 
     /// Mark the archive ZIP as sent (publish stage progress marker).
+    /// Only updates rows currently in `STATUS_PUBLISHING`.
     pub async fn mark_eh_archive_sent(&self, id: i32) -> Result<()> {
-        eh_download_queue::Entity::update_many()
+        let result = eh_download_queue::Entity::update_many()
             .col_expr(
                 eh_download_queue::Column::ArchiveSentAt,
-                Expr::value(Utc::now().naive_utc()),
+                Expr::value(Local::now().naive_local()),
             )
             .filter(eh_download_queue::Column::Id.eq(id))
+            .filter(eh_download_queue::Column::Status.eq(STATUS_PUBLISHING))
             .exec(&self.db)
             .await?;
+
+        if result.rows_affected != 1 {
+            anyhow::bail!(
+                "Cannot mark archive sent for EH download {}: expected status '{}', but it was changed",
+                id,
+                STATUS_PUBLISHING
+            );
+        }
         Ok(())
     }
 
     /// Mark the Telegraph link as sent (publish stage progress marker).
+    /// Only updates rows currently in `STATUS_PUBLISHING`.
     #[allow(dead_code)]
     pub async fn mark_eh_telegraph_sent(&self, id: i32) -> Result<()> {
-        eh_download_queue::Entity::update_many()
+        let result = eh_download_queue::Entity::update_many()
             .col_expr(
                 eh_download_queue::Column::TelegraphSentAt,
-                Expr::value(Utc::now().naive_utc()),
+                Expr::value(Local::now().naive_local()),
             )
             .filter(eh_download_queue::Column::Id.eq(id))
+            .filter(eh_download_queue::Column::Status.eq(STATUS_PUBLISHING))
             .exec(&self.db)
             .await?;
+
+        if result.rows_affected != 1 {
+            anyhow::bail!(
+                "Cannot mark telegraph sent for EH download {}: expected status '{}', but it was changed",
+                id,
+                STATUS_PUBLISHING
+            );
+        }
         Ok(())
     }
 
     /// Defer an entry: set status to `target_status` and delay next retry by `delay_secs`.
     /// Does NOT increment `retry_count` and does NOT set `error`.
+    ///
+    /// Legal target statuses: `STATUS_PENDING`, `STATUS_DOWNLOADED`, `STATUS_UPLOADED`.
+    /// Current-status guards:
+    /// - target `STATUS_PENDING`: current must be `STATUS_DOWNLOADING`.
+    /// - target `STATUS_DOWNLOADED`: current must be `STATUS_UPLOADING` or `STATUS_PUBLISHING`.
+    /// - target `STATUS_UPLOADED`: current must be `STATUS_PUBLISHING`.
     pub async fn defer_eh_download(
         &self,
         id: i32,
         target_status: &str,
         delay_secs: i64,
     ) -> Result<()> {
-        eh_download_queue::Entity::update_many()
+        let current_filter = match target_status {
+            STATUS_PENDING => eh_download_queue::Column::Status.eq(STATUS_DOWNLOADING),
+            STATUS_DOWNLOADED => eh_download_queue::Column::Status
+                .is_in([STATUS_UPLOADING, STATUS_PUBLISHING]),
+            STATUS_UPLOADED => eh_download_queue::Column::Status.eq(STATUS_PUBLISHING),
+            _ => anyhow::bail!(
+                "defer_eh_download: invalid target status '{}' (expected pending, downloaded, or uploaded)",
+                target_status
+            ),
+        };
+
+        let result = eh_download_queue::Entity::update_many()
             .col_expr(eh_download_queue::Column::Status, Expr::value(target_status))
             .col_expr(
                 eh_download_queue::Column::NextRetryAt,
                 Expr::value(Local::now().naive_local() + chrono::Duration::seconds(delay_secs)),
             )
             .filter(eh_download_queue::Column::Id.eq(id))
+            .filter(current_filter)
             .exec(&self.db)
             .await?;
+
+        if result.rows_affected != 1 {
+            anyhow::bail!(
+                "Cannot defer EH download {} to '{}': expected in-flight status, but it was changed by another worker",
+                id,
+                target_status
+            );
+        }
         Ok(())
     }
 
     /// Schedule a retry for an entry: set status back to target_status, increment retry_count,
     /// set next_retry_at to now + backoff. If retry_count exceeds max, set status=failed.
     /// Returns (model, is_permanent_failure).
+    ///
+    /// CAS guard: only updates from the expected in-flight status for the given target:
+    /// - target `STATUS_PENDING`: current must be `STATUS_DOWNLOADING`.
+    /// - target `STATUS_DOWNLOADED`: current may be `STATUS_UPLOADING` or `STATUS_PUBLISHING`.
+    /// - target `STATUS_UPLOADED`: current must be `STATUS_PUBLISHING`.
+    /// - any other target is an error.
     pub async fn schedule_eh_retry(
         &self,
         id: i32,
@@ -654,23 +812,90 @@ impl Repo {
         let is_permanent = new_retry_count > max_retry_count as i32;
         let now = Local::now().naive_local();
 
-        let mut active: eh_download_queue::ActiveModel = entry.into();
         if is_permanent {
-            active.status = Set(STATUS_FAILED.to_string());
-            active.completed_at = Set(Some(now));
-        } else {
-            let delay = Self::backoff_delay_secs(new_retry_count);
-            active.status = Set(target_status.to_string());
-            active.next_retry_at = Set(Some(now + chrono::Duration::seconds(delay)));
-            active.started_at = Set(None);
+            // Permanent failure: no CAS needed — just mark failed.
+            let _result = eh_download_queue::Entity::update_many()
+                .col_expr(
+                    eh_download_queue::Column::Status,
+                    Expr::value(STATUS_FAILED),
+                )
+                .col_expr(
+                    eh_download_queue::Column::CompletedAt,
+                    Expr::value(now),
+                )
+                .col_expr(
+                    eh_download_queue::Column::Error,
+                    Expr::value(Some(error.to_string())),
+                )
+                .col_expr(
+                    eh_download_queue::Column::RetryCount,
+                    Expr::value(new_retry_count),
+                )
+                .filter(eh_download_queue::Column::Id.eq(id))
+                .exec(&self.db)
+                .await
+                .context("Failed to schedule retry (permanent)")?;
+
+            let model = eh_download_queue::Entity::find_by_id(id)
+                .one(&self.db)
+                .await?
+                .context("Entry disappeared after retry")?;
+            return Ok((model, true));
         }
-        active.error = Set(Some(error.to_string()));
-        active.retry_count = Set(new_retry_count);
-        let model = active
-            .update(&self.db)
+
+        // Determine the valid current-status filter for the target.
+        let current_filter = match target_status {
+            STATUS_PENDING => eh_download_queue::Column::Status.eq(STATUS_DOWNLOADING),
+            STATUS_DOWNLOADED => eh_download_queue::Column::Status
+                .is_in([STATUS_UPLOADING, STATUS_PUBLISHING]),
+            STATUS_UPLOADED => eh_download_queue::Column::Status.eq(STATUS_PUBLISHING),
+            _ => anyhow::bail!(
+                "schedule_eh_retry: invalid target status '{}'",
+                target_status
+            ),
+        };
+
+        let delay = Self::backoff_delay_secs(new_retry_count);
+        let result = eh_download_queue::Entity::update_many()
+            .col_expr(
+                eh_download_queue::Column::Status,
+                Expr::value(target_status),
+            )
+            .col_expr(
+                eh_download_queue::Column::NextRetryAt,
+                Expr::value(now + chrono::Duration::seconds(delay)),
+            )
+            .col_expr(
+                eh_download_queue::Column::StartedAt,
+                Expr::value(None::<DateTime>),
+            )
+            .col_expr(
+                eh_download_queue::Column::Error,
+                Expr::value(Some(error.to_string())),
+            )
+            .col_expr(
+                eh_download_queue::Column::RetryCount,
+                Expr::value(new_retry_count),
+            )
+            .filter(eh_download_queue::Column::Id.eq(id))
+            .filter(current_filter)
+            .exec(&self.db)
             .await
             .context("Failed to schedule retry")?;
-        Ok((model, is_permanent))
+
+        if result.rows_affected != 1 {
+            anyhow::bail!(
+                "Cannot schedule retry for EH download {} to '{}': expected in-flight status, but it was changed by another worker",
+                id,
+                target_status
+            );
+        }
+
+        let model = eh_download_queue::Entity::find_by_id(id)
+            .one(&self.db)
+            .await?
+            .context("Entry disappeared after retry")?;
+        Ok((model, false))
     }
 
     /// Delete ZIP files in the cache dir that have no corresponding queue entry
@@ -717,6 +942,151 @@ mod tests {
     use crate::db::repo::tests_helpers;
     use chrono::Utc;
     use sea_orm::sea_query::Expr;
+
+    #[tokio::test]
+    async fn test_reenqueue_during_downloading_blocks_stale_download_completion() {
+        let repo = tests_helpers::setup_test_db().await.unwrap();
+        let model = repo
+            .enqueue_eh_download(-100, 40, "tok", "Title", false, SOURCE_SUBSCRIPTION)
+            .await
+            .unwrap();
+
+        // Claim for download (status -> downloading)
+        let claimed = repo.get_next_for_download().await.unwrap().unwrap();
+        assert_eq!(claimed.id, model.id);
+        assert_eq!(claimed.status, STATUS_DOWNLOADING);
+
+        // Re-enqueue with source upgrade causes full reset (status -> pending)
+        let reset = repo
+            .enqueue_eh_download(-100, 40, "new", "New", false, SOURCE_DIRECT)
+            .await
+            .unwrap();
+        assert_eq!(reset.id, model.id);
+        assert_eq!(reset.status, STATUS_PENDING);
+
+        // Stale worker tries to mark the old claimed row as downloaded — must fail
+        let err = repo
+            .mark_eh_download_downloaded(claimed.id, 9999, "/tmp/40.zip")
+            .await;
+        assert!(err.is_err(), "stale downloaded completion should be blocked");
+
+        // Verify final state is still pending, not overwritten
+        let final_row = Entity::find_by_id(model.id)
+            .one(&repo.db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(final_row.status, STATUS_PENDING);
+        assert_ne!(final_row.file_size, 9999);
+    }
+
+    #[tokio::test]
+    async fn test_publish_claim_requires_telegraph_false_for_downloaded() {
+        let repo = tests_helpers::setup_test_db().await.unwrap();
+        let model = repo
+            .enqueue_eh_download(-100, 45, "tok", "Title", false, SOURCE_DIRECT)
+            .await
+            .unwrap();
+
+        // Download stage: claim -> downloading -> downloaded
+        let claimed = repo.get_next_for_download().await.unwrap().unwrap();
+        assert_eq!(claimed.id, model.id);
+        repo.mark_eh_download_downloaded(model.id, 5000, "/tmp/45.zip")
+            .await
+            .unwrap();
+
+        // Row is now downloaded, telegraph=false — publish should claim it
+        let pub_claimed = repo.get_next_for_publish().await.unwrap().unwrap();
+        assert_eq!(pub_claimed.id, model.id);
+        assert_eq!(pub_claimed.status, STATUS_PUBLISHING);
+        // Reset back to downloaded for the next check
+        Entity::update_many()
+            .col_expr(Column::Status, Expr::value(STATUS_DOWNLOADED))
+            .col_expr(Column::Telegraph, Expr::value(true))
+            .filter(Column::Id.eq(model.id))
+            .exec(&repo.db)
+            .await
+            .unwrap();
+
+        // Now row is downloaded, telegraph=true — publish should NOT claim it
+        let none = repo.get_next_for_publish().await.unwrap();
+        assert!(
+            none.is_none(),
+            "publish should not claim downloaded row with telegraph=true"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_marker_methods_require_publishing_status() {
+        let repo = tests_helpers::setup_test_db().await.unwrap();
+        let model = repo
+            .enqueue_eh_download(-100, 50, "tok", "Title", false, SOURCE_DIRECT)
+            .await
+            .unwrap();
+
+        // Row is pending — archive marker should fail
+        let err = repo.mark_eh_archive_sent(model.id).await;
+        assert!(
+            err.is_err(),
+            "mark_eh_archive_sent should fail on non-publishing row"
+        );
+
+        // Telegraph marker should also fail
+        let err = repo.mark_eh_telegraph_sent(model.id).await;
+        assert!(
+            err.is_err(),
+            "mark_eh_telegraph_sent should fail on non-publishing row"
+        );
+
+        // Move to publishing
+        Entity::update_many()
+            .col_expr(Column::Status, Expr::value(STATUS_PUBLISHING))
+            .filter(Column::Id.eq(model.id))
+            .exec(&repo.db)
+            .await
+            .unwrap();
+
+        // Now markers should succeed
+        repo.mark_eh_archive_sent(model.id).await.unwrap();
+        repo.mark_eh_telegraph_sent(model.id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_defer_rejects_invalid_status_transition() {
+        let repo = tests_helpers::setup_test_db().await.unwrap();
+        let model = repo
+            .enqueue_eh_download(-100, 55, "tok", "Title", false, SOURCE_DIRECT)
+            .await
+            .unwrap();
+
+        // Defer from pending to publishing — invalid (not an in-flight status)
+        let err = repo
+            .defer_eh_download(model.id, STATUS_PUBLISHING, 60)
+            .await;
+        assert!(
+            err.is_err(),
+            "defer to publishing from pending should fail"
+        );
+
+        // Defer from pending to failed — invalid (not a legal target)
+        let err = repo
+            .defer_eh_download(model.id, STATUS_FAILED, 60)
+            .await;
+        assert!(
+            err.is_err(),
+            "defer to failed should be rejected as invalid target"
+        );
+
+        // Defer from pending to pending — invalid (must be from downloading)
+        let err = repo
+            .defer_eh_download(model.id, STATUS_PENDING, 60)
+            .await;
+        assert!(
+            err.is_err(),
+            "defer to pending from pending should fail (must be from downloading)"
+        );
+    }
+
 
     #[tokio::test]
     async fn test_enqueue_merges_telegraph_and_direct_source() {
@@ -775,10 +1145,44 @@ mod tests {
             .enqueue_eh_download(-100, 20, "tok", "Title", false, SOURCE_DIRECT)
             .await
             .unwrap();
-        repo.mark_eh_archive_sent(model.id).await.unwrap();
-        repo.defer_eh_download(model.id, STATUS_PUBLISHING, 60)
+
+        // Move to publishing via the normal pipeline so CAS guards pass.
+        // download: claim -> downloading -> downloaded
+        let claimed = repo.get_next_for_download().await.unwrap().unwrap();
+        assert_eq!(claimed.id, model.id);
+        repo.mark_eh_download_downloaded(model.id, 5000, "/tmp/20.zip")
             .await
             .unwrap();
+
+        // Simulate upload: set telegraph_url so publish claims from uploaded branch
+        Entity::update_many()
+            .col_expr(Column::TelegraphUrl, Expr::value(Some("https://telegra.ph/20".to_string())))
+            .col_expr(Column::Status, Expr::value(STATUS_UPLOADED))
+            .filter(Column::Id.eq(model.id))
+            .exec(&repo.db)
+            .await
+            .unwrap();
+
+        // Claim for publish -> publishing
+        let pub_claimed = repo.get_next_for_publish().await.unwrap().unwrap();
+        assert_eq!(pub_claimed.id, model.id);
+        assert_eq!(pub_claimed.status, STATUS_PUBLISHING);
+
+        // Mark archive sent while publishing
+        repo.mark_eh_archive_sent(model.id).await.unwrap();
+
+        // Defer back to publishing (simulates stale worker)
+        repo.defer_eh_download(model.id, STATUS_UPLOADED, 60)
+            .await
+            .unwrap();
+        // Move back to publishing manually for reset
+        Entity::update_many()
+            .col_expr(Column::Status, Expr::value(STATUS_PUBLISHING))
+            .filter(Column::Id.eq(model.id))
+            .exec(&repo.db)
+            .await
+            .unwrap();
+
         repo.reset_stale_eh_downloads().await.unwrap();
         let preserved = Entity::find_by_id(model.id)
             .one(&repo.db)
@@ -805,6 +1209,11 @@ mod tests {
             .enqueue_eh_download(-100, 30, "tok", "Title", false, SOURCE_DIRECT)
             .await
             .unwrap();
+        // Claim to downloading so defer-to-pending passes the CAS guard.
+        let claimed = repo.get_next_for_download().await.unwrap().unwrap();
+        assert_eq!(claimed.id, model.id);
+        assert_eq!(claimed.status, STATUS_DOWNLOADING);
+
         repo.defer_eh_download(model.id, STATUS_PENDING, 60)
             .await
             .unwrap();
@@ -825,6 +1234,9 @@ mod tests {
             .enqueue_eh_download(-100, 35, "tok", "Title", false, SOURCE_DIRECT)
             .await
             .unwrap();
+        // Claim to downloading so defer-to-pending passes the CAS guard.
+        let claimed = repo.get_next_for_download().await.unwrap().unwrap();
+        assert_eq!(claimed.id, model.id);
 
         // Defer with a long delay — the item should not be picked up
         repo.defer_eh_download(model.id, STATUS_PENDING, 3600)
@@ -886,7 +1298,18 @@ mod tests {
             .await
             .unwrap();
 
-        repo.get_next_pending_eh_download().await.unwrap();
+        // Download stage: claim -> downloading -> downloaded
+        let claimed = repo.get_next_for_download().await.unwrap().unwrap();
+        assert_eq!(claimed.id, model.id);
+        repo.mark_eh_download_downloaded(model.id, 50000, "/tmp/1.zip")
+            .await
+            .unwrap();
+
+        // Publish stage: claim -> publishing -> done
+        let pub_claimed = repo.get_next_for_publish().await.unwrap().unwrap();
+        assert_eq!(pub_claimed.id, model.id);
+        assert_eq!(pub_claimed.status, STATUS_PUBLISHING);
+
         let done = repo.mark_eh_download_done(model.id, 50000).await.unwrap();
 
         assert_eq!(done.status, STATUS_DONE);
@@ -920,19 +1343,31 @@ mod tests {
     async fn test_downloaded_bytes_in_window() {
         let repo = tests_helpers::setup_test_db().await.unwrap();
 
-        // Enqueue and complete two downloads
+        // Enqueue and complete two downloads through the full pipeline
         let m1 = repo
             .enqueue_eh_download(-100, 1, "tok1", "T1", false, SOURCE_DIRECT)
             .await
             .unwrap();
-        repo.get_next_pending_eh_download().await.unwrap();
+        let c1 = repo.get_next_for_download().await.unwrap().unwrap();
+        assert_eq!(c1.id, m1.id);
+        repo.mark_eh_download_downloaded(m1.id, 10000, "/tmp/1.zip")
+            .await
+            .unwrap();
+        let p1 = repo.get_next_for_publish().await.unwrap().unwrap();
+        assert_eq!(p1.id, m1.id);
         repo.mark_eh_download_done(m1.id, 10000).await.unwrap();
 
         let m2 = repo
             .enqueue_eh_download(-100, 2, "tok2", "T2", false, SOURCE_DIRECT)
             .await
             .unwrap();
-        repo.get_next_pending_eh_download().await.unwrap();
+        let c2 = repo.get_next_for_download().await.unwrap().unwrap();
+        assert_eq!(c2.id, m2.id);
+        repo.mark_eh_download_downloaded(m2.id, 20000, "/tmp/2.zip")
+            .await
+            .unwrap();
+        let p2 = repo.get_next_for_publish().await.unwrap().unwrap();
+        assert_eq!(p2.id, m2.id);
         repo.mark_eh_download_done(m2.id, 20000).await.unwrap();
 
         let bytes = repo.get_eh_downloaded_bytes_in_window(24).await.unwrap();

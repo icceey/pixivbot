@@ -167,12 +167,19 @@ async fn test_eh_download_queue_full_lifecycle() {
     assert!(m2.telegraph);
     assert_eq!(m3.source, "direct");
 
-    // FIFO: get m1 first
+    // FIFO: get m1 first (download stage)
     let next1 = repo.get_next_pending_eh_download().await.unwrap().unwrap();
     assert_eq!(next1.id, m1.id);
     assert_eq!(next1.status, "downloading");
 
-    // Complete m1
+    // Download m1
+    repo.mark_eh_download_downloaded(m1.id, 50000, "/tmp/100.zip")
+        .await
+        .unwrap();
+
+    // Complete m1 (publish stage)
+    let pub1 = repo.get_next_for_publish().await.unwrap().unwrap();
+    assert_eq!(pub1.id, m1.id);
     repo.mark_eh_download_done(m1.id, 50000).await.unwrap();
 
     // Get m2
@@ -218,10 +225,20 @@ async fn test_eh_download_queue_fifo_ordering() {
     // Should be FIFO (oldest first by created_at)
     let next1 = repo.get_next_pending_eh_download().await.unwrap().unwrap();
     assert_eq!(next1.id, m1.id);
+    repo.mark_eh_download_downloaded(m1.id, 100, "/tmp/1.zip")
+        .await
+        .unwrap();
+    let pub1 = repo.get_next_for_publish().await.unwrap().unwrap();
+    assert_eq!(pub1.id, m1.id);
     repo.mark_eh_download_done(m1.id, 100).await.unwrap();
 
     let next2 = repo.get_next_pending_eh_download().await.unwrap().unwrap();
     assert_eq!(next2.id, m2.id);
+    repo.mark_eh_download_downloaded(m2.id, 200, "/tmp/2.zip")
+        .await
+        .unwrap();
+    let pub2 = repo.get_next_for_publish().await.unwrap().unwrap();
+    assert_eq!(pub2.id, m2.id);
     repo.mark_eh_download_done(m2.id, 200).await.unwrap();
 
     let next3 = repo.get_next_pending_eh_download().await.unwrap().unwrap();
@@ -248,7 +265,12 @@ async fn test_eh_download_queue_reset_stale_then_reprocess() {
     let next = repo.get_next_pending_eh_download().await.unwrap().unwrap();
     assert_eq!(next.id, m.id);
 
-    // Complete it
+    // Complete through full pipeline
+    repo.mark_eh_download_downloaded(m.id, 1000, "/tmp/1.zip")
+        .await
+        .unwrap();
+    let pub_next = repo.get_next_for_publish().await.unwrap().unwrap();
+    assert_eq!(pub_next.id, m.id);
     repo.mark_eh_download_done(m.id, 1000).await.unwrap();
 
     let bytes = repo.get_eh_downloaded_bytes_in_window(24).await.unwrap();
@@ -296,13 +318,19 @@ async fn test_eh_task_key_db_roundtrip() {
 async fn test_eh_download_queue_rate_limit_window() {
     let repo = tests_helpers::setup_test_db().await.unwrap();
 
-    // Complete 3 downloads with different file sizes
+    // Complete 3 downloads through the full pipeline
     for i in 1..=3i64 {
         let m = repo
             .enqueue_eh_download(-100, i, "tok", "T", false, "direct")
             .await
             .unwrap();
-        repo.get_next_pending_eh_download().await.unwrap();
+        let c = repo.get_next_pending_eh_download().await.unwrap().unwrap();
+        assert_eq!(c.id, m.id);
+        repo.mark_eh_download_downloaded(m.id, i * 1000, &format!("/tmp/{}.zip", i))
+            .await
+            .unwrap();
+        let p = repo.get_next_for_publish().await.unwrap().unwrap();
+        assert_eq!(p.id, m.id);
         repo.mark_eh_download_done(m.id, i * 1000).await.unwrap();
     }
 
