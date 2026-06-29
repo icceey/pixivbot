@@ -1,5 +1,5 @@
 use eh_client::{EhClient, EhClientBuilder, EhCookies};
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// Build an EhClient pointing at the given mock server.
@@ -427,6 +427,43 @@ async fn test_download_gallery_images_fails_when_image_src_missing() {
     Mock::given(method("GET"))
         .and(path("/s/1/123-1"))
         .respond_with(ResponseTemplate::new(200).set_body_string("<html>no image here</html>"))
+        .mount(&server)
+        .await;
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let dest = temp_dir.path().join("gallery.zip");
+    let err = client
+        .download_gallery_images(123, "abc", &dest)
+        .await
+        .unwrap_err();
+    assert!(err
+        .to_string()
+        .contains("failed to download all gallery images"));
+    assert!(!dest.exists(), "dest should not exist after error");
+    assert!(
+        !dest.with_extension("zip.part").exists(),
+        "temp zip should not exist after error"
+    );
+}
+
+#[tokio::test]
+async fn test_download_gallery_images_fails_when_later_gallery_page_fetch_fails() {
+    let server = MockServer::start().await;
+    let client = client_at(&server);
+    Mock::given(method("GET"))
+        .and(path("/g/123/abc/"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"
+            <table class="ptt"><tr><td>1</td><td><a href="?p=1">2</a></td></tr></table>
+            <a href="/s/1/123-1">1</a>
+            "#,
+        ))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/g/123/abc/"))
+        .and(query_param("p", "1"))
+        .respond_with(ResponseTemplate::new(500))
         .mount(&server)
         .await;
 
