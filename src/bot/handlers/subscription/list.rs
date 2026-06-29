@@ -407,4 +407,21 @@ mod tests {
             "list:4:-1001234567890:1"
         );
     }
+
+    #[test]
+    fn test_eh_list_display_uses_markdown_escape() {
+        // E-Hentai task values should be escaped with markdown::escape,
+        // not just underscore replacement. The key difference:
+        // markdown::escape also escapes `-`, `.`, `!`, `=`, `|` etc.
+        let task_value = "e-hentai.org|test";
+        let escaped = markdown::escape(task_value);
+        // The old behavior (replace('_', "\\_")) would leave hyphens and dots unescaped
+        // markdown::escape must escape hyphens (used in E-Hentai domain names)
+        assert!(
+            escaped.contains("\\-"),
+            "hyphen should be escaped: {escaped}"
+        );
+        // Dots also escaped
+        assert!(escaped.contains("\\."), "dot should be escaped: {escaped}");
+    }
 }

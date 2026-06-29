@@ -11,7 +11,7 @@ use crate::config::Config;
 use anyhow::Result;
 use sea_orm_migration::MigratorTrait;
 use teloxide::requests::RequesterExt;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::fmt::time::ChronoLocal;
 use tracing_subscriber::{prelude::*, EnvFilter};
 
@@ -241,6 +241,14 @@ async fn main() -> Result<()> {
         .telegraph_access_token
         .as_ref()
         .map(|token| std::sync::Arc::new(eh_client::TelegraphClient::new(token.clone())));
+
+    // Warn when upload_telegraph is enabled but no token is configured
+    if config.ehentai.upload_telegraph && config.ehentai.telegraph_access_token.is_none() {
+        warn!(
+            "ehentai.upload_telegraph=true but no telegraph_access_token configured; \
+             Telegraph upload is disabled"
+        );
+    }
 
     // Reset stale EH entries before spawning workers (crash recovery for all stages)
     if eh_client.is_some() {

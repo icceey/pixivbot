@@ -671,6 +671,12 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_gallery_ref_rejects_short_token() {
+        // Token length < 8 should be rejected
+        assert!(parse_gallery_ref("https://e-hentai.org/g/12345/abc/").is_none());
+    }
+
+    #[test]
     fn test_esub_success_label_is_markdown_safe() {
         let label = markdown::escape("E-Hentai");
         assert_eq!(label, "E\\-Hentai");

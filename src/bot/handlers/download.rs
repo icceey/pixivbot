@@ -213,27 +213,25 @@ impl BotHandler {
     }
 
     /// Extract all e-hentai/exhentai gallery URLs from args or replied message.
+    /// Priority: command args > reply message (same precedence as extract_targets).
     fn extract_eh_galleries(&self, msg: &Message, args: &str) -> Vec<(u64, String)> {
         if self.eh_client.is_none() {
             return Vec::new();
         }
 
-        let mut text = String::new();
+        // Args take priority — only extract from args when present
         if !args.trim().is_empty() {
-            text.push_str(args);
-            text.push(' ');
+            return extract_eh_galleries_from_text(args);
         }
+
+        // Fall back to reply message
         if let Some(reply_msg) = msg.reply_to_message() {
             if let Some(reply_text) = reply_msg.text().or_else(|| reply_msg.caption()) {
-                text.push_str(reply_text);
+                return extract_eh_galleries_from_text(reply_text);
             }
         }
 
-        if text.is_empty() {
-            return Vec::new();
-        }
-
-        extract_eh_galleries_from_text(&text)
+        Vec::new()
     }
 
     /// Process downloads for multiple illusts
@@ -548,13 +546,21 @@ pub(super) fn sanitize_filename(name: &str) -> String {
 }
 
 /// Extract all E-Hentai/ExHentai gallery URLs from text, returning (gid, token) pairs.
+/// Only accepts tokens with length >= 8, matching the validation in `parse_gallery_ref`.
 fn extract_eh_galleries_from_text(text: &str) -> Vec<(u64, String)> {
     let re = Regex::new(r"https?://(?:e-|ex)hentai\.org/g/(\d+)/([A-Za-z0-9_-]+)/?")
         .expect("valid EH gallery regex");
+    let mut seen = HashSet::new();
     re.captures_iter(text)
         .filter_map(|cap| {
             let gid = cap.get(1)?.as_str().parse::<u64>().ok()?;
             let token = cap.get(2)?.as_str().to_string();
+            if token.len() < 8 {
+                return None;
+            }
+            if !seen.insert(gid) {
+                return None;
+            }
             Some((gid, token))
         })
         .collect()
@@ -582,5 +588,40 @@ mod tests {
         assert_eq!(galleries.len(), 2);
         assert_eq!(galleries[0], (1, "aaaaaaaaaa".to_string()));
         assert_eq!(galleries[1], (2, "bbbbbbbbbb".to_string()));
+    }
+
+    #[test]
+    fn test_extract_eh_galleries_rejects_short_tokens() {
+        // Token length < 8 should be rejected (matching parse_gallery_ref)
+        let text = "https://e-hentai.org/g/1/abc/";
+        let galleries = extract_eh_galleries_from_text(text);
+        assert!(galleries.is_empty());
+    }
+
+    #[test]
+    fn test_extract_eh_galleries_accepts_min_token_length() {
+        // Token length == 8 should be accepted
+        let text = "https://e-hentai.org/g/1/abcdefgh/";
+        let galleries = extract_eh_galleries_from_text(text);
+        assert_eq!(galleries.len(), 1);
+        assert_eq!(galleries[0], (1, "abcdefgh".to_string()));
+    }
+
+    #[test]
+    fn test_extract_eh_galleries_dedupes_same_gid() {
+        // Same gid appearing twice should be deduplicated
+        let text =
+            "https://e-hentai.org/g/1/aaaaaaaaaa/ and also https://e-hentai.org/g/1/aaaaaaaaaa/";
+        let galleries = extract_eh_galleries_from_text(text);
+        assert_eq!(galleries.len(), 1);
+        assert_eq!(galleries[0], (1, "aaaaaaaaaa".to_string()));
+    }
+
+    #[test]
+    fn test_extract_eh_galleries_exhentai_url() {
+        let text = "https://exhentai.org/g/99999/deadbeef00/";
+        let galleries = extract_eh_galleries_from_text(text);
+        assert_eq!(galleries.len(), 1);
+        assert_eq!(galleries[0], (99999, "deadbeef00".to_string()));
     }
 }
