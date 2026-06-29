@@ -121,9 +121,7 @@ impl EhEngine {
 
         if refs.is_empty() {
             for sub in &subs {
-                if let Err(e) = self.process_eh_sub(sub, &[]).await {
-                    warn!("Failed to drain eh backlog for sub {}: {:#}", sub.id, e);
-                }
+                self.process_eh_sub(sub, &[]).await?;
             }
             self.schedule_next_poll(task.id).await;
             return Ok(());
@@ -165,9 +163,7 @@ impl EhEngine {
 
         if filtered.is_empty() {
             for sub in &subs {
-                if let Err(e) = self.process_eh_sub(sub, &[]).await {
-                    warn!("Failed to drain eh backlog for sub {}: {:#}", sub.id, e);
-                }
+                self.process_eh_sub(sub, &[]).await?;
             }
             self.schedule_next_poll(task.id).await;
             return Ok(());
@@ -175,9 +171,7 @@ impl EhEngine {
 
         // Process each subscription
         for sub in &subs {
-            if let Err(e) = self.process_eh_sub(sub, &filtered).await {
-                warn!("Failed to process eh sub {}: {:#}", sub.id, e);
-            }
+            self.process_eh_sub(sub, &filtered).await?;
         }
 
         self.schedule_next_poll(task.id).await;
@@ -249,12 +243,14 @@ impl EhEngine {
         // Step 1: Consume pending backlog first (galleries from previous overflow).
         let mut still_pending = Vec::new();
         let backlog: Vec<_> = state.pending_galleries.drain(..).collect();
-        for pending in backlog {
+        let mut backlog_iter = backlog.into_iter();
+        while let Some(pending) = backlog_iter.next() {
             if remaining_slots == 0 {
                 still_pending.push(pending);
                 continue;
             }
-            self.repo
+            if let Err(e) = self
+                .repo
                 .enqueue_eh_download(
                     sub.chat_id,
                     pending.gid as i64,
@@ -264,7 +260,19 @@ impl EhEngine {
                     SOURCE_SUBSCRIPTION,
                 )
                 .await
-                .with_context(|| format!("Failed to enqueue pending gallery {}", pending.gid))?;
+            {
+                let failed_gid = pending.gid;
+                still_pending.push(pending);
+                still_pending.extend(backlog_iter);
+                state.pending_galleries = still_pending;
+                state.trim_pushed(self.config.pushed_cap);
+                self.repo
+                    .update_subscription_latest_data(sub.id, Some(SubscriptionState::EhTag(state)))
+                    .await
+                    .context("Failed to persist eh pending backlog after enqueue failure")?;
+                return Err(e)
+                    .with_context(|| format!("Failed to enqueue pending gallery {}", failed_gid));
+            }
             state.add_pushed_gid(pending.gid);
             remaining_slots -= 1;
         }
@@ -303,13 +311,15 @@ impl EhEngine {
             .unwrap_or(state.pending_high_water_ts);
         state.pending_high_water_ts = state.pending_high_water_ts.max(max_eligible_posted);
 
-        for gallery in eligible.into_iter() {
+        let mut eligible_iter = eligible.into_iter();
+        while let Some(gallery) = eligible_iter.next() {
             if remaining_slots == 0 {
                 // Overflow: store in pending backlog for next tick.
                 state.pending_galleries.push(gallery);
                 continue;
             }
-            self.repo
+            if let Err(e) = self
+                .repo
                 .enqueue_eh_download(
                     sub.chat_id,
                     gallery.gid as i64,
@@ -319,9 +329,19 @@ impl EhEngine {
                     SOURCE_SUBSCRIPTION,
                 )
                 .await
-                .with_context(|| {
-                    format!("Failed to enqueue download for gallery {}", gallery.gid)
-                })?;
+            {
+                let failed_gid = gallery.gid;
+                state.pending_galleries.push(gallery);
+                state.pending_galleries.extend(eligible_iter);
+                state.trim_pushed(self.config.pushed_cap);
+                self.repo
+                    .update_subscription_latest_data(sub.id, Some(SubscriptionState::EhTag(state)))
+                    .await
+                    .context("Failed to persist eh collect state after enqueue failure")?;
+                return Err(e).with_context(|| {
+                    format!("Failed to enqueue download for gallery {}", failed_gid)
+                });
+            }
             state.add_pushed_gid(gallery.gid);
             state.latest_posted_ts = state.latest_posted_ts.max(gallery.posted);
             remaining_slots -= 1;
