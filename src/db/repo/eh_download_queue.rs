@@ -687,6 +687,7 @@ impl Repo {
                 eh_download_queue::Column::NextRetryAt,
                 Expr::value(None::<DateTime>),
             )
+            .col_expr(eh_download_queue::Column::RetryCount, Expr::value(0))
             .filter(eh_download_queue::Column::Id.eq(id))
             .filter(eh_download_queue::Column::Status.eq(STATUS_UPLOADING))
             .exec(&self.db)

@@ -14,9 +14,7 @@ use rand::RngExt;
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
-use crate::db::repo::eh_download_queue::{
-    STATUS_DOWNLOADED, STATUS_PENDING, STATUS_UPLOADED, STATUS_UPLOADING,
-};
+use crate::db::repo::eh_download_queue::{STATUS_DOWNLOADED, STATUS_PENDING, STATUS_UPLOADED};
 
 /// Maximum search pages to fetch per tick (safety cap).
 const MAX_FETCH_PAGES: u32 = 5;
@@ -683,7 +681,13 @@ impl EhUploadWorker {
             // Permanent failure fallback: if archive delivery is configured
             // and the ZIP file still exists, downgrade to archive-only instead
             // of marking the entry as failed.
-            if would_be_permanent && self.config.send_archive && entry.zip_path.is_some() {
+            if would_be_permanent
+                && self.config.send_archive
+                && entry
+                    .zip_path
+                    .as_deref()
+                    .is_some_and(|p| std::path::Path::new(p).exists())
+            {
                 info!(
                     "Upload permanently failed for entry {}, falling back to archive delivery",
                     entry.id
@@ -1010,7 +1014,7 @@ impl EhPublishWorker {
 
         // Validate archive prerequisites
         if archive_required {
-            let zip_path = entry.zip_path.as_deref().ok_or_else(|| MissingEhZip)?;
+            let zip_path = entry.zip_path.as_deref().ok_or(MissingEhZip)?;
             if !std::path::Path::new(zip_path).exists() {
                 return Err(MissingEhZip.into());
             }
@@ -1124,7 +1128,8 @@ mod integration_tests {
     use crate::db::entities::eh_download_queue;
     use crate::db::entities::tasks;
     use crate::db::repo::eh_download_queue::{
-        SOURCE_DIRECT, STATUS_DONE, STATUS_DOWNLOADED, STATUS_PENDING, STATUS_UPLOADED,
+        SOURCE_DIRECT, STATUS_DONE, STATUS_DOWNLOADED, STATUS_FAILED, STATUS_PENDING,
+        STATUS_UPLOADED,
     };
     use crate::db::repo::tests_helpers;
     use crate::pixiv::downloader::Downloader;
@@ -2063,6 +2068,10 @@ mod integration_tests {
             updated.status, "pending",
             "should be pending for retry, not silently done"
         );
+        assert_eq!(
+            updated.retry_count, 0,
+            "chat disabled defer should not increment retry_count"
+        );
         assert!(
             updated.next_retry_at.is_some(),
             "should have next_retry_at set"
@@ -2368,6 +2377,10 @@ mod integration_tests {
             updated.status, STATUS_DOWNLOADED,
             "should be back to downloaded for retry"
         );
+        assert_eq!(
+            updated.retry_count, 0,
+            "chat disabled defer should not increment retry_count"
+        );
         assert!(
             updated.next_retry_at.is_some(),
             "should have next_retry_at set"
@@ -2476,6 +2489,7 @@ mod integration_tests {
         let notifier = make_notifier(&tg_server);
         let mut cfg = make_config();
         cfg.send_archive = false;
+        cfg.max_retry_count = 0;
         let config = Arc::new(cfg);
         let worker = EhPublishWorker::new(
             Arc::clone(&repo),
@@ -2505,7 +2519,7 @@ mod integration_tests {
             .await
             .unwrap()
             .unwrap();
-        assert_ne!(model.status, STATUS_DONE);
+        assert_eq!(model.status, STATUS_FAILED);
         assert!(model.error.unwrap().contains("no EH publish surface"));
     }
 
@@ -2590,5 +2604,147 @@ mod integration_tests {
             .unwrap();
         assert_eq!(model.status, STATUS_DOWNLOADED);
         assert!(!model.telegraph);
+        assert_eq!(model.retry_count, 0);
+        assert!(model.next_retry_at.is_none());
+        assert!(
+            zip_path.exists(),
+            "ZIP file should be preserved after archive fallback"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_upload_permanent_failure_without_zip_does_not_fallback() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        setup_chat(&repo, -100, true).await;
+        let tg_server = MockServer::start().await;
+        let notifier = make_notifier(&tg_server);
+        let mut cfg = make_config();
+        cfg.max_retry_count = 0;
+        cfg.send_archive = true;
+        let config = Arc::new(cfg);
+        let entry = insert_queue_entry(
+            &repo,
+            -100,
+            506,
+            "tok",
+            "Title",
+            true,
+            STATUS_DOWNLOADED,
+            Some("data/test_cache/missing_506.zip"),
+            None,
+        )
+        .await;
+
+        let worker = EhUploadWorker::new(
+            Arc::clone(&repo),
+            notifier,
+            make_telegraph_client(&tg_server),
+            config,
+        );
+        worker.tick().await.unwrap();
+        let model = eh_download_queue::Entity::find_by_id(entry.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        // Missing ZIP file → no fallback; permanent failure path.
+        assert_eq!(model.status, STATUS_FAILED);
+        assert!(model.error.is_some(), "should have error set");
+    }
+
+    #[tokio::test]
+    async fn test_upload_worker_chat_disabled_defer_does_not_increment_retry() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        setup_chat(&repo, -100, false).await; // disabled
+        let tg_server = MockServer::start().await;
+        let notifier = make_notifier(&tg_server);
+        let config = Arc::new(make_config());
+        let temp_dir = tempfile::tempdir().unwrap();
+        let zip_path = temp_dir.path().join("507.zip");
+        create_test_zip(&zip_path, 2);
+        let entry = insert_queue_entry(
+            &repo,
+            -100,
+            507,
+            "tok",
+            "Title",
+            true,
+            STATUS_DOWNLOADED,
+            Some(zip_path.to_str().unwrap()),
+            None,
+        )
+        .await;
+
+        let worker = EhUploadWorker::new(
+            Arc::clone(&repo),
+            notifier,
+            make_telegraph_client(&tg_server),
+            config,
+        );
+        worker.tick().await.unwrap();
+        let model = eh_download_queue::Entity::find_by_id(entry.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(model.status, STATUS_DOWNLOADED);
+        assert_eq!(model.retry_count, 0);
+        assert!(model.next_retry_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_publish_both_markers_already_set_skips_to_done() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        setup_chat(&repo, -100, true).await;
+        // No mocks mounted on tg_server — any outbound request would hang/fail.
+        let tg_server = MockServer::start().await;
+        let notifier = make_notifier(&tg_server);
+        let config = Arc::new(make_config());
+        let temp_dir = tempfile::tempdir().unwrap();
+        let zip_path = temp_dir.path().join("508.zip");
+        create_test_zip(&zip_path, 2);
+        let entry = insert_queue_entry(
+            &repo,
+            -100,
+            508,
+            "tok",
+            "Title",
+            true,
+            STATUS_UPLOADED,
+            Some(zip_path.to_str().unwrap()),
+            Some("https://telegra.ph/508"),
+        )
+        .await;
+
+        // Pre-set both markers to simulate a completed-but-not-done entry.
+        eh_download_queue::Entity::update_many()
+            .col_expr(
+                eh_download_queue::Column::ArchiveSentAt,
+                Expr::value(Some(Local::now().naive_local())),
+            )
+            .col_expr(
+                eh_download_queue::Column::TelegraphSentAt,
+                Expr::value(Some(Local::now().naive_local())),
+            )
+            .filter(eh_download_queue::Column::Id.eq(entry.id))
+            .exec(repo.db())
+            .await
+            .unwrap();
+
+        let eh_server = MockServer::start().await;
+        let worker = EhPublishWorker::new(
+            Arc::clone(&repo),
+            notifier,
+            make_eh_client(&eh_server),
+            config,
+        );
+        worker.tick().await.unwrap();
+
+        let model = eh_download_queue::Entity::find_by_id(entry.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(model.status, STATUS_DONE);
     }
 }
