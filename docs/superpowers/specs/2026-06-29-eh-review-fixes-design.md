@@ -147,9 +147,10 @@ Telegraph page splitting reserves bytes for continuation links before calling `c
 
 Publish determines required surfaces per entry:
 
-- Archive is required when `send_archive=true` and `zip_path` exists.
+- Archive delivery is required when `send_archive=true` for an entry that reached publish through the download stage. A missing `zip_path` or missing ZIP file is a recoverable publish error, not an absent surface.
 - Telegraph link is required when `telegraph_url` exists.
-- If neither surface is required, the entry fails with a clear internal error instead of being marked `done` silently.
+- If archive delivery is required but the ZIP is unavailable, release the entry back to a downloadable/retryable state so the archive can be re-downloaded, or fail it after the normal retry budget is exhausted. It must never be marked `done` without sending anything.
+- If neither archive nor Telegraph delivery is required, the entry fails with a clear internal error instead of being marked `done` silently.
 
 For each required surface:
 
@@ -205,6 +206,7 @@ When all required surfaces are marked sent, mark the entry `done` and delete the
 - Publish sends archive, persists `archive_sent_at`, then if link send fails the retry sends only the link.
 - If both publish markers exist but `done` is not set, the retry marks done and does not send either surface.
 - `send_archive=false` with no `telegraph_url` fails the entry rather than silently marking done.
+- `send_archive=true` with a missing `zip_path` or deleted ZIP file sends nothing and moves the entry to retry/re-download instead of marking it done.
 - Chat-not-notifiable defer does not increment `retry_count` in download, upload, or publish.
 - Permanent Telegraph upload failure falls back to archive-only publish when `send_archive=true` and ZIP exists.
 
@@ -249,6 +251,7 @@ git diff --check -- docs/superpowers/specs/2026-06-29-eh-review-fixes-design.md
 
 - No EH subscription gallery is skipped solely because a previous tick hit `max_push_per_tick`.
 - Publish retry does not resend surfaces whose sent markers were already persisted.
+- Publish does not mark archive-required entries done when the cached ZIP path is missing or the file was deleted.
 - Direct image fallback never publishes a ZIP missing discovered pages.
 - Duplicate queue requests merge stronger semantics instead of silently ignoring them.
 - Download quota blocks based on already consumed download bytes.
