@@ -55,8 +55,7 @@ impl Repo {
                     .await
             }
             Ok(None) => Err(db_err).context("Failed to enqueue eh download"),
-            Err(select_err) => Err(select_err)
-                .context("Failed to re-select after insert conflict"),
+            Err(select_err) => Err(select_err).context("Failed to re-select after insert conflict"),
         }
     }
 
@@ -151,24 +150,19 @@ impl Repo {
         let mut current = existing;
 
         for attempt in 0..MAX_RETRIES {
-            let is_terminal =
-                current.status == STATUS_DONE || current.status == STATUS_FAILED;
+            let is_terminal = current.status == STATUS_DONE || current.status == STATUS_FAILED;
             let merged_telegraph = current.telegraph || telegraph;
-            let merged_source =
-                if current.source == SOURCE_DIRECT || source == SOURCE_DIRECT {
-                    SOURCE_DIRECT
-                } else {
-                    SOURCE_SUBSCRIPTION
-                };
+            let merged_source = if current.source == SOURCE_DIRECT || source == SOURCE_DIRECT {
+                SOURCE_DIRECT
+            } else {
+                SOURCE_SUBSCRIPTION
+            };
             let source_upgraded_to_direct =
                 current.source != SOURCE_DIRECT && merged_source == SOURCE_DIRECT;
             let telegraph_upgraded = !current.telegraph && merged_telegraph;
             let reset_for_new_requirement = source_upgraded_to_direct
                 || (telegraph_upgraded
-                    && matches!(
-                        current.status.as_str(),
-                        STATUS_UPLOADED | STATUS_PUBLISHING
-                    ));
+                    && matches!(current.status.as_str(), STATUS_UPLOADED | STATUS_PUBLISHING));
 
             if is_terminal || reset_for_new_requirement {
                 // Full reset to pending — CAS-guarded so a stale snapshot does not
@@ -199,18 +193,12 @@ impl Repo {
                         eh_download_queue::Column::Source,
                         Expr::value(merged_source.to_string()),
                     )
-                    .col_expr(
-                        eh_download_queue::Column::FileSize,
-                        Expr::value(0),
-                    )
+                    .col_expr(eh_download_queue::Column::FileSize, Expr::value(0))
                     .col_expr(
                         eh_download_queue::Column::Error,
                         Expr::value(None::<String>),
                     )
-                    .col_expr(
-                        eh_download_queue::Column::RetryCount,
-                        Expr::value(0),
-                    )
+                    .col_expr(eh_download_queue::Column::RetryCount, Expr::value(0))
                     .col_expr(
                         eh_download_queue::Column::StartedAt,
                         Expr::value(None::<DateTime>),
@@ -383,10 +371,7 @@ impl Repo {
         let completed_at = entry.completed_at.unwrap_or(now);
 
         let result = eh_download_queue::Entity::update_many()
-            .col_expr(
-                eh_download_queue::Column::Status,
-                Expr::value(STATUS_DONE),
-            )
+            .col_expr(eh_download_queue::Column::Status, Expr::value(STATUS_DONE))
             .col_expr(eh_download_queue::Column::FileSize, Expr::value(file_size))
             .col_expr(
                 eh_download_queue::Column::CompletedAt,
@@ -450,15 +435,13 @@ impl Repo {
         let cutoff = Local::now().naive_local() - chrono::Duration::hours(hours as i64);
 
         let result = eh_download_queue::Entity::find()
-            .filter(
-                eh_download_queue::Column::Status.is_in([
-                    STATUS_DOWNLOADED,
-                    STATUS_UPLOADING,
-                    STATUS_UPLOADED,
-                    STATUS_PUBLISHING,
-                    STATUS_DONE,
-                ]),
-            )
+            .filter(eh_download_queue::Column::Status.is_in([
+                STATUS_DOWNLOADED,
+                STATUS_UPLOADING,
+                STATUS_UPLOADED,
+                STATUS_PUBLISHING,
+                STATUS_DONE,
+            ]))
             .filter(eh_download_queue::Column::CompletedAt.gte(cutoff))
             .all(&self.db)
             .await
@@ -603,10 +586,7 @@ impl Repo {
                 eh_download_queue::Column::ZipPath,
                 Expr::value(Some(zip_path.to_string())),
             )
-            .col_expr(
-                eh_download_queue::Column::CompletedAt,
-                Expr::value(now),
-            )
+            .col_expr(eh_download_queue::Column::CompletedAt, Expr::value(now))
             .col_expr(
                 eh_download_queue::Column::StartedAt,
                 Expr::value(None::<DateTime>),
@@ -833,8 +813,7 @@ impl Repo {
                 .add(eh_download_queue::Column::Telegraph.eq(false))
         } else {
             // Must still be uploaded
-            sea_orm::Condition::all()
-                .add(eh_download_queue::Column::Status.eq(STATUS_UPLOADED))
+            sea_orm::Condition::all().add(eh_download_queue::Column::Status.eq(STATUS_UPLOADED))
         };
         let retry_filter = sea_orm::Condition::any()
             .add(eh_download_queue::Column::NextRetryAt.is_null())
@@ -941,7 +920,10 @@ impl Repo {
         };
 
         let result = eh_download_queue::Entity::update_many()
-            .col_expr(eh_download_queue::Column::Status, Expr::value(target_status))
+            .col_expr(
+                eh_download_queue::Column::Status,
+                Expr::value(target_status),
+            )
             .col_expr(
                 eh_download_queue::Column::NextRetryAt,
                 Expr::value(Local::now().naive_local() + chrono::Duration::seconds(delay_secs)),
@@ -1043,10 +1025,7 @@ impl Repo {
                     eh_download_queue::Column::Status,
                     Expr::value(STATUS_FAILED),
                 )
-                .col_expr(
-                    eh_download_queue::Column::CompletedAt,
-                    Expr::value(now),
-                )
+                .col_expr(eh_download_queue::Column::CompletedAt, Expr::value(now))
                 .col_expr(
                     eh_download_queue::Column::Error,
                     Expr::value(Some(error.to_string())),
@@ -1188,7 +1167,10 @@ mod tests {
         let err = repo
             .mark_eh_download_downloaded(claimed.id, 9999, "/tmp/40.zip")
             .await;
-        assert!(err.is_err(), "stale downloaded completion should be blocked");
+        assert!(
+            err.is_err(),
+            "stale downloaded completion should be blocked"
+        );
 
         // Verify final state is still pending, not overwritten
         let final_row = Entity::find_by_id(model.id)
@@ -1283,30 +1265,22 @@ mod tests {
         let err = repo
             .defer_eh_download(model.id, STATUS_PUBLISHING, 60)
             .await;
-        assert!(
-            err.is_err(),
-            "defer to publishing from pending should fail"
-        );
+        assert!(err.is_err(), "defer to publishing from pending should fail");
 
         // Defer from pending to failed — invalid (not a legal target)
-        let err = repo
-            .defer_eh_download(model.id, STATUS_FAILED, 60)
-            .await;
+        let err = repo.defer_eh_download(model.id, STATUS_FAILED, 60).await;
         assert!(
             err.is_err(),
             "defer to failed should be rejected as invalid target"
         );
 
         // Defer from pending to pending — invalid (must be from downloading)
-        let err = repo
-            .defer_eh_download(model.id, STATUS_PENDING, 60)
-            .await;
+        let err = repo.defer_eh_download(model.id, STATUS_PENDING, 60).await;
         assert!(
             err.is_err(),
             "defer to pending from pending should fail (must be from downloading)"
         );
     }
-
 
     #[tokio::test]
     async fn test_enqueue_merges_telegraph_and_direct_source() {
@@ -1344,10 +1318,7 @@ mod tests {
             Entity::update_many()
                 .col_expr(Column::Status, Expr::value(status))
                 .col_expr(Column::FileSize, Expr::value(size))
-                .col_expr(
-                    Column::CompletedAt,
-                    Expr::value(Utc::now().naive_utc()),
-                )
+                .col_expr(Column::CompletedAt, Expr::value(Utc::now().naive_utc()))
                 .filter(Column::Id.eq(model.id))
                 .exec(&repo.db)
                 .await
@@ -1376,7 +1347,10 @@ mod tests {
 
         // Simulate upload: set telegraph_url so publish claims from uploaded branch
         Entity::update_many()
-            .col_expr(Column::TelegraphUrl, Expr::value(Some("https://telegra.ph/20".to_string())))
+            .col_expr(
+                Column::TelegraphUrl,
+                Expr::value(Some("https://telegra.ph/20".to_string())),
+            )
             .col_expr(Column::Status, Expr::value(STATUS_UPLOADED))
             .filter(Column::Id.eq(model.id))
             .exec(&repo.db)
@@ -1469,7 +1443,10 @@ mod tests {
 
         // get_next_for_download filters on next_retry_at <= now, so should return None
         let next = repo.get_next_for_download().await.unwrap();
-        assert!(next.is_none(), "deferred item should not be claimable before delay expires");
+        assert!(
+            next.is_none(),
+            "deferred item should not be claimable before delay expires"
+        );
 
         let reloaded = Entity::find_by_id(model.id)
             .one(&repo.db)
@@ -1479,7 +1456,6 @@ mod tests {
         assert_eq!(reloaded.retry_count, 0);
         assert!(reloaded.next_retry_at.is_some());
     }
-
 
     #[tokio::test]
     async fn test_enqueue_and_get_next_pending() {
@@ -1830,7 +1806,10 @@ mod tests {
         assert_eq!(merged.token, "tok2");
         assert_eq!(merged.title, "Title2");
         assert!(merged.telegraph, "telegraph should be OR-merged to true");
-        assert_eq!(merged.source, SOURCE_DIRECT, "source should be upgraded to direct");
+        assert_eq!(
+            merged.source, SOURCE_DIRECT,
+            "source should be upgraded to direct"
+        );
 
         // No duplicate rows
         let all: Vec<_> = Entity::find()
@@ -1886,7 +1865,13 @@ mod tests {
         // The CAS guard must detect that source changed from SUBSCRIPTION to
         // DIRECT, fail the update, re-read, and recompute -> source stays DIRECT.
         let merged = repo
-            .merge_eh_download(snap_a, "stale_tok", "Stale Title", false, SOURCE_SUBSCRIPTION)
+            .merge_eh_download(
+                snap_a,
+                "stale_tok",
+                "Stale Title",
+                false,
+                SOURCE_SUBSCRIPTION,
+            )
             .await
             .unwrap();
         assert_eq!(merged.id, model.id);
