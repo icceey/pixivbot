@@ -49,18 +49,25 @@ pub fn estimate_content_size(nodes: &[Node]) -> usize {
 /// Maximum content size per Telegraph page (64KB minus overhead).
 const MAX_PAGE_CONTENT_BYTES: usize = 60_000;
 
+/// Budget reserved for a continuation link ("Next Page →") so that adding it
+/// after splitting doesn't overflow `MAX_PAGE_CONTENT_BYTES`.
+pub const CONTINUATION_LINK_BUDGET: usize = 512;
+
 /// Split image URLs into chunks that fit within the content size limit.
+/// The effective per-page limit is `max_bytes - CONTINUATION_LINK_BUDGET`
+/// for non-last pages so that a continuation link can be added safely.
 pub fn split_for_pages(urls: &[String], max_bytes: usize) -> Vec<Vec<String>> {
     if urls.is_empty() {
         return vec![];
     }
+    let max_page_size = max_bytes.saturating_sub(CONTINUATION_LINK_BUDGET);
     let mut chunks = Vec::new();
     let mut current = Vec::new();
     let mut current_size = 0;
     for url in urls {
         let node = Node::img(url);
         let node_size = serde_json::to_vec(&node).map(|v| v.len()).unwrap_or(100);
-        if current_size + node_size > max_bytes && !current.is_empty() {
+        if current_size + node_size > max_page_size && !current.is_empty() {
             chunks.push(std::mem::take(&mut current));
             current_size = 0;
         }
@@ -397,5 +404,36 @@ mod tests {
         let chunks = split_for_pages(&urls, 1024);
         assert!(chunks.len() > 1);
         assert!(chunks.iter().all(|c| !c.is_empty()));
+    }
+
+    #[test]
+    fn test_split_for_pages_reserves_next_link_budget() {
+        // Each image node JSON: {"tag":"img","attrs":{"src":"<URL>"}} = 32 + URL_len bytes.
+        // For URL_len=478: node = 510 bytes. 2 nodes + array overhead = 1023 bytes.
+        // Max=1024: 3rd node would be 1533 > 1024, so chunk 1 has 2 nodes = 1023 bytes.
+        // Adding a link (~92 bytes) = 1115 > 1024 — should overflow WITHOUT the budget fix.
+        let url = format!("https://img.example/{}", "x".repeat(478 - 22)); // 22 = "https://img.example/".len()
+        let urls = vec![url; 6];
+        let max_bytes = 1024usize;
+        let pages = split_for_pages(&urls, max_bytes);
+        assert!(
+            pages.len() > 1,
+            "expected multiple pages, got {}",
+            pages.len()
+        );
+        for (idx, page) in pages.iter().enumerate() {
+            let mut nodes: Vec<Node> = page.iter().map(|u| Node::img(u)).collect();
+            if idx + 1 < pages.len() {
+                nodes.push(Node::link("https://telegra.ph/next", "Next Page \u{2192}"));
+            }
+            let size = estimate_content_size(&nodes);
+            assert!(
+                size <= max_bytes,
+                "page {} size {} exceeds max {} (without budget reservation)",
+                idx,
+                size,
+                max_bytes
+            );
+        }
     }
 }

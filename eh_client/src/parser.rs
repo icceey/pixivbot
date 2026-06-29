@@ -96,7 +96,7 @@ pub fn parse_archive_redirect(html: &str) -> Option<String> {
 fn image_page_urls_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        Regex::new(r#"<a\s+href="(https?://(?:e-hentai|exhentai)\.org/s/[^"]+)""#)
+        Regex::new(r#"<a\s+href="((?:https?://(?:e-hentai|exhentai)\.org)?/s/[^"]+)""#)
             .expect("invalid image_page_urls regex")
     })
 }
@@ -286,6 +286,22 @@ mod tests {
         assert_eq!(urls.len(), 2);
         assert!(urls[0].contains("/s/abc123/123456-01"));
         assert!(urls[1].contains("/s/def456/123456-02"));
+    }
+
+    #[test]
+    fn test_parse_image_page_urls_relative() {
+        let html = r#"
+        <div class="gdtm">
+          <a href="/s/abc123/123456-01">1</a>
+        </div>
+        <div class="gdtm">
+          <a href="/s/def456/123456-02">2</a>
+        </div>
+        "#;
+        let urls = parse_image_page_urls(html);
+        assert_eq!(urls.len(), 2);
+        assert_eq!(urls[0], "/s/abc123/123456-01");
+        assert_eq!(urls[1], "/s/def456/123456-02");
     }
 
     #[test]

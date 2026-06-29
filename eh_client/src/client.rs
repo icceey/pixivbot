@@ -320,6 +320,18 @@ impl EhClient {
         let mut seen = std::collections::HashSet::new();
         all_page_urls.retain(|url| seen.insert(url.clone()));
 
+        // Normalize relative URLs to absolute
+        let all_page_urls: Vec<String> = all_page_urls
+            .into_iter()
+            .map(|url| {
+                if url.starts_with('/') {
+                    format!("{}{}", self.base_url, url)
+                } else {
+                    url
+                }
+            })
+            .collect();
+
         if all_page_urls.is_empty() {
             return Err(Error::Parse("no image page URLs found".into()));
         }
@@ -362,6 +374,7 @@ impl EhClient {
     /// Used as a fallback when archive download is not available (no login).
     /// Downloads all images and packages them into a ZIP at `dest`.
     /// Returns total bytes written.
+    /// Fails if any image page fetch, image src extraction, or image download fails.
     pub async fn download_gallery_images(&self, gid: u64, token: &str, dest: &Path) -> Result<u64> {
         // Step 1: Fetch gallery page to get image page URLs and page count
         let gallery_url = format!("{}/g/{}/{}/", self.base_url, gid, token);
@@ -415,70 +428,78 @@ impl EhClient {
             return Err(Error::Parse("no image page URLs found".into()));
         }
 
-        // Step 3: Stream images to a blocking ZIP writer via a channel.
-        // This avoids loading all images into memory at once.
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<(String, Vec<u8>)>(8);
+        // Normalize relative URLs to absolute using base_url
+        let image_page_urls: Vec<String> = all_image_urls
+            .into_iter()
+            .map(|url| {
+                if url.starts_with('/') {
+                    format!("{}{}", self.base_url, url)
+                } else {
+                    url
+                }
+            })
+            .collect();
 
-        // Spawn the ZIP writer in a blocking task
-        let dest = dest.to_path_buf();
-        let zip_task = tokio::task::spawn_blocking(move || -> Result<u64> {
-            let file = std::fs::File::create(&dest)?;
-            let buf_writer = std::io::BufWriter::new(file);
-            let mut zip_writer = zip::ZipWriter::new(buf_writer);
-            let options = zip::write::SimpleFileOptions::default()
-                .compression_method(zip::CompressionMethod::Stored);
+        let total_pages_count = image_page_urls.len();
 
-            let mut total: u64 = 0;
-            // Block on receiving channel messages (this is a blocking task, so we use
-            // blocking_recv which is fine here)
-            while let Some((name, data)) = rx.blocking_recv() {
-                zip_writer.start_file(&name, options)?;
-                std::io::Write::write_all(&mut zip_writer, &data)?;
-                total += data.len() as u64;
-            }
-            zip_writer.finish()?;
-            Ok(total)
-        });
+        // Step 3: Download all images all-or-nothing, then write ZIP.
+        // Collect image bytes first so any failure stops the whole operation.
+        let mut images: Vec<(String, Vec<u8>)> = Vec::with_capacity(total_pages_count);
 
-        // Download images asynchronously and send to the ZIP writer
-        let mut images_downloaded: usize = 0;
-
-        for (idx, image_page_url) in all_image_urls.iter().enumerate() {
-            // Rate limit between image fetches (skip on first)
+        for (idx, image_page_url) in image_page_urls.iter().enumerate() {
             if idx > 0 {
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             }
 
-            // Fetch the image page to get the actual image URL
-            let resp = match self
+            let resp = self
                 .http
                 .get(image_page_url.as_str())
                 .header(COOKIE, self.cookies.to_header())
                 .send()
                 .await
-            {
-                Ok(r) => r,
-                Err(_) => continue,
-            };
+                .map_err(|e| {
+                    Error::Other(format!(
+                        "failed to download all gallery images: page {}/{} request error: {}",
+                        idx + 1,
+                        total_pages_count,
+                        e
+                    ))
+                })?;
 
             if !resp.status().is_success() {
-                continue;
+                return Err(Error::Other(format!(
+                    "failed to download all gallery images: page {}/{} returned {}",
+                    idx + 1,
+                    total_pages_count,
+                    resp.status()
+                )));
             }
 
             let html = resp.text().await?;
-            let image_url = match parser::parse_image_src(&html) {
-                Some(u) => u,
-                None => continue,
-            };
+            let image_url = parser::parse_image_src(&html).ok_or_else(|| {
+                Error::Parse(format!(
+                    "failed to download all gallery images: no image src on page {}/{}",
+                    idx + 1,
+                    total_pages_count
+                ))
+            })?;
 
-            // Download the actual image (no cookies to image CDN)
-            let img_resp = match self.http.get(&image_url).send().await {
-                Ok(r) => r,
-                Err(_) => continue,
-            };
+            let img_resp = self.http.get(&image_url).send().await.map_err(|e| {
+                Error::Other(format!(
+                    "failed to download all gallery images: image {}/{} request error: {}",
+                    idx + 1,
+                    total_pages_count,
+                    e
+                ))
+            })?;
 
             if !img_resp.status().is_success() {
-                continue;
+                return Err(Error::Other(format!(
+                    "failed to download all gallery images: image {}/{} returned {}",
+                    idx + 1,
+                    total_pages_count,
+                    img_resp.status()
+                )));
             }
 
             let img_bytes = img_resp.bytes().await?;
@@ -490,25 +511,29 @@ impl EhClient {
                 .unwrap_or("jpg");
             let entry_name = format!("{:04}.{}", idx + 1, ext);
 
-            // Send to ZIP writer (backpressure: channel capacity 8)
-            if tx.send((entry_name, img_bytes.to_vec())).await.is_err() {
-                break; // ZIP writer task died
+            images.push((entry_name, img_bytes.to_vec()));
+        }
+
+        // Write all collected images to ZIP in a blocking task
+        let dest = dest.to_path_buf();
+        let total_bytes = tokio::task::spawn_blocking(move || -> Result<u64> {
+            let file = std::fs::File::create(&dest)?;
+            let buf_writer = std::io::BufWriter::new(file);
+            let mut zip_writer = zip::ZipWriter::new(buf_writer);
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+
+            let mut total: u64 = 0;
+            for (name, data) in &images {
+                zip_writer.start_file(name, options)?;
+                std::io::Write::write_all(&mut zip_writer, data)?;
+                total += data.len() as u64;
             }
-            images_downloaded += 1;
-        }
-
-        // Drop sender to signal EOF to the ZIP writer
-        drop(tx);
-
-        let total_bytes = zip_task
-            .await
-            .map_err(|e| Error::Other(format!("spawn_blocking failed: {}", e)))??;
-
-        if images_downloaded == 0 {
-            return Err(Error::Other(
-                "all image downloads failed, no images in ZIP".into(),
-            ));
-        }
+            zip_writer.finish()?;
+            Ok(total)
+        })
+        .await
+        .map_err(|e| Error::Other(format!("spawn_blocking failed: {}", e)))??;
 
         Ok(total_bytes)
     }
