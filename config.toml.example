@@ -82,8 +82,9 @@ download_original_threshold = 1
 # # bypass = { mode = "flaresolverr", endpoint = "http://flaresolverr:8191/v1", max_timeout_ms = 60000, session = "pixivbot" }
 
 # ----------------------------------------------------------------------------
-# E-Hentai / ExHentai (optional). Uncomment and configure to enable EH
-# gallery subscription and direct download features.
+# E-Hentai / ExHentai customization. EH is enabled by default; this section
+# customizes site, credentials, and resolutions. Set `enabled = false` to
+# explicitly disable EH features.
 # ----------------------------------------------------------------------------
 # [ehentai]
 # # Whether the E-Hentai / ExHentai feature is enabled (default: true).
