@@ -73,21 +73,24 @@ impl Repo {
 
         match entry.insert(&self.db).await {
             Ok(model) => Ok(model),
-            Err(sea_orm::DbErr::Exec(sea_orm::RuntimeErr::SqlxError(e)))
-                if e.to_string().contains("UNIQUE constraint") =>
-            {
-                // Race: another caller inserted the same (chat_id, gid). Re-select and merge.
-                let raced = eh_download_queue::Entity::find()
+            Err(db_err) => {
+                // Race: another caller may have inserted the same (chat_id, gid).
+                // Re-select and merge instead of failing on unique constraint.
+                match eh_download_queue::Entity::find()
                     .filter(eh_download_queue::Column::ChatId.eq(chat_id))
                     .filter(eh_download_queue::Column::Gid.eq(gid))
                     .one(&self.db)
                     .await
-                    .context("Failed to re-select after insert conflict")?
-                    .context("Row disappeared after insert conflict — database inconsistency")?;
-                self.merge_eh_download(raced, token, title, telegraph, source)
-                    .await
+                {
+                    Ok(Some(raced)) => {
+                        self.merge_eh_download(raced, token, title, telegraph, source)
+                            .await
+                    }
+                    Ok(None) => Err(db_err).context("Failed to enqueue eh download"),
+                    Err(select_err) => Err(select_err)
+                        .context("Failed to re-select after insert conflict"),
+                }
             }
-            Err(e) => Err(e).context("Failed to enqueue eh download"),
         }
     }
 
@@ -623,7 +626,7 @@ impl Repo {
             .col_expr(eh_download_queue::Column::Status, Expr::value(target_status))
             .col_expr(
                 eh_download_queue::Column::NextRetryAt,
-                Expr::value(Utc::now().naive_utc() + chrono::Duration::seconds(delay_secs)),
+                Expr::value(Local::now().naive_local() + chrono::Duration::seconds(delay_secs)),
             )
             .filter(eh_download_queue::Column::Id.eq(id))
             .exec(&self.db)
@@ -813,6 +816,32 @@ mod tests {
         assert_eq!(deferred.status, STATUS_PENDING);
         assert_eq!(deferred.retry_count, 0);
         assert!(deferred.next_retry_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_deferred_item_not_claimable_before_delay_expires() {
+        let repo = tests_helpers::setup_test_db().await.unwrap();
+        let model = repo
+            .enqueue_eh_download(-100, 35, "tok", "Title", false, SOURCE_DIRECT)
+            .await
+            .unwrap();
+
+        // Defer with a long delay — the item should not be picked up
+        repo.defer_eh_download(model.id, STATUS_PENDING, 3600)
+            .await
+            .unwrap();
+
+        // get_next_for_download filters on next_retry_at <= now, so should return None
+        let next = repo.get_next_for_download().await.unwrap();
+        assert!(next.is_none(), "deferred item should not be claimable before delay expires");
+
+        let reloaded = Entity::find_by_id(model.id)
+            .one(&repo.db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reloaded.retry_count, 0);
+        assert!(reloaded.next_retry_at.is_some());
     }
 
 
