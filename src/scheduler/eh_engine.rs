@@ -188,7 +188,10 @@ impl EhEngine {
         let mut all_refs = Vec::new();
 
         for page in 0..MAX_FETCH_PAGES {
-            tokio::time::sleep(tokio::time::Duration::from_millis(SEARCH_RATE_LIMIT_MS)).await;
+            // Rate limit between search requests (skip before the first request)
+            if page > 0 {
+                tokio::time::sleep(tokio::time::Duration::from_millis(SEARCH_RATE_LIMIT_MS)).await;
+            }
 
             let refs = self
                 .client

@@ -249,7 +249,8 @@ impl TelegraphClient {
                     if attempt >= max_retries {
                         return Err(Error::RateLimited { retry_after_secs });
                     }
-                    let wait = retry_after_secs.unwrap_or_else(|| 40 * 2u64.pow(attempt));
+                    let computed = 40 * 2u64.pow(attempt);
+                    let wait = retry_after_secs.unwrap_or(0).max(computed);
                     tracing::warn!(
                         "pixi.mg returned 429, waiting {}s before retry (attempt {}/{})",
                         wait,
@@ -306,6 +307,10 @@ impl TelegraphClient {
 
     /// Create a gallery page from image URLs. Splits into multiple pages if needed.
     /// Returns the first page URL (with "Next Page" links to subsequent pages).
+    ///
+    /// If a page creation fails partway through, returns the last successfully
+    /// created page URL (if any) instead of erroring, so the user can still
+    /// access the partial gallery.
     pub async fn create_gallery_page(&self, title: &str, image_urls: &[String]) -> Result<String> {
         if image_urls.is_empty() {
             return Err(Error::Other("no images to upload".into()));
@@ -334,8 +339,21 @@ impl TelegraphClient {
             } else {
                 format!("{} (continued)", title)
             };
-            let url = self.create_page(&page_title, &nodes).await?;
-            next_url = Some(url);
+            match self.create_page(&page_title, &nodes).await {
+                Ok(url) => next_url = Some(url),
+                Err(e) => {
+                    // If we have at least one page created, return it instead of failing
+                    if let Some(ref url) = next_url {
+                        tracing::warn!(
+                            "Telegraph page creation failed at index {}, returning last successful page: {}",
+                            idx,
+                            e
+                        );
+                        return Ok(url.clone());
+                    }
+                    return Err(e);
+                }
+            }
         }
 
         Ok(next_url.unwrap_or_else(|| image_urls[0].clone()))

@@ -122,44 +122,6 @@ pub fn build_booru_caption(
     )
 }
 
-/// Build a MarkdownV2 caption for an e-hentai gallery.
-///
-/// Format: `📕 {title}\n{category} | ⭐ {rating} | {filecount}p | {filesize} | 🔗 [来源]({url})\n\n{tags}`
-#[allow(dead_code)]
-pub fn build_eh_caption(gallery: &eh_client::EhGallery, base_url: &str) -> String {
-    let clean_base = base_url.trim_end_matches('/');
-    let gallery_url = format!("{}/g/{}/{}", clean_base, gallery.gid, gallery.token);
-
-    let tag_list: Vec<&str> = gallery.tags.iter().take(10).map(|s| s.as_str()).collect();
-    let tags_display = if tag_list.is_empty() {
-        String::new()
-    } else {
-        let formatted: Vec<String> = tag_list
-            .iter()
-            .map(|t| format!("\\#{}", markdown::escape(t)))
-            .collect();
-        format!("\n\n{}", formatted.join("  "))
-    };
-
-    let filesize_kb = gallery.filesize as f64 / 1024.0;
-    let filesize_display = if filesize_kb >= 1024.0 {
-        format!("{:.1} MB", filesize_kb / 1024.0)
-    } else {
-        format!("{:.1} KB", filesize_kb)
-    };
-
-    format!(
-        "📕 {}\n*{}* \\| ⭐ {} \\| {}p \\| {}\n\n🔗 [来源]({}){}",
-        markdown::escape(&gallery.title),
-        markdown::escape(&gallery.category),
-        markdown::escape(&format!("{:.1}", gallery.rating)),
-        gallery.filecount,
-        markdown::escape(&filesize_display),
-        markdown::escape_link_url(&gallery_url),
-        tags_display
-    )
-}
-
 fn build_standard_caption(prefix: &str, illust: &Illust, title_suffix: &str) -> String {
     let tags = tag::format_tags_escaped(illust);
 
@@ -447,60 +409,5 @@ mod tests {
         );
         // The `-` in `-5` must be escaped for MarkdownV2
         assert!(caption.contains("\\-5"));
-    }
-
-    #[test]
-    fn build_eh_caption_basic() {
-        let gallery = eh_client::EhGallery {
-            gid: 12345,
-            token: "abcdef0123".to_string(),
-            title: "Test Gallery".to_string(),
-            title_jpn: None,
-            category: "Manga".to_string(),
-            thumb: "".to_string(),
-            uploader: "user".to_string(),
-            posted: 1376143500,
-            filecount: 20,
-            filesize: 5_121_050, // ~4.9 MB
-            expunged: false,
-            rating: 4.64,
-            tags: vec!["parody:touhou".to_string(), "artist:test".to_string()],
-        };
-
-        let caption = build_eh_caption(&gallery, "https://e-hentai.org");
-        assert!(caption.contains("Test Gallery"));
-        assert!(caption.contains("*Manga*"));
-        assert!(caption.contains("4\\.6"));
-        assert!(caption.contains("20p"));
-        assert!(caption.contains("4\\.9 MB"));
-        assert!(caption.contains("e-hentai.org/g/12345/abcdef0123"));
-        assert!(caption.contains("\\#parody:touhou"));
-        assert!(caption.contains("\\#artist:test"));
-    }
-
-    #[test]
-    fn build_eh_caption_escapes_special_chars() {
-        let gallery = eh_client::EhGallery {
-            gid: 1,
-            token: "tok".to_string(),
-            title: "Test (Special) [Brackets]".to_string(),
-            title_jpn: None,
-            category: "Doujinshi".to_string(),
-            thumb: "".to_string(),
-            uploader: "user".to_string(),
-            posted: 1000,
-            filecount: 1,
-            filesize: 500_000, // < 1 MB → KB
-            expunged: false,
-            rating: 3.0,
-            tags: vec![],
-        };
-
-        let caption = build_eh_caption(&gallery, "https://exhentai.org");
-        // Parentheses and brackets must be escaped for MarkdownV2
-        assert!(caption.contains("Test \\(Special\\)"));
-        assert!(caption.contains("\\[Brackets\\]"));
-        // Small file should show KB
-        assert!(caption.contains("488\\.3 KB"));
     }
 }

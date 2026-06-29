@@ -387,7 +387,7 @@ impl EhClient {
         let mut all_image_urls: Vec<String> = parser::parse_image_page_urls(&gallery_html);
 
         for page_num in 1..total_pages {
-            // Rate limit between page fetches
+            // Rate limit between page fetches (skip on first iteration)
             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
             let page_url = format!("{}/g/{}/{}/?p={}", self.base_url, gid, token, page_num);
             let resp = self
@@ -415,11 +415,36 @@ impl EhClient {
             return Err(Error::Parse("no image page URLs found".into()));
         }
 
-        // Step 3: Download each image (async HTTP), collect bytes
-        let mut image_data: Vec<(String, Vec<u8>)> = Vec::new();
+        // Step 3: Stream images to a blocking ZIP writer via a channel.
+        // This avoids loading all images into memory at once.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<(String, Vec<u8>)>(8);
+
+        // Spawn the ZIP writer in a blocking task
+        let dest = dest.to_path_buf();
+        let zip_task = tokio::task::spawn_blocking(move || -> Result<u64> {
+            let file = std::fs::File::create(&dest)?;
+            let buf_writer = std::io::BufWriter::new(file);
+            let mut zip_writer = zip::ZipWriter::new(buf_writer);
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+
+            let mut total: u64 = 0;
+            // Block on receiving channel messages (this is a blocking task, so we use
+            // blocking_recv which is fine here)
+            while let Some((name, data)) = rx.blocking_recv() {
+                zip_writer.start_file(&name, options)?;
+                std::io::Write::write_all(&mut zip_writer, &data)?;
+                total += data.len() as u64;
+            }
+            zip_writer.finish()?;
+            Ok(total)
+        });
+
+        // Download images asynchronously and send to the ZIP writer
+        let mut images_downloaded: usize = 0;
 
         for (idx, image_page_url) in all_image_urls.iter().enumerate() {
-            // Rate limit between image fetches
+            // Rate limit between image fetches (skip on first)
             if idx > 0 {
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             }
@@ -465,35 +490,25 @@ impl EhClient {
                 .unwrap_or("jpg");
             let entry_name = format!("{:04}.{}", idx + 1, ext);
 
-            image_data.push((entry_name, img_bytes.to_vec()));
+            // Send to ZIP writer (backpressure: channel capacity 8)
+            if tx.send((entry_name, img_bytes.to_vec())).await.is_err() {
+                break; // ZIP writer task died
+            }
+            images_downloaded += 1;
         }
 
-        if image_data.is_empty() {
+        // Drop sender to signal EOF to the ZIP writer
+        drop(tx);
+
+        let total_bytes = zip_task
+            .await
+            .map_err(|e| Error::Other(format!("spawn_blocking failed: {}", e)))??;
+
+        if images_downloaded == 0 {
             return Err(Error::Other(
                 "all image downloads failed, no images in ZIP".into(),
             ));
         }
-
-        // Step 4: Write ZIP in a blocking task to avoid blocking async executor
-        let dest = dest.to_path_buf();
-        let total_bytes = tokio::task::spawn_blocking(move || -> Result<u64> {
-            let file = std::fs::File::create(&dest)?;
-            let buf_writer = std::io::BufWriter::new(file);
-            let mut zip_writer = zip::ZipWriter::new(buf_writer);
-            let options = zip::write::SimpleFileOptions::default()
-                .compression_method(zip::CompressionMethod::Stored);
-
-            let mut total: u64 = 0;
-            for (name, data) in &image_data {
-                zip_writer.start_file(name, options)?;
-                std::io::Write::write_all(&mut zip_writer, data)?;
-                total += data.len() as u64;
-            }
-            zip_writer.finish()?;
-            Ok(total)
-        })
-        .await
-        .map_err(|e| Error::Other(format!("spawn_blocking failed: {}", e)))??;
 
         Ok(total_bytes)
     }

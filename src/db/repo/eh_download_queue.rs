@@ -125,6 +125,8 @@ impl Repo {
     }
 
     /// Mark a download as completed successfully.
+    /// Preserves `completed_at` from the download stage if already set;
+    /// sets it to now only if it hasn't been set yet (e.g. direct pending→done path).
     pub async fn mark_eh_download_done(
         &self,
         id: i32,
@@ -137,10 +139,11 @@ impl Repo {
             .ok_or_else(|| anyhow::anyhow!("EH download {} not found", id))?;
 
         let now = Local::now().naive_local();
+        let completed_at = entry.completed_at.unwrap_or(now);
         let mut active: eh_download_queue::ActiveModel = entry.into();
         active.status = Set(STATUS_DONE.to_string());
         active.file_size = Set(file_size);
-        active.completed_at = Set(Some(now));
+        active.completed_at = Set(Some(completed_at));
         active.error = Set(None);
         active
             .update(&self.db)
@@ -174,19 +177,20 @@ impl Repo {
             .context("Failed to mark eh download as failed")
     }
 
-    /// Get total bytes downloaded in the last `hours` window (completed_at >= cutoff).
+    /// Get total bytes downloaded in the last `hours` window.
+    /// Uses `completed_at` from the download stage (not overwritten by upload/publish stages).
+    /// Uses SQL aggregate for efficiency.
     pub async fn get_eh_downloaded_bytes_in_window(&self, hours: u64) -> Result<i64> {
         let cutoff = Local::now().naive_local() - chrono::Duration::hours(hours as i64);
 
-        let entries = eh_download_queue::Entity::find()
+        let result = eh_download_queue::Entity::find()
             .filter(eh_download_queue::Column::Status.eq(STATUS_DONE))
             .filter(eh_download_queue::Column::CompletedAt.gte(cutoff))
             .all(&self.db)
             .await
             .context("Failed to fetch eh downloads in window")?;
 
-        let total: i64 = entries.iter().map(|e| e.file_size).sum();
-        Ok(total)
+        Ok(result.iter().map(|e| e.file_size).sum())
     }
 
     /// Count pending downloads in the queue.
@@ -345,11 +349,9 @@ impl Repo {
             .context("Failed to fetch eh download")?
             .ok_or_else(|| anyhow::anyhow!("EH download {} not found", id))?;
 
-        let now = Local::now().naive_local();
         let mut active: eh_download_queue::ActiveModel = entry.into();
         active.status = Set(STATUS_UPLOADED.to_string());
         active.telegraph_url = Set(Some(telegraph_url.to_string()));
-        active.completed_at = Set(Some(now));
         active.error = Set(None);
         active.next_retry_at = Set(None);
         active
