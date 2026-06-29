@@ -173,6 +173,9 @@ impl EhClient {
     /// `archiver_key` is obtained from `get_archiver_key`.
     /// `resolution` controls quality: "780x"/"980x"/"1280x" (free resamples),
     /// "1600x"/"2400x" (donors), "original" (costs GP).
+    ///
+    /// Streams to a temporary path, validates the ZIP, then atomically renames
+    /// to `dest`. The temp file is removed on any error after creation.
     pub async fn download_archive(
         &self,
         gid: u64,
@@ -228,7 +231,7 @@ impl EhClient {
         let download_url = parser::parse_archive_redirect(&html)
             .ok_or_else(|| Error::Parse("archive redirect URL not found".into()))?;
 
-        // Step 3: Download the ZIP file — stream to disk, no cookies to H@H server
+        // Step 3: Download the ZIP file — stream to temp, no cookies to H@H server
         let mut resp = self
             .http
             .get(&download_url)
@@ -244,18 +247,41 @@ impl EhClient {
             });
         }
 
-        // Step 4: Stream to file (avoids loading entire archive into memory)
-        let mut file = tokio::fs::File::create(dest).await?;
-        let mut total: u64 = 0;
-        while let Some(chunk) = resp.chunk().await? {
-            file.write_all(&chunk).await?;
-            total += chunk.len() as u64;
+        // Step 4: Stream to temp file, validate, then rename atomically
+        let temp_path = dest.with_extension("zip.part");
+        let _ = tokio::fs::remove_file(&temp_path).await;
+
+        let download_result: Result<u64> = async {
+            let mut file = tokio::fs::File::create(&temp_path).await?;
+            let mut total: u64 = 0;
+            while let Some(chunk) = resp.chunk().await? {
+                file.write_all(&chunk).await?;
+                total += chunk.len() as u64;
+            }
+            file.flush().await?;
+            Ok(total)
         }
-        file.flush().await?;
-        drop(file);
+        .await;
+
+        let total = match download_result {
+            Ok(t) => t,
+            Err(e) => {
+                let _ = tokio::fs::remove_file(&temp_path).await;
+                return Err(e);
+            }
+        };
 
         // Step 5: Validate that we got a real ZIP (not an error HTML page)
-        validate_zip_magic(dest).await?;
+        if let Err(e) = validate_zip_magic(&temp_path).await {
+            let _ = tokio::fs::remove_file(&temp_path).await;
+            return Err(e);
+        }
+
+        // Step 6: Atomically rename temp to final dest
+        if let Err(e) = tokio::fs::rename(&temp_path, dest).await {
+            let _ = tokio::fs::remove_file(&temp_path).await;
+            return Err(e.into());
+        }
 
         Ok(total)
     }
@@ -375,6 +401,8 @@ impl EhClient {
     /// Downloads all images and packages them into a ZIP at `dest`.
     /// Returns total bytes written.
     /// Fails if any image page fetch, image src extraction, or image download fails.
+    /// Writes ZIP incrementally to a temp path; only renames to `dest` on success.
+    /// Cleans up the temp file and ensures `dest` does not exist on error.
     pub async fn download_gallery_images(&self, gid: u64, token: &str, dest: &Path) -> Result<u64> {
         // Step 1: Fetch gallery page to get image page URLs and page count
         let gallery_url = format!("{}/g/{}/{}/", self.base_url, gid, token);
@@ -442,9 +470,29 @@ impl EhClient {
 
         let total_pages_count = image_page_urls.len();
 
-        // Step 3: Download all images all-or-nothing, then write ZIP.
-        // Collect image bytes first so any failure stops the whole operation.
-        let mut images: Vec<(String, Vec<u8>)> = Vec::with_capacity(total_pages_count);
+        // Step 3: Write ZIP incrementally to a temp path. Only rename to dest on success.
+        let temp_path = dest.with_extension("zip.part");
+        let _ = tokio::fs::remove_file(&temp_path).await;
+
+        // Create the temp file and start the ZIP writer
+        let temp_file = std::fs::File::create(&temp_path).map_err(|e| {
+            Error::Other(format!(
+                "failed to download all gallery images: cannot create temp file: {}",
+                e
+            ))
+        })?;
+        let buf_writer = std::io::BufWriter::new(temp_file);
+        let mut zip_writer = zip::ZipWriter::new(buf_writer);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+
+        let mut total_bytes: u64 = 0;
+
+        // Helper: on any error, clean up temp and dest
+        let cleanup = |temp: &Path, final_dest: &Path| {
+            let _ = std::fs::remove_file(temp);
+            let _ = std::fs::remove_file(final_dest);
+        };
 
         for (idx, image_page_url) in image_page_urls.iter().enumerate() {
             if idx > 0 {
@@ -467,6 +515,7 @@ impl EhClient {
                 })?;
 
             if !resp.status().is_success() {
+                cleanup(&temp_path, dest);
                 return Err(Error::Other(format!(
                     "failed to download all gallery images: page {}/{} returned {}",
                     idx + 1,
@@ -475,7 +524,14 @@ impl EhClient {
                 )));
             }
 
-            let html = resp.text().await?;
+            let html = resp.text().await.map_err(|e| {
+                Error::Other(format!(
+                    "failed to download all gallery images: page {}/{} read error: {}",
+                    idx + 1,
+                    total_pages_count,
+                    e
+                ))
+            })?;
             let image_url = parser::parse_image_src(&html).ok_or_else(|| {
                 Error::Parse(format!(
                     "failed to download all gallery images: no image src on page {}/{}",
@@ -494,6 +550,7 @@ impl EhClient {
             })?;
 
             if !img_resp.status().is_success() {
+                cleanup(&temp_path, dest);
                 return Err(Error::Other(format!(
                     "failed to download all gallery images: image {}/{} returned {}",
                     idx + 1,
@@ -502,7 +559,14 @@ impl EhClient {
                 )));
             }
 
-            let img_bytes = img_resp.bytes().await?;
+            let img_bytes = img_resp.bytes().await.map_err(|e| {
+                Error::Other(format!(
+                    "failed to download all gallery images: image {}/{} read error: {}",
+                    idx + 1,
+                    total_pages_count,
+                    e
+                ))
+            })?;
 
             let ext = image_url
                 .rsplit('.')
@@ -511,29 +575,41 @@ impl EhClient {
                 .unwrap_or("jpg");
             let entry_name = format!("{:04}.{}", idx + 1, ext);
 
-            images.push((entry_name, img_bytes.to_vec()));
+            // Write to ZIP immediately
+            zip_writer.start_file(&entry_name, options).map_err(|e| {
+                cleanup(&temp_path, dest);
+                Error::Other(format!(
+                    "failed to download all gallery images: zip start_file error: {}",
+                    e
+                ))
+            })?;
+            std::io::Write::write_all(&mut zip_writer, &img_bytes).map_err(|e| {
+                cleanup(&temp_path, dest);
+                Error::Other(format!(
+                    "failed to download all gallery images: zip write error: {}",
+                    e
+                ))
+            })?;
+            total_bytes += img_bytes.len() as u64;
         }
 
-        // Write all collected images to ZIP in a blocking task
-        let dest = dest.to_path_buf();
-        let total_bytes = tokio::task::spawn_blocking(move || -> Result<u64> {
-            let file = std::fs::File::create(&dest)?;
-            let buf_writer = std::io::BufWriter::new(file);
-            let mut zip_writer = zip::ZipWriter::new(buf_writer);
-            let options = zip::write::SimpleFileOptions::default()
-                .compression_method(zip::CompressionMethod::Stored);
+        // Finish the ZIP
+        zip_writer.finish().map_err(|e| {
+            cleanup(&temp_path, dest);
+            Error::Other(format!(
+                "failed to download all gallery images: zip finish error: {}",
+                e
+            ))
+        })?;
 
-            let mut total: u64 = 0;
-            for (name, data) in &images {
-                zip_writer.start_file(name, options)?;
-                std::io::Write::write_all(&mut zip_writer, data)?;
-                total += data.len() as u64;
-            }
-            zip_writer.finish()?;
-            Ok(total)
-        })
-        .await
-        .map_err(|e| Error::Other(format!("spawn_blocking failed: {}", e)))??;
+        // Atomically rename temp to final dest
+        std::fs::rename(&temp_path, dest).map_err(|e| {
+            cleanup(&temp_path, dest);
+            Error::Other(format!(
+                "failed to download all gallery images: rename error: {}",
+                e
+            ))
+        })?;
 
         Ok(total_bytes)
     }

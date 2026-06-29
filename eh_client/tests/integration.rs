@@ -282,6 +282,37 @@ async fn test_download_archive_archiver_error() {
 }
 
 #[tokio::test]
+async fn test_download_archive_invalid_zip_response_cleans_up() {
+    let server = MockServer::start().await;
+    let redirect_html = format!(
+        r#"<script>document.location = "{}/archive/123456/abcdef0123/abcdef0123/0?autostart=1";</script>"#,
+        server.uri()
+    );
+
+    Mock::given(method("POST"))
+        .and(path("/archiver.php"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(redirect_html))
+        .mount(&server)
+        .await;
+
+    // Return an HTML page instead of a valid ZIP — zip_magic validation will fail
+    Mock::given(method("GET"))
+        .and(path("/archive/123456/abcdef0123/abcdef0123/0"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("<html>error page</html>"))
+        .mount(&server)
+        .await;
+
+    let client = client_at(&server);
+    let temp_dir = tempfile::tempdir().unwrap();
+    let dest = temp_dir.path().join("archive.zip");
+    let result = client
+        .download_archive(123456, "abcdef0123", "123456--abc123def456", "780x", &dest)
+        .await;
+    assert!(result.is_err());
+    assert!(!dest.exists(), "dest should not exist after invalid ZIP");
+}
+
+#[tokio::test]
 async fn test_download_gallery_images_fails_when_one_page_fetch_fails() {
     let server = MockServer::start().await;
     let client = client_at(&server);
@@ -312,7 +343,8 @@ async fn test_download_gallery_images_fails_when_one_page_fetch_fails() {
         .mount(&server)
         .await;
 
-    let dest = tempfile::tempdir().unwrap().path().join("gallery.zip");
+    let temp_dir = tempfile::tempdir().unwrap();
+    let dest = temp_dir.path().join("gallery.zip");
     let err = client
         .download_gallery_images(123, "abc", &dest)
         .await
@@ -320,6 +352,7 @@ async fn test_download_gallery_images_fails_when_one_page_fetch_fails() {
     assert!(err
         .to_string()
         .contains("failed to download all gallery images"));
+    assert!(!dest.exists(), "dest should not exist after error");
 }
 
 #[tokio::test]
@@ -370,4 +403,5 @@ async fn test_download_gallery_images_fails_when_one_image_fetch_fails() {
     assert!(err
         .to_string()
         .contains("failed to download all gallery images"));
+    assert!(!dest.exists(), "dest should not exist after error");
 }
