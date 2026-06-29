@@ -665,6 +665,48 @@ impl Repo {
         Ok(model)
     }
 
+    /// Fallback a permanently failed Telegraph upload to archive-only delivery.
+    /// Sets telegraph=false, status=downloaded, clears next_retry_at.
+    /// Only updates rows currently in `STATUS_UPLOADING`.
+    pub async fn fallback_eh_upload_to_archive(
+        &self,
+        id: i32,
+        error: &str,
+    ) -> Result<eh_download_queue::Model> {
+        let result = eh_download_queue::Entity::update_many()
+            .col_expr(eh_download_queue::Column::Telegraph, Expr::value(false))
+            .col_expr(
+                eh_download_queue::Column::Status,
+                Expr::value(STATUS_DOWNLOADED),
+            )
+            .col_expr(
+                eh_download_queue::Column::Error,
+                Expr::value(Some(error.to_string())),
+            )
+            .col_expr(
+                eh_download_queue::Column::NextRetryAt,
+                Expr::value(None::<DateTime>),
+            )
+            .filter(eh_download_queue::Column::Id.eq(id))
+            .filter(eh_download_queue::Column::Status.eq(STATUS_UPLOADING))
+            .exec(&self.db)
+            .await?;
+
+        if result.rows_affected != 1 {
+            anyhow::bail!(
+                "Cannot fallback EH upload {} to archive: expected status '{}', but it was changed",
+                id,
+                STATUS_UPLOADING
+            );
+        }
+
+        let model = eh_download_queue::Entity::find_by_id(id)
+            .one(&self.db)
+            .await?
+            .context("Entry disappeared after upload fallback")?;
+        Ok(model)
+    }
+
     /// Get next entry for the download stage: status=pending, next_retry_at is NULL or <= now.
     /// Uses a conditional UPDATE to atomically claim the entry.
     pub async fn get_next_for_download(&self) -> Result<Option<eh_download_queue::Model>> {
@@ -1009,6 +1051,9 @@ impl Repo {
                 eh_download_queue::Column::Status.eq(STATUS_PUBLISHING)
             }
             (STATUS_PUBLISHING, STATUS_UPLOADED) => {
+                eh_download_queue::Column::Status.eq(STATUS_PUBLISHING)
+            }
+            (STATUS_PUBLISHING, STATUS_PENDING) => {
                 eh_download_queue::Column::Status.eq(STATUS_PUBLISHING)
             }
             _ => anyhow::bail!(
