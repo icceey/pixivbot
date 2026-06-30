@@ -117,6 +117,8 @@ pub mod tests_helpers {
                 title TEXT NOT NULL,
                 telegraph BOOLEAN NOT NULL DEFAULT 0,
                 source TEXT NOT NULL DEFAULT 'subscription',
+                subscription_ids TEXT,
+                telegraph_subscription_ids TEXT,
                 status TEXT NOT NULL DEFAULT 'pending',
                 file_size INTEGER NOT NULL DEFAULT 0,
                 error TEXT,

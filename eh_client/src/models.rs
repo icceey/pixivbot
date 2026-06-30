@@ -106,7 +106,20 @@ impl EhCategory {
 /// Raw API response structures (internal).
 #[derive(Debug, Deserialize)]
 pub(crate) struct RawApiResponse {
-    pub gmetadata: Vec<RawGalleryMeta>,
+    pub gmetadata: Vec<RawGalleryMetaEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub(crate) enum RawGalleryMetaEntry {
+    Gallery(Box<RawGalleryMeta>),
+    Error(RawGalleryError),
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct RawGalleryError {
+    pub gid: u64,
+    pub error: String,
 }
 
 #[derive(Debug, Deserialize)]

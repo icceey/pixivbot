@@ -136,6 +136,48 @@ async fn test_get_metadata_parses_json() {
 }
 
 #[tokio::test]
+async fn test_get_metadata_skips_per_gallery_errors() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api.php"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "gmetadata": [
+                {
+                    "gid": 111111,
+                    "error": "Key missing, or incorrect key provided."
+                },
+                {
+                    "gid": 123456,
+                    "token": "abcdef0123",
+                    "title": "Valid Gallery",
+                    "title_jpn": null,
+                    "category": "Manga",
+                    "thumb": "https://ehgt.org/t/valid.jpg",
+                    "uploader": "validuser",
+                    "posted": "1376143500",
+                    "filecount": "20",
+                    "filesize": 51210504,
+                    "expunged": false,
+                    "rating": "4.64",
+                    "tags": ["artist:test"]
+                }
+            ]
+        })))
+        .mount(&server)
+        .await;
+
+    let client = client_at(&server);
+    let galleries = client
+        .get_metadata(&[(111111, "badtoken"), (123456, "abcdef0123")])
+        .await
+        .expect("metadata should skip per-gallery errors");
+
+    assert_eq!(galleries.len(), 1);
+    assert_eq!(galleries[0].gid, 123456);
+    assert_eq!(galleries[0].title, "Valid Gallery");
+}
+
+#[tokio::test]
 async fn test_get_metadata_empty_list() {
     let client = EhClientBuilder::new().build();
     let result = client

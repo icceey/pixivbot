@@ -255,6 +255,17 @@ async fn main() -> Result<()> {
         if let Err(e) = repo.reset_stale_eh_downloads().await {
             tracing::warn!("Failed to reset stale EH entries: {:#}", e);
         }
+        match repo.cancel_legacy_eh_subscription_queue_entries().await {
+            Ok(count) if count > 0 => warn!(
+                "Canceled {} legacy EH subscription queue entries without owner tracking",
+                count
+            ),
+            Ok(_) => {}
+            Err(e) => tracing::warn!(
+                "Failed to cancel legacy EH subscription queue entries without owner tracking: {:#}",
+                e
+            ),
+        }
         if telegraph_client.is_none() {
             match repo.disable_eh_telegraph_for_unuploaded_entries().await {
                 Ok(count) if count > 0 => warn!(

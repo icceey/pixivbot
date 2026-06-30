@@ -1,5 +1,5 @@
 use crate::error::{Error, Result};
-use crate::models::{EhCookies, EhGallery, EhGalleryRef, RawApiResponse};
+use crate::models::{EhCookies, EhGallery, EhGalleryRef, RawApiResponse, RawGalleryMetaEntry};
 use crate::parser;
 use reqwest::header::COOKIE;
 use std::path::Path;
@@ -114,11 +114,22 @@ impl EhClient {
         }
 
         let raw: RawApiResponse = resp.json().await?;
-        Ok(raw
+        let galleries = raw
             .gmetadata
             .into_iter()
-            .map(|m| m.into_gallery())
-            .collect())
+            .filter_map(|entry| match entry {
+                RawGalleryMetaEntry::Gallery(m) => Some((*m).into_gallery()),
+                RawGalleryMetaEntry::Error(e) => {
+                    tracing::warn!(
+                        gid = e.gid,
+                        error = %e.error,
+                        "Skipping E-Hentai metadata error entry"
+                    );
+                    None
+                }
+            })
+            .collect();
+        Ok(galleries)
     }
 
     /// Get the archiver_key for a gallery.

@@ -7,7 +7,20 @@ use sea_orm::sea_query::Expr;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, EntityTrait, Order, PaginatorTrait, QueryFilter, QueryOrder, Set,
 };
+use std::collections::BTreeSet;
+use std::sync::LazyLock;
 use tracing::warn;
+
+use crate::db::entities::subscriptions;
+
+/// Serializes EH publish side effects with subscription-queue cancellation.
+///
+/// A database status check alone cannot prevent `/eunsub` from canceling a row
+/// between the final active check and a Telegram send.  Both the cancel path
+/// and the publish-send path take this process-wide lock so their effects have
+/// a single observable order.
+pub static EH_PUBLISH_CANCEL_LOCK: LazyLock<tokio::sync::Mutex<()>> =
+    LazyLock::new(|| tokio::sync::Mutex::new(()));
 
 /// Bundled enqueue request parameters to keep helper signatures manageable
 /// and avoid clippy `too_many_arguments`.
@@ -18,6 +31,7 @@ struct EhEnqueueRequest<'a> {
     title: &'a str,
     telegraph: bool,
     source: &'a str,
+    subscription_id: Option<i32>,
 }
 
 /// Status constants for eh_download_queue.
@@ -29,10 +43,80 @@ pub const STATUS_DOWNLOADED: &str = "downloaded";
 pub const STATUS_UPLOADING: &str = "uploading";
 pub const STATUS_UPLOADED: &str = "uploaded";
 pub const STATUS_PUBLISHING: &str = "publishing";
+pub const STATUS_CANCELED: &str = "canceled";
 
 /// Source constants for eh_download_queue.
 pub const SOURCE_SUBSCRIPTION: &str = "subscription";
 pub const SOURCE_DIRECT: &str = "direct";
+
+fn parse_subscription_ids(value: Option<&str>) -> BTreeSet<i32> {
+    value
+        .unwrap_or_default()
+        .split(',')
+        .filter_map(|part| part.parse::<i32>().ok())
+        .collect()
+}
+
+fn format_subscription_ids(ids: &BTreeSet<i32>) -> Option<String> {
+    if ids.is_empty() {
+        None
+    } else {
+        Some(ids.iter().map(i32::to_string).collect::<Vec<_>>().join(","))
+    }
+}
+
+fn merge_subscription_ids(current: Option<&str>, new_id: Option<i32>) -> Option<String> {
+    let mut ids = parse_subscription_ids(current);
+    if let Some(id) = new_id {
+        ids.insert(id);
+    }
+    format_subscription_ids(&ids)
+}
+
+fn merge_telegraph_subscription_ids(
+    current: Option<&str>,
+    new_id: Option<i32>,
+    telegraph: bool,
+) -> Option<String> {
+    let mut ids = parse_subscription_ids(current);
+    if telegraph {
+        if let Some(id) = new_id {
+            ids.insert(id);
+        }
+    }
+    format_subscription_ids(&ids)
+}
+
+fn is_active_subscription_queue_status(status: &str) -> bool {
+    matches!(
+        status,
+        STATUS_PENDING
+            | STATUS_DOWNLOADING
+            | STATUS_DOWNLOADED
+            | STATUS_UPLOADING
+            | STATUS_UPLOADED
+            | STATUS_PUBLISHING
+    )
+}
+
+fn is_cancelable_subscription_queue_status(status: &str) -> bool {
+    is_active_subscription_queue_status(status)
+        || matches!(status, STATUS_DONE | STATUS_FAILED | STATUS_CANCELED)
+}
+
+fn subscription_ids_filter(expected: Option<String>) -> sea_orm::sea_query::SimpleExpr {
+    match expected {
+        Some(value) => eh_download_queue::Column::SubscriptionIds.eq(value),
+        None => eh_download_queue::Column::SubscriptionIds.is_null(),
+    }
+}
+
+fn telegraph_subscription_ids_filter(expected: Option<String>) -> sea_orm::sea_query::SimpleExpr {
+    match expected {
+        Some(value) => eh_download_queue::Column::TelegraphSubscriptionIds.eq(value),
+        None => eh_download_queue::Column::TelegraphSubscriptionIds.is_null(),
+    }
+}
 
 impl Repo {
     /// Recover from a failed insert in `enqueue_eh_download` by re-selecting
@@ -51,8 +135,15 @@ impl Repo {
             .await
         {
             Ok(Some(raced)) => {
-                self.merge_eh_download(raced, req.token, req.title, req.telegraph, req.source)
-                    .await
+                self.merge_eh_download(
+                    raced,
+                    req.token,
+                    req.title,
+                    req.telegraph,
+                    req.source,
+                    req.subscription_id,
+                )
+                .await
             }
             Ok(None) => Err(db_err).context("Failed to enqueue eh download"),
             Err(select_err) => Err(select_err).context("Failed to re-select after insert conflict"),
@@ -73,29 +164,81 @@ impl Repo {
         telegraph: bool,
         source: &str,
     ) -> Result<eh_download_queue::Model> {
+        self.enqueue_eh_download_request(EhEnqueueRequest {
+            chat_id,
+            gid,
+            token,
+            title,
+            telegraph,
+            source,
+            subscription_id: None,
+        })
+        .await
+    }
+
+    /// Enqueue a scheduler-created EH subscription download and remember the
+    /// originating subscription id so unsubscribe can cancel queued work.
+    pub async fn enqueue_eh_subscription_download(
+        &self,
+        chat_id: i64,
+        subscription_id: i32,
+        gid: i64,
+        token: &str,
+        title: &str,
+        telegraph: bool,
+    ) -> Result<eh_download_queue::Model> {
+        self.enqueue_eh_download_request(EhEnqueueRequest {
+            chat_id,
+            gid,
+            token,
+            title,
+            telegraph,
+            source: SOURCE_SUBSCRIPTION,
+            subscription_id: Some(subscription_id),
+        })
+        .await
+    }
+
+    async fn enqueue_eh_download_request(
+        &self,
+        req: EhEnqueueRequest<'_>,
+    ) -> Result<eh_download_queue::Model> {
         let now = Local::now().naive_local();
 
         // Check for existing entry
         let existing = eh_download_queue::Entity::find()
-            .filter(eh_download_queue::Column::ChatId.eq(chat_id))
-            .filter(eh_download_queue::Column::Gid.eq(gid))
+            .filter(eh_download_queue::Column::ChatId.eq(req.chat_id))
+            .filter(eh_download_queue::Column::Gid.eq(req.gid))
             .one(&self.db)
             .await?;
 
         if let Some(model) = existing {
             return self
-                .merge_eh_download(model, token, title, telegraph, source)
+                .merge_eh_download(
+                    model,
+                    req.token,
+                    req.title,
+                    req.telegraph,
+                    req.source,
+                    req.subscription_id,
+                )
                 .await;
         }
 
         // No existing entry — insert new; handle race on unique conflict
         let entry = eh_download_queue::ActiveModel {
-            chat_id: Set(chat_id),
-            gid: Set(gid),
-            token: Set(token.to_string()),
-            title: Set(title.to_string()),
-            telegraph: Set(telegraph),
-            source: Set(source.to_string()),
+            chat_id: Set(req.chat_id),
+            gid: Set(req.gid),
+            token: Set(req.token.to_string()),
+            title: Set(req.title.to_string()),
+            telegraph: Set(req.telegraph),
+            source: Set(req.source.to_string()),
+            subscription_ids: Set(req.subscription_id.map(|id| id.to_string())),
+            telegraph_subscription_ids: Set(if req.telegraph {
+                req.subscription_id.map(|id| id.to_string())
+            } else {
+                None
+            }),
             status: Set(STATUS_PENDING.to_string()),
             file_size: Set(0),
             error: Set(None),
@@ -111,18 +254,8 @@ impl Repo {
             Err(db_err) => {
                 // Race: another caller may have inserted the same (chat_id, gid).
                 // Re-select and merge instead of failing on unique constraint.
-                self.recover_eh_enqueue_after_insert_error(
-                    EhEnqueueRequest {
-                        chat_id,
-                        gid,
-                        token,
-                        title,
-                        telegraph,
-                        source,
-                    },
-                    db_err,
-                )
-                .await
+                self.recover_eh_enqueue_after_insert_error(req, db_err)
+                    .await
             }
         }
     }
@@ -145,17 +278,39 @@ impl Repo {
         title: &str,
         telegraph: bool,
         source: &str,
+        subscription_id: Option<i32>,
     ) -> Result<eh_download_queue::Model> {
         const MAX_RETRIES: usize = 3;
         let mut current = existing;
 
         for attempt in 0..MAX_RETRIES {
-            let is_terminal = current.status == STATUS_DONE || current.status == STATUS_FAILED;
-            let merged_telegraph = current.telegraph || telegraph;
+            let is_terminal = matches!(
+                current.status.as_str(),
+                STATUS_DONE | STATUS_FAILED | STATUS_CANCELED
+            );
             let merged_source = if current.source == SOURCE_DIRECT || source == SOURCE_DIRECT {
                 SOURCE_DIRECT
             } else {
                 SOURCE_SUBSCRIPTION
+            };
+            let merged_subscription_ids = if merged_source == SOURCE_DIRECT {
+                None
+            } else {
+                merge_subscription_ids(current.subscription_ids.as_deref(), subscription_id)
+            };
+            let merged_telegraph_subscription_ids = if merged_source == SOURCE_DIRECT {
+                None
+            } else {
+                merge_telegraph_subscription_ids(
+                    current.telegraph_subscription_ids.as_deref(),
+                    subscription_id,
+                    telegraph,
+                )
+            };
+            let merged_telegraph = if merged_source == SOURCE_SUBSCRIPTION {
+                merged_telegraph_subscription_ids.is_some()
+            } else {
+                current.telegraph || telegraph
             };
             let source_upgraded_to_direct =
                 current.source != SOURCE_DIRECT && merged_source == SOURCE_DIRECT;
@@ -171,6 +326,7 @@ impl Repo {
                 let expected_status = current.status.clone();
                 let expected_telegraph = current.telegraph;
                 let expected_source = current.source.clone();
+                let expected_subscription_ids = current.subscription_ids.clone();
 
                 let result = eh_download_queue::Entity::update_many()
                     .col_expr(
@@ -192,6 +348,14 @@ impl Repo {
                     .col_expr(
                         eh_download_queue::Column::Source,
                         Expr::value(merged_source.to_string()),
+                    )
+                    .col_expr(
+                        eh_download_queue::Column::SubscriptionIds,
+                        Expr::value(merged_subscription_ids.clone()),
+                    )
+                    .col_expr(
+                        eh_download_queue::Column::TelegraphSubscriptionIds,
+                        Expr::value(merged_telegraph_subscription_ids.clone()),
                     )
                     .col_expr(eh_download_queue::Column::FileSize, Expr::value(0))
                     .col_expr(
@@ -231,6 +395,7 @@ impl Repo {
                     .filter(eh_download_queue::Column::Status.eq(&expected_status))
                     .filter(eh_download_queue::Column::Telegraph.eq(expected_telegraph))
                     .filter(eh_download_queue::Column::Source.eq(&expected_source))
+                    .filter(subscription_ids_filter(expected_subscription_ids))
                     .exec(&self.db)
                     .await
                     .context("Failed to reset eh download for re-enqueue")?;
@@ -270,6 +435,7 @@ impl Repo {
             let expected_status = current.status.clone();
             let expected_telegraph = current.telegraph;
             let expected_source = current.source.clone();
+            let expected_subscription_ids = current.subscription_ids.clone();
 
             let result = eh_download_queue::Entity::update_many()
                 .col_expr(
@@ -288,10 +454,19 @@ impl Repo {
                     eh_download_queue::Column::Source,
                     Expr::value(merged_source.to_string()),
                 )
+                .col_expr(
+                    eh_download_queue::Column::SubscriptionIds,
+                    Expr::value(merged_subscription_ids.clone()),
+                )
+                .col_expr(
+                    eh_download_queue::Column::TelegraphSubscriptionIds,
+                    Expr::value(merged_telegraph_subscription_ids.clone()),
+                )
                 .filter(eh_download_queue::Column::Id.eq(id))
                 .filter(eh_download_queue::Column::Status.eq(&expected_status))
                 .filter(eh_download_queue::Column::Telegraph.eq(expected_telegraph))
                 .filter(eh_download_queue::Column::Source.eq(&expected_source))
+                .filter(subscription_ids_filter(expected_subscription_ids))
                 .exec(&self.db)
                 .await
                 .context("Failed to update eh download in place")?;
@@ -458,6 +633,328 @@ impl Repo {
             .count(&self.db)
             .await
             .context("Failed to count pending eh downloads")
+    }
+
+    /// Cancel queued/in-flight EH downloads that were created for a subscription
+    /// that has just been removed. Direct downloads and terminal rows are left
+    /// untouched; rows with other active subscription owners keep running.
+    pub async fn cancel_eh_subscription_queue_entries(&self, subscription_id: i32) -> Result<u64> {
+        let _guard = EH_PUBLISH_CANCEL_LOCK.lock().await;
+        self.cancel_eh_subscription_queue_entries_inner(subscription_id)
+            .await
+    }
+
+    /// Cancel legacy subscription queue rows that predate `subscription_ids`.
+    ///
+    /// They cannot be attributed to a specific subscription safely, so they are
+    /// canceled instead of being published after an unsubscribe or after the
+    /// migration introduces owner-aware queue semantics.  Already-canceled
+    /// legacy rows are included so startup can repair rows from an older
+    /// migration attempt that canceled them without clearing Telegraph state.
+    pub async fn cancel_legacy_eh_subscription_queue_entries(&self) -> Result<u64> {
+        let result = eh_download_queue::Entity::update_many()
+            .col_expr(
+                eh_download_queue::Column::Status,
+                Expr::value(STATUS_CANCELED),
+            )
+            .col_expr(eh_download_queue::Column::Telegraph, Expr::value(false))
+            .col_expr(
+                eh_download_queue::Column::TelegraphUrl,
+                Expr::value(None::<String>),
+            )
+            .col_expr(
+                eh_download_queue::Column::TelegraphSubscriptionIds,
+                Expr::value(None::<String>),
+            )
+            .col_expr(
+                eh_download_queue::Column::ArchiveSentAt,
+                Expr::value(None::<DateTime>),
+            )
+            .col_expr(
+                eh_download_queue::Column::TelegraphSentAt,
+                Expr::value(None::<DateTime>),
+            )
+            .filter(eh_download_queue::Column::Source.eq(SOURCE_SUBSCRIPTION))
+            .filter(eh_download_queue::Column::SubscriptionIds.is_null())
+            .filter(eh_download_queue::Column::Status.is_in([
+                STATUS_PENDING,
+                STATUS_DOWNLOADING,
+                STATUS_DOWNLOADED,
+                STATUS_UPLOADING,
+                STATUS_UPLOADED,
+                STATUS_PUBLISHING,
+                STATUS_CANCELED,
+                STATUS_DONE,
+                STATUS_FAILED,
+            ]))
+            .exec(&self.db)
+            .await
+            .context("Failed to cancel legacy EH subscription queue entries")?;
+        Ok(result.rows_affected)
+    }
+
+    /// Delete an EH subscription and cancel/prune its queued work in one
+    /// publish/cancel critical section.
+    pub async fn delete_eh_subscription_and_cancel_queue(
+        &self,
+        subscription_id: i32,
+    ) -> Result<()> {
+        let _guard = EH_PUBLISH_CANCEL_LOCK.lock().await;
+        self.delete_subscription(subscription_id).await?;
+        self.cancel_eh_subscription_queue_entries_inner(subscription_id)
+            .await?;
+        Ok(())
+    }
+
+    async fn cancel_eh_subscription_queue_entries_inner(
+        &self,
+        subscription_id: i32,
+    ) -> Result<u64> {
+        let active_rows = eh_download_queue::Entity::find()
+            .filter(eh_download_queue::Column::Source.eq(SOURCE_SUBSCRIPTION))
+            .filter(eh_download_queue::Column::SubscriptionIds.is_not_null())
+            .filter(eh_download_queue::Column::Status.is_in([
+                STATUS_PENDING,
+                STATUS_DOWNLOADING,
+                STATUS_DOWNLOADED,
+                STATUS_UPLOADING,
+                STATUS_UPLOADED,
+                STATUS_PUBLISHING,
+                STATUS_DONE,
+                STATUS_FAILED,
+                STATUS_CANCELED,
+            ]))
+            .all(&self.db)
+            .await
+            .context("Failed to cancel eh subscription queue entries")?;
+
+        let mut changed = 0u64;
+        for row in active_rows {
+            changed += self
+                .remove_subscription_owner_from_eh_row(row, subscription_id)
+                .await?;
+        }
+        Ok(changed)
+    }
+
+    async fn remove_subscription_owner_from_eh_row(
+        &self,
+        mut row: eh_download_queue::Model,
+        subscription_id: i32,
+    ) -> Result<u64> {
+        const MAX_RETRIES: usize = 3;
+        for attempt in 0..MAX_RETRIES {
+            if row.source != SOURCE_SUBSCRIPTION
+                || !is_cancelable_subscription_queue_status(&row.status)
+            {
+                return Ok(0);
+            }
+
+            let mut ids = parse_subscription_ids(row.subscription_ids.as_deref());
+            if !ids.remove(&subscription_id) {
+                return Ok(0);
+            }
+            let remaining_ids = format_subscription_ids(&ids);
+            let mut telegraph_ids =
+                parse_subscription_ids(row.telegraph_subscription_ids.as_deref());
+            telegraph_ids.remove(&subscription_id);
+            let remaining_telegraph_ids = format_subscription_ids(&telegraph_ids);
+            let canceled = remaining_ids.is_none();
+            let telegraph_still_required = remaining_telegraph_ids.is_some();
+            let new_status = if canceled && is_active_subscription_queue_status(&row.status) {
+                STATUS_CANCELED.to_string()
+            } else if !telegraph_still_required
+                && matches!(
+                    row.status.as_str(),
+                    STATUS_UPLOADING | STATUS_UPLOADED | STATUS_PUBLISHING
+                )
+            {
+                STATUS_DOWNLOADED.to_string()
+            } else {
+                row.status.clone()
+            };
+            let result = eh_download_queue::Entity::update_many()
+                .col_expr(
+                    eh_download_queue::Column::SubscriptionIds,
+                    Expr::value(remaining_ids),
+                )
+                .col_expr(
+                    eh_download_queue::Column::TelegraphSubscriptionIds,
+                    Expr::value(remaining_telegraph_ids),
+                )
+                .col_expr(eh_download_queue::Column::Status, Expr::value(new_status))
+                .col_expr(
+                    eh_download_queue::Column::Telegraph,
+                    Expr::value(telegraph_still_required),
+                )
+                .col_expr(
+                    eh_download_queue::Column::TelegraphUrl,
+                    Expr::value(if telegraph_still_required {
+                        row.telegraph_url.clone()
+                    } else {
+                        None::<String>
+                    }),
+                )
+                .col_expr(
+                    eh_download_queue::Column::ArchiveSentAt,
+                    Expr::value(if canceled {
+                        None::<DateTime>
+                    } else {
+                        row.archive_sent_at
+                    }),
+                )
+                .col_expr(
+                    eh_download_queue::Column::TelegraphSentAt,
+                    Expr::value(if telegraph_still_required {
+                        row.telegraph_sent_at
+                    } else {
+                        None::<DateTime>
+                    }),
+                )
+                .col_expr(
+                    eh_download_queue::Column::NextRetryAt,
+                    Expr::value(if telegraph_still_required {
+                        row.next_retry_at
+                    } else {
+                        None::<DateTime>
+                    }),
+                )
+                .filter(eh_download_queue::Column::Id.eq(row.id))
+                .filter(eh_download_queue::Column::Status.eq(&row.status))
+                .filter(eh_download_queue::Column::Source.eq(SOURCE_SUBSCRIPTION))
+                .filter(eh_download_queue::Column::SubscriptionIds.eq(row.subscription_ids.clone()))
+                .filter(eh_download_queue::Column::Telegraph.eq(row.telegraph))
+                .filter(telegraph_subscription_ids_filter(
+                    row.telegraph_subscription_ids.clone(),
+                ))
+                .exec(&self.db)
+                .await
+                .context("Failed to cancel eh subscription queue entry")?;
+            if result.rows_affected == 1 {
+                return Ok(1);
+            }
+
+            if attempt + 1 == MAX_RETRIES {
+                anyhow::bail!(
+                    "Failed to cancel EH subscription queue entry {} after {} attempts: row changed too frequently",
+                    row.id,
+                    MAX_RETRIES
+                );
+            }
+
+            match eh_download_queue::Entity::find_by_id(row.id)
+                .one(&self.db)
+                .await?
+            {
+                Some(fresh) => row = fresh,
+                None => return Ok(0),
+            }
+        }
+        Ok(0)
+    }
+
+    /// True if a claimed queue row is still active and has not been canceled
+    /// after its originating subscription was removed.
+    pub async fn eh_download_is_active(&self, id: i32, expected_status: &str) -> Result<bool> {
+        let row = eh_download_queue::Entity::find()
+            .filter(eh_download_queue::Column::Id.eq(id))
+            .filter(eh_download_queue::Column::Status.eq(expected_status))
+            .one(&self.db)
+            .await
+            .context("Failed to check eh download activity")?;
+        let Some(row) = row else {
+            return Ok(false);
+        };
+        if row.source != SOURCE_SUBSCRIPTION {
+            return Ok(true);
+        }
+        self.eh_download_has_live_owner_or_cancel(row, expected_status)
+            .await
+    }
+
+    async fn eh_download_has_live_owner_or_cancel(
+        &self,
+        mut row: eh_download_queue::Model,
+        expected_status: &str,
+    ) -> Result<bool> {
+        const MAX_RETRIES: usize = 3;
+        for attempt in 0..MAX_RETRIES {
+            if row.status != expected_status || row.source != SOURCE_SUBSCRIPTION {
+                return Ok(false);
+            }
+            let ids = parse_subscription_ids(row.subscription_ids.as_deref());
+            let alive = if ids.is_empty() {
+                false
+            } else {
+                subscriptions::Entity::find()
+                    .filter(subscriptions::Column::Id.is_in(ids.iter().copied()))
+                    .count(&self.db)
+                    .await
+                    .context("Failed to check EH subscription owners")?
+                    > 0
+            };
+            if alive {
+                return Ok(true);
+            }
+
+            let result = eh_download_queue::Entity::update_many()
+                .col_expr(
+                    eh_download_queue::Column::Status,
+                    Expr::value(STATUS_CANCELED),
+                )
+                .col_expr(eh_download_queue::Column::Telegraph, Expr::value(false))
+                .col_expr(
+                    eh_download_queue::Column::SubscriptionIds,
+                    Expr::value(None::<String>),
+                )
+                .col_expr(
+                    eh_download_queue::Column::TelegraphSubscriptionIds,
+                    Expr::value(None::<String>),
+                )
+                .col_expr(
+                    eh_download_queue::Column::TelegraphUrl,
+                    Expr::value(None::<String>),
+                )
+                .col_expr(
+                    eh_download_queue::Column::ArchiveSentAt,
+                    Expr::value(None::<DateTime>),
+                )
+                .col_expr(
+                    eh_download_queue::Column::TelegraphSentAt,
+                    Expr::value(None::<DateTime>),
+                )
+                .filter(eh_download_queue::Column::Id.eq(row.id))
+                .filter(eh_download_queue::Column::Status.eq(&row.status))
+                .filter(eh_download_queue::Column::Source.eq(SOURCE_SUBSCRIPTION))
+                .filter(eh_download_queue::Column::Telegraph.eq(row.telegraph))
+                .filter(subscription_ids_filter(row.subscription_ids.clone()))
+                .filter(telegraph_subscription_ids_filter(
+                    row.telegraph_subscription_ids.clone(),
+                ))
+                .exec(&self.db)
+                .await
+                .context("Failed to soft-cancel inactive EH download")?;
+            if result.rows_affected == 1 {
+                return Ok(false);
+            }
+
+            if attempt + 1 == MAX_RETRIES {
+                anyhow::bail!(
+                    "Failed to soft-cancel inactive EH download {} after {} attempts: row changed too frequently",
+                    row.id,
+                    MAX_RETRIES
+                );
+            }
+
+            match eh_download_queue::Entity::find_by_id(row.id)
+                .one(&self.db)
+                .await?
+            {
+                Some(fresh) => row = fresh,
+                None => return Ok(false),
+            }
+        }
+        Ok(false)
     }
 
     /// Reset stale in-flight entries back to their pre-claim status (crash recovery).
@@ -695,6 +1192,10 @@ impl Repo {
                 Expr::value(None::<String>),
             )
             .col_expr(
+                eh_download_queue::Column::TelegraphSubscriptionIds,
+                Expr::value(None::<String>),
+            )
+            .col_expr(
                 eh_download_queue::Column::ArchiveSentAt,
                 Expr::value(None::<DateTime>),
             )
@@ -744,6 +1245,10 @@ impl Repo {
                 Expr::value(None::<String>),
             )
             .col_expr(
+                eh_download_queue::Column::TelegraphSubscriptionIds,
+                Expr::value(None::<String>),
+            )
+            .col_expr(
                 eh_download_queue::Column::ArchiveSentAt,
                 Expr::value(None::<DateTime>),
             )
@@ -772,6 +1277,10 @@ impl Repo {
             )
             .col_expr(
                 eh_download_queue::Column::TelegraphUrl,
+                Expr::value(None::<String>),
+            )
+            .col_expr(
+                eh_download_queue::Column::TelegraphSubscriptionIds,
                 Expr::value(None::<String>),
             )
             .col_expr(
@@ -804,20 +1313,15 @@ impl Repo {
         let terminal = eh_download_queue::Entity::update_many()
             .col_expr(eh_download_queue::Column::Telegraph, Expr::value(false))
             .col_expr(
-                eh_download_queue::Column::TelegraphUrl,
+                eh_download_queue::Column::TelegraphSubscriptionIds,
                 Expr::value(None::<String>),
             )
-            .col_expr(
-                eh_download_queue::Column::ArchiveSentAt,
-                Expr::value(None::<DateTime>),
-            )
-            .col_expr(
-                eh_download_queue::Column::TelegraphSentAt,
-                Expr::value(None::<DateTime>),
-            )
             .filter(eh_download_queue::Column::Telegraph.eq(true))
-            .filter(eh_download_queue::Column::TelegraphUrl.is_null())
-            .filter(eh_download_queue::Column::Status.is_in([STATUS_DONE, STATUS_FAILED]))
+            .filter(eh_download_queue::Column::Status.is_in([
+                STATUS_DONE,
+                STATUS_FAILED,
+                STATUS_CANCELED,
+            ]))
             .exec(&self.db)
             .await
             .context("Failed to disable unuploaded EH Telegraph terminal entries")?;
@@ -1305,6 +1809,520 @@ mod tests {
     use crate::db::repo::tests_helpers;
     use chrono::Utc;
     use sea_orm::sea_query::Expr;
+
+    #[tokio::test]
+    async fn test_subscription_enqueue_records_origin_subscription() {
+        let repo = tests_helpers::setup_test_db().await.unwrap();
+        let model = repo
+            .enqueue_eh_subscription_download(-100, 123, 40, "tok", "Title", false)
+            .await
+            .unwrap();
+
+        assert_eq!(model.source, SOURCE_SUBSCRIPTION);
+        assert_eq!(model.subscription_ids.as_deref(), Some("123"));
+
+        let direct = repo
+            .enqueue_eh_download(-100, 41, "tok", "Title", false, SOURCE_DIRECT)
+            .await
+            .unwrap();
+        assert_eq!(direct.subscription_ids, None);
+    }
+
+    #[tokio::test]
+    async fn test_cancel_subscription_queue_entries_cancels_only_active_subscription_rows() {
+        let repo = tests_helpers::setup_test_db().await.unwrap();
+        let sub_row = repo
+            .enqueue_eh_subscription_download(-100, 123, 40, "tok", "Title", false)
+            .await
+            .unwrap();
+        let other_sub_row = repo
+            .enqueue_eh_subscription_download(-100, 456, 41, "tok", "Title", false)
+            .await
+            .unwrap();
+        let direct_row = repo
+            .enqueue_eh_download(-100, 42, "tok", "Title", false, SOURCE_DIRECT)
+            .await
+            .unwrap();
+        let done_row = repo
+            .enqueue_eh_subscription_download(-100, 123, 43, "tok", "Title", false)
+            .await
+            .unwrap();
+        Entity::update_many()
+            .col_expr(Column::Status, Expr::value(STATUS_DONE))
+            .filter(Column::Id.eq(done_row.id))
+            .exec(&repo.db)
+            .await
+            .unwrap();
+
+        let changed = repo
+            .cancel_eh_subscription_queue_entries(123)
+            .await
+            .unwrap();
+        assert_eq!(changed, 2);
+        let canceled = Entity::find_by_id(sub_row.id)
+            .one(&repo.db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(canceled.status, STATUS_CANCELED);
+        assert_eq!(canceled.subscription_ids, None);
+        assert!(Entity::find_by_id(other_sub_row.id)
+            .one(&repo.db)
+            .await
+            .unwrap()
+            .is_some());
+        assert!(Entity::find_by_id(direct_row.id)
+            .one(&repo.db)
+            .await
+            .unwrap()
+            .is_some());
+        let done = Entity::find_by_id(done_row.id)
+            .one(&repo.db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(done.status, STATUS_DONE);
+        assert_eq!(done.subscription_ids, None);
+    }
+
+    #[tokio::test]
+    async fn test_cancel_subscription_queue_entries_keeps_other_subscription_owners() {
+        let repo = tests_helpers::setup_test_db().await.unwrap();
+        let row = repo
+            .enqueue_eh_subscription_download(-100, 123, 44, "tok", "Title", false)
+            .await
+            .unwrap();
+        let merged = repo
+            .enqueue_eh_subscription_download(-100, 456, 44, "tok2", "Title 2", false)
+            .await
+            .unwrap();
+        assert_eq!(merged.id, row.id);
+        assert_eq!(merged.subscription_ids.as_deref(), Some("123,456"));
+
+        let changed = repo
+            .cancel_eh_subscription_queue_entries(123)
+            .await
+            .unwrap();
+        assert_eq!(changed, 1);
+        let remaining = Entity::find_by_id(row.id)
+            .one(&repo.db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(remaining.status, STATUS_PENDING);
+        assert_eq!(remaining.subscription_ids.as_deref(), Some("456"));
+
+        let changed = repo
+            .cancel_eh_subscription_queue_entries(456)
+            .await
+            .unwrap();
+        assert_eq!(changed, 1);
+        let canceled = Entity::find_by_id(row.id)
+            .one(&repo.db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(canceled.status, STATUS_CANCELED);
+        assert_eq!(canceled.subscription_ids, None);
+    }
+
+    #[tokio::test]
+    async fn test_cancel_subscription_queue_entries_removes_stale_telegraph_requirement() {
+        let repo = tests_helpers::setup_test_db().await.unwrap();
+        let telegraph_owner = repo
+            .enqueue_eh_subscription_download(-100, 123, 52, "tok", "Title", true)
+            .await
+            .unwrap();
+        let merged = repo
+            .enqueue_eh_subscription_download(-100, 456, 52, "tok2", "Title 2", false)
+            .await
+            .unwrap();
+        assert_eq!(merged.id, telegraph_owner.id);
+        assert!(merged.telegraph);
+        assert_eq!(merged.subscription_ids.as_deref(), Some("123,456"));
+        assert_eq!(merged.telegraph_subscription_ids.as_deref(), Some("123"));
+        Entity::update_many()
+            .col_expr(
+                Column::NextRetryAt,
+                Expr::value(Some(
+                    chrono::Local::now().naive_local() + chrono::Duration::hours(1),
+                )),
+            )
+            .filter(Column::Id.eq(merged.id))
+            .exec(&repo.db)
+            .await
+            .unwrap();
+
+        let changed = repo
+            .cancel_eh_subscription_queue_entries(123)
+            .await
+            .unwrap();
+        assert_eq!(changed, 1);
+        let row = Entity::find_by_id(telegraph_owner.id)
+            .one(&repo.db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, STATUS_PENDING);
+        assert_eq!(row.subscription_ids.as_deref(), Some("456"));
+        assert_eq!(row.telegraph_subscription_ids, None);
+        assert!(!row.telegraph);
+        assert!(row.next_retry_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_cancel_subscription_queue_entries_preserves_concurrent_telegraph_upgrade() {
+        let repo = tests_helpers::setup_test_db().await.unwrap();
+        repo.enqueue_eh_subscription_download(-100, 123, 54, "tok", "Title", false)
+            .await
+            .unwrap();
+        let stale = repo
+            .enqueue_eh_subscription_download(-100, 456, 54, "tok2", "Title 2", false)
+            .await
+            .unwrap();
+        assert_eq!(stale.subscription_ids.as_deref(), Some("123,456"));
+        assert_eq!(stale.telegraph_subscription_ids, None);
+
+        Entity::update_many()
+            .col_expr(Column::Telegraph, Expr::value(true))
+            .col_expr(
+                Column::TelegraphSubscriptionIds,
+                Expr::value(Some("456".to_string())),
+            )
+            .filter(Column::Id.eq(stale.id))
+            .exec(&repo.db)
+            .await
+            .unwrap();
+
+        let row_id = stale.id;
+        let changed = repo
+            .remove_subscription_owner_from_eh_row(stale, 123)
+            .await
+            .unwrap();
+        assert_eq!(changed, 1);
+        let row = Entity::find_by_id(row_id)
+            .one(&repo.db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.subscription_ids.as_deref(), Some("456"));
+        assert_eq!(row.telegraph_subscription_ids.as_deref(), Some("456"));
+        assert!(row.telegraph);
+    }
+
+    #[tokio::test]
+    async fn test_cancel_subscription_queue_entries_scrubs_terminal_telegraph_owner() {
+        let repo = tests_helpers::setup_test_db().await.unwrap();
+        let row = repo
+            .enqueue_eh_subscription_download(-100, 123, 53, "tok", "Title", true)
+            .await
+            .unwrap();
+        Entity::update_many()
+            .col_expr(Column::Status, Expr::value(STATUS_DONE))
+            .col_expr(
+                Column::TelegraphUrl,
+                Expr::value(Some("https://telegra.ph/old".to_string())),
+            )
+            .filter(Column::Id.eq(row.id))
+            .exec(&repo.db)
+            .await
+            .unwrap();
+
+        let changed = repo
+            .cancel_eh_subscription_queue_entries(123)
+            .await
+            .unwrap();
+        assert_eq!(changed, 1);
+        let scrubbed = Entity::find_by_id(row.id)
+            .one(&repo.db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(scrubbed.status, STATUS_DONE);
+        assert_eq!(scrubbed.subscription_ids, None);
+        assert_eq!(scrubbed.telegraph_subscription_ids, None);
+        assert!(!scrubbed.telegraph);
+        assert!(scrubbed.telegraph_url.is_none());
+
+        let reenqueued = repo
+            .enqueue_eh_download(-100, 53, "new", "New", false, SOURCE_DIRECT)
+            .await
+            .unwrap();
+        assert_eq!(reenqueued.status, STATUS_PENDING);
+        assert!(!reenqueued.telegraph);
+    }
+
+    #[tokio::test]
+    async fn test_merge_preserves_concurrent_subscription_owner_updates() {
+        let repo = tests_helpers::setup_test_db().await.unwrap();
+        let row = repo
+            .enqueue_eh_subscription_download(-100, 123, 45, "tok", "Title", false)
+            .await
+            .unwrap();
+
+        eh_download_queue::Entity::update_many()
+            .col_expr(
+                eh_download_queue::Column::SubscriptionIds,
+                Expr::value(Some("123,789".to_string())),
+            )
+            .filter(eh_download_queue::Column::Id.eq(row.id))
+            .exec(&repo.db)
+            .await
+            .unwrap();
+
+        let merged = repo
+            .merge_eh_download(
+                row,
+                "tok2",
+                "Title 2",
+                false,
+                SOURCE_SUBSCRIPTION,
+                Some(456),
+            )
+            .await
+            .unwrap();
+        assert_eq!(merged.subscription_ids.as_deref(), Some("123,456,789"));
+    }
+
+    #[tokio::test]
+    async fn test_inactive_check_preserves_concurrent_live_subscription_owner() {
+        let repo = tests_helpers::setup_test_db().await.unwrap();
+        let now = chrono::Local::now().naive_local();
+        repo.upsert_chat(-100, "private".to_string(), None, true, Default::default())
+            .await
+            .unwrap();
+        let task = crate::db::entities::tasks::ActiveModel {
+            r#type: Set(crate::db::types::TaskType::Ehentai),
+            value: Set("eh:test".to_string()),
+            author_name: Set(None),
+            next_poll_at: Set(now),
+            last_polled_at: Set(None),
+            ..Default::default()
+        }
+        .insert(&repo.db)
+        .await
+        .unwrap();
+        let live_sub = crate::db::entities::subscriptions::ActiveModel {
+            chat_id: Set(-100),
+            task_id: Set(task.id),
+            created_at: Set(now),
+            ..Default::default()
+        }
+        .insert(&repo.db)
+        .await
+        .unwrap();
+        let row = eh_download_queue::ActiveModel {
+            chat_id: Set(-100i64),
+            gid: Set(46i64),
+            token: Set("tok".to_string()),
+            title: Set("Title".to_string()),
+            telegraph: Set(false),
+            source: Set(SOURCE_SUBSCRIPTION.to_string()),
+            subscription_ids: Set(Some("123".to_string())),
+            status: Set(STATUS_PUBLISHING.to_string()),
+            file_size: Set(0),
+            error: Set(None),
+            retry_count: Set(0),
+            created_at: Set(now),
+            started_at: Set(None),
+            completed_at: Set(None),
+            ..Default::default()
+        }
+        .insert(&repo.db)
+        .await
+        .unwrap();
+
+        eh_download_queue::Entity::update_many()
+            .col_expr(
+                eh_download_queue::Column::SubscriptionIds,
+                Expr::value(Some(format!("123,{}", live_sub.id))),
+            )
+            .filter(eh_download_queue::Column::Id.eq(row.id))
+            .exec(&repo.db)
+            .await
+            .unwrap();
+
+        let row_id = row.id;
+        let active = repo
+            .eh_download_has_live_owner_or_cancel(row, STATUS_PUBLISHING)
+            .await
+            .unwrap();
+        assert!(active, "fresh live owner should prevent soft cancel");
+        let persisted = Entity::find_by_id(row_id)
+            .one(&repo.db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.status, STATUS_PUBLISHING);
+    }
+
+    #[tokio::test]
+    async fn test_inactive_check_cancels_row_without_live_subscription_owner() {
+        let repo = tests_helpers::setup_test_db().await.unwrap();
+        let now = chrono::Local::now().naive_local();
+        let row = eh_download_queue::ActiveModel {
+            chat_id: Set(-100i64),
+            gid: Set(47i64),
+            token: Set("tok".to_string()),
+            title: Set("Title".to_string()),
+            telegraph: Set(false),
+            source: Set(SOURCE_SUBSCRIPTION.to_string()),
+            subscription_ids: Set(Some("123".to_string())),
+            status: Set(STATUS_PUBLISHING.to_string()),
+            file_size: Set(0),
+            error: Set(None),
+            retry_count: Set(0),
+            created_at: Set(now),
+            started_at: Set(None),
+            completed_at: Set(None),
+            ..Default::default()
+        }
+        .insert(&repo.db)
+        .await
+        .unwrap();
+        let row_id = row.id;
+
+        let active = repo
+            .eh_download_has_live_owner_or_cancel(row, STATUS_PUBLISHING)
+            .await
+            .unwrap();
+        assert!(!active, "missing owner should make row inactive");
+        let persisted = Entity::find_by_id(row_id)
+            .one(&repo.db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.status, STATUS_CANCELED);
+        assert_eq!(persisted.subscription_ids, None);
+    }
+
+    #[tokio::test]
+    async fn test_cancel_legacy_subscription_queue_entries_without_owner_tracking() {
+        let repo = tests_helpers::setup_test_db().await.unwrap();
+        let now = chrono::Local::now().naive_local();
+        let legacy = eh_download_queue::ActiveModel {
+            chat_id: Set(-100i64),
+            gid: Set(48i64),
+            token: Set("tok".to_string()),
+            title: Set("Title".to_string()),
+            telegraph: Set(true),
+            source: Set(SOURCE_SUBSCRIPTION.to_string()),
+            subscription_ids: Set(None),
+            status: Set(STATUS_DOWNLOADED.to_string()),
+            file_size: Set(0),
+            error: Set(None),
+            retry_count: Set(0),
+            created_at: Set(now),
+            started_at: Set(None),
+            completed_at: Set(None),
+            telegraph_url: Set(Some("https://telegra.ph/stale".to_string())),
+            ..Default::default()
+        }
+        .insert(&repo.db)
+        .await
+        .unwrap();
+        let direct = eh_download_queue::ActiveModel {
+            chat_id: Set(-100i64),
+            gid: Set(49i64),
+            token: Set("tok".to_string()),
+            title: Set("Title".to_string()),
+            telegraph: Set(false),
+            source: Set(SOURCE_DIRECT.to_string()),
+            subscription_ids: Set(None),
+            status: Set(STATUS_DOWNLOADED.to_string()),
+            file_size: Set(0),
+            error: Set(None),
+            retry_count: Set(0),
+            created_at: Set(now),
+            started_at: Set(None),
+            completed_at: Set(None),
+            ..Default::default()
+        }
+        .insert(&repo.db)
+        .await
+        .unwrap();
+        let terminal = eh_download_queue::ActiveModel {
+            chat_id: Set(-100i64),
+            gid: Set(50i64),
+            token: Set("tok".to_string()),
+            title: Set("Title".to_string()),
+            telegraph: Set(false),
+            source: Set(SOURCE_SUBSCRIPTION.to_string()),
+            subscription_ids: Set(None),
+            status: Set(STATUS_DONE.to_string()),
+            file_size: Set(0),
+            error: Set(None),
+            retry_count: Set(0),
+            created_at: Set(now),
+            started_at: Set(None),
+            completed_at: Set(None),
+            ..Default::default()
+        }
+        .insert(&repo.db)
+        .await
+        .unwrap();
+        let already_canceled = eh_download_queue::ActiveModel {
+            chat_id: Set(-100i64),
+            gid: Set(51i64),
+            token: Set("tok".to_string()),
+            title: Set("Title".to_string()),
+            telegraph: Set(true),
+            source: Set(SOURCE_SUBSCRIPTION.to_string()),
+            subscription_ids: Set(None),
+            status: Set(STATUS_CANCELED.to_string()),
+            file_size: Set(0),
+            error: Set(None),
+            retry_count: Set(0),
+            created_at: Set(now),
+            started_at: Set(None),
+            completed_at: Set(None),
+            telegraph_url: Set(Some("https://telegra.ph/stale-canceled".to_string())),
+            ..Default::default()
+        }
+        .insert(&repo.db)
+        .await
+        .unwrap();
+
+        let count = repo
+            .cancel_legacy_eh_subscription_queue_entries()
+            .await
+            .unwrap();
+        assert_eq!(count, 3);
+        let legacy = Entity::find_by_id(legacy.id)
+            .one(&repo.db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(legacy.status, STATUS_CANCELED);
+        assert!(!legacy.telegraph);
+        assert!(legacy.telegraph_url.is_none());
+        let already_canceled = Entity::find_by_id(already_canceled.id)
+            .one(&repo.db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(already_canceled.status, STATUS_CANCELED);
+        assert!(!already_canceled.telegraph);
+        assert!(already_canceled.telegraph_url.is_none());
+        assert_eq!(
+            Entity::find_by_id(direct.id)
+                .one(&repo.db)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            STATUS_DOWNLOADED
+        );
+        assert_eq!(
+            Entity::find_by_id(terminal.id)
+                .one(&repo.db)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            STATUS_CANCELED
+        );
+    }
 
     #[tokio::test]
     async fn test_reenqueue_during_downloading_blocks_stale_download_completion() {
@@ -1883,7 +2901,7 @@ mod tests {
     async fn test_merge_rechecks_after_publish_claim_race() {
         let repo = tests_helpers::setup_test_db().await.unwrap();
         let model = repo
-            .enqueue_eh_download(-100, 65, "tok", "Title", false, SOURCE_SUBSCRIPTION)
+            .enqueue_eh_subscription_download(-100, 123, 65, "tok", "Title", false)
             .await
             .unwrap();
 
@@ -1903,7 +2921,7 @@ mod tests {
         // `publishing` and telegraph was upgraded → resets to pending so the
         // new telegraph requirement is not lost.
         let merged = repo
-            .enqueue_eh_download(-100, 65, "newtok", "NewTitle", true, SOURCE_SUBSCRIPTION)
+            .enqueue_eh_subscription_download(-100, 456, 65, "newtok", "NewTitle", true)
             .await
             .unwrap();
 
@@ -1913,6 +2931,8 @@ mod tests {
         assert_eq!(merged.id, model.id);
         assert_eq!(merged.status, STATUS_PENDING);
         assert!(merged.telegraph, "reset must preserve telegraph=true");
+        assert_eq!(merged.subscription_ids.as_deref(), Some("123,456"));
+        assert_eq!(merged.telegraph_subscription_ids.as_deref(), Some("456"));
         assert_eq!(merged.token, "newtok");
         assert_eq!(merged.title, "NewTitle");
 
@@ -2035,6 +3055,7 @@ mod tests {
                 "Stale Title",
                 false,
                 SOURCE_SUBSCRIPTION,
+                None,
             )
             .await
             .unwrap();
@@ -2090,6 +3111,7 @@ mod tests {
                     title: "Real Title",
                     telegraph: true,
                     source: SOURCE_DIRECT,
+                    subscription_id: None,
                 },
                 synthetic_err,
             )
@@ -2122,6 +3144,7 @@ mod tests {
                     title: "Title",
                     telegraph: false,
                     source: SOURCE_DIRECT,
+                    subscription_id: None,
                 },
                 synthetic_err,
             )
@@ -2290,12 +3313,36 @@ mod tests {
             .exec(&repo.db)
             .await
             .unwrap();
+        let canceled_model = repo
+            .enqueue_eh_download(-100, 94, "tok", "Title", true, SOURCE_DIRECT)
+            .await
+            .unwrap();
+        Entity::update_many()
+            .col_expr(Column::Status, Expr::value(STATUS_CANCELED))
+            .filter(Column::Id.eq(canceled_model.id))
+            .exec(&repo.db)
+            .await
+            .unwrap();
+        let done_with_url = repo
+            .enqueue_eh_download(-100, 95, "tok", "Title", true, SOURCE_DIRECT)
+            .await
+            .unwrap();
+        Entity::update_many()
+            .col_expr(Column::Status, Expr::value(STATUS_DONE))
+            .col_expr(
+                Column::TelegraphUrl,
+                Expr::value(Some("https://telegra.ph/old".to_string())),
+            )
+            .filter(Column::Id.eq(done_with_url.id))
+            .exec(&repo.db)
+            .await
+            .unwrap();
 
         let changed = repo
             .disable_eh_telegraph_for_unuploaded_entries()
             .await
             .unwrap();
-        assert_eq!(changed, 1);
+        assert_eq!(changed, 3);
 
         let row = Entity::find_by_id(model.id)
             .one(&repo.db)
@@ -2304,6 +3351,24 @@ mod tests {
             .unwrap();
         assert_eq!(row.status, STATUS_FAILED);
         assert!(!row.telegraph);
+        let canceled = Entity::find_by_id(canceled_model.id)
+            .one(&repo.db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(canceled.status, STATUS_CANCELED);
+        assert!(!canceled.telegraph);
+        let done = Entity::find_by_id(done_with_url.id)
+            .one(&repo.db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(done.status, STATUS_DONE);
+        assert!(!done.telegraph);
+        assert_eq!(
+            done.telegraph_url.as_deref(),
+            Some("https://telegra.ph/old")
+        );
 
         let reenqueued = repo
             .enqueue_eh_download(-100, 93, "new", "New", false, SOURCE_DIRECT)
@@ -2311,5 +3376,11 @@ mod tests {
             .unwrap();
         assert_eq!(reenqueued.status, STATUS_PENDING);
         assert!(!reenqueued.telegraph);
+        let reenqueued_done_url = repo
+            .enqueue_eh_download(-100, 95, "new", "New", false, SOURCE_DIRECT)
+            .await
+            .unwrap();
+        assert_eq!(reenqueued_done_url.status, STATUS_PENDING);
+        assert!(!reenqueued_done_url.telegraph);
     }
 }

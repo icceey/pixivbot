@@ -9,6 +9,7 @@ mod m20260626_000000_add_ehentai;
 mod m20260628_000000_eh_pipeline_decouple;
 mod m20260628_000100_eh_unique_constraint;
 mod m20260629_000000_eh_review_fixes;
+mod m20260630_000200_eh_queue_subscription_id;
 
 pub struct Migrator;
 
@@ -25,6 +26,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260628_000000_eh_pipeline_decouple::Migration),
             Box::new(m20260628_000100_eh_unique_constraint::Migration),
             Box::new(m20260629_000000_eh_review_fixes::Migration),
+            Box::new(m20260630_000200_eh_queue_subscription_id::Migration),
         ]
     }
 }

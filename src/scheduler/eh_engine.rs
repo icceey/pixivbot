@@ -1,7 +1,6 @@
 use crate::bot::notifier::Notifier;
 use crate::config::EhentaiConfig;
 use crate::db::entities::{eh_download_queue, subscriptions};
-use crate::db::repo::eh_download_queue::SOURCE_SUBSCRIPTION;
 use crate::db::repo::Repo;
 use crate::db::types::{
     EhFilter, EhPendingGallery, EhTagState, EhTaskKey, SubscriptionState, TaskType,
@@ -14,7 +13,9 @@ use rand::RngExt;
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
-use crate::db::repo::eh_download_queue::{STATUS_DOWNLOADED, STATUS_PENDING, STATUS_UPLOADED};
+use crate::db::repo::eh_download_queue::{
+    EH_PUBLISH_CANCEL_LOCK, STATUS_DOWNLOADED, STATUS_PENDING, STATUS_UPLOADED,
+};
 
 /// Maximum search pages to fetch per tick (safety cap).
 const MAX_FETCH_PAGES: u32 = 5;
@@ -265,6 +266,13 @@ impl EhEngine {
         mut remaining_slots: usize,
         telegraph_default: bool,
     ) -> Result<(subscriptions::Model, EhTagState, usize)> {
+        if !self.repo.subscription_exists(sub.id).await? {
+            info!(
+                "Skipping pending EH backlog for removed subscription {}",
+                sub.id
+            );
+            return Ok((sub.clone(), state, 0));
+        }
         let mut still_pending = Vec::new();
         let backlog: Vec<_> = state.pending_galleries.drain(..).collect();
         let mut backlog_iter = backlog.into_iter();
@@ -273,18 +281,35 @@ impl EhEngine {
                 still_pending.push(pending);
                 continue;
             }
+            if !self.repo.subscription_exists(sub.id).await? {
+                info!(
+                    "Skipping pending EH gallery {} for removed subscription {}",
+                    pending.gid, sub.id
+                );
+                continue;
+            }
             if let Err(e) = self
                 .repo
-                .enqueue_eh_download(
+                .enqueue_eh_subscription_download(
                     sub.chat_id,
+                    sub.id,
                     pending.gid as i64,
                     &pending.token,
                     &pending.title,
                     telegraph_default,
-                    SOURCE_SUBSCRIPTION,
                 )
                 .await
             {
+                if !self.repo.subscription_exists(sub.id).await? {
+                    self.repo
+                        .cancel_eh_subscription_queue_entries(sub.id)
+                        .await?;
+                    info!(
+                        "Skipping pending EH gallery {} for removed subscription {}",
+                        pending.gid, sub.id
+                    );
+                    continue;
+                }
                 let failed_gid = pending.gid;
                 still_pending.push(pending);
                 still_pending.extend(backlog_iter);
@@ -297,6 +322,16 @@ impl EhEngine {
                 return Err(e)
                     .with_context(|| format!("Failed to enqueue pending gallery {}", failed_gid));
             }
+            if !self.repo.subscription_exists(sub.id).await? {
+                self.repo
+                    .cancel_eh_subscription_queue_entries(sub.id)
+                    .await?;
+                info!(
+                    "Removed pending EH gallery {} owner for deleted subscription {}",
+                    pending.gid, sub.id
+                );
+                continue;
+            }
             state.add_pushed_gid(pending.gid);
             remaining_slots -= 1;
         }
@@ -307,6 +342,12 @@ impl EhEngine {
             state.pending_high_water_ts = 0;
         }
         state.trim_pushed(self.config.pushed_cap);
+        if !self.repo.subscription_exists(sub.id).await? {
+            self.repo
+                .cancel_eh_subscription_queue_entries(sub.id)
+                .await?;
+            return Ok((sub.clone(), state, 0));
+        }
         let updated_sub = self
             .repo
             .update_subscription_latest_data(sub.id, Some(SubscriptionState::EhTag(state.clone())))
@@ -321,6 +362,10 @@ impl EhEngine {
         galleries: &[EhGallery],
         max_push: usize,
     ) -> Result<()> {
+        if !self.repo.subscription_exists(sub.id).await? {
+            info!("Skipping EH collect for removed subscription {}", sub.id);
+            return Ok(());
+        }
         let mut state = eh_tag_subscription_state(sub).unwrap_or_else(EhTagState::cleared);
 
         let sub_filter = sub.eh_filter.as_ref();
@@ -369,18 +414,35 @@ impl EhEngine {
                 state.pending_galleries.push(gallery);
                 continue;
             }
+            if !self.repo.subscription_exists(sub.id).await? {
+                info!(
+                    "Skipping EH gallery {} for removed subscription {}",
+                    gallery.gid, sub.id
+                );
+                continue;
+            }
             if let Err(e) = self
                 .repo
-                .enqueue_eh_download(
+                .enqueue_eh_subscription_download(
                     sub.chat_id,
+                    sub.id,
                     gallery.gid as i64,
                     &gallery.token,
                     &gallery.title,
                     telegraph_default,
-                    SOURCE_SUBSCRIPTION,
                 )
                 .await
             {
+                if !self.repo.subscription_exists(sub.id).await? {
+                    self.repo
+                        .cancel_eh_subscription_queue_entries(sub.id)
+                        .await?;
+                    info!(
+                        "Skipping EH gallery {} for removed subscription {}",
+                        gallery.gid, sub.id
+                    );
+                    continue;
+                }
                 let failed_gid = gallery.gid;
                 state.pending_galleries.push(gallery);
                 state.pending_galleries.extend(eligible_iter);
@@ -392,6 +454,16 @@ impl EhEngine {
                 return Err(e).with_context(|| {
                     format!("Failed to enqueue download for gallery {}", failed_gid)
                 });
+            }
+            if !self.repo.subscription_exists(sub.id).await? {
+                self.repo
+                    .cancel_eh_subscription_queue_entries(sub.id)
+                    .await?;
+                info!(
+                    "Removed EH gallery {} owner for deleted subscription {}",
+                    gallery.gid, sub.id
+                );
+                continue;
             }
             state.add_pushed_gid(gallery.gid);
             max_enqueued_posted = max_enqueued_posted.max(gallery.posted);
@@ -408,6 +480,12 @@ impl EhEngine {
         }
 
         state.trim_pushed(self.config.pushed_cap);
+        if !self.repo.subscription_exists(sub.id).await? {
+            self.repo
+                .cancel_eh_subscription_queue_entries(sub.id)
+                .await?;
+            return Ok(());
+        }
 
         self.repo
             .update_subscription_latest_data(sub.id, Some(SubscriptionState::EhTag(state)))
@@ -552,6 +630,15 @@ impl EhDownloadWorker {
         // Check chat is enabled before downloading
         let chat = get_chat_if_should_notify(&self.repo, entry.chat_id).await?;
         if chat.is_none() {
+            let _publish_cancel_guard = EH_PUBLISH_CANCEL_LOCK.lock().await;
+            if !self
+                .repo
+                .eh_download_is_active(entry.id, &entry.status)
+                .await?
+            {
+                info!("Skipping canceled EH download entry {}", entry.id);
+                return Ok(());
+            }
             info!(
                 "Deferring download for gid={} — chat {} not notifiable",
                 gid, entry.chat_id
@@ -565,6 +652,16 @@ impl EhDownloadWorker {
                     self.config.download_poll_interval_sec as i64,
                 )
                 .await?;
+            return Ok(());
+        }
+
+        let _publish_cancel_guard = EH_PUBLISH_CANCEL_LOCK.lock().await;
+        if !self
+            .repo
+            .eh_download_is_active(entry.id, &entry.status)
+            .await?
+        {
+            info!("Skipping canceled EH download entry {}", entry.id);
             return Ok(());
         }
 
@@ -735,6 +832,15 @@ impl EhUploadWorker {
         // Check chat is enabled before doing upload work (avoid wasting image upload quota)
         let chat = get_chat_if_should_notify(&self.repo, entry.chat_id).await?;
         if chat.is_none() {
+            let _publish_cancel_guard = EH_PUBLISH_CANCEL_LOCK.lock().await;
+            if !self
+                .repo
+                .eh_download_is_active(entry.id, &entry.status)
+                .await?
+            {
+                info!("Skipping canceled EH upload entry {}", entry.id);
+                return Ok(());
+            }
             info!(
                 "Deferring upload for entry {} — chat {} not notifiable",
                 entry.id, entry.chat_id
@@ -746,6 +852,16 @@ impl EhUploadWorker {
                     self.config.download_poll_interval_sec as i64,
                 )
                 .await?;
+            return Ok(());
+        }
+
+        let _publish_cancel_guard = EH_PUBLISH_CANCEL_LOCK.lock().await;
+        if !self
+            .repo
+            .eh_download_is_active(entry.id, &entry.status)
+            .await?
+        {
+            info!("Skipping canceled EH upload entry {}", entry.id);
             return Ok(());
         }
 
@@ -994,6 +1110,12 @@ impl EhPublishWorker {
         }
         let chat_id = teloxide::types::ChatId(entry.chat_id);
 
+        let _publish_cancel_guard = EH_PUBLISH_CANCEL_LOCK.lock().await;
+
+        if !self.ensure_entry_active(entry).await? {
+            return Ok(());
+        }
+
         // Determine which surfaces need to be sent.
         let archive_required = self.config.send_archive && entry.archive_sent_at.is_none();
         let telegraph_required = entry.telegraph_url.is_some() && entry.telegraph_sent_at.is_none();
@@ -1002,10 +1124,10 @@ impl EhPublishWorker {
         if !archive_required && !telegraph_required {
             if entry.archive_sent_at.is_some() || entry.telegraph_sent_at.is_some() {
                 // At least one marker is set — the work is complete.
-                self.cleanup_zip(entry).await;
                 self.repo
                     .mark_eh_download_done(entry.id, entry.file_size)
                     .await?;
+                self.cleanup_zip(entry).await;
                 info!(
                     "Published eh gallery gid={} to chat {} (already sent, now done)",
                     entry.gid, entry.chat_id
@@ -1026,6 +1148,9 @@ impl EhPublishWorker {
 
         // Send archive if required
         if archive_required {
+            if !self.ensure_entry_active(entry).await? {
+                return Ok(());
+            }
             let zip_path = entry.zip_path.as_deref().expect("zip_path checked above");
             let zip_path = std::path::Path::new(zip_path);
             let caption = self.build_caption(entry);
@@ -1034,11 +1159,17 @@ impl EhPublishWorker {
                 .send_document(chat_id, zip_path, &filename, &caption)
                 .await
                 .context("Failed to send archive document")?;
+            if !self.ensure_entry_active(entry).await? {
+                return Ok(());
+            }
             self.repo.mark_eh_archive_sent(entry.id).await?;
         }
 
         // Send Telegraph link if required
         if telegraph_required {
+            if !self.ensure_entry_active(entry).await? {
+                return Ok(());
+            }
             let telegraph_url = entry
                 .telegraph_url
                 .as_deref()
@@ -1051,19 +1182,39 @@ impl EhPublishWorker {
                 .send_text(chat_id, &link_text, false)
                 .await
                 .context("Failed to send telegraph link")?;
+            if !self.ensure_entry_active(entry).await? {
+                return Ok(());
+            }
             self.repo.mark_eh_telegraph_sent(entry.id).await?;
         }
 
         // Both surfaces are now sent — mark done and clean up ZIP.
-        self.cleanup_zip(entry).await;
+        if !self.ensure_entry_active(entry).await? {
+            return Ok(());
+        }
         self.repo
             .mark_eh_download_done(entry.id, entry.file_size)
             .await?;
+        self.cleanup_zip(entry).await;
         info!(
             "Published eh gallery gid={} to chat {}",
             entry.gid, entry.chat_id
         );
         Ok(())
+    }
+
+    async fn ensure_entry_active(&self, entry: &eh_download_queue::Model) -> Result<bool> {
+        let active = self
+            .repo
+            .eh_download_is_active(entry.id, &entry.status)
+            .await?;
+        if !active {
+            info!(
+                "Skipping canceled EH publish entry {} for chat {}",
+                entry.id, entry.chat_id
+            );
+        }
+        Ok(active)
     }
 
     async fn cleanup_zip(&self, entry: &eh_download_queue::Model) {
@@ -1132,8 +1283,8 @@ mod integration_tests {
     use crate::db::entities::eh_download_queue;
     use crate::db::entities::tasks;
     use crate::db::repo::eh_download_queue::{
-        SOURCE_DIRECT, STATUS_DONE, STATUS_DOWNLOADED, STATUS_FAILED, STATUS_PENDING,
-        STATUS_UPLOADED,
+        SOURCE_DIRECT, SOURCE_SUBSCRIPTION, STATUS_CANCELED, STATUS_DONE, STATUS_DOWNLOADED,
+        STATUS_FAILED, STATUS_PENDING, STATUS_UPLOADED,
     };
     use crate::db::repo::tests_helpers;
     use crate::pixiv::downloader::Downloader;
@@ -1332,6 +1483,43 @@ mod integration_tests {
             title: Set(title.to_string()),
             telegraph: Set(telegraph),
             source: Set(SOURCE_DIRECT.to_string()),
+            status: Set(status.to_string()),
+            file_size: Set(0),
+            error: Set(None),
+            retry_count: Set(0),
+            created_at: Set(now),
+            started_at: Set(None),
+            completed_at: Set(None),
+            zip_path: Set(zip_path.map(|s| s.to_string())),
+            telegraph_url: Set(telegraph_url.map(|s| s.to_string())),
+            next_retry_at: Set(None),
+            ..Default::default()
+        };
+        active.insert(repo.db()).await.unwrap()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn insert_subscription_queue_entry(
+        repo: &Repo,
+        chat_id: i64,
+        subscription_ids: &str,
+        gid: i64,
+        token: &str,
+        title: &str,
+        telegraph: bool,
+        status: &str,
+        zip_path: Option<&str>,
+        telegraph_url: Option<&str>,
+    ) -> eh_download_queue::Model {
+        let now = Local::now().naive_local();
+        let active = eh_download_queue::ActiveModel {
+            chat_id: Set(chat_id),
+            gid: Set(gid),
+            token: Set(token.to_string()),
+            title: Set(title.to_string()),
+            telegraph: Set(telegraph),
+            source: Set(SOURCE_SUBSCRIPTION.to_string()),
+            subscription_ids: Set(Some(subscription_ids.to_string())),
             status: Set(status.to_string()),
             file_size: Set(0),
             error: Set(None),
@@ -2493,6 +2681,53 @@ mod integration_tests {
         assert_eq!(model.status, STATUS_PENDING);
         assert_eq!(model.retry_count, 1);
         assert!(model.next_retry_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_publish_skips_entry_canceled_after_claim() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        setup_chat(&repo, -100, true).await;
+        let tg_server = MockServer::start().await;
+        let notifier = make_notifier(&tg_server);
+        let config = Arc::new(make_config());
+        let temp_dir = tempfile::tempdir().unwrap();
+        let zip_path = temp_dir.path().join("509.zip");
+        create_test_zip(&zip_path, 2);
+        let entry = insert_subscription_queue_entry(
+            &repo,
+            -100,
+            "123",
+            509,
+            "tok",
+            "Title",
+            false,
+            STATUS_DOWNLOADED,
+            Some(zip_path.to_str().unwrap()),
+            None,
+        )
+        .await;
+        let claimed = repo.get_next_for_publish().await.unwrap().unwrap();
+        assert_eq!(claimed.id, entry.id);
+        repo.cancel_eh_subscription_queue_entries(123)
+            .await
+            .unwrap();
+
+        let worker = EhPublishWorker::new(
+            Arc::clone(&repo),
+            notifier,
+            make_eh_client(&MockServer::start().await),
+            config,
+        );
+        worker.process(&claimed).await.unwrap();
+
+        let model = eh_download_queue::Entity::find_by_id(entry.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(model.status, STATUS_CANCELED);
+        assert!(model.archive_sent_at.is_none());
+        assert!(zip_path.exists(), "canceled publish should not clean ZIP");
     }
 
     #[tokio::test]

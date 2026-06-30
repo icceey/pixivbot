@@ -111,10 +111,24 @@ impl BotHandler {
 
         let author_name = task.author_name.clone();
 
-        self.repo
-            .delete_subscription_by_chat_task(chat_id, task.id)
+        let subscription = self
+            .repo
+            .get_subscription_by_chat_task(chat_id, task.id)
             .await
-            .context("未订阅")?;
+            .context("Failed to query subscription")?
+            .ok_or_else(|| anyhow::anyhow!("未订阅"))?;
+
+        if task_type == TaskType::Ehentai {
+            self.repo
+                .delete_eh_subscription_and_cancel_queue(subscription.id)
+                .await
+                .context("Failed to delete EH subscription and cancel queued downloads")?;
+        } else {
+            self.repo
+                .delete_subscription(subscription.id)
+                .await
+                .context("未订阅")?;
+        }
 
         self.cleanup_orphaned_task(task.id, task_type, task_value)
             .await;

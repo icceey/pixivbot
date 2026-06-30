@@ -19,6 +19,14 @@ pub struct Model {
     pub telegraph: bool,
     /// "subscription" or "direct"
     pub source: String,
+    /// Comma-separated owning subscription ids for scheduler-created entries.
+    /// Direct entries and older rows keep this null.
+    #[sea_orm(nullable)]
+    pub subscription_ids: Option<String>,
+    /// Comma-separated owning subscription ids that requested Telegraph delivery.
+    /// Subset of `subscription_ids`; direct entries keep this null.
+    #[sea_orm(nullable)]
+    pub telegraph_subscription_ids: Option<String>,
     /// "pending", "downloading", "done", "failed"
     pub status: String,
     #[sea_orm(default = 0)]
