@@ -82,6 +82,30 @@ download_original_threshold = 1
 # # bypass = { mode = "flaresolverr", endpoint = "http://flaresolverr:8191/v1", max_timeout_ms = 60000, session = "pixivbot" }
 
 # ----------------------------------------------------------------------------
+# Image upload backend for Telegraph pages. Default provider is "pixi". Set
+# provider to "s3" to upload images to an S3-compatible object store, or
+# "catbox" to use Catbox.
+# ----------------------------------------------------------------------------
+# [image_upload]
+# provider = "pixi"
+#
+# [image_upload.s3]
+# endpoint_url = "https://<account>.r2.cloudflarestorage.com"
+# bucket = "pixivbot-images"
+# region = "auto"
+# access_key_id = "your_access_key_id"
+# secret_access_key = "your_secret_access_key"
+# public_base_url = "https://cdn.example.com/pixivbot-images"
+# key_prefix = "eh"
+# path_style = true
+#
+# [image_upload.catbox]
+# # Catbox uploads are public; userhash is optional. Anonymous uploads cannot be
+# # deleted through the Catbox API later.
+# api_url = "https://catbox.moe/user/api.php"
+# # userhash = "your_catbox_userhash"
+
+# ----------------------------------------------------------------------------
 # E-Hentai / ExHentai customization. EH is enabled by default; this section
 # customizes site, credentials, and resolutions. Set `enabled = false` to
 # explicitly disable EH features.
@@ -106,7 +130,7 @@ download_original_threshold = 1
 # # Send archive ZIP to chat (default: true)
 # send_archive = true
 # # Upload to Telegraph and send link for subscription updates (default: false)
-# # Requires telegraph_access_token. Images are uploaded to pixi.mg (no auth needed).
+# # Requires telegraph_access_token. Image hosting uses the [image_upload] provider.
 # upload_telegraph = false
 # # Poll interval range (seconds) for subscription checks
 # min_interval_sec = 1800        # default: 30 min

@@ -9,7 +9,7 @@ use crate::db::types::{
 use crate::scheduler::helpers::{eh_tag_subscription_state, get_chat_if_should_notify};
 use anyhow::{Context, Result};
 use chrono::Local;
-use eh_client::{EhClient, EhGallery, TelegraphClient};
+use eh_client::{EhClient, EhGallery, ImageUploadInput, ImageUploader, TelegraphClient};
 use rand::RngExt;
 use std::sync::Arc;
 use tracing::{error, info, warn};
@@ -628,13 +628,14 @@ impl EhDownloadWorker {
 }
 
 // ============================================================================
-// Stage 3: EhUploadWorker — Extract images from ZIP, upload to pixi.mg, create Telegraph page
+// Stage 3: EhUploadWorker — Extract images from ZIP, upload images, create Telegraph page
 // ============================================================================
 
 pub struct EhUploadWorker {
     repo: Arc<Repo>,
     notifier: Notifier,
     telegraph: Arc<TelegraphClient>,
+    image_uploader: Arc<dyn ImageUploader>,
     config: Arc<EhentaiConfig>,
 }
 
@@ -643,12 +644,14 @@ impl EhUploadWorker {
         repo: Arc<Repo>,
         notifier: Notifier,
         telegraph: Arc<TelegraphClient>,
+        image_uploader: Arc<dyn ImageUploader>,
         config: Arc<EhentaiConfig>,
     ) -> Self {
         Self {
             repo,
             notifier,
             telegraph,
+            image_uploader,
             config,
         }
     }
@@ -729,7 +732,7 @@ impl EhUploadWorker {
     }
 
     async fn process(&self, entry: &eh_download_queue::Model) -> Result<()> {
-        // Check chat is enabled before doing upload work (avoid wasting pixi.mg quota)
+        // Check chat is enabled before doing upload work (avoid wasting image upload quota)
         let chat = get_chat_if_should_notify(&self.repo, entry.chat_id).await?;
         if chat.is_none() {
             info!(
@@ -796,20 +799,21 @@ impl EhUploadWorker {
             anyhow::bail!("No images found in ZIP");
         }
 
-        // Upload images to pixi.mg with 429 backoff (batch up to 5 at a time)
-        let mut all_urls = Vec::new();
-        for chunk in image_data_list.chunks(5) {
-            let refs: Vec<&[u8]> = chunk.iter().map(|(_, d)| d.as_slice()).collect();
-            let urls = self
-                .telegraph
-                .upload_images_with_retry(&refs, 3)
-                .await
-                .context("Failed to upload images to pixi.mg")?;
-            all_urls.extend(urls);
-        }
+        let upload_inputs: Vec<ImageUploadInput<'_>> = image_data_list
+            .iter()
+            .map(|(filename, data)| ImageUploadInput {
+                filename,
+                bytes: data.as_slice(),
+            })
+            .collect();
+        let all_urls = self
+            .image_uploader
+            .upload_images(&upload_inputs)
+            .await
+            .context("Failed to upload images for Telegraph page")?;
 
         if all_urls.is_empty() {
-            anyhow::bail!("No images uploaded to pixi.mg");
+            anyhow::bail!("No images uploaded by configured image uploader");
         }
 
         // Create Telegraph gallery page
@@ -1133,6 +1137,7 @@ mod integration_tests {
     };
     use crate::db::repo::tests_helpers;
     use crate::pixiv::downloader::Downloader;
+    use eh_client::PixiUploader;
     use eh_client::{EhClientBuilder, EhCookies, TelegraphClient};
     use reqwest::Client;
     use sea_orm::sea_query::Expr;
@@ -1177,6 +1182,13 @@ mod integration_tests {
             format!("{}/pixi/upload", tg_server.uri()),
             tg_server.uri(),
         ))
+    }
+
+    fn make_image_uploader(tg_server: &MockServer) -> Arc<dyn ImageUploader> {
+        Arc::new(PixiUploader::new_with_url(format!(
+            "{}/pixi/upload",
+            tg_server.uri()
+        )))
     }
 
     fn make_config() -> EhentaiConfig {
@@ -2165,6 +2177,7 @@ mod integration_tests {
             Arc::clone(&repo),
             make_notifier(&tg_server),
             make_telegraph_client(&tg_server),
+            make_image_uploader(&tg_server),
             Arc::new(make_config()),
         );
         worker.tick().await.unwrap();
@@ -2215,6 +2228,7 @@ mod integration_tests {
             Arc::clone(&repo),
             make_notifier(&tg_server),
             make_telegraph_client(&tg_server),
+            make_image_uploader(&tg_server),
             Arc::new(make_config()),
         );
         worker.tick().await.unwrap();
@@ -2594,6 +2608,7 @@ mod integration_tests {
             Arc::clone(&repo),
             notifier,
             make_telegraph_client(&tg_server),
+            make_image_uploader(&tg_server),
             config,
         );
         worker.tick().await.unwrap();
@@ -2639,6 +2654,7 @@ mod integration_tests {
             Arc::clone(&repo),
             notifier,
             make_telegraph_client(&tg_server),
+            make_image_uploader(&tg_server),
             config,
         );
         worker.tick().await.unwrap();
@@ -2679,6 +2695,7 @@ mod integration_tests {
             Arc::clone(&repo),
             notifier,
             make_telegraph_client(&tg_server),
+            make_image_uploader(&tg_server),
             config,
         );
         worker.tick().await.unwrap();

@@ -53,7 +53,7 @@ Behavior:
 
 - Read an existing ZIP path from the command line.
 - Extract image entries from the ZIP into memory one at a time or in bounded batches.
-- Upload images using `TelegraphClient::upload_images_with_retry()` / existing pixi.mg upload behavior.
+- Upload images using the configured `ImageUploader` implementation, defaulting to pixi.mg and supporting the same configured image hosting backends as production.
 - Create a Telegraph page with `TelegraphClient::create_gallery_page()`.
 - Print the resulting `https://telegra.ph/...` URL.
 

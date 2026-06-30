@@ -302,10 +302,12 @@ async fn main() -> Result<()> {
 
     let eh_upload_worker_handle = if eh_client.is_some() {
         if let Some(ref telegraph) = telegraph_client {
+            let image_uploader = config.image_upload.build_uploader().await?;
             let worker = scheduler::EhUploadWorker::new(
                 repo.clone(),
                 notifier.clone(),
                 std::sync::Arc::clone(telegraph),
+                image_uploader,
                 std::sync::Arc::new(config.ehentai.clone()),
             );
             info!("✅ E-Hentai upload worker initialized");

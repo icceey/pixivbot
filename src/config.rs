@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use booru_client::{BooruEngineType, BypassConfig};
 use serde::Deserialize;
 
-use eh_client::EhCookies;
+use eh_client::{EhCookies, ImageUploadConfig};
 
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
@@ -31,6 +31,8 @@ pub struct Config {
     pub booru: BooruConfig,
     #[serde(default)]
     pub ehentai: EhentaiConfig,
+    #[serde(default)]
+    pub image_upload: ImageUploadConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -362,7 +364,7 @@ pub struct EhentaiConfig {
     #[serde(default = "default_eh_max_interval_sec")]
     pub max_interval_sec: u64,
     /// Telegraph access token for creating Telegraph pages.
-    /// Required for Telegraph upload feature. Images are uploaded to pixi.mg (no auth needed).
+    /// Required for Telegraph page creation. Image hosting uses `[image_upload]`.
     #[serde(default)]
     pub telegraph_access_token: Option<String>,
     #[serde(default = "default_eh_max_push_per_tick")]
