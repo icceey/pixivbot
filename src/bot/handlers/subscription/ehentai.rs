@@ -57,48 +57,20 @@ impl BotHandler {
             return Ok(());
         }
 
-        // Parse query and filter args
-        let parts: Vec<&str> = remaining.split_whitespace().collect();
-        let mut query_parts = Vec::new();
-        let mut filter_args = Vec::new();
-        let mut cat_str: Option<String> = None;
-        let mut telegraph_on = false;
-
-        for part in &parts {
-            if let Some(val) = part.strip_prefix("rating>=") {
-                filter_args.push(format!("rating>={}", val));
-            } else if let Some(val) = part.strip_prefix("rating>") {
-                // Strict > stored as +1
-                if let Ok(n) = val.parse::<u8>() {
-                    filter_args.push(format!("rating>={}", n.saturating_add(1)));
-                }
-            } else if let Some(val) = part.strip_prefix("pages>=") {
-                filter_args.push(format!("pages>={}", val));
-            } else if let Some(val) = part.strip_prefix("pages>") {
-                if let Ok(n) = val.parse::<u32>() {
-                    filter_args.push(format!("pages>={}", n.saturating_add(1)));
-                }
-            } else if let Some(val) = part.strip_prefix("pages<=") {
-                filter_args.push(format!("pages<={}", val));
-            } else if let Some(val) = part.strip_prefix("pages<") {
-                if let Ok(n) = val.parse::<u32>() {
-                    filter_args.push(format!("pages<={}", n.saturating_sub(1)));
-                }
-            } else if let Some(val) = part.strip_prefix("cat=") {
-                cat_str = Some(val.to_string());
-            } else if *part == "telegraph=on" {
-                telegraph_on = true;
-            } else {
-                query_parts.push(*part);
+        let parsed_esub = match parse_esub_remaining(remaining) {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                let _ = bot
+                    .send_message(chat_id, format!("❌ {}", markdown::escape(&e)))
+                    .parse_mode(ParseMode::MarkdownV2)
+                    .await;
+                return Ok(());
             }
-        }
-
-        if query_parts.is_empty() {
-            let _ = bot.send_message(chat_id, "❌ 请提供搜索词").await;
-            return Ok(());
-        }
-
-        let query = query_parts.join(" ");
+        };
+        let query = parsed_esub.query;
+        let filter_args = parsed_esub.filter_args;
+        let cat_str = parsed_esub.cat_str;
+        let telegraph_on = parsed_esub.telegraph_on;
 
         // Parse filter
         let mut eh_filter = match parse_eh_filter(&filter_args) {
@@ -160,7 +132,10 @@ impl BotHandler {
             markdown::escape(&query)
         );
         if cats > 0 {
-            msg.push_str(&format!("分类: {}\n", markdown::escape(&cat_str.unwrap())));
+            msg.push_str(&format!(
+                "分类: {}\n",
+                markdown::escape(cat_str.as_deref().unwrap_or_default())
+            ));
         }
         let filter_display = eh_filter.format_for_display();
         if !filter_display.is_empty() {
@@ -226,9 +201,9 @@ impl BotHandler {
                         .into_iter()
                         .filter(|(_, task)| task.r#type == crate::db::types::TaskType::Ehentai)
                         .filter_map(|(sub, task)| {
-                            EhTaskKey::parse(&task.value).map(|key| (sub, key))
+                            eh_task_value_for_query(&task.value, remaining)
+                                .map(|value| (sub, value.to_string()))
                         })
-                        .filter(|(_, key)| key.query == remaining)
                         .collect();
 
                     match matching.len() {
@@ -236,7 +211,7 @@ impl BotHandler {
                             let _ = bot.send_message(chat_id, "❌ 未找到对应的订阅").await;
                             return Ok(());
                         }
-                        1 => matching[0].1.to_task_value(),
+                        1 => matching[0].1.clone(),
                         _ => {
                             let _ = bot
                                 .send_message(
@@ -570,6 +545,68 @@ fn parse_eh_filter(args: &[String]) -> Result<EhFilter, String> {
     Ok(filter)
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct ParsedEhSubscriptionArgs {
+    query: String,
+    filter_args: Vec<String>,
+    cat_str: Option<String>,
+    telegraph_on: bool,
+}
+
+fn parse_esub_remaining(remaining: &str) -> Result<ParsedEhSubscriptionArgs, String> {
+    let mut query_parts = Vec::new();
+    let mut filter_args = Vec::new();
+    let mut cat_str: Option<String> = None;
+    let mut telegraph_on = false;
+
+    for part in remaining.split_whitespace() {
+        if let Some(val) = part.strip_prefix("rating>=") {
+            filter_args.push(format!("rating>={val}"));
+        } else if let Some(val) = part.strip_prefix("rating>") {
+            let n = val
+                .parse::<u8>()
+                .map_err(|_| format!("无效的评分值: {val}"))?;
+            filter_args.push(format!("rating>={}", n.saturating_add(1)));
+        } else if let Some(val) = part.strip_prefix("pages>=") {
+            filter_args.push(format!("pages>={val}"));
+        } else if let Some(val) = part.strip_prefix("pages>") {
+            let n = val
+                .parse::<u32>()
+                .map_err(|_| format!("无效的页数: {val}"))?;
+            filter_args.push(format!("pages>={}", n.saturating_add(1)));
+        } else if let Some(val) = part.strip_prefix("pages<=") {
+            filter_args.push(format!("pages<={val}"));
+        } else if let Some(val) = part.strip_prefix("pages<") {
+            let n = val
+                .parse::<u32>()
+                .map_err(|_| format!("无效的页数: {val}"))?;
+            filter_args.push(format!("pages<={}", n.saturating_sub(1)));
+        } else if let Some(val) = part.strip_prefix("cat=") {
+            cat_str = Some(val.to_string());
+        } else if part == "telegraph=on" {
+            telegraph_on = true;
+        } else {
+            query_parts.push(part);
+        }
+    }
+
+    if query_parts.is_empty() {
+        return Err("请提供搜索词".to_string());
+    }
+
+    Ok(ParsedEhSubscriptionArgs {
+        query: query_parts.join(" "),
+        filter_args,
+        cat_str,
+        telegraph_on,
+    })
+}
+
+fn eh_task_value_for_query<'a>(task_value: &'a str, query: &str) -> Option<&'a str> {
+    let key = EhTaskKey::parse(task_value)?;
+    (key.query == query).then_some(task_value)
+}
+
 /// Parse a gallery URL or GID into (gid, token).
 fn parse_gallery_ref(s: &str) -> Option<(u64, String)> {
     let s = s.trim();
@@ -674,6 +711,56 @@ mod tests {
     fn test_parse_eh_filter_rating_out_of_range() {
         let result = parse_eh_filter(&["rating>=6".to_string()]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_esub_remaining_rejects_invalid_strict_rating() {
+        let result = parse_esub_remaining("foo rating>abc");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("无效的评分值: abc"));
+    }
+
+    #[test]
+    fn test_parse_esub_remaining_rejects_invalid_strict_pages() {
+        let result = parse_esub_remaining("foo pages>abc");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("无效的页数: abc"));
+
+        let result = parse_esub_remaining("foo pages<abc");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("无效的页数: abc"));
+    }
+
+    #[test]
+    fn test_parse_esub_remaining_preserves_valid_strict_filters() {
+        let parsed =
+            parse_esub_remaining("foo rating>3 pages>20 pages<100 telegraph=on cat=manga").unwrap();
+        assert_eq!(parsed.query, "foo");
+        assert_eq!(parsed.filter_args, ["rating>=4", "pages>=21", "pages<=99"]);
+        assert_eq!(parsed.cat_str.as_deref(), Some("manga"));
+        assert!(parsed.telegraph_on);
+    }
+
+    #[test]
+    fn test_eh_task_value_for_query_preserves_legacy_value() {
+        let legacy = "eh:~foo%7Cbar|f=r4";
+        assert_eq!(eh_task_value_for_query(legacy, "~foo%7Cbar"), Some(legacy));
+        assert_eq!(eh_task_value_for_query(legacy, "~foo|bar"), None);
+    }
+
+    #[test]
+    fn test_eh_task_value_for_query_matches_encoded_value() {
+        let filter = EhFilter {
+            min_rating: Some(4),
+            ..Default::default()
+        };
+        let key = EhTaskKey::new("foo|bar", 0, &filter);
+        let value = key.to_task_value();
+        assert_eq!(value, "ehq:foo%7Cbar|f=r4");
+        assert_eq!(
+            eh_task_value_for_query(&value, "foo|bar"),
+            Some(value.as_str())
+        );
     }
 
     #[test]
