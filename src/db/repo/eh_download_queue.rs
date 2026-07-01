@@ -616,6 +616,7 @@ impl Repo {
                 STATUS_UPLOADED,
                 STATUS_PUBLISHING,
                 STATUS_DONE,
+                STATUS_FAILED,
             ]))
             .filter(eh_download_queue::Column::CompletedAt.gte(cutoff))
             .all(&self.db)
@@ -2492,6 +2493,7 @@ mod tests {
             (3, STATUS_UPLOADED, 300),
             (4, STATUS_PUBLISHING, 400),
             (5, STATUS_DONE, 500),
+            (6, STATUS_FAILED, 600),
         ] {
             let model = repo
                 .enqueue_eh_download(-100, gid, "tok", "Title", false, SOURCE_DIRECT)
@@ -2508,7 +2510,7 @@ mod tests {
         }
 
         let bytes = repo.get_eh_downloaded_bytes_in_window(24).await.unwrap();
-        assert_eq!(bytes, 1500);
+        assert_eq!(bytes, 2100);
     }
 
     #[tokio::test]

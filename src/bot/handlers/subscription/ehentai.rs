@@ -97,10 +97,16 @@ impl BotHandler {
         }
 
         // Parse category bitmask
-        let cats = cat_str
-            .as_deref()
-            .map(EhCategory::bitmask_from_str)
-            .unwrap_or(0);
+        let cats = match parse_eh_category_bitmask(cat_str.as_deref()) {
+            Ok(cats) => cats,
+            Err(e) => {
+                let _ = bot
+                    .send_message(chat_id, format!("❌ {}", markdown::escape(&e)))
+                    .parse_mode(ParseMode::MarkdownV2)
+                    .await;
+                return Ok(());
+            }
+        };
 
         // Build task key
         let task_key = EhTaskKey::new(&query, cats, &eh_filter);
@@ -545,6 +551,23 @@ fn parse_eh_filter(args: &[String]) -> Result<EhFilter, String> {
     Ok(filter)
 }
 
+fn parse_eh_category_bitmask(cat_str: Option<&str>) -> Result<u32, String> {
+    let Some(cat_str) = cat_str else {
+        return Ok(0);
+    };
+    let mut bitmask = 0u32;
+    for raw in cat_str.split(',') {
+        let cat = raw.trim();
+        if cat.is_empty() || cat.eq_ignore_ascii_case("all") {
+            continue;
+        }
+        let parsed =
+            EhCategory::parse_str(cat).ok_or_else(|| format!("未知的 E-Hentai 分类: {}", cat))?;
+        bitmask |= parsed as u32;
+    }
+    Ok(bitmask)
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct ParsedEhSubscriptionArgs {
     query: String,
@@ -711,6 +734,23 @@ mod tests {
     fn test_parse_eh_filter_rating_out_of_range() {
         let result = parse_eh_filter(&["rating>=6".to_string()]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_eh_category_bitmask_rejects_unknown_category() {
+        let result = parse_eh_category_bitmask(Some("mnga"));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("未知的 E-Hentai 分类"));
+    }
+
+    #[test]
+    fn test_parse_eh_category_bitmask_accepts_known_categories_and_all() {
+        assert_eq!(
+            parse_eh_category_bitmask(Some("manga,artistcg")).unwrap(),
+            6
+        );
+        assert_eq!(parse_eh_category_bitmask(Some("all")).unwrap(), 0);
+        assert_eq!(parse_eh_category_bitmask(None).unwrap(), 0);
     }
 
     #[test]
