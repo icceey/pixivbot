@@ -11,7 +11,7 @@ use crate::config::Config;
 use anyhow::Result;
 use sea_orm_migration::MigratorTrait;
 use teloxide::requests::RequesterExt;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::fmt::time::ChronoLocal;
 use tracing_subscriber::{prelude::*, EnvFilter};
 
@@ -199,6 +199,151 @@ async fn main() -> Result<()> {
         None
     };
 
+    // Initialize E-Hentai client and engines
+    let eh_client: Option<std::sync::Arc<eh_client::EhClient>> = if config.ehentai.is_enabled() {
+        if config.ehentai.site == "exhentai" && !config.ehentai.is_exhentai_ready() {
+            tracing::warn!(
+                "ExHentai enabled but missing required cookies (ipb_member_id, ipb_pass_hash, \
+                 igneous). EH feature disabled."
+            );
+            None
+        } else {
+            let site = &config.ehentai.site;
+            let base_url = if site == "exhentai" {
+                "https://exhentai.org"
+            } else {
+                "https://e-hentai.org"
+            };
+            let api_url = "https://api.e-hentai.org/api.php";
+            let cookies = config.ehentai.to_cookies();
+
+            match eh_client::EhClient::new(base_url, api_url, cookies) {
+                Ok(client) => {
+                    info!(
+                        "✅ E-Hentai client initialized (site: {})",
+                        config.ehentai.site
+                    );
+                    Some(std::sync::Arc::new(client))
+                }
+                Err(e) => {
+                    error!("Failed to initialize EH client: {:#}", e);
+                    None
+                }
+            }
+        }
+    } else {
+        info!("E-Hentai not configured, skipping EH engines");
+        None
+    };
+
+    let telegraph_client = config
+        .ehentai
+        .telegraph_access_token
+        .as_ref()
+        .map(|token| std::sync::Arc::new(eh_client::TelegraphClient::new(token.clone())));
+
+    // Warn when upload_telegraph is enabled but no token is configured
+    if config.ehentai.upload_telegraph && config.ehentai.telegraph_access_token.is_none() {
+        warn!(
+            "ehentai.upload_telegraph=true but no telegraph_access_token configured; \
+             Telegraph upload is disabled"
+        );
+    }
+
+    // Reset stale EH entries before spawning workers (crash recovery for all stages)
+    if eh_client.is_some() {
+        if let Err(e) = repo.reset_stale_eh_downloads().await {
+            tracing::warn!("Failed to reset stale EH entries: {:#}", e);
+        }
+        match repo.cancel_legacy_eh_subscription_queue_entries().await {
+            Ok(count) if count > 0 => warn!(
+                "Canceled {} legacy EH subscription queue entries without owner tracking",
+                count
+            ),
+            Ok(_) => {}
+            Err(e) => tracing::warn!(
+                "Failed to cancel legacy EH subscription queue entries without owner tracking: {:#}",
+                e
+            ),
+        }
+        if telegraph_client.is_none() {
+            match repo.disable_eh_telegraph_for_unuploaded_entries().await {
+                Ok(count) if count > 0 => warn!(
+                    "Disabled Telegraph delivery for {} EH queue entries because no telegraph token is configured",
+                    count
+                ),
+                Ok(_) => {}
+                Err(e) => tracing::warn!(
+                    "Failed to disable unuploaded EH Telegraph entries without token: {:#}",
+                    e
+                ),
+            }
+        }
+    }
+
+    let eh_engine_handle = if let Some(ref eh_client) = eh_client {
+        let eh_engine = scheduler::EhEngine::new(
+            repo.clone(),
+            std::sync::Arc::clone(eh_client),
+            std::sync::Arc::new(config.ehentai.clone()),
+            scheduler_config.tick_interval_sec,
+        );
+        info!("✅ E-Hentai engine initialized");
+        Some(tokio::spawn(async move {
+            eh_engine.run().await;
+        }))
+    } else {
+        None
+    };
+
+    let eh_cache_dir = std::path::PathBuf::from(&config.scheduler.cache_dir);
+
+    let eh_download_worker_handle = if let Some(ref eh_client) = eh_client {
+        let worker = scheduler::EhDownloadWorker::new(
+            repo.clone(),
+            std::sync::Arc::clone(eh_client),
+            std::sync::Arc::new(config.ehentai.clone()),
+            eh_cache_dir.clone(),
+        );
+        info!("✅ E-Hentai download worker initialized");
+        Some(tokio::spawn(async move { worker.run().await }))
+    } else {
+        None
+    };
+
+    let eh_upload_worker_handle = if eh_client.is_some() {
+        if let Some(ref telegraph) = telegraph_client {
+            let image_uploader = config.image_upload.build_uploader().await?;
+            let worker = scheduler::EhUploadWorker::new(
+                repo.clone(),
+                notifier.clone(),
+                std::sync::Arc::clone(telegraph),
+                image_uploader,
+                std::sync::Arc::new(config.ehentai.clone()),
+            );
+            info!("✅ E-Hentai upload worker initialized");
+            Some(tokio::spawn(async move { worker.run().await }))
+        } else {
+            info!("E-Hentai upload worker disabled (no telegraph token)");
+            None
+        }
+    } else {
+        None
+    };
+
+    let eh_publish_worker_handle = if let Some(ref eh_client) = eh_client {
+        let worker = scheduler::EhPublishWorker::new(
+            repo.clone(),
+            notifier.clone(),
+            std::sync::Arc::clone(eh_client),
+            std::sync::Arc::new(config.ehentai.clone()),
+        );
+        info!("✅ E-Hentai publish worker initialized");
+        Some(tokio::spawn(async move { worker.run().await }))
+    } else {
+        None
+    };
+
     info!("🤖 Starting Telegram Bot...");
 
     // Setup Ctrl+C handler
@@ -218,6 +363,8 @@ async fn main() -> Result<()> {
     let cache_dir_for_bot = config.scheduler.cache_dir.clone();
     let log_dir_for_bot = config.logging.dir.clone();
     let booru_registry_for_bot = booru_registry.clone();
+    let eh_client_for_bot = eh_client.clone();
+    let has_telegraph_for_bot = telegraph_client.is_some();
     let bot_handle = tokio::spawn(async move {
         if let Err(e) = bot::run(
             bot,
@@ -231,6 +378,8 @@ async fn main() -> Result<()> {
             cache_dir_for_bot,
             log_dir_for_bot,
             booru_registry_for_bot,
+            eh_client_for_bot,
+            has_telegraph_for_bot,
         )
         .await
         {
@@ -248,6 +397,18 @@ async fn main() -> Result<()> {
     ranking_engine_handle.abort();
     name_update_engine_handle.abort();
     if let Some(handle) = booru_engine_handle {
+        handle.abort();
+    }
+    if let Some(handle) = eh_engine_handle {
+        handle.abort();
+    }
+    if let Some(handle) = eh_download_worker_handle {
+        handle.abort();
+    }
+    if let Some(handle) = eh_upload_worker_handle {
+        handle.abort();
+    }
+    if let Some(handle) = eh_publish_worker_handle {
         handle.abort();
     }
 

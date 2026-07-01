@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "migration", "pixiv_client", "booru_client"]
+members = [".", "migration", "pixiv_client", "booru_client", "eh_client"]
 
 [workspace.package]
 version = "0.2.0"
@@ -17,19 +17,20 @@ rust-version = "1.94"
 
 [features]
 default = []
-# Enable tests that require a working ffmpeg H.264 encoder (libx264).
-# Off by default because many environments (e.g. vcpkg ffmpeg without x264) cannot run them.
-ffmpeg-codec = []
+# Enable ffmpeg-dependent ugoira MP4 encoding (requires ffmpeg dev libs + pkg-config).
+# Off by default because many environments cannot build ffmpeg-sys-next.
+ffmpeg-codec = ["dep:ffmpeg-next"]
 
 [dependencies]
 anyhow = "1.0.102"
 chrono = { version = "0.4.44", features = ["serde"] }
 config = { version = "0.15.23", features = ["toml"], default-features = false }
-ffmpeg-next = { version = "8.1.0", default-features = false, features = ["codec", "format", "software-scaling"] }
+ffmpeg-next = { version = "8.1.0", default-features = false, features = ["codec", "format", "software-scaling"], optional = true }
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
 md5 = "0.8.0"
 migration = { path = "migration" }
 booru_client = { path = "booru_client" }
+eh_client = { path = "eh_client" }
 pixiv_client = { path = "pixiv_client" }
 rand = "0.10.1"
 regex = "1.12.3"
@@ -47,3 +48,6 @@ tracing-appender = "0.2.5"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "chrono"] }
 url = "2.5.8"
 zip = "8.6.0"
+
+[dev-dependencies]
+wiremock = "0.6"

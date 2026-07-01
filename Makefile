@@ -52,7 +52,7 @@ clippy:
 # 构建 release 版本
 build:
 	@echo "🔨 Building release..."
-	cargo build --release --workspace
+	cargo build --release --workspace --features ffmpeg-codec
 
 # 清理构建产物
 clean:

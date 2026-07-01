@@ -2,6 +2,8 @@ use anyhow::{Context, Result};
 use booru_client::{BooruEngineType, BypassConfig};
 use serde::Deserialize;
 
+use eh_client::{EhCookies, ImageUploadConfig};
+
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum BotMode {
@@ -27,6 +29,10 @@ pub struct Config {
     pub content: ContentConfig,
     #[serde(default)]
     pub booru: BooruConfig,
+    #[serde(default)]
+    pub ehentai: EhentaiConfig,
+    #[serde(default)]
+    pub image_upload: ImageUploadConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -317,6 +323,175 @@ fn default_booru_page_limit() -> u32 {
     20
 }
 
+// ── E-Hentai / ExHentai config ──────────────────────────────────────────
+
+/// Configuration for e-hentai/exhentai subscription feature.
+///
+/// EH is enabled by default. Set `enabled = false` to explicitly disable.
+/// Uncomment `[ehentai]` to customize site, credentials, and resolutions.
+/// For e-hentai, no auth cookies are required (public galleries).
+/// For exhentai, `ipb_member_id`, `ipb_pass_hash`, and `igneous` are all required.
+#[derive(Debug, Deserialize, Clone)]
+pub struct EhentaiConfig {
+    /// Whether the E-Hentai / ExHentai feature is enabled (default: true).
+    /// Set to `false` to explicitly disable EH regardless of site configuration.
+    #[serde(default = "default_eh_enabled")]
+    pub enabled: bool,
+    /// "e-hentai" or "exhentai" (default: "e-hentai")
+    #[serde(default = "default_eh_site")]
+    pub site: String,
+    #[serde(default)]
+    pub ipb_member_id: Option<String>,
+    #[serde(default)]
+    pub ipb_pass_hash: Option<String>,
+    #[serde(default)]
+    pub igneous: Option<String>,
+    /// Resolution for subscription downloads: "780x", "980x", "1280x" (free),
+    /// "1600x"/"2400x" (donors), "original" (costs GP). Default: "1280x" (free max).
+    #[serde(default = "default_eh_subscription_resolution")]
+    pub subscription_resolution: String,
+    /// Resolution for /edl direct downloads. Default: "1280x".
+    #[serde(default = "default_eh_download_resolution")]
+    pub download_resolution: String,
+    /// Whether subscription updates send the archive ZIP (default: true).
+    #[serde(default = "default_eh_send_archive")]
+    pub send_archive: bool,
+    /// Whether subscription updates upload to Telegraph (default: false).
+    #[serde(default)]
+    pub upload_telegraph: bool,
+    #[serde(default = "default_eh_min_interval_sec")]
+    pub min_interval_sec: u64,
+    #[serde(default = "default_eh_max_interval_sec")]
+    pub max_interval_sec: u64,
+    /// Telegraph access token for creating Telegraph pages.
+    /// Required for Telegraph page creation. Image hosting uses `[image_upload]`.
+    #[serde(default)]
+    pub telegraph_access_token: Option<String>,
+    #[serde(default = "default_eh_max_push_per_tick")]
+    pub max_push_per_tick: usize,
+    #[serde(default = "default_eh_max_retry_count")]
+    pub max_retry_count: u8,
+    #[serde(default = "default_eh_scan_window_hours")]
+    pub scan_window_hours: u64,
+    #[serde(default = "default_eh_download_rate_limit_gb")]
+    pub download_rate_limit_gb: u64,
+    #[serde(default = "default_eh_download_rate_window_hours")]
+    pub download_rate_window_hours: u64,
+    #[serde(default = "default_eh_download_poll_interval_sec")]
+    pub download_poll_interval_sec: u64,
+    #[serde(default = "default_eh_pushed_cap")]
+    pub pushed_cap: usize,
+}
+
+impl Default for EhentaiConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_eh_enabled(),
+            site: default_eh_site(),
+            ipb_member_id: None,
+            ipb_pass_hash: None,
+            igneous: None,
+            subscription_resolution: default_eh_subscription_resolution(),
+            download_resolution: default_eh_download_resolution(),
+            send_archive: default_eh_send_archive(),
+            upload_telegraph: false,
+            min_interval_sec: default_eh_min_interval_sec(),
+            max_interval_sec: default_eh_max_interval_sec(),
+            telegraph_access_token: None,
+            max_push_per_tick: default_eh_max_push_per_tick(),
+            max_retry_count: default_eh_max_retry_count(),
+            scan_window_hours: default_eh_scan_window_hours(),
+            download_rate_limit_gb: default_eh_download_rate_limit_gb(),
+            download_rate_window_hours: default_eh_download_rate_window_hours(),
+            download_poll_interval_sec: default_eh_download_poll_interval_sec(),
+            pushed_cap: default_eh_pushed_cap(),
+        }
+    }
+}
+
+impl EhentaiConfig {
+    /// Build EhCookies from config values.
+    pub fn to_cookies(&self) -> EhCookies {
+        EhCookies {
+            ipb_member_id: self.ipb_member_id.clone(),
+            ipb_pass_hash: self.ipb_pass_hash.clone(),
+            igneous: self.igneous.clone(),
+            nw: true,
+        }
+    }
+
+    /// Check if exhentai mode is enabled with all required cookies.
+    pub fn is_exhentai_ready(&self) -> bool {
+        self.site == "exhentai" && self.to_cookies().is_exhentai_capable()
+    }
+
+    /// Check if the feature is enabled (explicit flag + supported site).
+    pub fn is_enabled(&self) -> bool {
+        self.enabled && matches!(self.site.as_str(), "exhentai" | "e-hentai")
+    }
+
+    /// Download rate limit in bytes.
+    pub fn download_rate_limit_bytes(&self) -> u64 {
+        self.download_rate_limit_gb * 1024 * 1024 * 1024
+    }
+}
+
+fn default_eh_enabled() -> bool {
+    true
+}
+
+fn default_eh_site() -> String {
+    "e-hentai".to_string()
+}
+
+fn default_eh_subscription_resolution() -> String {
+    "1280x".to_string()
+}
+
+fn default_eh_download_resolution() -> String {
+    "1280x".to_string()
+}
+
+fn default_eh_send_archive() -> bool {
+    true
+}
+
+fn default_eh_min_interval_sec() -> u64 {
+    30 * 60
+}
+
+fn default_eh_max_interval_sec() -> u64 {
+    60 * 60
+}
+
+fn default_eh_max_push_per_tick() -> usize {
+    3
+}
+
+fn default_eh_max_retry_count() -> u8 {
+    3
+}
+
+fn default_eh_scan_window_hours() -> u64 {
+    48
+}
+
+fn default_eh_download_rate_limit_gb() -> u64 {
+    7
+}
+
+fn default_eh_download_rate_window_hours() -> u64 {
+    168
+}
+
+fn default_eh_download_poll_interval_sec() -> u64 {
+    60
+}
+
+fn default_eh_pushed_cap() -> usize {
+    500
+}
+
 impl Config {
     pub fn load() -> Result<Self> {
         let builder = config::Config::builder()
@@ -387,5 +562,22 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(config.download_threshold(), 10);
+    }
+
+    #[test]
+    fn test_eh_enabled_defaults_true() {
+        let cfg = EhentaiConfig::default();
+        assert!(cfg.enabled);
+        assert!(cfg.is_enabled());
+    }
+
+    #[test]
+    fn test_eh_enabled_false_disables_supported_site() {
+        let cfg = EhentaiConfig {
+            enabled: false,
+            site: "e-hentai".to_string(),
+            ..Default::default()
+        };
+        assert!(!cfg.is_enabled());
     }
 }

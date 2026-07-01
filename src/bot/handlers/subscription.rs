@@ -1,6 +1,7 @@
 mod author;
 mod booru;
 mod channel;
+mod ehentai;
 mod helpers;
 mod list;
 mod ranking;

@@ -135,6 +135,7 @@ impl BotHandler {
                             TaskType::BooruTag | TaskType::BooruPool | TaskType::BooruRanking => {
                                 unreachable!("booru task types are handled above")
                             }
+                            TaskType::Ehentai => "📖",
                         };
 
                         let display_info = if task.r#type == TaskType::Author {
@@ -161,7 +162,7 @@ impl BotHandler {
                                 }
                             }
                         } else {
-                            task.value.replace('_', "\\_")
+                            markdown::escape(&task.value)
                         };
                         (type_emoji, display_info)
                     };
@@ -270,7 +271,9 @@ fn booru_list_display(
         TaskType::BooruTag => "🏷",
         TaskType::BooruPool => "📦",
         TaskType::BooruRanking => booru_ranking_list_emoji(task_value),
-        TaskType::Author | TaskType::Ranking => unreachable!("not a booru task type"),
+        TaskType::Author | TaskType::Ranking | TaskType::Ehentai => {
+            unreachable!("not a booru task type")
+        }
     };
 
     let display_info = if let Some(name) = author_name {
@@ -284,7 +287,9 @@ fn booru_list_display(
             TaskType::BooruTag => "标签",
             TaskType::BooruPool => "Pool",
             TaskType::BooruRanking => "排行",
-            TaskType::Author | TaskType::Ranking => unreachable!("not a booru task type"),
+            TaskType::Author | TaskType::Ranking | TaskType::Ehentai => {
+                unreachable!("not a booru task type")
+            }
         };
 
         format!("{}: `{}`", label, markdown::escape(task_value))
@@ -401,5 +406,22 @@ mod tests {
             build_list_callback_data(4, ChatId(-1001234567890), true),
             "list:4:-1001234567890:1"
         );
+    }
+
+    #[test]
+    fn test_eh_list_display_uses_markdown_escape() {
+        // E-Hentai task values should be escaped with markdown::escape,
+        // not just underscore replacement. The key difference:
+        // markdown::escape also escapes `-`, `.`, `!`, `=`, `|` etc.
+        let task_value = "e-hentai.org|test";
+        let escaped = markdown::escape(task_value);
+        // The old behavior (replace('_', "\\_")) would leave hyphens and dots unescaped
+        // markdown::escape must escape hyphens (used in E-Hentai domain names)
+        assert!(
+            escaped.contains("\\-"),
+            "hyphen should be escaped: {escaped}"
+        );
+        // Dots also escaped
+        assert!(escaped.contains("\\."), "dot should be escaped: {escaped}");
     }
 }

@@ -11,6 +11,7 @@ use crate::bot::notifier::ThrottledBot;
 use crate::bot::BotHandler;
 use anyhow::{Context, Result};
 use chrono::Local;
+use regex::Regex;
 use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -40,20 +41,81 @@ impl BotHandler {
     ) -> ResponseResult<()> {
         info!("Processing /download command from chat {}", chat_id);
 
-        let (illust_ids, booru_refs) = self.extract_targets(&msg, &args).await;
+        let has_args = !args.trim().is_empty();
 
-        if illust_ids.is_empty() && booru_refs.is_empty() {
+        let (illust_ids, booru_refs) = self.extract_targets(&msg, &args, has_args).await;
+
+        // Check for e-hentai/exhentai gallery links
+        let eh_galleries = self.extract_eh_galleries(&msg, &args);
+
+        let has_other_download_targets = !illust_ids.is_empty()
+            || !booru_refs.is_empty()
+            || args_have_bare_pixiv_ids_outside_eh_urls(&args);
+        let eh_decision = classify_eh_download_input(&eh_galleries, has_other_download_targets);
+        match &eh_decision {
+            EhDownloadInput::Multiple => {
+                bot.send_message(
+                    chat_id,
+                    "❌ 一次只能处理一个 E-Hentai 链接，请使用 /edl <url>。",
+                )
+                .await?;
+                return Ok(());
+            }
+            EhDownloadInput::Mixed => {
+                bot.send_message(
+                    chat_id,
+                    "❌ 请不要把 E-Hentai 链接和 Pixiv/Booru 链接混在同一次 /download 中；E-Hentai 请使用 /edl <url>。",
+                )
+                .await?;
+                return Ok(());
+            }
+            EhDownloadInput::None | EhDownloadInput::Single(_, _) => {}
+        }
+
+        if illust_ids.is_empty() && booru_refs.is_empty() && eh_galleries.is_empty() {
             bot.send_message(
                 chat_id,
                 "❌ 请提供作品 ID 或 URL，或回复包含作品链接的消息\n\n例如：\n\
                  • `/download 123456789`\n\
                  • `/download https://www.pixiv.net/artworks/123456789`\n\
+                 • `/download https://e-hentai.org/g/12345/token/`\n\
                  • `/download https://yande.re/post/show/123456`（需先在配置中启用）\n\
                  • 回复包含链接的消息并使用 `/download`",
             )
             .parse_mode(ParseMode::MarkdownV2)
             .await?;
             return Ok(());
+        }
+
+        // Handle eh gallery download via the download queue
+        if let EhDownloadInput::Single(gid, token) = eh_decision {
+            if let Some(eh_client) = &self.eh_client {
+                let metadata = eh_client.get_metadata(&[(gid, &token)]).await;
+                let title = match &metadata {
+                    Ok(m) if !m.is_empty() => m[0].title.clone(),
+                    _ => format!("gallery_{}", gid),
+                };
+                if let Err(e) = self
+                    .repo
+                    .enqueue_eh_download(
+                        chat_id.0,
+                        gid as i64,
+                        &token,
+                        &title,
+                        false,
+                        crate::db::repo::eh_download_queue::SOURCE_DIRECT,
+                    )
+                    .await
+                {
+                    error!("Failed to enqueue eh download from /download: {:#}", e);
+                    bot.send_message(chat_id, "❌ 加入 E-Hentai 下载队列失败")
+                        .await?;
+                } else {
+                    bot.send_message(chat_id, "⏳ 已加入 E-Hentai 下载队列")
+                        .await?;
+                }
+                return Ok(());
+            }
         }
 
         info!(
@@ -93,7 +155,12 @@ impl BotHandler {
         result
     }
 
-    async fn extract_targets(&self, msg: &Message, args: &str) -> (Vec<u64>, Vec<BooruPostRef>) {
+    async fn extract_targets(
+        &self,
+        msg: &Message,
+        args: &str,
+        has_args: bool,
+    ) -> (Vec<u64>, Vec<BooruPostRef>) {
         let mut ids = HashSet::new();
         let mut booru_seen: HashSet<(String, u64)> = HashSet::new();
         let mut booru_refs: Vec<BooruPostRef> = Vec::new();
@@ -122,7 +189,7 @@ impl BotHandler {
             }
         }
 
-        if ids.is_empty() && booru_refs.is_empty() {
+        if !has_args && ids.is_empty() && booru_refs.is_empty() {
             if let Some(reply_msg) = msg.reply_to_message() {
                 if let Some(text) = reply_msg.text().or_else(|| reply_msg.caption()) {
                     absorb(text, &mut ids, &mut booru_seen, &mut booru_refs);
@@ -154,6 +221,19 @@ impl BotHandler {
         }
 
         (ids.into_iter().collect(), booru_refs)
+    }
+
+    /// Extract all e-hentai/exhentai gallery URLs from args or replied message.
+    /// Priority: command args > reply message (same precedence as extract_targets).
+    fn extract_eh_galleries(&self, msg: &Message, args: &str) -> Vec<(u64, String)> {
+        if self.eh_client.is_none() {
+            return Vec::new();
+        }
+
+        let reply_text = msg
+            .reply_to_message()
+            .and_then(|reply_msg| reply_msg.text().or_else(|| reply_msg.caption()));
+        extract_eh_galleries_from_sources(args, reply_text)
     }
 
     /// Process downloads for multiple illusts
@@ -248,25 +328,37 @@ impl BotHandler {
 
         // For ugoira works, download as MP4 instead of static images
         if illust.is_ugoira() {
-            let metadata = pixiv
-                .get_ugoira_metadata(illust_id)
-                .await
-                .context("Failed to fetch ugoira metadata")?;
-            drop(pixiv);
+            #[cfg(feature = "ffmpeg-codec")]
+            {
+                let metadata = pixiv
+                    .get_ugoira_metadata(illust_id)
+                    .await
+                    .context("Failed to fetch ugoira metadata")?;
+                drop(pixiv);
 
-            let title = illust.title.clone();
-            let artist = illust.user.name.clone();
-            let downloader = self.notifier.get_downloader();
+                let title = illust.title.clone();
+                let artist = illust.user.name.clone();
+                let downloader = self.notifier.get_downloader();
 
-            let mp4_path = downloader
-                .download_ugoira_mp4(&metadata.zip_urls.medium, metadata.frames)
-                .await
-                .context("Failed to download ugoira MP4")?;
+                let mp4_path = downloader
+                    .download_ugoira_mp4(&metadata.zip_urls.medium, metadata.frames)
+                    .await
+                    .context("Failed to download ugoira MP4")?;
 
-            let sanitized_title = sanitize_filename(&title);
-            let filename = format!("{}_{}.mp4", sanitized_title, illust_id);
+                let sanitized_title = sanitize_filename(&title);
+                let filename = format!("{}_{}.mp4", sanitized_title, illust_id);
 
-            return Ok((vec![(mp4_path, filename)], title, artist));
+                return Ok((vec![(mp4_path, filename)], title, artist));
+            }
+
+            #[cfg(not(feature = "ffmpeg-codec"))]
+            {
+                drop(pixiv);
+                anyhow::bail!(
+                    "Ugoira MP4 download requires the ffmpeg-codec feature, \
+                     which is not enabled in this build"
+                );
+            }
         }
 
         drop(pixiv);
@@ -455,6 +547,74 @@ pub(super) fn sanitize_filename(name: &str) -> String {
         .collect()
 }
 
+/// Extract all E-Hentai/ExHentai gallery URLs from text, returning (gid, token) pairs.
+/// Only accepts tokens with length >= 8, matching the validation in `parse_gallery_ref`.
+fn extract_eh_galleries_from_text(text: &str) -> Vec<(u64, String)> {
+    let re = Regex::new(r"https?://(?:e-|ex)hentai\.org/g/(\d+)/([A-Za-z0-9_-]+)/?")
+        .expect("valid EH gallery regex");
+    let mut seen = HashSet::new();
+    re.captures_iter(text)
+        .filter_map(|cap| {
+            let gid = cap.get(1)?.as_str().parse::<u64>().ok()?;
+            let token = cap.get(2)?.as_str().to_string();
+            if token.len() < 8 {
+                return None;
+            }
+            if !seen.insert((gid, token.clone())) {
+                return None;
+            }
+            Some((gid, token))
+        })
+        .collect()
+}
+
+fn extract_eh_galleries_from_sources(args: &str, reply_text: Option<&str>) -> Vec<(u64, String)> {
+    if !args.trim().is_empty() {
+        extract_eh_galleries_from_text(args)
+    } else {
+        reply_text
+            .map(extract_eh_galleries_from_text)
+            .unwrap_or_default()
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum EhDownloadInput {
+    None,
+    Single(u64, String),
+    Multiple,
+    Mixed,
+}
+
+fn classify_eh_download_input(
+    eh_galleries: &[(u64, String)],
+    has_pixiv_or_booru_targets: bool,
+) -> EhDownloadInput {
+    match (eh_galleries, has_pixiv_or_booru_targets) {
+        ([], _) => EhDownloadInput::None,
+        ([(gid, token)], true) => {
+            let _ = (gid, token);
+            EhDownloadInput::Mixed
+        }
+        ([(gid, token)], false) => EhDownloadInput::Single(*gid, token.clone()),
+        (_, _) => EhDownloadInput::Multiple,
+    }
+}
+
+fn args_have_bare_pixiv_ids_outside_eh_urls(args: &str) -> bool {
+    let trimmed = args.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    let eh_re = Regex::new(r"https?://(?:e-|ex)hentai\.org/g/\d+/[A-Za-z0-9_-]+/?")
+        .expect("valid EH gallery regex");
+    let without_eh = eh_re.replace_all(trimmed, " ");
+    without_eh
+        .split_whitespace()
+        .any(|token| token.chars().all(|c| c.is_ascii_digit()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -468,5 +628,134 @@ mod tests {
             sanitize_filename("title|with?many*bad\\chars"),
             "title_with_many_bad_chars"
         );
+    }
+
+    #[test]
+    fn test_extract_eh_galleries_finds_multiple_links() {
+        let text = "https://e-hentai.org/g/1/aaaaaaaaaa/ https://e-hentai.org/g/2/bbbbbbbbbb/";
+        let galleries = extract_eh_galleries_from_text(text);
+        assert_eq!(galleries.len(), 2);
+        assert_eq!(galleries[0], (1, "aaaaaaaaaa".to_string()));
+        assert_eq!(galleries[1], (2, "bbbbbbbbbb".to_string()));
+    }
+
+    #[test]
+    fn test_extract_eh_galleries_rejects_short_tokens() {
+        // Token length < 8 should be rejected (matching parse_gallery_ref)
+        let text = "https://e-hentai.org/g/1/abc/";
+        let galleries = extract_eh_galleries_from_text(text);
+        assert!(galleries.is_empty());
+    }
+
+    #[test]
+    fn test_extract_eh_galleries_accepts_min_token_length() {
+        // Token length == 8 should be accepted
+        let text = "https://e-hentai.org/g/1/abcdefgh/";
+        let galleries = extract_eh_galleries_from_text(text);
+        assert_eq!(galleries.len(), 1);
+        assert_eq!(galleries[0], (1, "abcdefgh".to_string()));
+    }
+
+    #[test]
+    fn test_extract_eh_galleries_dedupes_same_gid() {
+        // Same (gid, token) appearing twice should be deduplicated
+        let text =
+            "https://e-hentai.org/g/1/aaaaaaaaaa/ and also https://e-hentai.org/g/1/aaaaaaaaaa/";
+        let galleries = extract_eh_galleries_from_text(text);
+        assert_eq!(galleries.len(), 1);
+        assert_eq!(galleries[0], (1, "aaaaaaaaaa".to_string()));
+    }
+
+    #[test]
+    fn test_extract_eh_galleries_same_gid_different_token_returns_both() {
+        // Same gid but different token — two distinct links
+        let text = "https://e-hentai.org/g/1/aaaaaaaaaa/ and https://e-hentai.org/g/1/bbbbbbbbbb/";
+        let galleries = extract_eh_galleries_from_text(text);
+        assert_eq!(galleries.len(), 2);
+        assert_eq!(galleries[0], (1, "aaaaaaaaaa".to_string()));
+        assert_eq!(galleries[1], (1, "bbbbbbbbbb".to_string()));
+    }
+
+    #[test]
+    fn test_extract_eh_galleries_args_take_precedence_over_reply() {
+        let args = "https://e-hentai.org/g/1/aaaaaaaaaa/";
+        let reply = Some("https://e-hentai.org/g/2/bbbbbbbbbb/");
+        let galleries = extract_eh_galleries_from_sources(args, reply);
+        assert_eq!(galleries, vec![(1, "aaaaaaaaaa".to_string())]);
+    }
+
+    #[test]
+    fn test_extract_eh_galleries_pixiv_args_ignore_reply_eh() {
+        let args = "https://www.pixiv.net/artworks/123456789";
+        let reply = Some("https://e-hentai.org/g/2/bbbbbbbbbb/");
+        let galleries = extract_eh_galleries_from_sources(args, reply);
+        assert!(galleries.is_empty());
+    }
+
+    #[test]
+    fn test_extract_eh_galleries_args_eh_ignore_reply_duplicate() {
+        let args = "https://e-hentai.org/g/1/aaaaaaaaaa/";
+        let reply = Some("https://e-hentai.org/g/1/aaaaaaaaaa/");
+        let galleries = extract_eh_galleries_from_sources(args, reply);
+        assert_eq!(galleries, vec![(1, "aaaaaaaaaa".to_string())]);
+    }
+
+    #[test]
+    fn test_extract_eh_galleries_uses_reply_when_args_empty() {
+        let galleries =
+            extract_eh_galleries_from_sources("   ", Some("https://e-hentai.org/g/2/bbbbbbbbbb/"));
+        assert_eq!(galleries, vec![(2, "bbbbbbbbbb".to_string())]);
+    }
+
+    #[test]
+    fn test_classify_eh_download_input_rejects_distinct_multiple_links() {
+        let galleries = vec![(1, "aaaaaaaaaa".to_string()), (1, "bbbbbbbbbb".to_string())];
+        assert_eq!(
+            classify_eh_download_input(&galleries, false),
+            EhDownloadInput::Multiple
+        );
+    }
+
+    #[test]
+    fn test_classify_eh_download_input_rejects_mixed_targets() {
+        let galleries = vec![(1, "aaaaaaaaaa".to_string())];
+        assert_eq!(
+            classify_eh_download_input(&galleries, true),
+            EhDownloadInput::Mixed
+        );
+    }
+
+    #[test]
+    fn test_args_bare_pixiv_id_after_eh_url_is_mixed_target() {
+        let args = "https://e-hentai.org/g/1/aaaaaaaaaa/ 123456789";
+        assert!(args_have_bare_pixiv_ids_outside_eh_urls(args));
+        let galleries = extract_eh_galleries_from_sources(args, None);
+        assert_eq!(
+            classify_eh_download_input(&galleries, args_have_bare_pixiv_ids_outside_eh_urls(args),),
+            EhDownloadInput::Mixed
+        );
+    }
+
+    #[test]
+    fn test_args_eh_url_digits_do_not_count_as_bare_pixiv_id() {
+        let args = "https://e-hentai.org/g/123456789/aaaaaaaaaa/";
+        assert!(!args_have_bare_pixiv_ids_outside_eh_urls(args));
+    }
+
+    #[test]
+    fn test_classify_eh_download_input_accepts_single_eh_only() {
+        let galleries = vec![(1, "aaaaaaaaaa".to_string())];
+        assert_eq!(
+            classify_eh_download_input(&galleries, false),
+            EhDownloadInput::Single(1, "aaaaaaaaaa".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_eh_galleries_exhentai_url() {
+        let text = "https://exhentai.org/g/99999/deadbeef00/";
+        let galleries = extract_eh_galleries_from_text(text);
+        assert_eq!(galleries.len(), 1);
+        assert_eq!(galleries[0], (99999, "deadbeef00".to_string()));
     }
 }

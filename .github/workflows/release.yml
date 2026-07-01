@@ -117,7 +117,7 @@ jobs:
       - name: Build Binary
         shell: bash
         run: |
-          cargo build --release --target ${{ matrix.target }}
+          cargo build --release --target ${{ matrix.target }} --features ffmpeg-codec
 
       - name: Prepare Archive
         id: prepare_archive
