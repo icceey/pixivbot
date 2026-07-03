@@ -83,8 +83,8 @@ download_original_threshold = 1
 
 # ----------------------------------------------------------------------------
 # Image upload backend for Telegraph pages. Default provider is "pixi". Set
-# provider to "s3" to upload images to an S3-compatible object store, or
-# "catbox" to use Catbox.
+# provider to "s3" to upload images to an S3-compatible object store, "catbox"
+# to use Catbox, or "ipfs3" to use an ipfS3 (S3-compatible IPFS gateway) store.
 # ----------------------------------------------------------------------------
 # [image_upload]
 # provider = "pixi"
@@ -96,6 +96,22 @@ download_original_threshold = 1
 # access_key_id = "your_access_key_id"
 # secret_access_key = "your_secret_access_key"
 # public_base_url = "https://cdn.example.com/pixivbot-images"
+# key_prefix = "eh"
+# path_style = true
+#
+# [image_upload.ipfs3]
+# # ipfS3 is an S3-compatible gateway in front of IPFS (Kubo). It returns the
+# # IPFS Content ID (CID) of each uploaded object in the ETag response header.
+# # The public URL is built as {gateway_url}/{CID}, so reads are served by any
+# # public IPFS gateway, independent of endpoint_url. Only plaintext (non-
+# # encrypted) uploads are gateway-accessible; do not enable SSE-S3/SSE-C.
+# # See: https://github.com/hugefiver/ipfS3
+# endpoint_url = "http://localhost:9000"
+# bucket = "pixivbot-images"
+# region = "us-east-1"
+# access_key_id = "test"
+# secret_access_key = "test"
+# gateway_url = "https://ipfs.io/ipfs"
 # key_prefix = "eh"
 # path_style = true
 #

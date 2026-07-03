@@ -9,5 +9,6 @@ pub use error::{Error, Result};
 pub use models::{EhCategory, EhCookies, EhGallery, EhGalleryRef};
 pub use telegraph::{
     CatboxUploader, CatboxUploaderConfig, ImageUploadConfig, ImageUploadInput, ImageUploadProvider,
-    ImageUploader, PixiUploader, S3Uploader, S3UploaderConfig, TelegraphClient,
+    ImageUploader, IpfS3Uploader, IpfS3UploaderConfig, PixiUploader, S3Uploader, S3UploaderConfig,
+    TelegraphClient,
 };

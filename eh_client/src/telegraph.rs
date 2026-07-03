@@ -138,6 +138,7 @@ pub enum ImageUploadProvider {
     Pixi,
     S3,
     Catbox,
+    IpfS3,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -146,6 +147,8 @@ pub struct ImageUploadConfig {
     pub provider: ImageUploadProvider,
     #[serde(default)]
     pub s3: Option<S3UploaderConfig>,
+    #[serde(default)]
+    pub ipfs3: Option<IpfS3UploaderConfig>,
     #[serde(default)]
     pub catbox: CatboxUploaderConfig,
 }
@@ -157,6 +160,11 @@ impl ImageUploadConfig {
             ImageUploadProvider::S3 => Ok(Arc::new(S3Uploader::from_config(
                 self.s3.as_ref().ok_or_else(|| {
                     Error::Other("image_upload.s3 is required when provider=s3".into())
+                })?,
+            )?)),
+            ImageUploadProvider::IpfS3 => Ok(Arc::new(IpfS3Uploader::from_config(
+                self.ipfs3.as_ref().ok_or_else(|| {
+                    Error::Other("image_upload.ipfs3 is required when provider=ipfs3".into())
                 })?,
             )?)),
             ImageUploadProvider::Catbox => Ok(Arc::new(CatboxUploader::from_config(&self.catbox)?)),
@@ -233,6 +241,67 @@ impl S3UploaderConfig {
             path_style: self.path_style,
         })
     }
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct IpfS3UploaderConfig {
+    #[serde(default)]
+    pub endpoint_url: Option<String>,
+    #[serde(default)]
+    pub bucket: Option<String>,
+    #[serde(default)]
+    pub region: Option<String>,
+    #[serde(default)]
+    pub access_key_id: Option<String>,
+    #[serde(default)]
+    pub secret_access_key: Option<String>,
+    #[serde(default)]
+    pub gateway_url: Option<String>,
+    #[serde(default)]
+    pub key_prefix: String,
+    #[serde(default = "default_s3_path_style")]
+    pub path_style: bool,
+}
+
+impl IpfS3UploaderConfig {
+    fn required(&self) -> Result<ResolvedIpfS3UploaderConfig> {
+        Ok(ResolvedIpfS3UploaderConfig {
+            endpoint_url: validate_http_url(
+                "image_upload.ipfs3.endpoint_url",
+                &required_config("image_upload.ipfs3.endpoint_url", &self.endpoint_url)?,
+            )?,
+            bucket: required_config("image_upload.ipfs3.bucket", &self.bucket)?,
+            region: required_config("image_upload.ipfs3.region", &self.region)?,
+            access_key_id: required_config(
+                "image_upload.ipfs3.access_key_id",
+                &self.access_key_id,
+            )?,
+            secret_access_key: required_config(
+                "image_upload.ipfs3.secret_access_key",
+                &self.secret_access_key,
+            )?,
+            gateway_url: validate_http_url(
+                "image_upload.ipfs3.gateway_url",
+                &required_config("image_upload.ipfs3.gateway_url", &self.gateway_url)?,
+            )?
+            .trim_end_matches('/')
+            .to_string(),
+            key_prefix: self.key_prefix.trim_matches('/').to_string(),
+            path_style: self.path_style,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedIpfS3UploaderConfig {
+    endpoint_url: String,
+    bucket: String,
+    region: String,
+    access_key_id: String,
+    secret_access_key: String,
+    gateway_url: String,
+    key_prefix: String,
+    path_style: bool,
 }
 
 fn required_config(name: &str, value: &Option<String>) -> Result<String> {
@@ -541,6 +610,91 @@ impl ImageUploader for S3Uploader {
                 });
             }
             urls.push(self.public_url(&key));
+        }
+        Ok(urls)
+    }
+}
+
+pub struct IpfS3Uploader {
+    bucket: Box<Bucket>,
+    config: ResolvedIpfS3UploaderConfig,
+}
+
+impl IpfS3Uploader {
+    pub fn from_config(config: &IpfS3UploaderConfig) -> Result<Self> {
+        let config = config.required()?;
+        let credentials = Credentials::new(
+            Some(&config.access_key_id),
+            Some(&config.secret_access_key),
+            None,
+            None,
+            None,
+        )
+        .map_err(|e| Error::Other(format!("invalid ipfS3 credentials: {e}")))?;
+        let region = Region::Custom {
+            region: config.region.clone(),
+            endpoint: config.endpoint_url.clone(),
+        };
+        let mut bucket = Bucket::new(&config.bucket, region, credentials)
+            .map_err(|e| Error::Other(format!("failed to build ipfS3 bucket client: {e}")))?;
+        if config.path_style {
+            bucket = bucket.with_path_style();
+        }
+        Ok(Self { bucket, config })
+    }
+
+    fn object_key(&self, index: usize, input: &ImageUploadInput<'_>) -> String {
+        let timestamp = chrono::Utc::now().format("%Y%m%d%H%M%S");
+        let hash = short_hash_hex(input.bytes);
+        let ext = extension_for_upload(input.filename, input.bytes);
+        let filename = format!("{timestamp}-{index:04}-{hash}.{ext}");
+        if self.config.key_prefix.is_empty() {
+            filename
+        } else {
+            format!("{}/{}", self.config.key_prefix, filename)
+        }
+    }
+}
+
+#[async_trait]
+impl ImageUploader for IpfS3Uploader {
+    async fn upload_images(&self, images: &[ImageUploadInput<'_>]) -> Result<Vec<String>> {
+        let mut urls = Vec::with_capacity(images.len());
+        for (index, image) in images.iter().enumerate() {
+            let key = self.object_key(index + 1, image);
+            let content_type = detect_content_type(image.bytes);
+            let response = self
+                .bucket
+                .put_object_with_content_type(&key, image.bytes, &content_type)
+                .await
+                .map_err(|e| Error::Other(format!("ipfS3 put_object failed for key {key}: {e}")))?;
+            let status = response.status_code();
+            if !(200..300).contains(&status) {
+                return Err(Error::Api {
+                    message: format!("ipfS3 put_object returned {status} for key {key}"),
+                    status,
+                });
+            }
+            // rust-s3's put_object path extracts the ETag header into the
+            // response body (see response_data(etag=true)), so the IPFS CID
+            // lives in `response.as_str()`, not in the headers map. The value
+            // retains its surrounding double quotes, which we strip.
+            let cid = response
+                .as_str()
+                .map_err(|e| {
+                    Error::Other(format!(
+                        "ipfS3 put_object for key {key} returned non-UTF-8 ETag: {e}"
+                    ))
+                })?
+                .trim_matches('"')
+                .trim();
+            if cid.is_empty() {
+                return Err(Error::Other(format!(
+                    "ipfS3 put_object for key {key} returned no ETag (CID); \
+                     cannot build public URL"
+                )));
+            }
+            urls.push(format!("{}/{cid}", self.config.gateway_url));
         }
         Ok(urls)
     }
@@ -903,6 +1057,62 @@ mod tests {
     }
 
     #[test]
+    fn ipfs3_config_requires_fields_for_provider() {
+        let cfg = IpfS3UploaderConfig::default();
+        let err = cfg.required().unwrap_err();
+        assert!(err.to_string().contains("image_upload.ipfs3.endpoint_url"));
+    }
+
+    #[test]
+    fn ipfs3_config_rejects_invalid_gateway_url() {
+        let mut cfg = complete_ipfs3_config("http://localhost:9000", "not a url");
+        let err = cfg.required().unwrap_err();
+        assert!(err.to_string().contains("image_upload.ipfs3.gateway_url"));
+
+        cfg.gateway_url = Some("ftp://ipfs.io/ipfs".to_string());
+        let err = cfg.required().unwrap_err();
+        assert!(err.to_string().contains("must use http or https"));
+    }
+
+    #[test]
+    fn ipfs3_config_rejects_gateway_url_with_secret_or_non_path_parts() {
+        let mut cfg =
+            complete_ipfs3_config("http://localhost:9000", "https://user:pass@ipfs.io/ipfs");
+        let err = cfg.required().unwrap_err();
+        assert!(err.to_string().contains("must not contain userinfo"));
+
+        cfg.gateway_url = Some("https://ipfs.io/ipfs?token=secret".to_string());
+        let err = cfg.required().unwrap_err();
+        assert!(err.to_string().contains("must not contain query"));
+
+        cfg.gateway_url = Some("https://ipfs.io/ipfs#frag".to_string());
+        let err = cfg.required().unwrap_err();
+        assert!(err.to_string().contains("must not contain fragment"));
+    }
+
+    #[test]
+    fn ipfs3_config_rejects_unsafe_endpoint_url() {
+        let mut cfg = complete_ipfs3_config("ftp://localhost:9000", "https://ipfs.io/ipfs");
+        let err = cfg.required().unwrap_err();
+        assert!(err.to_string().contains("must use http or https"));
+
+        cfg.endpoint_url = Some("https://user:secret@ipfs3.example.com".to_string());
+        let err = cfg.required().unwrap_err();
+        assert!(err.to_string().contains("must not contain userinfo"));
+
+        cfg.endpoint_url = Some("https://ipfs3.example.com?token=secret".to_string());
+        let err = cfg.required().unwrap_err();
+        assert!(err.to_string().contains("must not contain query"));
+    }
+
+    #[test]
+    fn ipfs3_config_trims_gateway_url_trailing_slash() {
+        let cfg = complete_ipfs3_config("http://localhost:9000", "https://ipfs.io/ipfs/");
+        let resolved = cfg.required().unwrap();
+        assert_eq!(resolved.gateway_url, "https://ipfs.io/ipfs");
+    }
+
+    #[test]
     fn catbox_config_rejects_unsafe_api_url() {
         let err = CatboxUploader::from_config(&CatboxUploaderConfig {
             api_url: "ftp://catbox.moe/user/api.php".to_string(),
@@ -962,6 +1172,19 @@ mod tests {
             access_key_id: Some("key".to_string()),
             secret_access_key: Some("secret".to_string()),
             public_base_url: Some(public_base_url.to_string()),
+            key_prefix: "eh".to_string(),
+            path_style: true,
+        }
+    }
+
+    fn complete_ipfs3_config(endpoint: &str, gateway_url: &str) -> IpfS3UploaderConfig {
+        IpfS3UploaderConfig {
+            endpoint_url: Some(endpoint.to_string()),
+            bucket: Some("bucket".to_string()),
+            region: Some("auto".to_string()),
+            access_key_id: Some("key".to_string()),
+            secret_access_key: Some("secret".to_string()),
+            gateway_url: Some(gateway_url.to_string()),
             key_prefix: "eh".to_string(),
             path_style: true,
         }
@@ -1037,6 +1260,98 @@ mod tests {
             .unwrap_err();
 
         assert!(err.to_string().contains("S3 put_object returned 500"));
+    }
+
+    #[tokio::test]
+    async fn ipfs3_uploader_puts_object_and_returns_gateway_url_from_etag() {
+        use wiremock::matchers::{body_bytes, method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let cid = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi";
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path_regex(r"^/bucket/eh/\d{14}-0001-[0-9a-f]{8}\.png$"))
+            .and(body_bytes(vec![
+                0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n',
+            ]))
+            .respond_with(ResponseTemplate::new(200).insert_header("etag", format!("\"{cid}\"")))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let uploader = IpfS3Uploader::from_config(&complete_ipfs3_config(
+            &server.uri(),
+            "https://ipfs.io/ipfs",
+        ))
+        .unwrap();
+        let urls = uploader
+            .upload_images(&[ImageUploadInput {
+                filename: "image.png",
+                bytes: b"\x89PNG\r\n\x1a\n",
+            }])
+            .await
+            .unwrap();
+
+        assert_eq!(urls.len(), 1);
+        assert_eq!(urls[0], format!("https://ipfs.io/ipfs/{cid}"));
+    }
+
+    #[tokio::test]
+    async fn ipfs3_uploader_returns_error_when_etag_missing() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path_regex(r"^/bucket/eh/.*\.png$"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let uploader = IpfS3Uploader::from_config(&complete_ipfs3_config(
+            &server.uri(),
+            "https://ipfs.io/ipfs",
+        ))
+        .unwrap();
+        let err = uploader
+            .upload_images(&[ImageUploadInput {
+                filename: "image.png",
+                bytes: b"\x89PNG\r\n\x1a\n",
+            }])
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("no ETag (CID)"));
+    }
+
+    #[tokio::test]
+    async fn ipfs3_uploader_returns_error_on_failed_put() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path_regex(r"^/bucket/eh/.*\.jpg$"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let uploader = IpfS3Uploader::from_config(&complete_ipfs3_config(
+            &server.uri(),
+            "https://ipfs.io/ipfs",
+        ))
+        .unwrap();
+        let err = uploader
+            .upload_images(&[ImageUploadInput {
+                filename: "image.jpg",
+                bytes: b"\xFF\xD8\xFF\x00",
+            }])
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("ipfS3 put_object returned 500"));
     }
 
     #[tokio::test]
