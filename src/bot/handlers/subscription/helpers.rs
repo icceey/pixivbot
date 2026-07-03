@@ -1,5 +1,5 @@
 use crate::bot::BotHandler;
-use crate::db::types::{BooruFilter, TagFilter, TaskType};
+use crate::db::types::{BooruFilter, EhFilter, TagFilter, TaskType};
 use anyhow::{Context, Result};
 use tracing::{error, info};
 
@@ -63,6 +63,39 @@ impl BotHandler {
         Ok(())
     }
 
+    pub(crate) async fn create_eh_subscription(
+        &self,
+        chat_id: i64,
+        task_type: TaskType,
+        task_value: &str,
+        display_name: Option<&str>,
+        filter_tags: TagFilter,
+        eh_filter: EhFilter,
+    ) -> Result<()> {
+        let task = self
+            .repo
+            .get_or_create_task(
+                task_type,
+                task_value.to_string(),
+                display_name.map(|s| s.to_string()),
+            )
+            .await
+            .context("Failed to create task")?;
+
+        let eh_filter_opt = if eh_filter.is_empty() {
+            None
+        } else {
+            Some(eh_filter)
+        };
+
+        self.repo
+            .upsert_eh_subscription(chat_id, task.id, filter_tags, eh_filter_opt)
+            .await
+            .context("Failed to upsert eh subscription")?;
+
+        Ok(())
+    }
+
     pub(crate) async fn delete_subscription(
         &self,
         chat_id: i64,
@@ -78,10 +111,24 @@ impl BotHandler {
 
         let author_name = task.author_name.clone();
 
-        self.repo
-            .delete_subscription_by_chat_task(chat_id, task.id)
+        let subscription = self
+            .repo
+            .get_subscription_by_chat_task(chat_id, task.id)
             .await
-            .context("未订阅")?;
+            .context("Failed to query subscription")?
+            .ok_or_else(|| anyhow::anyhow!("未订阅"))?;
+
+        if task_type == TaskType::Ehentai {
+            self.repo
+                .delete_eh_subscription_and_cancel_queue(subscription.id)
+                .await
+                .context("Failed to delete EH subscription and cancel queued downloads")?;
+        } else {
+            self.repo
+                .delete_subscription(subscription.id)
+                .await
+                .context("未订阅")?;
+        }
 
         self.cleanup_orphaned_task(task.id, task_type, task_value)
             .await;

@@ -1,8 +1,11 @@
 use anyhow::{anyhow, Context, Result};
+#[cfg(feature = "ffmpeg-codec")]
 use pixiv_client::UgoiraFrame;
 use reqwest::Client;
+#[cfg(feature = "ffmpeg-codec")]
 use std::io::{Cursor, Read};
 use std::path::PathBuf;
+#[cfg(feature = "ffmpeg-codec")]
 use std::sync::OnceLock;
 use tracing::{info, warn};
 
@@ -88,6 +91,7 @@ impl Downloader {
     /// 3. 使用 ffmpeg-next 库编码为无音频轨道的 MP4 (H.264 High profile, 画质优化)
     ///
     /// 使用 ZIP URL 的 MD5 哈希作为缓存键
+    #[cfg(feature = "ffmpeg-codec")]
     pub async fn download_ugoira_mp4(
         &self,
         zip_url: &str,
@@ -146,6 +150,7 @@ fn download_referer(url: &str) -> Option<&'static str> {
 }
 
 /// Read a named entry from a ZIP archive into a byte vector.
+#[cfg(feature = "ffmpeg-codec")]
 fn read_zip_entry(archive: &mut zip::ZipArchive<Cursor<&[u8]>>, name: &str) -> Result<Vec<u8>> {
     let mut entry = archive
         .by_name(name)
@@ -158,8 +163,10 @@ fn read_zip_entry(archive: &mut zip::ZipArchive<Cursor<&[u8]>>, name: &str) -> R
 }
 
 /// Global FFmpeg initialization guard (runs only once per process).
+#[cfg(feature = "ffmpeg-codec")]
 static FFMPEG_INIT: OnceLock<Result<(), ffmpeg_next::Error>> = OnceLock::new();
 
+#[cfg(feature = "ffmpeg-codec")]
 fn h264_compatible_dimension(value: u32) -> u32 {
     if value.is_multiple_of(2) {
         value
@@ -173,6 +180,7 @@ fn h264_compatible_dimension(value: u32) -> u32 {
 /// Uses H.264 High profile with quality-optimized settings (CRF 18, fast preset)
 /// and no audio track. Frames are decoded from PNG in memory, scaled to YUV420P,
 /// and encoded with per-frame timing from ugoira metadata.
+#[cfg(feature = "ffmpeg-codec")]
 fn encode_ugoira_mp4(zip_data: &[u8], frames: &[UgoiraFrame]) -> Result<Vec<u8>> {
     use ffmpeg_next::format::Pixel;
     use ffmpeg_next::software::scaling;
@@ -403,8 +411,6 @@ fn encode_ugoira_mp4(zip_data: &[u8], frames: &[UgoiraFrame]) -> Result<Vec<u8>>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use image::{ImageFormat, RgbaImage};
-    use std::io::Write;
 
     #[test]
     fn pixiv_urls_keep_pixiv_referer() {
@@ -430,11 +436,14 @@ mod tests {
     }
 
     /// Create a minimal PNG image in memory (2x2 pixels with given color)
+    #[cfg(feature = "ffmpeg-codec")]
     fn create_test_png(r: u8, g: u8, b: u8) -> Vec<u8> {
         create_test_png_with_size(2, 2, r, g, b)
     }
 
+    #[cfg(feature = "ffmpeg-codec")]
     fn create_test_png_with_size(width: u32, height: u32, r: u8, g: u8, b: u8) -> Vec<u8> {
+        use image::{ImageFormat, RgbaImage};
         let img = RgbaImage::from_pixel(width, height, image::Rgba([r, g, b, 255]));
         let mut buf = Vec::new();
         let mut cursor = Cursor::new(&mut buf);
@@ -443,7 +452,10 @@ mod tests {
     }
 
     /// Create a ZIP archive in memory containing the given named files
+    #[cfg(feature = "ffmpeg-codec")]
     fn create_test_zip(files: &[(&str, &[u8])]) -> Vec<u8> {
+        use std::io::Cursor;
+        use std::io::Write;
         let mut buf = Vec::new();
         {
             let mut zip = zip::ZipWriter::new(Cursor::new(&mut buf));
@@ -567,6 +579,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "ffmpeg-codec")]
     fn test_encode_ugoira_mp4_empty_frames() {
         let frame0 = create_test_png(255, 0, 0);
         let zip_data = create_test_zip(&[("000000.png", &frame0)]);

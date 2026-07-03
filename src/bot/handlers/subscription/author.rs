@@ -311,6 +311,13 @@ impl BotHandler {
             TaskType::BooruRanking => {
                 format!("Booru排行 `{}`", markdown::escape(&task_value))
             }
+            TaskType::Ehentai => {
+                format!(
+                    "{} `{}`",
+                    markdown::escape("E-Hentai"),
+                    markdown::escape(&task_value)
+                )
+            }
         };
 
         bot.send_message(chat_id, format!("✅ 成功取消订阅 {}", display_name))

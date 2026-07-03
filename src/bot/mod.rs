@@ -46,12 +46,15 @@ pub async fn run(
     cache_dir: String,
     log_dir: String,
     booru_registry: Arc<BooruSiteRegistry>,
+    eh_client: Option<Arc<eh_client::EhClient>>,
+    has_telegraph: bool,
 ) -> Result<()> {
     info!("Starting Telegram Bot...");
 
     // Parse bot mode from config
     let is_public_mode = config.bot_mode.is_public();
     let has_booru = !booru_registry.is_empty();
+    let has_ehentai = eh_client.is_some();
 
     info!(
         "Bot mode: {:?} (new chats will be {} by default)",
@@ -81,6 +84,8 @@ pub async fn run(
         cache_dir,
         log_dir,
         booru_registry,
+        eh_client,
+        has_telegraph,
     );
 
     info!("✅ Bot initialized, starting command handler");
@@ -89,7 +94,7 @@ pub async fn run(
     let settings_storage = state::new_settings_storage();
 
     // 设置命令可见性
-    setup_commands(&bot, &repo, has_booru).await;
+    setup_commands(&bot, &repo, has_booru, has_ehentai).await;
 
     // 构建 handler 树
     let handler_tree = build_handler_tree();
@@ -652,10 +657,10 @@ async fn handle_chat_migration(msg: Message, repo: Arc<Repo>) -> HandlerResult {
 /// - 普通用户看到基础命令
 /// - 数据库中的 Admin 用户看到管理员命令
 /// - 数据库中的 Owner 用户看到所有命令
-async fn setup_commands(bot: &ThrottledBot, repo: &Repo, has_booru: bool) {
+async fn setup_commands(bot: &ThrottledBot, repo: &Repo, has_booru: bool, has_ehentai: bool) {
     // 1. 设置默认命令（所有用户都能看到的基础命令）
     if let Err(e) = bot
-        .set_my_commands(Command::user_commands(has_booru))
+        .set_my_commands(Command::user_commands(has_booru, has_ehentai))
         .scope(BotCommandScope::Default)
         .await
     {
@@ -669,8 +674,8 @@ async fn setup_commands(bot: &ThrottledBot, repo: &Repo, has_booru: bool) {
         Ok(admin_users) => {
             for user in admin_users {
                 let commands = match user.role {
-                    UserRole::Owner => Command::owner_commands(has_booru),
-                    UserRole::Admin => Command::admin_commands(has_booru),
+                    UserRole::Owner => Command::owner_commands(has_booru, has_ehentai),
+                    UserRole::Admin => Command::admin_commands(has_booru, has_ehentai),
                     UserRole::User => continue, // 不应该出现，但以防万一
                 };
 
