@@ -112,9 +112,9 @@ dependencies = [
 
 [[package]]
 name = "anyhow"
-version = "1.0.102"
+version = "1.0.103"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
+checksum = "2a4385e2e34eb35d6b3efe798b9eb88096925d87726c0798709bf56d9ed84af3"
 
 [[package]]
 name = "aquamarine"
@@ -359,7 +359,7 @@ dependencies = [
 
 [[package]]
 name = "booru_client"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "reqwest",
@@ -622,9 +622,9 @@ dependencies = [
 
 [[package]]
 name = "config"
-version = "0.15.23"
+version = "0.15.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f316c6237b2d38be61949ecd15268a4c6ca32570079394a2444d9ce2c72a72d8"
+checksum = "0b34d0237145f33580b89724f75d16950efd3e2c91b2d823917ecb69ec7f84f0"
 dependencies = [
  "pathdiff",
  "serde_core",
@@ -1056,7 +1056,7 @@ checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 
 [[package]]
 name = "eh_client"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2081,7 +2081,7 @@ dependencies = [
 
 [[package]]
 name = "migration"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "sea-orm",
  "sea-orm-migration",
@@ -2469,7 +2469,7 @@ checksum = "8b870d8c151b6f2fb93e84a13146138f05d02ed11c7e7c54f8826aaaf7c9f184"
 
 [[package]]
 name = "pixiv_client"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2483,7 +2483,7 @@ dependencies = [
 
 [[package]]
 name = "pixivbot"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "booru_client",
