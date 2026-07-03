@@ -4,7 +4,7 @@ members = [".", "migration", "pixiv_client", "booru_client", "eh_client"]
 [workspace.package]
 version = "0.3.0"
 edition = "2021"
-authors = ["icceey" "Hugefiver <i@iruri.moe>"]
+authors = ["icceey", "Hugefiver <i@iruri.moe>"]
 license = "MIT"
 
 [package]
