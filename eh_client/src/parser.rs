@@ -2,6 +2,12 @@ use crate::models::EhGalleryRef;
 use regex::Regex;
 use std::sync::OnceLock;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArchiverForm {
+    pub action: String,
+    pub fields: Vec<(String, String)>,
+}
+
 fn search_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
@@ -35,6 +41,48 @@ fn archive_redirect_re() -> &'static Regex {
         Regex::new(r#"document\.location\s*=\s*["'](https?://[^"']+/archive/[^"']+)["']"#)
             .expect("invalid archive_redirect regex")
     })
+}
+
+fn archiver_form_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r#"(?is)<form\b([^>]*)>(.*?)</form>"#).expect("invalid archiver_form regex")
+    })
+}
+
+fn input_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r#"(?is)<input\b([^>]*)>"#).expect("invalid input regex"))
+}
+
+fn attr_value(attrs: &str, name: &str) -> Option<String> {
+    let re = Regex::new(&format!(
+        r#"(?is)\b{}\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))"#,
+        regex::escape(name)
+    ))
+    .expect("invalid attr regex");
+    let cap = re.captures(attrs)?;
+    cap.get(1)
+        .or_else(|| cap.get(2))
+        .or_else(|| cap.get(3))
+        .map(|m| decode_html_attr(m.as_str()))
+}
+
+fn decode_html_attr(value: &str) -> String {
+    value
+        .replace("&amp;", "&")
+        .replace("&#38;", "&")
+        .replace("&#x26;", "&")
+        .replace("&#X26;", "&")
+        .replace("&quot;", "\"")
+        .replace("&#34;", "\"")
+        .replace("&#x22;", "\"")
+        .replace("&#X22;", "\"")
+        .replace("&#39;", "'")
+        .replace("&#x27;", "'")
+        .replace("&#X27;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
 }
 
 /// Parse search results HTML, extracting gallery references.
@@ -83,14 +131,57 @@ pub fn parse_archiver_key(html: &str) -> Option<String> {
     Some(format!("{}--{}", numeric, hex))
 }
 
+/// Extract the archiver download form from an archiver.php page.
+pub fn parse_archiver_form(html: &str) -> Option<ArchiverForm> {
+    for cap in archiver_form_re().captures_iter(html) {
+        let attrs = cap.get(1)?.as_str();
+        let body = cap.get(2)?.as_str();
+        let action = attr_value(attrs, "action")?;
+        if !action.contains("archiver.php") {
+            continue;
+        }
+
+        let fields: Vec<(String, String)> = input_re()
+            .captures_iter(body)
+            .filter_map(|input| {
+                let attrs = input.get(1)?.as_str();
+                let name = attr_value(attrs, "name")?;
+                if name.is_empty() {
+                    return None;
+                }
+                let value = attr_value(attrs, "value").unwrap_or_default();
+                Some((name, value))
+            })
+            .collect();
+
+        if fields
+            .iter()
+            .any(|(name, _)| matches!(name.as_str(), "dlcheck" | "dltype" | "hathdl_xres"))
+        {
+            return Some(ArchiverForm { action, fields });
+        }
+    }
+
+    None
+}
+
 /// Extract the archive download URL from the archiver.php HTML response.
-/// Replaces `autostart=1` with `start=1` in the redirect URL.
+/// Normalizes the redirect URL so H@H starts the archive download.
 /// Returns None if no redirect is found.
 pub fn parse_archive_redirect(html: &str) -> Option<String> {
     let re = archive_redirect_re();
     re.captures(html)
         .and_then(|cap| cap.get(1).map(|m| m.as_str().to_string()))
-        .map(|url| url.replace("autostart=1", "start=1"))
+        .map(|url| {
+            let url = url.replace("autostart=1", "start=1");
+            if url.contains("start=1") {
+                url
+            } else if url.contains('?') {
+                format!("{url}&start=1")
+            } else {
+                format!("{url}?start=1")
+            }
+        })
 }
 
 fn image_page_urls_re() -> &'static Regex {
@@ -250,6 +341,31 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_archiver_form() {
+        let html = r#"
+        <form id="hathdl_form" method="post" action="https://exhentai.org/archiver.php?gid=4034806&amp;token=abc123def0">
+          <input type="hidden" name="dltype" value="org" />
+          <input type="submit" name="dlcheck" value="Download Original Archive" />
+        </form>
+        "#;
+        let form = parse_archiver_form(html).expect("should parse archiver form");
+        assert_eq!(
+            form.action,
+            "https://exhentai.org/archiver.php?gid=4034806&token=abc123def0"
+        );
+        assert_eq!(
+            form.fields,
+            vec![
+                ("dltype".to_string(), "org".to_string()),
+                (
+                    "dlcheck".to_string(),
+                    "Download Original Archive".to_string()
+                ),
+            ]
+        );
+    }
+
+    #[test]
     fn test_parse_archive_redirect() {
         let html = r#"
         <script type="text/javascript">
@@ -263,6 +379,20 @@ mod tests {
         assert_eq!(
             url,
             "http://123.45.67.89/archive/123456/abcdef0123/abcdef0123/0?start=1"
+        );
+    }
+
+    #[test]
+    fn test_parse_archive_redirect_adds_start_when_missing() {
+        let html = r#"
+        <script type="text/javascript">
+        document.location = "https://hath.example/archive/4034806/hash/file/0";
+        </script>
+        "#;
+        let url = parse_archive_redirect(html).expect("should find redirect URL");
+        assert_eq!(
+            url,
+            "https://hath.example/archive/4034806/hash/file/0?start=1"
         );
     }
 

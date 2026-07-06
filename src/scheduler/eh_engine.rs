@@ -676,20 +676,20 @@ impl EhDownloadWorker {
 
         // Download
         let file_size = if self.client.is_logged_in() {
-            let archiver_key = self
-                .client
-                .get_archiver_key(gid, token)
-                .await
-                .context("Failed to get archiver key")?;
-
             let resolution = if entry.source == "direct" {
                 &self.config.download_resolution
             } else {
                 &self.config.subscription_resolution
             };
 
+            let archive_request = self
+                .client
+                .prepare_archive_download(gid, token, resolution)
+                .await
+                .context("Failed to prepare archive download")?;
+
             self.client
-                .download_archive(gid, token, &archiver_key, resolution, &zip_path)
+                .download_archive_with_request(&archive_request, &zip_path)
                 .await
                 .context("Failed to download archive")?
         } else {

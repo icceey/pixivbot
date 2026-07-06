@@ -14,6 +14,105 @@ pub struct EhClient {
     cookies: EhCookies,
 }
 
+#[derive(Debug, Clone)]
+pub struct ArchiveDownloadRequest {
+    action_url: String,
+    form_data: Vec<(String, String)>,
+}
+
+impl ArchiveDownloadRequest {
+    fn from_archiver_key(
+        base_url: &str,
+        gid: u64,
+        token: &str,
+        archiver_key: &str,
+        resolution: &str,
+    ) -> Self {
+        Self {
+            action_url: format!(
+                "{}/archiver.php?gid={}&token={}&or={}",
+                base_url, gid, token, archiver_key
+            ),
+            form_data: archive_form_data_for_resolution(resolution),
+        }
+    }
+
+    fn from_archiver_form(base_url: &str, form: parser::ArchiverForm, resolution: &str) -> Self {
+        let mut form_data = form.fields;
+        apply_resolution_to_form_data(&mut form_data, resolution);
+        Self {
+            action_url: resolve_url(base_url, &form.action),
+            form_data,
+        }
+    }
+}
+
+fn archive_form_data_for_resolution(resolution: &str) -> Vec<(String, String)> {
+    let want_original = resolution == "original" || resolution.is_empty();
+    let xres_val = if want_original {
+        "org".to_string()
+    } else {
+        resolution.trim_end_matches('x').to_string()
+    };
+
+    vec![
+        (
+            "dlcheck".to_string(),
+            if want_original {
+                "Download Original Archive"
+            } else {
+                "Download Resample Archive"
+            }
+            .to_string(),
+        ),
+        ("hathdl_xres".to_string(), xres_val),
+    ]
+}
+
+fn apply_resolution_to_form_data(form_data: &mut Vec<(String, String)>, resolution: &str) {
+    let want_original = resolution == "original" || resolution.is_empty();
+    if let Some((_, value)) = form_data.iter_mut().find(|(name, _)| name == "hathdl_xres") {
+        *value = if want_original {
+            "org".to_string()
+        } else {
+            resolution.trim_end_matches('x').to_string()
+        };
+    }
+    if want_original {
+        if let Some((_, value)) = form_data.iter_mut().find(|(name, _)| name == "dltype") {
+            *value = "org".to_string();
+        }
+    }
+    if !form_data.iter().any(|(name, _)| name == "dlcheck") {
+        form_data.push((
+            "dlcheck".to_string(),
+            if want_original {
+                "Download Original Archive"
+            } else {
+                "Download Resample Archive"
+            }
+            .to_string(),
+        ));
+    }
+}
+
+fn resolve_url(base_url: &str, url: &str) -> String {
+    if url.starts_with("http://") || url.starts_with("https://") {
+        url.to_string()
+    } else if url.starts_with('/') {
+        format!("{}{}", base_url, url)
+    } else {
+        format!("{}/{}", base_url, url)
+    }
+}
+
+fn is_ehentai_host(url: &str) -> bool {
+    reqwest::Url::parse(url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+        .is_some_and(|host| matches!(host.as_str(), "e-hentai.org" | "exhentai.org"))
+}
+
 impl EhClient {
     pub fn new(base_url: &str, api_url: &str, cookies: EhCookies) -> Result<Self> {
         let mut builder = reqwest::Client::builder()
@@ -51,6 +150,48 @@ impl EhClient {
             "{}/archiver.php?gid={}&token={}&or={}",
             self.base_url, gid, token, or
         )
+    }
+
+    async fn fetch_archiver_page(&self, gid: u64, token: &str) -> Result<(u64, String, String)> {
+        let gallery_url = format!("{}/g/{}/{}/", self.base_url, gid, token);
+        let resp = self
+            .http
+            .get(&gallery_url)
+            .header(COOKIE, self.cookies.to_header())
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(Error::Api {
+                message: format!("gallery page returned {}", status),
+                status: status.as_u16(),
+            });
+        }
+        let gallery_html = resp.text().await?;
+
+        let (archiver_gid, archiver_token) = parser::parse_archiver_url(&gallery_html)
+            .ok_or_else(|| Error::Parse("archiver URL not found in gallery page".into()))?;
+
+        let archiver_page_url = format!(
+            "{}/archiver.php?gid={}&token={}",
+            self.base_url, archiver_gid, archiver_token
+        );
+        let resp = self
+            .http
+            .get(&archiver_page_url)
+            .header(COOKIE, self.cookies.to_header())
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(Error::Api {
+                message: format!("archiver.php returned {}", status),
+                status: status.as_u16(),
+            });
+        }
+        let archiver_html = resp.text().await?;
+
+        Ok((archiver_gid, archiver_token, archiver_html))
     }
 
     /// Search for galleries. Returns gallery references parsed from HTML.
@@ -136,50 +277,41 @@ impl EhClient {
     /// Step 1: Scrape gallery page for archiver.php URL (in onclick attribute).
     /// Step 2: GET the archiver.php URL and parse the response for the archiver_key.
     pub async fn get_archiver_key(&self, gid: u64, token: &str) -> Result<String> {
-        // Step 1: Fetch gallery page to find archiver.php URL
-        let gallery_url = format!("{}/g/{}/{}/", self.base_url, gid, token);
-        let resp = self
-            .http
-            .get(&gallery_url)
-            .header(COOKIE, self.cookies.to_header())
-            .send()
-            .await?;
-        let status = resp.status();
-        if !status.is_success() {
-            return Err(Error::Api {
-                message: format!("gallery page returned {}", status),
-                status: status.as_u16(),
-            });
-        }
-        let gallery_html = resp.text().await?;
-
-        // Extract archiver.php URL from onclick attribute
-        let (archiver_gid, archiver_token) = parser::parse_archiver_url(&gallery_html)
-            .ok_or_else(|| Error::Parse("archiver URL not found in gallery page".into()))?;
-
-        // Step 2: GET archiver.php to get the actual archiver_key
-        let archiver_page_url = format!(
-            "{}/archiver.php?gid={}&token={}",
-            self.base_url, archiver_gid, archiver_token
-        );
-        let resp = self
-            .http
-            .get(&archiver_page_url)
-            .header(COOKIE, self.cookies.to_header())
-            .send()
-            .await?;
-        let status = resp.status();
-        if !status.is_success() {
-            return Err(Error::Api {
-                message: format!("archiver.php returned {}", status),
-                status: status.as_u16(),
-            });
-        }
-        let archiver_html = resp.text().await?;
+        let (_, _, archiver_html) = self.fetch_archiver_page(gid, token).await?;
 
         // Parse the archiver_key from the response
         parser::parse_archiver_key(&archiver_html)
             .ok_or_else(|| Error::Parse("archiver_key not found in archiver.php response".into()))
+    }
+
+    /// Prepare the POST request needed to initiate an archive download.
+    pub async fn prepare_archive_download(
+        &self,
+        gid: u64,
+        token: &str,
+        resolution: &str,
+    ) -> Result<ArchiveDownloadRequest> {
+        let (archiver_gid, archiver_token, archiver_html) =
+            self.fetch_archiver_page(gid, token).await?;
+
+        if let Some(archiver_key) = parser::parse_archiver_key(&archiver_html) {
+            return Ok(ArchiveDownloadRequest::from_archiver_key(
+                &self.base_url,
+                archiver_gid,
+                &archiver_token,
+                &archiver_key,
+                resolution,
+            ));
+        }
+
+        let form = parser::parse_archiver_form(&archiver_html).ok_or_else(|| {
+            Error::Parse("archiver download form not found in archiver.php response".into())
+        })?;
+        Ok(ArchiveDownloadRequest::from_archiver_form(
+            &self.base_url,
+            form,
+            resolution,
+        ))
     }
 
     /// Download a gallery archive ZIP to the specified path.
@@ -197,36 +329,28 @@ impl EhClient {
         resolution: &str,
         dest: &Path,
     ) -> Result<u64> {
+        let request = ArchiveDownloadRequest::from_archiver_key(
+            &self.base_url,
+            gid,
+            token,
+            archiver_key,
+            resolution,
+        );
+        self.download_archive_with_request(&request, dest).await
+    }
+
+    /// Download a gallery archive ZIP from a prepared archiver POST request.
+    pub async fn download_archive_with_request(
+        &self,
+        request: &ArchiveDownloadRequest,
+        dest: &Path,
+    ) -> Result<u64> {
         // Step 1: POST to archiver.php to initiate download
-        let archiver_url = self.build_archiver_url(gid, token, archiver_key);
-
-        // Determine whether to download original or resampled archive
-        let want_original = resolution == "original" || resolution.is_empty();
-
-        // Build form data with hathdl_xres to select resolution
-        let xres_val = if want_original {
-            "org".to_string()
-        } else {
-            resolution.trim_end_matches('x').to_string()
-        };
-
-        let form_data = vec![
-            (
-                "dlcheck",
-                if want_original {
-                    "Download Original Archive"
-                } else {
-                    "Download Resample Archive"
-                },
-            ),
-            ("hathdl_xres", xres_val.as_str()),
-        ];
-
         let resp = self
             .http
-            .post(&archiver_url)
+            .post(&request.action_url)
             .header(COOKIE, self.cookies.to_header())
-            .form(&form_data)
+            .form(&request.form_data)
             .send()
             .await?;
 
@@ -245,12 +369,14 @@ impl EhClient {
             .ok_or_else(|| Error::Parse("archive redirect URL not found".into()))?;
 
         // Step 3: Download the ZIP file — stream to temp, no cookies to H@H server
-        let mut resp = self
+        let mut request = self
             .http
             .get(&download_url)
-            .timeout(std::time::Duration::from_secs(300))
-            .send()
-            .await?;
+            .timeout(std::time::Duration::from_secs(300));
+        if is_ehentai_host(&download_url) {
+            request = request.header(COOKIE, self.cookies.to_header());
+        }
+        let mut resp = request.send().await?;
 
         let status = resp.status();
         if !status.is_success() {
@@ -801,5 +927,21 @@ mod tests {
             url,
             "https://e-hentai.org/archiver.php?gid=123456&token=abcdef0123&or=780x"
         );
+    }
+
+    #[test]
+    fn archive_download_cookie_host_check_only_matches_eh_domains() {
+        assert!(is_ehentai_host(
+            "https://e-hentai.org/archive/1/abc/file/0?start=1"
+        ));
+        assert!(is_ehentai_host(
+            "https://exhentai.org/archive/1/abc/file/0?start=1"
+        ));
+        assert!(!is_ehentai_host(
+            "http://127.0.0.1/archive/1/abc/file/0?start=1"
+        ));
+        assert!(!is_ehentai_host(
+            "https://example.com/archive/1/abc/file/0?start=1"
+        ));
     }
 }
