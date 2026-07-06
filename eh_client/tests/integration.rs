@@ -14,6 +14,15 @@ fn client_at(server: &MockServer) -> EhClient {
         .build()
 }
 
+#[derive(Debug)]
+struct BodyContains(&'static str);
+
+impl wiremock::Match for BodyContains {
+    fn matches(&self, request: &wiremock::Request) -> bool {
+        String::from_utf8_lossy(&request.body).contains(self.0)
+    }
+}
+
 const SEARCH_HTML: &str = r#"
 <div class="gl1t">
   <a href="https://e-hentai.org/g/123456/abcdef0123/">
@@ -289,6 +298,78 @@ async fn test_download_archive_full_flow() {
 
     let saved = std::fs::read(dest).expect("should read saved file");
     assert_eq!(saved, zip_bytes);
+}
+
+#[tokio::test]
+async fn test_prepare_and_download_archive_form_flow() {
+    let server = MockServer::start().await;
+    let gallery_page_html = r#"
+<html><body>
+<a onclick="return popUp('/archiver.php?gid=4034806&amp;token=fedcba9876',480,320)">Archive Download</a>
+</body></html>
+"#;
+    let archiver_form_html = format!(
+        r#"
+<html><body>
+<form id="hathdl_form" method="post" action="{}/archiver.php?gid=4034806&amp;token=fedcba9876">
+  <input type="hidden" name="dltype" value="org" />
+  <input type="submit" name="dlcheck" value="Download Original Archive" />
+</form>
+</body></html>
+"#,
+        server.uri()
+    );
+    let redirect_html = format!(
+        r#"<script>document.location = "{}/archive/4034806/fedcba9876/archive/0?autostart=1";</script>"#,
+        server.uri()
+    );
+    let zip_bytes = b"PK\x03\x04live_form_zip";
+
+    Mock::given(method("GET"))
+        .and(path("/g/4034806/e13b7d119b/"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(gallery_page_html))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/archiver.php"))
+        .and(query_param("gid", "4034806"))
+        .and(query_param("token", "fedcba9876"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(archiver_form_html))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/archiver.php"))
+        .and(query_param("gid", "4034806"))
+        .and(query_param("token", "fedcba9876"))
+        .and(BodyContains("dltype=org"))
+        .and(BodyContains("dlcheck=Download+Original+Archive"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(redirect_html))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/archive/4034806/fedcba9876/archive/0"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(zip_bytes.to_vec()))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = client_at(&server);
+    let request = client
+        .prepare_archive_download(4034806, "e13b7d119b", "original")
+        .await
+        .expect("should prepare form-driven archive request");
+    let temp_dir = tempfile::tempdir().unwrap();
+    let dest = temp_dir.path().join("archive.zip");
+    let bytes = client
+        .download_archive_with_request(&request, &dest)
+        .await
+        .expect("form-driven download should succeed");
+
+    assert_eq!(bytes as usize, zip_bytes.len());
+    assert_eq!(std::fs::read(dest).unwrap(), zip_bytes);
 }
 
 #[tokio::test]
