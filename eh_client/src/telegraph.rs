@@ -98,6 +98,11 @@ struct PageResult {
     url: String,
 }
 
+#[derive(Debug, Deserialize, Default)]
+struct AccountResult {
+    access_token: String,
+}
+
 /// Response from pixi.mg upload API.
 #[derive(Debug, Deserialize)]
 struct PixiResponse {
@@ -800,6 +805,75 @@ impl TelegraphClient {
         }
     }
 
+    /// Create a Telegraph account and return a client using the new access token.
+    pub async fn create_account(
+        short_name: &str,
+        author_name: Option<&str>,
+        author_url: Option<&str>,
+    ) -> Result<Self> {
+        Self::create_account_with_urls(
+            short_name,
+            author_name,
+            author_url,
+            "https://pixi.mg/api".to_string(),
+            "https://api.telegra.ph".to_string(),
+        )
+        .await
+    }
+
+    /// Create a Telegraph account with configurable endpoint URLs (for testing).
+    pub async fn create_account_with_urls(
+        short_name: &str,
+        author_name: Option<&str>,
+        author_url: Option<&str>,
+        upload_url: String,
+        api_url: String,
+    ) -> Result<Self> {
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(60))
+            .build()
+            .expect("failed to build telegraph http client");
+
+        let mut form = vec![("short_name", short_name)];
+        if let Some(author_name) = author_name {
+            form.push(("author_name", author_name));
+        }
+        if let Some(author_url) = author_url {
+            form.push(("author_url", author_url));
+        }
+
+        let resp = http
+            .post(format!("{}/createAccount", api_url))
+            .form(&form)
+            .send()
+            .await?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(Error::Api {
+                message: format!("createAccount returned {}", status),
+                status: status.as_u16(),
+            });
+        }
+
+        let telegraph_resp: TelegraphResponse<AccountResult> = resp.json().await?;
+        if telegraph_resp.ok {
+            if let Some(result) = telegraph_resp.result {
+                return Ok(Self::new_with_urls(
+                    result.access_token,
+                    upload_url,
+                    api_url,
+                ));
+            }
+        }
+        Err(Error::Api {
+            message: telegraph_resp
+                .error
+                .unwrap_or_else(|| "unknown error".into()),
+            status: 0,
+        })
+    }
+
     /// Upload an image to pixi.mg. Returns the direct image URL.
     /// Pixi.mg supports JPEG, PNG, GIF, WebP. No auth required. Permanent URLs.
     pub async fn upload_image(&self, image_data: &[u8], _filename: &str) -> Result<String> {
@@ -991,6 +1065,37 @@ mod tests {
                 max_bytes
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_create_account_returns_client_with_access_token() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/createAccount"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": {
+                    "access_token": "auto-created-token"
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = TelegraphClient::create_account_with_urls(
+            "PixivBot",
+            Some("PixivBot"),
+            None,
+            "https://pixi.example/api".to_string(),
+            server.uri(),
+        )
+        .await
+        .expect("createAccount should build a Telegraph client");
+
+        assert_eq!(client.telegraph_token, "auto-created-token");
     }
 
     #[test]

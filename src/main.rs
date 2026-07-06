@@ -236,19 +236,28 @@ async fn main() -> Result<()> {
         None
     };
 
-    let telegraph_client = config
-        .ehentai
-        .telegraph_access_token
-        .as_ref()
-        .map(|token| std::sync::Arc::new(eh_client::TelegraphClient::new(token.clone())));
-
-    // Warn when upload_telegraph is enabled but no token is configured
-    if config.ehentai.upload_telegraph && config.ehentai.telegraph_access_token.is_none() {
-        warn!(
-            "ehentai.upload_telegraph=true but no telegraph_access_token configured; \
-             Telegraph upload is disabled"
-        );
-    }
+    let telegraph_client = if let Some(token) = config.ehentai.telegraph_access_token.as_ref() {
+        Some(std::sync::Arc::new(eh_client::TelegraphClient::new(
+            token.clone(),
+        )))
+    } else if config.ehentai.upload_telegraph {
+        match eh_client::TelegraphClient::create_account("PixivBot", Some("PixivBot"), None).await {
+            Ok(client) => {
+                info!("✅ Telegraph account auto-created for this process");
+                Some(std::sync::Arc::new(client))
+            }
+            Err(e) => {
+                warn!(
+                    "ehentai.upload_telegraph=true but Telegraph account auto-creation failed; \
+                     Telegraph upload is disabled: {:#}",
+                    e
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     // Reset stale EH entries before spawning workers (crash recovery for all stages)
     if eh_client.is_some() {
@@ -286,6 +295,7 @@ async fn main() -> Result<()> {
             repo.clone(),
             std::sync::Arc::clone(eh_client),
             std::sync::Arc::new(config.ehentai.clone()),
+            telegraph_client.is_some(),
             scheduler_config.tick_interval_sec,
         );
         info!("✅ E-Hentai engine initialized");
