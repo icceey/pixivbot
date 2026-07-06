@@ -154,12 +154,14 @@ impl EhClient {
         let gallery_html = resp.text().await?;
 
         // Extract archiver.php URL from onclick attribute
-        let (_archiver_gid, _archiver_token) = parser::parse_archiver_url(&gallery_html)
+        let (archiver_gid, archiver_token) = parser::parse_archiver_url(&gallery_html)
             .ok_or_else(|| Error::Parse("archiver URL not found in gallery page".into()))?;
 
         // Step 2: GET archiver.php to get the actual archiver_key
-        let archiver_page_url =
-            format!("{}/archiver.php?gid={}&token={}", self.base_url, gid, token);
+        let archiver_page_url = format!(
+            "{}/archiver.php?gid={}&token={}",
+            self.base_url, archiver_gid, archiver_token
+        );
         let resp = self
             .http
             .get(&archiver_page_url)

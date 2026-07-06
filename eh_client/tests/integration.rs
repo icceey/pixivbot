@@ -29,12 +29,6 @@ const SEARCH_HTML: &str = r#"
 </div>
 "#;
 
-const GALLERY_PAGE_HTML: &str = r#"
-<html><body>
-<a onclick="return popUp('https://e-hentai.org/archiver.php?gid=123456&amp;token=abcdef0123',480,320)">Archive Download</a>
-</body></html>
-"#;
-
 const ARCHIVER_PAGE_HTML: &str = r#"
 <html><body>
 <input type="hidden" name="or" value="470592--63bbddc729b849100ec24ab920ffdb84b6542b23" />
@@ -198,16 +192,24 @@ async fn test_get_metadata_too_many() {
 #[tokio::test]
 async fn test_get_archiver_key() {
     let server = MockServer::start().await;
+    let gallery_page_html = r#"
+<html><body>
+<a onclick="return popUp('https://e-hentai.org/archiver.php?gid=123456&amp;token=fedcba9876',480,320)">Archive Download</a>
+</body></html>
+"#;
     // Step 1: gallery page contains archiver URL in onclick
     Mock::given(method("GET"))
         .and(path("/g/123456/abcdef0123/"))
-        .respond_with(ResponseTemplate::new(200).set_body_string(GALLERY_PAGE_HTML))
+        .respond_with(ResponseTemplate::new(200).set_body_string(gallery_page_html))
         .mount(&server)
         .await;
     // Step 2: archiver.php GET returns the archiver_key
     Mock::given(method("GET"))
         .and(path("/archiver.php"))
+        .and(query_param("gid", "123456"))
+        .and(query_param("token", "fedcba9876"))
         .respond_with(ResponseTemplate::new(200).set_body_string(ARCHIVER_PAGE_HTML))
+        .expect(1)
         .mount(&server)
         .await;
 

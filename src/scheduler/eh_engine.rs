@@ -34,6 +34,7 @@ pub struct EhEngine {
     repo: Arc<Repo>,
     client: Arc<EhClient>,
     config: Arc<EhentaiConfig>,
+    telegraph_available: bool,
     tick_interval_sec: u64,
 }
 
@@ -42,12 +43,14 @@ impl EhEngine {
         repo: Arc<Repo>,
         client: Arc<EhClient>,
         config: Arc<EhentaiConfig>,
+        telegraph_available: bool,
         tick_interval_sec: u64,
     ) -> Self {
         Self {
             repo,
             client,
             config,
+            telegraph_available,
             tick_interval_sec,
         }
     }
@@ -255,7 +258,7 @@ impl EhEngine {
     }
 
     fn telegraph_default(&self, sub_filter: Option<&EhFilter>) -> bool {
-        self.config.telegraph_access_token.is_some()
+        self.telegraph_available
             && (self.config.upload_telegraph || sub_filter.map(|f| f.telegraph).unwrap_or(false))
     }
 
@@ -1575,6 +1578,7 @@ mod integration_tests {
             Arc::clone(&repo),
             make_eh_client(&eh_server),
             Arc::clone(&config),
+            true,
             60,
         );
         engine.tick().await.unwrap();
@@ -1651,6 +1655,7 @@ mod integration_tests {
             Arc::clone(&repo),
             make_eh_client(&eh_server),
             Arc::new(make_config()),
+            true,
             60,
         );
         engine.tick().await.unwrap();
@@ -1669,7 +1674,7 @@ mod integration_tests {
     }
 
     #[tokio::test]
-    async fn test_collect_telegraph_subscription_without_token_enqueues_archive_only() {
+    async fn test_collect_telegraph_subscription_without_token_enqueues_upload_intent() {
         let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
         setup_chat(&repo, -100, true).await;
 
@@ -1713,6 +1718,63 @@ mod integration_tests {
             Arc::clone(&repo),
             make_eh_client(&eh_server),
             Arc::new(config),
+            true,
+            60,
+        );
+        engine.tick().await.unwrap();
+
+        let claimed_download = repo.get_next_for_download().await.unwrap().unwrap();
+        assert!(claimed_download.telegraph);
+        repo.mark_eh_download_downloaded(claimed_download.id, 100, "data/test_cache/archive.zip")
+            .await
+            .unwrap();
+
+        let claimed_upload = repo.get_next_for_upload().await.unwrap().unwrap();
+        assert_eq!(claimed_upload.gid, claimed_download.gid);
+    }
+
+    #[tokio::test]
+    async fn test_collect_telegraph_unavailable_enqueues_archive_only() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        setup_chat(&repo, -100, true).await;
+
+        let task_key =
+            crate::db::types::EhTaskKey::new("artist:test", 0, &crate::db::types::EhFilter::new());
+        let task_value = task_key.to_task_value();
+        let task = repo
+            .get_or_create_task(crate::db::types::TaskType::Ehentai, task_value, None)
+            .await
+            .unwrap();
+        let task_id = task.id;
+        let mut active: tasks::ActiveModel = task.into();
+        active.next_poll_at =
+            Set(chrono::Local::now().naive_local() - chrono::Duration::seconds(1));
+        active.update(repo.db()).await.unwrap();
+
+        repo.upsert_eh_subscription(
+            -100,
+            task_id,
+            crate::db::types::TagFilter::default(),
+            Some(crate::db::types::EhFilter {
+                telegraph: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let eh_server = MockServer::start().await;
+        mock_eh_search_with_four_galleries(&eh_server).await;
+        mock_eh_metadata_for_four_galleries(&eh_server).await;
+
+        let mut config = make_config();
+        config.upload_telegraph = true;
+        config.telegraph_access_token = None;
+        let engine = EhEngine::new(
+            Arc::clone(&repo),
+            make_eh_client(&eh_server),
+            Arc::new(config),
+            false,
             60,
         );
         engine.tick().await.unwrap();
@@ -1787,6 +1849,7 @@ mod integration_tests {
             Arc::clone(&repo),
             make_eh_client(&eh_server),
             Arc::new(make_config()),
+            true,
             60,
         );
         engine.tick().await.unwrap();
@@ -1863,6 +1926,7 @@ mod integration_tests {
             Arc::clone(&repo),
             make_eh_client(&eh_server),
             Arc::new(make_config()),
+            true,
             60,
         );
         engine.tick().await.unwrap();
@@ -1939,6 +2003,7 @@ mod integration_tests {
             Arc::clone(&repo),
             make_eh_client(&eh_server),
             Arc::new(make_config()),
+            true,
             60,
         );
         engine.tick().await.unwrap();
@@ -2003,6 +2068,7 @@ mod integration_tests {
             Arc::clone(&repo),
             make_eh_client(&eh_server),
             Arc::new(make_config()),
+            true,
             60,
         );
         engine.tick().await.unwrap();
@@ -2071,6 +2137,7 @@ mod integration_tests {
             Arc::clone(&repo),
             make_eh_client(&MockServer::start().await),
             Arc::new(make_config()),
+            true,
             60,
         );
 
