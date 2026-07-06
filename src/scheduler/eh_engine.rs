@@ -898,10 +898,6 @@ impl EhUploadWorker {
                 std::io::Read::read_to_end(&mut file, &mut data)
                     .context("Failed to read image from zip")?;
 
-                if data.len() > 6 * 1024 * 1024 {
-                    continue;
-                }
-
                 let filename = std::path::Path::new(file.name())
                     .file_name()
                     .and_then(|n| n.to_str())
@@ -1369,6 +1365,28 @@ mod integration_tests {
             zip.write_all(data.as_bytes()).unwrap();
         }
         zip.finish().unwrap();
+    }
+
+    fn create_test_zip_with_sizes(path: &std::path::Path, image_sizes: &[usize]) {
+        let file = std::fs::File::create(path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        for (i, size) in image_sizes.iter().enumerate() {
+            let name = format!("page{:03}.jpg", i);
+            let options = zip::write::SimpleFileOptions::default();
+            zip.start_file(name, options).unwrap();
+            zip.write_all(&vec![b'a'; *size]).unwrap();
+        }
+        zip.finish().unwrap();
+    }
+
+    #[derive(Debug)]
+    struct MultipartFileCount(usize);
+
+    impl wiremock::Match for MultipartFileCount {
+        fn matches(&self, request: &wiremock::Request) -> bool {
+            let body = String::from_utf8_lossy(&request.body);
+            body.matches("name=\"files[]\"").count() == self.0
+        }
     }
 
     async fn mock_tg_send_document(server: &MockServer) {
@@ -2444,6 +2462,64 @@ mod integration_tests {
             .unwrap();
         assert_eq!(updated.status, STATUS_UPLOADED);
         assert!(updated.telegraph_url.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_upload_worker_includes_images_larger_than_six_mib() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        let tg_server = MockServer::start().await;
+
+        setup_chat(&repo, -100, true).await;
+
+        let temp = tempfile::tempdir().unwrap();
+        let zip_path = temp.path().join("large_gallery.zip");
+        create_test_zip_with_sizes(&zip_path, &[1024, 6 * 1024 * 1024 + 1, 2048]);
+        let zip_path_str = zip_path.to_string_lossy().to_string();
+
+        let entry = insert_queue_entry(
+            &repo,
+            -100,
+            123456,
+            "abcdef0123",
+            "Large Gallery",
+            true,
+            STATUS_DOWNLOADED,
+            Some(&zip_path_str),
+            None,
+        )
+        .await;
+
+        let upload_body = serde_json::json!({
+            "success": true,
+            "images": [
+                {"direct_url": "https://i.pixi.mg/i/large-0.jpg"},
+                {"direct_url": "https://i.pixi.mg/i/large-1.jpg"},
+                {"direct_url": "https://i.pixi.mg/i/large-2.jpg"}
+            ]
+        });
+        Mock::given(method("POST"))
+            .and(path("/pixi/upload"))
+            .and(MultipartFileCount(3))
+            .respond_with(ResponseTemplate::new(200).set_body_json(upload_body))
+            .expect(1)
+            .mount(&tg_server)
+            .await;
+        mock_telegraph_create_page(&tg_server).await;
+        let worker = EhUploadWorker::new(
+            Arc::clone(&repo),
+            make_notifier(&tg_server),
+            make_telegraph_client(&tg_server),
+            make_image_uploader(&tg_server),
+            Arc::new(make_config()),
+        );
+        worker.tick().await.unwrap();
+
+        let updated = eh_download_queue::Entity::find_by_id(entry.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.status, STATUS_UPLOADED);
     }
 
     #[tokio::test]
