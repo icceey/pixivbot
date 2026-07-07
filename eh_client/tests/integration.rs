@@ -15,6 +15,15 @@ fn test_zip_bytes(name: &str, content: &[u8]) -> Vec<u8> {
     cursor.into_inner()
 }
 
+fn corrupt_zip_entry_payload(mut zip_bytes: Vec<u8>, original: &[u8]) -> Vec<u8> {
+    let offset = zip_bytes
+        .windows(original.len())
+        .position(|window| window == original)
+        .expect("test ZIP should contain stored payload bytes");
+    zip_bytes[offset] ^= 0xff;
+    zip_bytes
+}
+
 /// Build an EhClient pointing at the given mock server.
 fn client_at(server: &MockServer) -> EhClient {
     EhClientBuilder::new()
@@ -749,6 +758,49 @@ async fn test_download_archive_rejects_corrupt_pk_prefixed_zip() {
     assert!(
         !dest.with_extension("zip.part").exists(),
         "temp zip should be removed after corrupt ZIP"
+    );
+}
+
+#[tokio::test]
+async fn test_download_archive_rejects_zip_with_corrupt_entry_data() {
+    let server = MockServer::start().await;
+    let redirect_html = format!(
+        r#"<script>document.location = "{}/archive/123456/abcdef0123/abcdef0123/0?autostart=1";</script>"#,
+        server.uri()
+    );
+    let payload = b"valid archive image bytes";
+    let corrupt_zip_bytes = corrupt_zip_entry_payload(test_zip_bytes("001.jpg", payload), payload);
+
+    Mock::given(method("POST"))
+        .and(path("/archiver.php"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(redirect_html))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/archive/123456/abcdef0123/abcdef0123/0"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(corrupt_zip_bytes))
+        .mount(&server)
+        .await;
+
+    let client = client_at(&server);
+    let temp_dir = tempfile::tempdir().unwrap();
+    let dest = temp_dir.path().join("archive.zip");
+    let result = client
+        .download_archive(123456, "abcdef0123", "123456--abc123def456", "780x", &dest)
+        .await;
+
+    let err = result.expect_err("corrupt ZIP entry data should be rejected");
+    assert!(
+        err.to_string().contains("invalid") || err.to_string().contains("CRC"),
+        "unexpected error: {err}"
+    );
+    assert!(
+        !dest.exists(),
+        "dest should not exist after corrupt ZIP entry"
+    );
+    assert!(
+        !dest.with_extension("zip.part").exists(),
+        "temp zip should be removed after corrupt ZIP entry"
     );
 }
 
