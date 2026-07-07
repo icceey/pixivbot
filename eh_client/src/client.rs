@@ -3,20 +3,20 @@ use crate::models::{EhCookies, EhGallery, EhGalleryRef, RawApiResponse, RawGalle
 use crate::parser;
 use reqwest::header::{CONTENT_LENGTH, CONTENT_RANGE, COOKIE, RANGE};
 use std::path::Path;
+use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
+use tokio::time::sleep;
 
 const USER_AGENT_STR: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 const ARCHIVE_DOWNLOAD_TIMEOUT_SECS: u64 = 300;
 const ARCHIVE_DOWNLOAD_MAX_ATTEMPTS: usize = 4;
 
 /// Threshold for "made progress": strictly greater than 10 KiB/s.
-#[allow(dead_code)] // used in Task 2 (download_archive_response_resumable)
 const PROGRESS_THRESHOLD_BYTES_PER_SEC: f64 = 10_240.0;
 
 /// Returns true if the attempt transferred data fast enough to count as real progress.
 /// - 10 KiB/s = 10240 bytes/s; strictly greater than (not equal to).
 /// - `elapsed_secs == 0.0` returns false (prevents division by zero).
-#[allow(dead_code)] // used in Task 2 (download_archive_response_resumable)
 fn made_progress(new_bytes: u64, elapsed_secs: f64) -> bool {
     elapsed_secs > 0.0 && (new_bytes as f64 / elapsed_secs) > PROGRESS_THRESHOLD_BYTES_PER_SEC
 }
@@ -473,25 +473,55 @@ impl EhClient {
         download_url: &str,
         temp_path: &Path,
     ) -> Result<()> {
+        let mut had_progress = false;
         let mut last_error: Option<Error> = None;
+
         for attempt in 1..=ARCHIVE_DOWNLOAD_MAX_ATTEMPTS {
+            let before_len = tokio::fs::metadata(temp_path)
+                .await
+                .map(|m| m.len())
+                .unwrap_or(0);
+            let start = Instant::now();
+
             match self
                 .download_archive_response_once(download_url, temp_path)
                 .await
             {
                 Ok(()) => return Ok(()),
                 Err(e) => {
+                    let elapsed = start.elapsed().as_secs_f64();
+                    let after_len = tokio::fs::metadata(temp_path)
+                        .await
+                        .map(|m| m.len())
+                        .unwrap_or(before_len);
+                    let new_bytes = after_len.saturating_sub(before_len);
+                    let attempt_made_progress = made_progress(new_bytes, elapsed);
+                    if attempt_made_progress {
+                        had_progress = true;
+                    }
                     tracing::warn!(
-                        "archive download attempt {}/{} failed; will resume if possible: {}",
                         attempt,
-                        ARCHIVE_DOWNLOAD_MAX_ATTEMPTS,
-                        e
+                        max_attempts = ARCHIVE_DOWNLOAD_MAX_ATTEMPTS,
+                        new_bytes,
+                        elapsed_secs = elapsed,
+                        attempt_made_progress,
+                        had_progress,
+                        error = %e,
+                        "archive download attempt failed",
                     );
                     last_error = Some(e);
+                    // Sleep between attempts to avoid request burst on immediate failures.
+                    // Worst case: 4 immediate failures ≈ 3s extra, acceptable for a single worker tick.
+                    sleep(Duration::from_secs(1)).await;
                 }
             }
         }
-        Err(last_error.unwrap_or_else(|| Error::Other("archive download failed".into())))
+
+        match last_error {
+            Some(e) if had_progress => Err(Error::DownloadInProgress { inner: Box::new(e) }),
+            Some(e) => Err(e),
+            None => Err(Error::Other("archive download failed".into())),
+        }
     }
 
     async fn download_archive_response_once(
