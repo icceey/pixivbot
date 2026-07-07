@@ -89,6 +89,7 @@ jobs:
             slug: linux-arm64
             
     permissions:
+      actions: write
       contents: read
       packages: write
 
@@ -112,7 +113,37 @@ jobs:
         uses: docker/metadata-action@v6
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          
+
+      - name: Prepare Docker cache configuration
+        id: cache
+        shell: bash
+        run: |
+          cargo_lock_hash="${{ hashFiles('Cargo.lock') }}"
+          image="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+          deps_scope="cargo-deps-${{ matrix.slug }}-${cargo_lock_hash}"
+          build_scope="docker-build-${{ matrix.slug }}"
+
+          {
+            echo 'cache-from<<EOF'
+            # Cargo.lock-scoped dependency cache first, then the rolling build cache.
+            echo "type=gha,scope=${deps_scope}"
+            echo "type=gha,scope=${build_scope}"
+            if [[ "${{ inputs.push_to_ghcr }}" == "true" ]]; then
+              echo "type=registry,ref=${image}:buildcache-deps-${{ matrix.slug }}-${cargo_lock_hash}"
+              echo "type=registry,ref=${image}:buildcache-${{ matrix.slug }}"
+            fi
+            echo 'EOF'
+
+            echo 'cache-to<<EOF'
+            echo "type=gha,mode=max,scope=${deps_scope}"
+            echo "type=gha,mode=max,scope=${build_scope}"
+            if [[ "${{ inputs.push_to_ghcr }}" == "true" ]]; then
+              echo "type=registry,ref=${image}:buildcache-deps-${{ matrix.slug }}-${cargo_lock_hash},mode=max"
+              echo "type=registry,ref=${image}:buildcache-${{ matrix.slug }},mode=max"
+            fi
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
       - name: Build and push by digest
         id: build
         uses: docker/build-push-action@v7
@@ -121,8 +152,8 @@ jobs:
           platforms: ${{ matrix.platform }}
           labels: ${{ steps.meta.outputs.labels }}
           outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=${{ inputs.push_to_ghcr }}
-          cache-from: type=gha,scope=${{ matrix.platform }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.platform }}
+          cache-from: ${{ steps.cache.outputs.cache-from }}
+          cache-to: ${{ steps.cache.outputs.cache-to }}
 
       - name: Export digest
         if: ${{ inputs.push_to_ghcr }}
