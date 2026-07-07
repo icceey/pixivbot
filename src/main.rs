@@ -97,6 +97,7 @@ async fn main() -> Result<()> {
     // Initialize Downloader (use reqwest client)
     let http_client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
+        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36")
         .build()?;
     let downloader = std::sync::Arc::new(pixiv::downloader::Downloader::new(
         http_client,
