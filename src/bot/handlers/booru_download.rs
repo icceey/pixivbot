@@ -179,15 +179,12 @@ impl BotHandler {
 }
 
 fn booru_post_image_urls(post: &booru_client::BooruPost) -> Vec<&str> {
-    [
-        post.file_url.as_deref(),
-        post.jpeg_url.as_deref(),
-        post.sample_url.as_deref(),
-        post.preview_url.as_deref(),
-    ]
-    .into_iter()
-    .flatten()
-    .collect()
+    // Downloads prefer the original file; jpeg_url is the only fallback.
+    // sample_url is a downscaled variant and preview_url is only a thumbnail.
+    [post.file_url.as_deref(), post.jpeg_url.as_deref()]
+        .into_iter()
+        .flatten()
+        .collect()
 }
 
 async fn remove_file_after<T, E, Fut>(path: &Path, operation: Fut) -> std::result::Result<T, E>
@@ -245,12 +242,9 @@ mod tests {
     }
 
     #[test]
-    fn booru_download_url_priority_prefers_file_jpeg_sample_preview() {
+    fn booru_download_url_priority_prefers_file_then_jpeg() {
         let post = make_post();
-        assert_eq!(
-            booru_post_image_urls(&post),
-            ["file", "jpeg", "sample", "preview"]
-        );
+        assert_eq!(booru_post_image_urls(&post), ["file", "jpeg"]);
     }
 
     #[test]

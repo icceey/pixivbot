@@ -44,24 +44,23 @@ const MAX_GRACE_PUSH_PER_TICK: usize = 5;
 const MAX_RANKING_PUSH_PER_TICK: usize = 5;
 
 fn booru_post_image_urls(post: &booru_client::BooruPost) -> Vec<Cow<'_, str>> {
-    [
-        post.sample_url.as_deref(),
-        post.jpeg_url.as_deref(),
-        post.file_url.as_deref(),
-        post.preview_url.as_deref(),
-    ]
-    .into_iter()
-    .flatten()
-    .map(Cow::Borrowed)
-    .collect()
+    // Real-time (user-triggered) sends prefer the original file; sample_url
+    // is a downscaled variant and preview_url only a thumbnail.
+    [post.file_url.as_deref(), post.jpeg_url.as_deref()]
+        .into_iter()
+        .flatten()
+        .map(Cow::Borrowed)
+        .collect()
 }
 
 fn queued_booru_post_image_urls(post: &QueuedBooruPost) -> Vec<Cow<'_, str>> {
+    // Pending-queue retries keep sample_url (most reliable downscaled sample)
+    // and fall back through jpeg_url to file_url. preview_url is only a
+    // thumbnail and excluded as a final fallback.
     [
         post.sample_url.as_deref(),
         post.jpeg_url.as_deref(),
         post.file_url.as_deref(),
-        post.preview_url.as_deref(),
     ]
     .into_iter()
     .flatten()
@@ -70,10 +69,7 @@ fn queued_booru_post_image_urls(post: &QueuedBooruPost) -> Vec<Cow<'_, str>> {
 }
 
 fn booru_post_has_image_url(post: &booru_client::BooruPost) -> bool {
-    post.sample_url.is_some()
-        || post.jpeg_url.is_some()
-        || post.file_url.is_some()
-        || post.preview_url.is_some()
+    post.sample_url.is_some() || post.jpeg_url.is_some() || post.file_url.is_some()
 }
 
 pub struct BooruEngine {
@@ -1262,7 +1258,7 @@ mod tests {
     }
 
     #[test]
-    fn test_booru_image_url_priority_prefers_sample_jpeg_file_preview() {
+    fn test_booru_image_url_priority_realtime_file_then_jpeg_queued_sample_jpeg_file() {
         let post = BooruPost {
             id: 7,
             tags: "test".to_string(),
@@ -1282,18 +1278,20 @@ mod tests {
             file_ext: None,
             status: None,
         };
+        // Real-time sends prefer the original file over samples/previews.
         let urls: Vec<_> = booru_post_image_urls(&post)
             .into_iter()
             .map(|url| url.into_owned())
             .collect();
-        assert_eq!(urls, ["sample", "jpeg", "file", "preview"]);
+        assert_eq!(urls, ["file", "jpeg"]);
 
+        // Queued retries keep sample_url as primary, fall back to jpeg/file.
         let queued = BooruEngine::post_to_queued(&post);
         let queued_urls: Vec<_> = queued_booru_post_image_urls(&queued)
             .into_iter()
             .map(|url| url.into_owned())
             .collect();
-        assert_eq!(queued_urls, ["sample", "jpeg", "file", "preview"]);
+        assert_eq!(queued_urls, ["sample", "jpeg", "file"]);
     }
 
     #[test]
