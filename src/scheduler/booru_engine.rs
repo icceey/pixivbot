@@ -14,6 +14,7 @@ use crate::utils::{caption, duration::parse_duration_key, sensitive};
 use anyhow::{Context, Result};
 use chrono::{Local, Utc};
 use rand::RngExt;
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::sync::Arc;
 use teloxide::prelude::*;
@@ -41,6 +42,39 @@ const MAX_GRACE_PUSH_PER_TICK: usize = 5;
 // booru tasks. Unpushed posts naturally re-appear next tick if they're still
 // in the ranking (filtered by `!state.pushed_ids.contains`).
 const MAX_RANKING_PUSH_PER_TICK: usize = 5;
+
+fn booru_post_image_urls(post: &booru_client::BooruPost) -> Vec<Cow<'_, str>> {
+    [
+        post.sample_url.as_deref(),
+        post.jpeg_url.as_deref(),
+        post.file_url.as_deref(),
+        post.preview_url.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .map(Cow::Borrowed)
+    .collect()
+}
+
+fn queued_booru_post_image_urls(post: &QueuedBooruPost) -> Vec<Cow<'_, str>> {
+    [
+        post.sample_url.as_deref(),
+        post.jpeg_url.as_deref(),
+        post.file_url.as_deref(),
+        post.preview_url.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .map(Cow::Borrowed)
+    .collect()
+}
+
+fn booru_post_has_image_url(post: &booru_client::BooruPost) -> bool {
+    post.sample_url.is_some()
+        || post.jpeg_url.is_some()
+        || post.file_url.is_some()
+        || post.preview_url.is_some()
+}
 
 pub struct BooruEngine {
     repo: Arc<Repo>,
@@ -669,9 +703,7 @@ impl BooruEngine {
             let queue: Vec<QueuedBooruPost> = filtered
                 .iter()
                 .skip(1)
-                .filter(|p| {
-                    p.sample_url.is_some() || p.file_url.is_some() || p.preview_url.is_some()
-                })
+                .filter(|p| booru_post_has_image_url(p))
                 .map(|p| Self::post_to_queued(p))
                 .collect();
 
@@ -681,9 +713,7 @@ impl BooruEngine {
 
             // Check if the first post has a sendable image URL. If not, skip it
             // rather than queueing it for retry (it will never become sendable).
-            let has_image = first.sample_url.is_some()
-                || first.file_url.is_some()
-                || first.preview_url.is_some();
+            let has_image = booru_post_has_image_url(first);
 
             if !has_image {
                 warn!(
@@ -753,7 +783,7 @@ impl BooruEngine {
             // upfront. Letting them through would consume MAX_GRACE_SEND_ATTEMPTS
             // failed sends and pin the cursor at (post_id - 1) for the entire
             // grace window, since they're permanently unsendable.
-            .filter(|p| p.sample_url.is_some() || p.file_url.is_some() || p.preview_url.is_some())
+            .filter(|p| booru_post_has_image_url(p))
             .collect();
         // Mirror non-grace first-run behavior (line ~617): on a brand-new
         // subscription (no prior state), only consider the single newest post
@@ -912,19 +942,15 @@ impl BooruEngine {
         }
 
         let first = &state.pending_queue[0];
-        let image_url = first
-            .sample_url
-            .as_deref()
-            .or(first.file_url.as_deref())
-            .or(first.preview_url.as_deref());
+        let image_urls = queued_booru_post_image_urls(first);
 
-        let Some(url) = image_url else {
+        if image_urls.is_empty() {
             warn!(
                 "No image URL for queued booru post {} (sub {} chat {}), removing from queue",
                 first.id, subscription.id, chat_id
             );
             return Ok(Some(state.popped_front()));
-        };
+        }
 
         let caption_text = caption::build_booru_caption(
             &Self::queued_to_booru_post(first),
@@ -936,18 +962,26 @@ impl BooruEngine {
         let queued_rating = booru_client::BooruRating::from_short_str(&first.rating);
         let has_spoiler = sensitive::should_blur_booru(chat, &first.tags, queued_rating);
 
-        let send_result = self
-            .notifier
-            .notify_with_images_and_button(
-                chat_id,
-                &[url.to_string()],
-                Some(&caption_text),
-                has_spoiler,
-                &DownloadButtonConfig::for_booru_chat(site_name, first.id, chat),
-            )
-            .await;
+        let mut successful_send = None;
+        for url in image_urls {
+            let image_url = url.into_owned();
+            let send_result = self
+                .notifier
+                .notify_with_images_and_button(
+                    chat_id,
+                    &[image_url],
+                    Some(&caption_text),
+                    has_spoiler,
+                    &DownloadButtonConfig::for_booru_chat(site_name, first.id, chat),
+                )
+                .await;
+            if send_result.is_complete_success() {
+                successful_send = Some(send_result);
+                break;
+            }
+        }
 
-        if send_result.is_complete_success() {
+        if let Some(send_result) = successful_send {
             save_first_message_record(
                 &self.repo,
                 chat_id,
@@ -974,32 +1008,36 @@ impl BooruEngine {
         base_url: &str,
         engine_type: booru_client::BooruEngineType,
     ) -> bool {
-        let image_url = post
-            .sample_url
-            .as_deref()
-            .or(post.file_url.as_deref())
-            .or(post.preview_url.as_deref());
+        let image_urls = booru_post_image_urls(post);
 
-        let Some(url) = image_url else {
+        if image_urls.is_empty() {
             warn!("No image URL for booru post {}", post.id);
             return false;
-        };
+        }
 
         let caption_text = caption::build_booru_caption(post, site_name, base_url, engine_type);
         let has_spoiler = sensitive::should_blur_booru(chat, &post.tags, post.rating);
 
-        let send_result = self
-            .notifier
-            .notify_with_images_and_button(
-                chat_id,
-                &[url.to_string()],
-                Some(&caption_text),
-                has_spoiler,
-                &DownloadButtonConfig::for_booru_chat(site_name, post.id, chat),
-            )
-            .await;
+        let mut successful_send = None;
+        for url in image_urls {
+            let image_url = url.into_owned();
+            let send_result = self
+                .notifier
+                .notify_with_images_and_button(
+                    chat_id,
+                    &[image_url],
+                    Some(&caption_text),
+                    has_spoiler,
+                    &DownloadButtonConfig::for_booru_chat(site_name, post.id, chat),
+                )
+                .await;
+            if send_result.is_complete_success() {
+                successful_send = Some(send_result);
+                break;
+            }
+        }
 
-        if send_result.is_complete_success() {
+        if let Some(send_result) = successful_send {
             save_first_message_record(
                 &self.repo,
                 chat_id,
@@ -1084,6 +1122,7 @@ impl BooruEngine {
             fav_count: post.fav_count,
             file_url: post.file_url.clone(),
             sample_url: post.sample_url.clone(),
+            jpeg_url: post.jpeg_url.clone(),
             preview_url: post.preview_url.clone(),
             rating: post.rating.as_short_str().to_string(),
             width: post.width,
@@ -1100,6 +1139,7 @@ impl BooruEngine {
             fav_count: queued.fav_count,
             file_url: queued.file_url.clone(),
             sample_url: queued.sample_url.clone(),
+            jpeg_url: queued.jpeg_url.clone(),
             preview_url: queued.preview_url.clone(),
             rating: booru_client::BooruRating::from_short_str(&queued.rating),
             width: queued.width,
@@ -1153,6 +1193,7 @@ mod tests {
             fav_count: 0,
             file_url: Some(format!("https://example.com/{}.jpg", id)),
             sample_url: Some(format!("https://example.com/sample/{}.jpg", id)),
+            jpeg_url: Some(format!("https://example.com/jpeg/{}.jpg", id)),
             preview_url: None,
             rating,
             width: 800,
@@ -1213,10 +1254,66 @@ mod tests {
         assert_eq!(recovered.fav_count, post.fav_count);
         assert_eq!(recovered.file_url, post.file_url);
         assert_eq!(recovered.sample_url, post.sample_url);
+        assert_eq!(recovered.jpeg_url, post.jpeg_url);
         assert_eq!(recovered.rating, post.rating);
         assert_eq!(recovered.width, post.width);
         assert_eq!(recovered.height, post.height);
         assert_eq!(recovered.source, post.source);
+    }
+
+    #[test]
+    fn test_booru_image_url_priority_prefers_sample_jpeg_file_preview() {
+        let post = BooruPost {
+            id: 7,
+            tags: "test".to_string(),
+            score: 0,
+            fav_count: 0,
+            file_url: Some("file".to_string()),
+            sample_url: Some("sample".to_string()),
+            jpeg_url: Some("jpeg".to_string()),
+            preview_url: Some("preview".to_string()),
+            rating: BooruRating::Safe,
+            width: 1,
+            height: 1,
+            md5: None,
+            source: None,
+            created_at: None,
+            file_size: None,
+            file_ext: None,
+            status: None,
+        };
+        let urls: Vec<_> = booru_post_image_urls(&post)
+            .into_iter()
+            .map(|url| url.into_owned())
+            .collect();
+        assert_eq!(urls, ["sample", "jpeg", "file", "preview"]);
+
+        let queued = BooruEngine::post_to_queued(&post);
+        let queued_urls: Vec<_> = queued_booru_post_image_urls(&queued)
+            .into_iter()
+            .map(|url| url.into_owned())
+            .collect();
+        assert_eq!(queued_urls, ["sample", "jpeg", "file", "preview"]);
+    }
+
+    #[test]
+    fn test_booru_image_url_priority_accepts_jpeg_only_posts() {
+        let mut post = make_post(9, "test", 0, BooruRating::Safe);
+        post.sample_url = None;
+        post.file_url = None;
+        post.preview_url = None;
+        post.jpeg_url = Some("jpeg-only".to_string());
+
+        assert!(booru_post_has_image_url(&post));
+        let urls: Vec<_> = booru_post_image_urls(&post)
+            .into_iter()
+            .map(|url| url.into_owned())
+            .collect();
+        assert_eq!(urls, ["jpeg-only"]);
+
+        let queued = BooruEngine::post_to_queued(&post);
+        assert_eq!(queued.jpeg_url.as_deref(), Some("jpeg-only"));
+        assert_eq!(queued_booru_post_image_urls(&queued)[0], "jpeg-only");
     }
 
     #[test]

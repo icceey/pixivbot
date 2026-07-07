@@ -216,6 +216,8 @@ pub struct QueuedBooruPost {
     pub fav_count: i32,
     pub file_url: Option<String>,
     pub sample_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jpeg_url: Option<String>,
     pub preview_url: Option<String>,
     pub rating: String,
     pub width: u32,
@@ -235,6 +237,7 @@ mod tests {
             fav_count: 0,
             file_url: Some(format!("https://example.com/{}.jpg", id)),
             sample_url: None,
+            jpeg_url: None,
             preview_url: None,
             rating: "s".to_string(),
             width: 100,

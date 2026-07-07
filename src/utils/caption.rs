@@ -313,6 +313,7 @@ mod tests {
             fav_count,
             file_url: Some("https://example.com/file.jpg".to_string()),
             sample_url: Some("https://example.com/sample.jpg".to_string()),
+            jpeg_url: None,
             preview_url: Some("https://example.com/preview.jpg".to_string()),
             rating,
             width: 1920,
