@@ -598,6 +598,117 @@ async fn test_download_archive_rejects_incomplete_content_range() {
 }
 
 #[tokio::test]
+async fn test_download_archive_returns_download_in_progress_when_fast_partial() {
+    let server = MockServer::start().await;
+    let redirect_html = format!(
+        r#"<script>document.location = "{}/archive/123456/abcdef0123/abcdef0123/0?autostart=1";</script>"#,
+        server.uri()
+    );
+
+    Mock::given(method("POST"))
+        .and(path("/archiver.php"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(redirect_html))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // Pre-seed .part so the 206 response takes the append path and validates Content-Range.
+    // Content-Range claims total=100000, end=99999, so end+1==total → validate_content_range
+    // returns Ok(100000). Body is 20000 bytes per attempt; after 4 attempts total=80001,
+    // still < 100000 → Error::Other size-mismatch every attempt.
+    // new_bytes=20000, elapsed tiny → made_progress=true → DownloadInProgress.
+    let partial_body = vec![0u8; 20000];
+    Mock::given(method("GET"))
+        .and(path("/archive/123456/abcdef0123/abcdef0123/0"))
+        .respond_with(
+            ResponseTemplate::new(206)
+                .insert_header("Content-Range", "bytes 1-99999/100000")
+                .set_body_bytes(partial_body.clone()),
+        )
+        // 4 attempts (ARCHIVE_DOWNLOAD_MAX_ATTEMPTS)
+        .expect(4)
+        .mount(&server)
+        .await;
+
+    let client = client_at(&server);
+    let temp_dir = tempfile::tempdir().unwrap();
+    let dest = temp_dir.path().join("archive.zip");
+    let part = dest.with_extension("zip.part");
+    tokio::fs::write(&part, b"x").await.unwrap();
+
+    let err = client
+        .download_archive(123456, "abcdef0123", "123456--abc123def456", "780x", &dest)
+        .await
+        .expect_err("fast partial download should fail after 4 attempts");
+
+    assert!(
+        matches!(err, eh_client::Error::DownloadInProgress { .. }),
+        "expected DownloadInProgress, got: {:?}",
+        err
+    );
+    // .part file should be preserved for resumption
+    assert!(
+        part.exists(),
+        ".part file should be preserved for resumption"
+    );
+    assert!(!dest.exists(), "final dest should not exist on failure");
+}
+
+#[tokio::test]
+async fn test_download_archive_returns_plain_error_when_no_progress() {
+    let server = MockServer::start().await;
+    let redirect_html = format!(
+        r#"<script>document.location = "{}/archive/123456/abcdef0123/abcdef0123/0?autostart=1";</script>"#,
+        server.uri()
+    );
+
+    Mock::given(method("POST"))
+        .and(path("/archiver.php"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(redirect_html))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // Pre-seed .part so the 206 response takes the append path and runs validate_content_range.
+    // Content-Range: start=1, end=26, total=127, end+1=27 != 127 → validate_content_range fails
+    // BEFORE any bytes are written → new_bytes=0 → made_progress=false → plain Error.
+    let rest = b"zip_content";
+    Mock::given(method("GET"))
+        .and(path("/archive/123456/abcdef0123/abcdef0123/0"))
+        .respond_with(
+            ResponseTemplate::new(206)
+                .insert_header("Content-Range", "bytes 1-26/127")
+                .insert_header("Content-Length", rest.len().to_string())
+                .set_body_bytes(rest.to_vec()),
+        )
+        .expect(4)
+        .mount(&server)
+        .await;
+
+    let client = client_at(&server);
+    let temp_dir = tempfile::tempdir().unwrap();
+    let dest = temp_dir.path().join("archive.zip");
+    let part = dest.with_extension("zip.part");
+    tokio::fs::write(&part, b"x").await.unwrap();
+
+    let err = client
+        .download_archive(123456, "abcdef0123", "123456--abc123def456", "780x", &dest)
+        .await
+        .expect_err("no-progress download should fail");
+
+    assert!(
+        !matches!(err, eh_client::Error::DownloadInProgress { .. }),
+        "should NOT be DownloadInProgress when no progress was made, got: {:?}",
+        err
+    );
+    assert!(
+        err.to_string().contains("Content-Range ended"),
+        "should contain Content-Range error message, got: {}",
+        err
+    );
+}
+
+#[tokio::test]
 async fn test_prepare_and_download_archive_form_flow() {
     let server = MockServer::start().await;
     let gallery_page_html = r#"
