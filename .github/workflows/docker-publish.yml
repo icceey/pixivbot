@@ -15,6 +15,7 @@ jobs:
       channel: beta
       push_to_ghcr: true
     permissions:
+      actions: write
       contents: read
       packages: write
 
@@ -27,5 +28,6 @@ jobs:
       version: ${{ github.event.release.tag_name }}
       push_to_ghcr: true
     permissions:
+      actions: write
       contents: read
       packages: write
