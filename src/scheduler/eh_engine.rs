@@ -2216,6 +2216,30 @@ mod integration_tests {
             .await;
     }
 
+    #[test]
+    fn download_in_progress_downcasts_through_anyhow_context() {
+        // Simulate the error propagation path in process():
+        // eh_client::Error::DownloadInProgress → .context("...") → anyhow::Error
+        let inner = eh_client::Error::Other("simulated failure".into());
+        let client_err = eh_client::Error::DownloadInProgress {
+            inner: Box::new(inner),
+        };
+        // Context trait is implemented on Result<T, E>, not bare E.
+        // Wrap in Err to match how process() propagates the error.
+        let result: eh_client::Result<()> = Err(client_err);
+        let wrapped: anyhow::Error = result.context("Failed to download archive").unwrap_err();
+
+        let found = wrapped
+            .chain()
+            .find_map(|c| c.downcast_ref::<eh_client::Error>())
+            .map(|e| matches!(e, eh_client::Error::DownloadInProgress { .. }))
+            .unwrap_or(false);
+        assert!(
+            found,
+            "DownloadInProgress must be findable through anyhow error chain"
+        );
+    }
+
     // === Download Worker Tests ===
 
     #[tokio::test]

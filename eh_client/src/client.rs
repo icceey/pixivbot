@@ -9,6 +9,18 @@ const USER_AGENT_STR: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWeb
 const ARCHIVE_DOWNLOAD_TIMEOUT_SECS: u64 = 300;
 const ARCHIVE_DOWNLOAD_MAX_ATTEMPTS: usize = 4;
 
+/// Threshold for "made progress": strictly greater than 10 KiB/s.
+#[allow(dead_code)] // used in Task 2 (download_archive_response_resumable)
+const PROGRESS_THRESHOLD_BYTES_PER_SEC: f64 = 10_240.0;
+
+/// Returns true if the attempt transferred data fast enough to count as real progress.
+/// - 10 KiB/s = 10240 bytes/s; strictly greater than (not equal to).
+/// - `elapsed_secs == 0.0` returns false (prevents division by zero).
+#[allow(dead_code)] // used in Task 2 (download_archive_response_resumable)
+fn made_progress(new_bytes: u64, elapsed_secs: f64) -> bool {
+    elapsed_secs > 0.0 && (new_bytes as f64 / elapsed_secs) > PROGRESS_THRESHOLD_BYTES_PER_SEC
+}
+
 pub struct EhClient {
     http: reqwest::Client,
     base_url: String,
@@ -1087,5 +1099,21 @@ mod tests {
         assert!(!is_ehentai_host(
             "https://example.com/archive/1/abc/file/0?start=1"
         ));
+    }
+
+    #[test]
+    fn test_made_progress_threshold() {
+        // Exactly 10KB/s (10240 bytes in 1.0s) → NOT progress (strictly greater)
+        assert!(!made_progress(10240, 1.0));
+        // One byte above threshold → progress
+        assert!(made_progress(10241, 1.0));
+        // Zero bytes → never progress
+        assert!(!made_progress(0, 1.0));
+        // Zero elapsed → false (prevents division by zero)
+        assert!(!made_progress(99999, 0.0));
+        // Large transfer, small elapsed → progress
+        assert!(made_progress(20000, 0.5));
+        // Small transfer, large elapsed → no progress
+        assert!(!made_progress(100, 10.0));
     }
 }

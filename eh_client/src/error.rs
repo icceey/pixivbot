@@ -16,6 +16,11 @@ pub enum Error {
         retry_after_secs: Option<u64>,
     },
     Other(String),
+    /// Archive download failed but this attempt made real progress (>10KB/s).
+    /// Preserve `.part` file for resumption instead of incrementing retry_count.
+    DownloadInProgress {
+        inner: Box<Error>,
+    },
 }
 
 impl fmt::Display for Error {
@@ -31,6 +36,9 @@ impl fmt::Display for Error {
                 write!(f, "Rate limited (429), retry after {:?}", retry_after_secs)
             }
             Error::Other(msg) => write!(f, "{}", msg),
+            Error::DownloadInProgress { inner } => {
+                write!(f, "download failed but made progress: {}", inner)
+            }
         }
     }
 }
@@ -41,6 +49,7 @@ impl std::error::Error for Error {
             Error::Http(e) => Some(e),
             Error::Json(e) => Some(e),
             Error::Io(e) => Some(e),
+            Error::DownloadInProgress { inner } => Some(inner.as_ref()),
             _ => None,
         }
     }
