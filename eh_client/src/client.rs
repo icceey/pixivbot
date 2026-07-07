@@ -508,13 +508,10 @@ impl EhClient {
         let mut resp = request.send().await?;
         let status = resp.status();
         if existing_len > 0 && status.as_u16() == 416 {
-            if validate_complete_zip(temp_path).await.is_ok() {
-                return Ok(());
-            }
             let _ = tokio::fs::remove_file(temp_path).await;
             return Err(Error::Api {
                 message: format!(
-                    "archive download returned {} for invalid partial file",
+                    "archive download returned {}; restarting without partial",
                     status
                 ),
                 status: status.as_u16(),
