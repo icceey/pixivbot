@@ -16,6 +16,8 @@ pub struct BooruPost {
     #[serde(default)]
     pub sample_url: Option<String>,
     #[serde(default)]
+    pub jpeg_url: Option<String>,
+    #[serde(default)]
     pub preview_url: Option<String>,
     pub rating: BooruRating,
     #[serde(default)]
@@ -208,6 +210,8 @@ pub struct MoebooruRawPost {
     #[serde(default)]
     pub sample_url: Option<String>,
     #[serde(default)]
+    pub jpeg_url: Option<String>,
+    #[serde(default)]
     pub preview_url: Option<String>,
     #[serde(default)]
     pub rating: String,
@@ -241,6 +245,7 @@ impl MoebooruRawPost {
             fav_count: self.fav_count,
             file_url: self.file_url,
             sample_url: self.sample_url,
+            jpeg_url: self.jpeg_url,
             preview_url: self.preview_url,
             rating: BooruRating::from_moebooru(&self.rating),
             width: self.width,
@@ -343,6 +348,7 @@ impl DanbooruRawPost {
             fav_count: self.fav_count,
             file_url: self.file_url,
             sample_url: self.large_file_url,
+            jpeg_url: None,
             preview_url: self.preview_file_url,
             rating: BooruRating::from_danbooru(self.rating.as_deref().unwrap_or("s")),
             width: self.image_width,
@@ -458,6 +464,7 @@ impl GelbooruRawPost {
             fav_count: self.fav_count.unwrap_or(0),
             file_url: self.file_url,
             sample_url: self.sample_url,
+            jpeg_url: None,
             preview_url: self.preview_url,
             rating: BooruRating::from_gelbooru(&self.rating),
             width: self.width,
@@ -490,6 +497,7 @@ mod tests {
             "file_url": "https://files.yande.re/image/abc123/yande.re%201234567.jpg",
             "preview_url": "https://files.yande.re/preview/abc123/yande.re%201234567.jpg",
             "sample_url": "https://files.yande.re/sample/abc123/yande.re%201234567.jpg",
+            "jpeg_url": "https://files.yande.re/jpeg/abc123/yande.re%201234567.jpg",
             "rating": "s",
             "width": 3840,
             "height": 2160,
@@ -508,10 +516,15 @@ mod tests {
         assert_eq!(raw.height, 2160);
         assert!(raw.file_url.is_some());
         assert!(raw.sample_url.is_some());
+        assert!(raw.jpeg_url.is_some());
 
         let post = raw.into_booru_post();
         assert_eq!(post.id, 1234567);
         assert_eq!(post.rating, BooruRating::Safe);
+        assert_eq!(
+            post.jpeg_url.as_deref(),
+            Some("https://files.yande.re/jpeg/abc123/yande.re%201234567.jpg")
+        );
         assert!(post.created_at.is_some());
         assert_eq!(post.score, 42);
     }
@@ -537,6 +550,7 @@ mod tests {
         let post = raw.into_booru_post();
         assert_eq!(post.rating, BooruRating::Questionable);
         assert!(post.file_url.is_none());
+        assert!(post.jpeg_url.is_none());
         assert!(post.md5.is_none());
         assert!(post.created_at.is_none());
     }
@@ -795,6 +809,7 @@ mod tests {
             fav_count: 5,
             file_url: Some("https://example.com/file.jpg".to_string()),
             sample_url: Some("https://example.com/sample.jpg".to_string()),
+            jpeg_url: None,
             preview_url: None,
             rating: BooruRating::Safe,
             width: 1920,

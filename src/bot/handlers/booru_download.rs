@@ -138,19 +138,29 @@ impl BotHandler {
             .next()
             .with_context(|| format!("post {}#{} not found", site_name, post_id))?;
 
-        let url = post
-            .file_url
-            .clone()
-            .or_else(|| post.sample_url.clone())
-            .or_else(|| post.preview_url.clone())
-            .with_context(|| format!("post {}#{} has no downloadable url", site_name, post_id))?;
+        let urls = booru_post_image_urls(&post);
+        if urls.is_empty() {
+            anyhow::bail!("post {}#{} has no downloadable url", site_name, post_id);
+        }
 
-        let path = self
-            .notifier
-            .get_downloader()
-            .download(&url)
-            .await
-            .with_context(|| format!("download booru image {}", url))?;
+        let downloader = self.notifier.get_downloader();
+        let mut downloaded = None;
+        let mut last_error = None;
+        for url in urls {
+            match downloader.download(url).await {
+                Ok(path) => {
+                    downloaded = Some((path, url.to_string()));
+                    break;
+                }
+                Err(e) => {
+                    warn!("Failed to download booru image {}: {:#}", url, e);
+                    last_error = Some(e);
+                }
+            }
+        }
+
+        let (path, url) = downloaded
+            .ok_or_else(|| last_error.unwrap_or_else(|| anyhow::anyhow!("no downloadable url")))?;
 
         let ext = url
             .rsplit('/')
@@ -166,6 +176,18 @@ impl BotHandler {
         let title = format!("{} #{}", site_name, post_id);
         Ok((path, filename, title))
     }
+}
+
+fn booru_post_image_urls(post: &booru_client::BooruPost) -> Vec<&str> {
+    [
+        post.sample_url.as_deref(),
+        post.jpeg_url.as_deref(),
+        post.file_url.as_deref(),
+        post.preview_url.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
 }
 
 async fn remove_file_after<T, E, Fut>(path: &Path, operation: Fut) -> std::result::Result<T, E>
@@ -197,7 +219,49 @@ fn build_booru_caption(titles: &[String], failed: &[String]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::remove_file_after;
+    use super::{booru_post_image_urls, remove_file_after};
+    use booru_client::{BooruPost, BooruRating};
+
+    fn make_post() -> BooruPost {
+        BooruPost {
+            id: 1,
+            tags: String::new(),
+            score: 0,
+            fav_count: 0,
+            file_url: Some("file".to_string()),
+            sample_url: Some("sample".to_string()),
+            jpeg_url: Some("jpeg".to_string()),
+            preview_url: Some("preview".to_string()),
+            rating: BooruRating::Safe,
+            width: 1,
+            height: 1,
+            md5: None,
+            source: None,
+            created_at: None,
+            file_size: None,
+            file_ext: None,
+            status: None,
+        }
+    }
+
+    #[test]
+    fn booru_download_url_priority_prefers_sample_jpeg_file_preview() {
+        let post = make_post();
+        assert_eq!(
+            booru_post_image_urls(&post),
+            ["sample", "jpeg", "file", "preview"]
+        );
+    }
+
+    #[test]
+    fn booru_download_url_priority_accepts_jpeg_only_posts() {
+        let mut post = make_post();
+        post.sample_url = None;
+        post.file_url = None;
+        post.preview_url = None;
+
+        assert_eq!(booru_post_image_urls(&post), ["jpeg"]);
+    }
 
     #[tokio::test]
     async fn remove_file_after_cleans_zip_after_successful_send() {
