@@ -7,8 +7,11 @@ fn test_zip_bytes(name: &str, content: &[u8]) -> Vec<u8> {
     let mut cursor = std::io::Cursor::new(Vec::new());
     {
         let mut zip = zip::ZipWriter::new(&mut cursor);
-        zip.start_file(name, SimpleFileOptions::default())
-            .expect("start zip file");
+        zip.start_file(
+            name,
+            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored),
+        )
+        .expect("start zip file");
         std::io::Write::write_all(&mut zip, content).expect("write zip file");
         zip.finish().expect("finish zip");
     }
@@ -442,7 +445,7 @@ async fn test_download_archive_rejects_mismatched_content_range() {
 }
 
 #[tokio::test]
-async fn test_download_archive_accepts_complete_partial_on_416() {
+async fn test_download_archive_restarts_complete_partial_on_416() {
     let server = MockServer::start().await;
     let redirect_html = format!(
         r#"<script>document.location = "{}/archive/123456/abcdef0123/abcdef0123/0?autostart=1";</script>"#,
@@ -457,6 +460,7 @@ async fn test_download_archive_accepts_complete_partial_on_416() {
         .await;
 
     let complete = test_zip_bytes("image.jpg", b"complete_zip");
+    let fresh_zip = test_zip_bytes("image.jpg", b"fresh_zip_after_restart");
     Mock::given(method("GET"))
         .and(path("/archive/123456/abcdef0123/abcdef0123/0"))
         .and(header("range", format!("bytes={}-", complete.len())))
@@ -464,10 +468,18 @@ async fn test_download_archive_accepts_complete_partial_on_416() {
         .expect(1)
         .mount(&server)
         .await;
+    Mock::given(method("GET"))
+        .and(path("/archive/123456/abcdef0123/abcdef0123/0"))
+        .and(HeaderAbsent("range"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(fresh_zip.clone()))
+        .expect(1)
+        .mount(&server)
+        .await;
 
     let client = client_at(&server);
     let temp_dir = tempfile::tempdir().unwrap();
     let dest = temp_dir.path().join("archive.zip");
+    let part = dest.with_extension("zip.part");
     tokio::fs::write(dest.with_extension("zip.part"), &complete)
         .await
         .unwrap();
@@ -475,10 +487,11 @@ async fn test_download_archive_accepts_complete_partial_on_416() {
     let bytes = client
         .download_archive(123456, "abcdef0123", "123456--abc123def456", "780x", &dest)
         .await
-        .expect("complete partial should be accepted on 416");
+        .expect("complete partial should be discarded and restarted on 416");
 
-    assert_eq!(bytes as usize, complete.len());
-    assert_eq!(std::fs::read(dest).unwrap(), complete);
+    assert_eq!(bytes as usize, fresh_zip.len());
+    assert!(!part.exists(), "stale complete partial should be removed");
+    assert_eq!(std::fs::read(dest).unwrap(), fresh_zip);
 }
 
 #[tokio::test]
