@@ -608,20 +608,41 @@ impl EhDownloadWorker {
 
         if let Err(e) = self.process(&entry).await {
             error!("Download failed for entry {}: {:#}", entry.id, e);
-            let (_, permanent) = self
-                .repo
-                .schedule_eh_retry_from(
-                    entry.id,
-                    &entry.status,
-                    STATUS_PENDING,
-                    &e.to_string(),
-                    self.config.max_retry_count,
-                )
-                .await?;
-            if permanent {
-                warn!("Permanent download failure for gid={}: {}", entry.gid, e);
-                // Delete partial ZIP if it exists
-                self.cleanup_zip(&entry).await;
+
+            // process() wraps errors with .context(); downcast_ref only checks the
+            // outermost layer. Must traverse the error chain to find eh_client::Error.
+            let is_in_progress = e
+                .chain()
+                .find_map(|c| c.downcast_ref::<eh_client::Error>())
+                .map(|client_err| matches!(client_err, eh_client::Error::DownloadInProgress { .. }))
+                .unwrap_or(false);
+
+            if is_in_progress {
+                // Transfer made real progress (>10KB/s): don't increment retry_count,
+                // preserve .part file for resumption on the next tick.
+                self.repo
+                    .defer_eh_download(
+                        entry.id,
+                        STATUS_PENDING,
+                        self.config.download_poll_interval_sec as i64,
+                    )
+                    .await?;
+            } else {
+                let (_, permanent) = self
+                    .repo
+                    .schedule_eh_retry_from(
+                        entry.id,
+                        &entry.status,
+                        STATUS_PENDING,
+                        &e.to_string(),
+                        self.config.max_retry_count,
+                    )
+                    .await?;
+                if permanent {
+                    warn!("Permanent download failure for gid={}: {}", entry.gid, e);
+                    // Delete partial ZIP if it exists — only on unrecoverable failure
+                    self.cleanup_zip(&entry).await;
+                }
             }
         }
 
@@ -2515,6 +2536,95 @@ mod integration_tests {
         assert_eq!(updated.status, STATUS_FAILED);
         assert!(!zip_path.exists(), "final ZIP should be cleaned");
         assert!(!part_path.exists(), "partial ZIP should be cleaned");
+    }
+
+    #[tokio::test]
+    async fn test_download_worker_progress_failure_defers_without_retry() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        let eh_server = MockServer::start().await;
+        let temp = tempfile::tempdir().unwrap();
+
+        setup_chat(&repo, -100, true).await;
+        let entry = insert_queue_entry(
+            &repo,
+            -100,
+            123456,
+            "abcdef0123",
+            "Test",
+            false,
+            "pending",
+            None,
+            None,
+        )
+        .await;
+
+        mock_eh_gallery_page(&eh_server, 123456, "abcdef0123").await;
+        let download_url = format!("{}/archive/123456/token/0", eh_server.uri());
+        mock_eh_archiver_post(&eh_server, &download_url).await;
+
+        // Pre-seed 1-byte .part so the 206 response takes the append path and
+        // runs validate_content_range. Content-Range start=1 matches existing_len=1.
+        let eh_cache = temp.path().join("eh_cache");
+        tokio::fs::create_dir_all(&eh_cache).await.unwrap();
+        let part_path = eh_cache.join("123456_abcdef0123.zip.part");
+        tokio::fs::write(&part_path, b"x").await.unwrap();
+
+        // 206 with valid Content-Range (start=1==existing_len, end+1==total → validate passes)
+        // but body smaller than claimed (>10KB) → written < expected_total → error
+        // after writing >10KB → made_progress=true → DownloadInProgress.
+        // Note: the mock returns the same fixed Content-Range on every attempt. After the
+        // first append the start no longer matches existing_len, so validate_content_range
+        // fails before writing further bytes; only the first attempt appends 20000 bytes.
+        let partial_body = vec![0u8; 20000];
+        Mock::given(method("GET"))
+            .and(path("/archive/123456/token/0"))
+            .respond_with(
+                ResponseTemplate::new(206)
+                    .insert_header("Content-Range", "bytes 1-99999/100000")
+                    .set_body_bytes(partial_body.clone()),
+            )
+            // 4 attempts per ARCHIVE_DOWNLOAD_MAX_ATTEMPTS
+            .expect(4)
+            .mount(&eh_server)
+            .await;
+
+        let worker = EhDownloadWorker::new(
+            Arc::clone(&repo),
+            make_eh_client(&eh_server),
+            Arc::new(make_config()),
+            temp.path().to_path_buf(),
+        );
+        worker.tick().await.unwrap();
+
+        let updated = eh_download_queue::Entity::find_by_id(entry.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            updated.status, STATUS_PENDING,
+            "should be pending for deferred retry"
+        );
+        assert_eq!(
+            updated.retry_count, 0,
+            "DownloadInProgress should NOT increment retry_count"
+        );
+        assert!(
+            updated.next_retry_at.is_some(),
+            "should have next_retry_at set by defer_eh_download"
+        );
+
+        // .part file should be preserved for resumption.
+        assert!(
+            part_path.exists(),
+            ".part file should be preserved for resumption"
+        );
+        let part_size = std::fs::metadata(&part_path).unwrap().len();
+        assert_eq!(
+            part_size, 20001,
+            ".part should contain 20001 bytes (1 pre-seeded + 20000 written on first attempt), got {}",
+            part_size
+        );
     }
 
     // === Upload Worker Tests ===
