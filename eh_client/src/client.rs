@@ -1005,11 +1005,24 @@ async fn validate_complete_zip(path: &Path) -> Result<()> {
     let path = path.to_owned();
     tokio::task::spawn_blocking(move || {
         let file = std::fs::File::open(&path)?;
-        let archive = zip::ZipArchive::new(file)
+        let mut archive = zip::ZipArchive::new(file)
             .map_err(|e| Error::Parse(format!("downloaded file is not a complete ZIP: {e}")))?;
         if archive.is_empty() {
             return Err(Error::Parse("downloaded ZIP is empty".into()));
         }
+
+        for index in 0..archive.len() {
+            let mut entry = archive.by_index(index).map_err(|e| {
+                Error::Parse(format!(
+                    "downloaded ZIP entry {index} cannot be opened: {e}"
+                ))
+            })?;
+            let name = entry.name().to_string();
+            std::io::copy(&mut entry, &mut std::io::sink()).map_err(|e| {
+                Error::Parse(format!("downloaded ZIP entry {name} is invalid: {e}"))
+            })?;
+        }
+
         Ok(())
     })
     .await
