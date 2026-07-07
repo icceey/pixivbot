@@ -1,11 +1,13 @@
 use crate::error::{Error, Result};
 use crate::models::{EhCookies, EhGallery, EhGalleryRef, RawApiResponse, RawGalleryMetaEntry};
 use crate::parser;
-use reqwest::header::COOKIE;
+use reqwest::header::{CONTENT_LENGTH, CONTENT_RANGE, COOKIE, RANGE};
 use std::path::Path;
 use tokio::io::AsyncWriteExt;
 
 const USER_AGENT_STR: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+const ARCHIVE_DOWNLOAD_TIMEOUT_SECS: u64 = 300;
+const ARCHIVE_DOWNLOAD_MAX_ATTEMPTS: usize = 4;
 
 pub struct EhClient {
     http: reqwest::Client,
@@ -111,6 +113,70 @@ fn is_ehentai_host(url: &str) -> bool {
         .ok()
         .and_then(|url| url.host_str().map(str::to_owned))
         .is_some_and(|host| matches!(host.as_str(), "e-hentai.org" | "exhentai.org"))
+}
+
+fn response_expected_total(
+    headers: &reqwest::header::HeaderMap,
+    existing_len: u64,
+    append: bool,
+) -> Option<u64> {
+    let content_len = headers
+        .get(CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())?;
+    Some(if append {
+        existing_len + content_len
+    } else {
+        content_len
+    })
+}
+
+fn parse_content_range_header(value: &str) -> Option<(u64, u64, Option<u64>)> {
+    let range = value.strip_prefix("bytes ")?;
+    let (bounds, total) = range.split_once('/')?;
+    let (start, end) = bounds.split_once('-')?;
+    let start = start.parse::<u64>().ok()?;
+    let end = end.parse::<u64>().ok()?;
+    if end < start {
+        return None;
+    }
+    let total = if total == "*" {
+        None
+    } else {
+        Some(total.parse::<u64>().ok()?)
+    };
+    Some((start, end, total))
+}
+
+fn validate_content_range(headers: &reqwest::header::HeaderMap, existing_len: u64) -> Result<u64> {
+    let value = headers
+        .get(CONTENT_RANGE)
+        .ok_or_else(|| Error::Other("archive resume response missing Content-Range".into()))?
+        .to_str()
+        .map_err(|_| Error::Other("archive resume response has invalid Content-Range".into()))?;
+    let (start, end, total) = parse_content_range_header(value)
+        .ok_or_else(|| Error::Other("archive resume response has invalid Content-Range".into()))?;
+    if start != existing_len {
+        return Err(Error::Other(format!(
+            "archive resume Content-Range starts at {start}, expected {existing_len}"
+        )));
+    }
+    if let Some(total) = total {
+        if end >= total {
+            return Err(Error::Other(format!(
+                "archive resume Content-Range end {end} exceeds total {total}"
+            )));
+        }
+        if end + 1 != total {
+            return Err(Error::Other(format!(
+                "archive resume Content-Range ended at {}, expected final byte {}",
+                end,
+                total.saturating_sub(1)
+            )));
+        }
+        return Ok(total);
+    }
+    Ok(end + 1)
 }
 
 impl EhClient {
@@ -368,53 +434,18 @@ impl EhClient {
         let download_url = parser::parse_archive_redirect(&html)
             .ok_or_else(|| Error::Parse("archive redirect URL not found".into()))?;
 
-        // Step 3: Download the ZIP file — stream to temp, no cookies to H@H server
-        let mut request = self
-            .http
-            .get(&download_url)
-            .timeout(std::time::Duration::from_secs(300));
-        if is_ehentai_host(&download_url) {
-            request = request.header(COOKIE, self.cookies.to_header());
-        }
-        let mut resp = request.send().await?;
-
-        let status = resp.status();
-        if !status.is_success() {
-            return Err(Error::Api {
-                message: format!("archive download returned {}", status),
-                status: status.as_u16(),
-            });
-        }
-
         // Step 4: Stream to temp file, validate, then rename atomically
         let temp_path = dest.with_extension("zip.part");
-        let _ = tokio::fs::remove_file(&temp_path).await;
-
-        let download_result: Result<u64> = async {
-            let mut file = tokio::fs::File::create(&temp_path).await?;
-            let mut total: u64 = 0;
-            while let Some(chunk) = resp.chunk().await? {
-                file.write_all(&chunk).await?;
-                total += chunk.len() as u64;
-            }
-            file.flush().await?;
-            Ok(total)
-        }
-        .await;
-
-        let total = match download_result {
-            Ok(t) => t,
-            Err(e) => {
-                let _ = tokio::fs::remove_file(&temp_path).await;
-                return Err(e);
-            }
-        };
+        self.download_archive_response_resumable(&download_url, &temp_path)
+            .await?;
 
         // Step 5: Validate that we got a real ZIP (not an error HTML page)
         if let Err(e) = validate_zip_magic(&temp_path).await {
             let _ = tokio::fs::remove_file(&temp_path).await;
             return Err(e);
         }
+
+        let total = tokio::fs::metadata(&temp_path).await?.len();
 
         // Step 6: Atomically rename temp to final dest
         if let Err(e) = tokio::fs::rename(&temp_path, dest).await {
@@ -423,6 +454,118 @@ impl EhClient {
         }
 
         Ok(total)
+    }
+
+    async fn download_archive_response_resumable(
+        &self,
+        download_url: &str,
+        temp_path: &Path,
+    ) -> Result<()> {
+        let mut last_error: Option<Error> = None;
+        for attempt in 1..=ARCHIVE_DOWNLOAD_MAX_ATTEMPTS {
+            match self
+                .download_archive_response_once(download_url, temp_path)
+                .await
+            {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    tracing::warn!(
+                        "archive download attempt {}/{} failed; will resume if possible: {}",
+                        attempt,
+                        ARCHIVE_DOWNLOAD_MAX_ATTEMPTS,
+                        e
+                    );
+                    last_error = Some(e);
+                }
+            }
+        }
+        Err(last_error.unwrap_or_else(|| Error::Other("archive download failed".into())))
+    }
+
+    async fn download_archive_response_once(
+        &self,
+        download_url: &str,
+        temp_path: &Path,
+    ) -> Result<()> {
+        let existing_len = tokio::fs::metadata(temp_path)
+            .await
+            .map(|m| m.len())
+            .unwrap_or(0);
+
+        let mut request = self
+            .http
+            .get(download_url)
+            .timeout(std::time::Duration::from_secs(
+                ARCHIVE_DOWNLOAD_TIMEOUT_SECS,
+            ));
+        if existing_len > 0 {
+            request = request.header(RANGE, format!("bytes={existing_len}-"));
+        }
+        if is_ehentai_host(download_url) {
+            request = request.header(COOKIE, self.cookies.to_header());
+        }
+
+        let mut resp = request.send().await?;
+        let status = resp.status();
+        if existing_len > 0 && status.as_u16() == 416 {
+            if validate_complete_zip(temp_path).await.is_ok() {
+                return Ok(());
+            }
+            let _ = tokio::fs::remove_file(temp_path).await;
+            return Err(Error::Api {
+                message: format!(
+                    "archive download returned {} for invalid partial file",
+                    status
+                ),
+                status: status.as_u16(),
+            });
+        }
+        let mut expected_total_from_range = None;
+        let append = if existing_len > 0 && status.as_u16() == 206 {
+            expected_total_from_range = Some(validate_content_range(resp.headers(), existing_len)?);
+            true
+        } else if status.is_success() {
+            if existing_len > 0 && status.as_u16() == 200 {
+                let _ = tokio::fs::remove_file(temp_path).await;
+            }
+            false
+        } else {
+            return Err(Error::Api {
+                message: format!("archive download returned {}", status),
+                status: status.as_u16(),
+            });
+        };
+
+        let expected_total = expected_total_from_range
+            .or_else(|| response_expected_total(resp.headers(), existing_len, append));
+        if append && expected_total == Some(existing_len) {
+            return Ok(());
+        }
+
+        let mut options = tokio::fs::OpenOptions::new();
+        options.create(true).write(true);
+        if append {
+            options.append(true);
+        } else {
+            options.truncate(true);
+        }
+
+        let mut file = options.open(temp_path).await?;
+        let mut written = if append { existing_len } else { 0 };
+        while let Some(chunk) = resp.chunk().await? {
+            file.write_all(&chunk).await?;
+            written += chunk.len() as u64;
+        }
+        file.flush().await?;
+
+        if let Some(expected_total) = expected_total {
+            if written < expected_total {
+                return Err(Error::Other(format!(
+                    "archive download ended at {written} bytes, expected {expected_total}"
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Get the base URL.
@@ -880,6 +1023,22 @@ async fn validate_zip_magic(path: &Path) -> Result<()> {
         }
         Err(e) => Err(e.into()),
     }
+}
+
+/// Validate that a file is a complete ZIP archive.
+async fn validate_complete_zip(path: &Path) -> Result<()> {
+    let path = path.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let file = std::fs::File::open(&path)?;
+        let archive = zip::ZipArchive::new(file)
+            .map_err(|e| Error::Parse(format!("downloaded file is not a complete ZIP: {e}")))?;
+        if archive.is_empty() {
+            return Err(Error::Parse("downloaded ZIP is empty".into()));
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| Error::Other(format!("ZIP validation task failed: {e}")))?
 }
 
 #[cfg(test)]

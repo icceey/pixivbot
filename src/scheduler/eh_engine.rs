@@ -11,6 +11,7 @@ use chrono::Local;
 use eh_client::{EhClient, EhGallery, ImageUploadInput, ImageUploader, TelegraphClient};
 use rand::RngExt;
 use std::sync::Arc;
+use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
 use crate::db::repo::eh_download_queue::{
@@ -25,6 +26,7 @@ const MAX_METADATA_BATCH: usize = 25;
 
 /// Search rate limit: minimum delay between search requests (3s + buffer).
 const SEARCH_RATE_LIMIT_MS: u64 = 3500;
+const EH_UPLOAD_IMAGE_CHANNEL_CAPACITY: usize = 1;
 
 // ============================================================================
 // Stage 1: EhEngine — Collect (search → metadata → filter → enqueue downloads)
@@ -709,19 +711,21 @@ impl EhDownloadWorker {
         Ok(())
     }
 
-    /// Delete the ZIP file for an entry if it exists (used on permanent failure).
+    /// Delete the ZIP/partial ZIP files for an entry if they exist (used on permanent failure).
     async fn cleanup_zip(&self, _entry: &eh_download_queue::Model) {
         // Download worker's ZIP path is constructed from gid+token, not stored yet on failure.
-        // The ZIP may exist at the expected path if download started but failed mid-stream.
+        // The ZIP or resumable .part may exist at the expected path if download started but failed mid-stream.
         let gid = _entry.gid as u64;
         let token = &_entry.token;
         let zip_path = self
             .cache_dir
             .join("eh_cache")
             .join(format!("{}_{}.zip", gid, token));
-        if zip_path.exists() {
-            if let Err(e) = tokio::fs::remove_file(&zip_path).await {
-                warn!("Failed to delete partial zip {}: {}", zip_path.display(), e);
+        for path in [&zip_path, &zip_path.with_extension("zip.part")] {
+            if path.exists() {
+                if let Err(e) = tokio::fs::remove_file(path).await {
+                    warn!("Failed to delete partial zip {}: {}", path.display(), e);
+                }
             }
         }
     }
@@ -737,6 +741,19 @@ pub struct EhUploadWorker {
     telegraph: Arc<TelegraphClient>,
     image_uploader: Arc<dyn ImageUploader>,
     config: Arc<EhentaiConfig>,
+}
+
+struct ZipImageData {
+    filename: String,
+    data: Vec<u8>,
+}
+
+fn is_uploadable_zip_image_name(name: &str) -> bool {
+    name.ends_with(".jpg")
+        || name.ends_with(".jpeg")
+        || name.ends_with(".png")
+        || name.ends_with(".gif")
+        || name.ends_with(".webp")
 }
 
 impl EhUploadWorker {
@@ -874,58 +891,55 @@ impl EhUploadWorker {
             .context("zip_path is None for downloaded entry")?;
         let zip_path = std::path::Path::new(zip_path);
 
-        // Extract images in spawn_blocking to avoid blocking async executor
+        let (image_tx, mut image_rx) = mpsc::channel(EH_UPLOAD_IMAGE_CHANNEL_CAPACITY);
         let zip_path_owned = zip_path.to_path_buf();
-        let image_data_list: Vec<(String, Vec<u8>)> = tokio::task::spawn_blocking(move || {
+        let reader = tokio::task::spawn_blocking(move || -> Result<()> {
             let zip_file = std::fs::File::open(&zip_path_owned).context("Failed to open zip")?;
             let mut archive =
                 zip::ZipArchive::new(zip_file).context("Failed to read zip archive")?;
 
-            let mut images = Vec::new();
             for i in 0..archive.len() {
                 let mut file = archive.by_index(i).context("Failed to read zip entry")?;
                 let name = file.name().to_lowercase();
-                if !name.ends_with(".jpg")
-                    && !name.ends_with(".jpeg")
-                    && !name.ends_with(".png")
-                    && !name.ends_with(".gif")
-                    && !name.ends_with(".webp")
-                {
+                if !is_uploadable_zip_image_name(&name) {
                     continue;
                 }
 
                 let mut data = Vec::new();
                 std::io::Read::read_to_end(&mut file, &mut data)
                     .context("Failed to read image from zip")?;
-
                 let filename = std::path::Path::new(file.name())
                     .file_name()
                     .and_then(|n| n.to_str())
                     .unwrap_or("image.jpg")
                     .to_string();
-                images.push((filename, data));
-            }
-            Ok::<_, anyhow::Error>(images)
-        })
-        .await
-        .context("spawn_blocking failed")??;
 
-        if image_data_list.is_empty() {
-            anyhow::bail!("No images found in ZIP");
+                if image_tx
+                    .blocking_send(ZipImageData { filename, data })
+                    .is_err()
+                {
+                    return Ok(());
+                }
+            }
+
+            Ok(())
+        });
+
+        let mut all_urls = Vec::new();
+        while let Some(image) = image_rx.recv().await {
+            let input = ImageUploadInput {
+                filename: &image.filename,
+                bytes: image.data.as_slice(),
+            };
+            let urls = self
+                .image_uploader
+                .upload_images(&[input])
+                .await
+                .context("Failed to upload images for Telegraph page")?;
+            all_urls.extend(urls);
         }
 
-        let upload_inputs: Vec<ImageUploadInput<'_>> = image_data_list
-            .iter()
-            .map(|(filename, data)| ImageUploadInput {
-                filename,
-                bytes: data.as_slice(),
-            })
-            .collect();
-        let all_urls = self
-            .image_uploader
-            .upload_images(&upload_inputs)
-            .await
-            .context("Failed to upload images for Telegraph page")?;
+        reader.await.context("spawn_blocking failed")??;
 
         if all_urls.is_empty() {
             anyhow::bail!("No images uploaded by configured image uploader");
@@ -1459,12 +1473,14 @@ mod integration_tests {
             .await;
     }
 
-    async fn mock_telegraph_upload(server: &MockServer) {
+    async fn mock_telegraph_upload(server: &MockServer, expected_requests: u64) {
         let body =
             serde_json::json!({"success": true, "direct_url": "https://i.pixi.mg/i/abc123.jpg"});
         Mock::given(method("POST"))
             .and(path("/pixi/upload"))
+            .and(MultipartFileCount(1))
             .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .expect(expected_requests)
             .mount(server)
             .await;
     }
@@ -2415,6 +2431,68 @@ mod integration_tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_download_worker_permanent_failure_cleans_partial_archive() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        let eh_server = MockServer::start().await;
+        let temp = tempfile::tempdir().unwrap();
+
+        setup_chat(&repo, -100, true).await;
+        let entry = insert_queue_entry(
+            &repo,
+            -100,
+            123456,
+            "abcdef0123",
+            "Test",
+            false,
+            "pending",
+            None,
+            None,
+        )
+        .await;
+
+        eh_download_queue::Entity::update_many()
+            .col_expr(
+                eh_download_queue::Column::RetryCount,
+                Expr::value(make_config().max_retry_count as i32),
+            )
+            .filter(eh_download_queue::Column::Id.eq(entry.id))
+            .exec(repo.db())
+            .await
+            .unwrap();
+
+        let eh_cache = temp.path().join("eh_cache");
+        std::fs::create_dir_all(&eh_cache).unwrap();
+        let zip_path = eh_cache.join("123456_abcdef0123.zip");
+        let part_path = zip_path.with_extension("zip.part");
+        std::fs::write(&zip_path, b"PK\x03\x04stale").unwrap();
+        std::fs::write(&part_path, b"PK\x03\x04partial").unwrap();
+
+        mock_eh_gallery_page(&eh_server, 123456, "abcdef0123").await;
+        Mock::given(method("POST"))
+            .and(path("/archiver.php"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&eh_server)
+            .await;
+
+        let worker = EhDownloadWorker::new(
+            Arc::clone(&repo),
+            make_eh_client(&eh_server),
+            Arc::new(make_config()),
+            temp.path().to_path_buf(),
+        );
+        worker.tick().await.unwrap();
+
+        let updated = eh_download_queue::Entity::find_by_id(entry.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.status, STATUS_FAILED);
+        assert!(!zip_path.exists(), "final ZIP should be cleaned");
+        assert!(!part_path.exists(), "partial ZIP should be cleaned");
+    }
+
     // === Upload Worker Tests ===
 
     #[tokio::test]
@@ -2443,7 +2521,7 @@ mod integration_tests {
         )
         .await;
 
-        mock_telegraph_upload(&tg_server).await;
+        mock_telegraph_upload(&tg_server, 3).await;
         mock_telegraph_create_page(&tg_server).await;
 
         let worker = EhUploadWorker::new(
@@ -2491,17 +2569,13 @@ mod integration_tests {
 
         let upload_body = serde_json::json!({
             "success": true,
-            "images": [
-                {"direct_url": "https://i.pixi.mg/i/large-0.jpg"},
-                {"direct_url": "https://i.pixi.mg/i/large-1.jpg"},
-                {"direct_url": "https://i.pixi.mg/i/large-2.jpg"}
-            ]
+            "direct_url": "https://i.pixi.mg/i/large.jpg"
         });
         Mock::given(method("POST"))
             .and(path("/pixi/upload"))
-            .and(MultipartFileCount(3))
+            .and(MultipartFileCount(1))
             .respond_with(ResponseTemplate::new(200).set_body_json(upload_body))
-            .expect(1)
+            .expect(3)
             .mount(&tg_server)
             .await;
         mock_telegraph_create_page(&tg_server).await;

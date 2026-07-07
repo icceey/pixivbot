@@ -1,6 +1,19 @@
 use eh_client::{EhClient, EhClientBuilder, EhCookies};
-use wiremock::matchers::{method, path, query_param};
+use wiremock::matchers::{header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
+use zip::write::SimpleFileOptions;
+
+fn test_zip_bytes(name: &str, content: &[u8]) -> Vec<u8> {
+    let mut cursor = std::io::Cursor::new(Vec::new());
+    {
+        let mut zip = zip::ZipWriter::new(&mut cursor);
+        zip.start_file(name, SimpleFileOptions::default())
+            .expect("start zip file");
+        std::io::Write::write_all(&mut zip, content).expect("write zip file");
+        zip.finish().expect("finish zip");
+    }
+    cursor.into_inner()
+}
 
 /// Build an EhClient pointing at the given mock server.
 fn client_at(server: &MockServer) -> EhClient {
@@ -20,6 +33,15 @@ struct BodyContains(&'static str);
 impl wiremock::Match for BodyContains {
     fn matches(&self, request: &wiremock::Request) -> bool {
         String::from_utf8_lossy(&request.body).contains(self.0)
+    }
+}
+
+#[derive(Debug)]
+struct HeaderAbsent(&'static str);
+
+impl wiremock::Match for HeaderAbsent {
+    fn matches(&self, request: &wiremock::Request) -> bool {
+        request.headers.get(self.0).is_none()
     }
 }
 
@@ -298,6 +320,259 @@ async fn test_download_archive_full_flow() {
 
     let saved = std::fs::read(dest).expect("should read saved file");
     assert_eq!(saved, zip_bytes);
+}
+
+#[tokio::test]
+async fn test_download_archive_resumes_existing_partial_file() {
+    let server = MockServer::start().await;
+    let redirect_html = format!(
+        r#"<script>document.location = "{}/archive/123456/abcdef0123/abcdef0123/0?autostart=1";</script>"#,
+        server.uri()
+    );
+
+    Mock::given(method("POST"))
+        .and(path("/archiver.php"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(redirect_html))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let first = b"PK\x03\x04partial_";
+    let rest = b"zip_content";
+    Mock::given(method("GET"))
+        .and(path("/archive/123456/abcdef0123/abcdef0123/0"))
+        .and(header("range", format!("bytes={}-", first.len())))
+        .respond_with(
+            ResponseTemplate::new(206)
+                .insert_header(
+                    "Content-Range",
+                    format!(
+                        "bytes {}-{}/{}",
+                        first.len(),
+                        first.len() + rest.len() - 1,
+                        first.len() + rest.len()
+                    ),
+                )
+                .insert_header("Content-Length", rest.len().to_string())
+                .set_body_bytes(rest.to_vec()),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = client_at(&server);
+    let temp_dir = tempfile::tempdir().unwrap();
+    let dest = temp_dir.path().join("archive.zip");
+    tokio::fs::write(dest.with_extension("zip.part"), first)
+        .await
+        .unwrap();
+
+    let bytes = client
+        .download_archive(123456, "abcdef0123", "123456--abc123def456", "780x", &dest)
+        .await
+        .expect("download should resume and succeed");
+
+    assert_eq!(bytes as usize, first.len() + rest.len());
+    let mut expected = first.to_vec();
+    expected.extend_from_slice(rest);
+    assert_eq!(std::fs::read(dest).unwrap(), expected);
+}
+
+#[tokio::test]
+async fn test_download_archive_rejects_mismatched_content_range() {
+    let server = MockServer::start().await;
+    let redirect_html = format!(
+        r#"<script>document.location = "{}/archive/123456/abcdef0123/abcdef0123/0?autostart=1";</script>"#,
+        server.uri()
+    );
+
+    Mock::given(method("POST"))
+        .and(path("/archiver.php"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(redirect_html))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let first = b"PK\x03\x04partial_";
+    let rest = b"zip_content";
+    Mock::given(method("GET"))
+        .and(path("/archive/123456/abcdef0123/abcdef0123/0"))
+        .and(header("range", format!("bytes={}-", first.len())))
+        .respond_with(
+            ResponseTemplate::new(206)
+                .insert_header(
+                    "Content-Range",
+                    format!(
+                        "bytes {}-{}/{}",
+                        first.len() + 1,
+                        first.len() + rest.len(),
+                        first.len() + rest.len() + 1
+                    ),
+                )
+                .insert_header("Content-Length", rest.len().to_string())
+                .set_body_bytes(rest.to_vec()),
+        )
+        .expect(4)
+        .mount(&server)
+        .await;
+
+    let client = client_at(&server);
+    let temp_dir = tempfile::tempdir().unwrap();
+    let dest = temp_dir.path().join("archive.zip");
+    let part = dest.with_extension("zip.part");
+    tokio::fs::write(&part, first).await.unwrap();
+
+    let err = client
+        .download_archive(123456, "abcdef0123", "123456--abc123def456", "780x", &dest)
+        .await
+        .expect_err("mismatched Content-Range should fail");
+
+    assert!(err.to_string().contains("Content-Range starts"));
+    assert_eq!(std::fs::read(part).unwrap(), first);
+    assert!(!dest.exists());
+}
+
+#[tokio::test]
+async fn test_download_archive_accepts_complete_partial_on_416() {
+    let server = MockServer::start().await;
+    let redirect_html = format!(
+        r#"<script>document.location = "{}/archive/123456/abcdef0123/abcdef0123/0?autostart=1";</script>"#,
+        server.uri()
+    );
+
+    Mock::given(method("POST"))
+        .and(path("/archiver.php"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(redirect_html))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let complete = test_zip_bytes("image.jpg", b"complete_zip");
+    Mock::given(method("GET"))
+        .and(path("/archive/123456/abcdef0123/abcdef0123/0"))
+        .and(header("range", format!("bytes={}-", complete.len())))
+        .respond_with(ResponseTemplate::new(416))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = client_at(&server);
+    let temp_dir = tempfile::tempdir().unwrap();
+    let dest = temp_dir.path().join("archive.zip");
+    tokio::fs::write(dest.with_extension("zip.part"), &complete)
+        .await
+        .unwrap();
+
+    let bytes = client
+        .download_archive(123456, "abcdef0123", "123456--abc123def456", "780x", &dest)
+        .await
+        .expect("complete partial should be accepted on 416");
+
+    assert_eq!(bytes as usize, complete.len());
+    assert_eq!(std::fs::read(dest).unwrap(), complete);
+}
+
+#[tokio::test]
+async fn test_download_archive_restarts_after_invalid_partial_on_416() {
+    let server = MockServer::start().await;
+    let redirect_html = format!(
+        r#"<script>document.location = "{}/archive/123456/abcdef0123/abcdef0123/0?autostart=1";</script>"#,
+        server.uri()
+    );
+
+    Mock::given(method("POST"))
+        .and(path("/archiver.php"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(redirect_html))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let incomplete = b"PK\x03\x04incomplete_zip";
+    let full_zip = test_zip_bytes("image.jpg", b"fresh_zip_after_restart");
+    Mock::given(method("GET"))
+        .and(path("/archive/123456/abcdef0123/abcdef0123/0"))
+        .and(header("range", format!("bytes={}-", incomplete.len())))
+        .respond_with(ResponseTemplate::new(416))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/archive/123456/abcdef0123/abcdef0123/0"))
+        .and(HeaderAbsent("range"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(full_zip.clone()))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = client_at(&server);
+    let temp_dir = tempfile::tempdir().unwrap();
+    let dest = temp_dir.path().join("archive.zip");
+    let part = dest.with_extension("zip.part");
+    tokio::fs::write(&part, incomplete).await.unwrap();
+
+    let bytes = client
+        .download_archive(123456, "abcdef0123", "123456--abc123def456", "780x", &dest)
+        .await
+        .expect("invalid partial should be discarded and restarted after 416");
+
+    assert_eq!(bytes as usize, full_zip.len());
+    assert!(!part.exists(), "invalid partial should be removed");
+    assert_eq!(std::fs::read(dest).unwrap(), full_zip);
+}
+
+#[tokio::test]
+async fn test_download_archive_rejects_incomplete_content_range() {
+    let server = MockServer::start().await;
+    let redirect_html = format!(
+        r#"<script>document.location = "{}/archive/123456/abcdef0123/abcdef0123/0?autostart=1";</script>"#,
+        server.uri()
+    );
+
+    Mock::given(method("POST"))
+        .and(path("/archiver.php"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(redirect_html))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let first = b"PK\x03\x04partial_";
+    let rest = b"zip_content";
+    let total = first.len() + rest.len() + 100;
+    Mock::given(method("GET"))
+        .and(path("/archive/123456/abcdef0123/abcdef0123/0"))
+        .and(header("range", format!("bytes={}-", first.len())))
+        .respond_with(
+            ResponseTemplate::new(206)
+                .insert_header(
+                    "Content-Range",
+                    format!(
+                        "bytes {}-{}/{}",
+                        first.len(),
+                        first.len() + rest.len() - 1,
+                        total
+                    ),
+                )
+                .insert_header("Content-Length", rest.len().to_string())
+                .set_body_bytes(rest.to_vec()),
+        )
+        .expect(4)
+        .mount(&server)
+        .await;
+
+    let client = client_at(&server);
+    let temp_dir = tempfile::tempdir().unwrap();
+    let dest = temp_dir.path().join("archive.zip");
+    let part = dest.with_extension("zip.part");
+    tokio::fs::write(&part, first).await.unwrap();
+
+    let err = client
+        .download_archive(123456, "abcdef0123", "123456--abc123def456", "780x", &dest)
+        .await
+        .expect_err("incomplete Content-Range should fail");
+
+    assert!(err.to_string().contains("Content-Range ended"));
+    assert_eq!(std::fs::read(part).unwrap(), first);
+    assert!(!dest.exists());
 }
 
 #[tokio::test]
