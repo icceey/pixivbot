@@ -1060,6 +1060,7 @@ version = "0.3.0"
 dependencies = [
  "async-trait",
  "chrono",
+ "futures-util",
  "regex",
  "reqwest",
  "rust-s3",
@@ -1067,6 +1068,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "tokio-util",
  "tracing",
  "urlencoding",
  "wiremock",
