@@ -439,8 +439,8 @@ impl EhClient {
         self.download_archive_response_resumable(&download_url, &temp_path)
             .await?;
 
-        // Step 5: Validate that we got a real ZIP (not an error HTML page)
-        if let Err(e) = validate_zip_magic(&temp_path).await {
+        // Step 5: Validate that we got a complete ZIP (not an error HTML page or corrupt resume)
+        if let Err(e) = validate_complete_zip(&temp_path).await {
             let _ = tokio::fs::remove_file(&temp_path).await;
             return Err(e);
         }
@@ -997,31 +997,6 @@ impl EhClientBuilder {
     pub fn build(self) -> EhClient {
         EhClient::new(&self.base_url, &self.api_url, self.cookies)
             .expect("failed to build EhClient")
-    }
-}
-
-/// Validate that a file starts with ZIP magic bytes (PK\x03\x04).
-/// Prevents error HTML pages from being sent as "archive" files.
-async fn validate_zip_magic(path: &Path) -> Result<()> {
-    use tokio::io::AsyncReadExt;
-    let mut file = tokio::fs::File::open(path).await?;
-    let mut header = [0u8; 4];
-    use std::io::ErrorKind;
-    match file.read(&mut header).await {
-        Ok(n) if n >= 4 => {
-            if &header == b"PK\x03\x04" {
-                Ok(())
-            } else {
-                Err(Error::Parse(
-                    "downloaded file is not a valid ZIP (invalid magic bytes)".into(),
-                ))
-            }
-        }
-        Ok(_) => Err(Error::Parse("downloaded file too small to be a ZIP".into())),
-        Err(e) if e.kind() == ErrorKind::UnexpectedEof => {
-            Err(Error::Parse("downloaded file too small to be a ZIP".into()))
-        }
-        Err(e) => Err(e.into()),
     }
 }
 

@@ -1766,8 +1766,8 @@ impl Repo {
         Ok((model, false))
     }
 
-    /// Delete ZIP files in the cache dir that have no corresponding queue entry
-    /// in an active status (downloaded, uploading, uploaded, publishing).
+    /// Delete ZIP/partial ZIP files in the cache dir that have no corresponding
+    /// active or retryable queue entry.
     pub async fn cleanup_eh_cache_orphans(&self, cache_dir: &std::path::Path) -> Result<()> {
         if !cache_dir.exists() {
             return Ok(());
@@ -1775,6 +1775,8 @@ impl Repo {
 
         let active_paths: std::collections::HashSet<String> = eh_download_queue::Entity::find()
             .filter(eh_download_queue::Column::Status.is_in([
+                STATUS_PENDING,
+                STATUS_DOWNLOADING,
                 STATUS_DOWNLOADED,
                 STATUS_UPLOADING,
                 STATUS_UPLOADED,
@@ -1783,23 +1785,64 @@ impl Repo {
             .all(&self.db)
             .await?
             .into_iter()
-            .filter_map(|e| e.zip_path)
+            .flat_map(|entry| expected_eh_cache_zip_paths(cache_dir, entry))
             .collect();
 
         for entry in std::fs::read_dir(cache_dir).context("Failed to read eh_cache dir")? {
             let entry = entry?;
             let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) == Some("zip") {
-                let path_str = path.to_string_lossy().to_string();
-                if !active_paths.contains(&path_str) {
-                    if let Err(e) = std::fs::remove_file(&path) {
-                        warn!("Failed to remove orphan zip {}: {}", path.display(), e);
-                    }
+            if !is_eh_cache_archive_artifact(&path) {
+                continue;
+            }
+
+            let final_path = final_eh_cache_zip_path(&path);
+            let final_path_str = final_path.to_string_lossy().to_string();
+            if !active_paths.contains(&final_path_str) {
+                if let Err(e) = std::fs::remove_file(&path) {
+                    warn!("Failed to remove orphan zip {}: {}", path.display(), e);
                 }
             }
         }
 
         Ok(())
+    }
+}
+
+fn expected_eh_cache_zip_paths(
+    cache_dir: &std::path::Path,
+    entry: eh_download_queue::Model,
+) -> Vec<String> {
+    let mut paths = Vec::new();
+    if let Some(zip_path) = entry.zip_path {
+        paths.push(zip_path);
+    }
+    if matches!(entry.status.as_str(), STATUS_PENDING | STATUS_DOWNLOADING) {
+        paths.push(
+            cache_dir
+                .join(format!("{}_{}.zip", entry.gid, entry.token))
+                .to_string_lossy()
+                .to_string(),
+        );
+    }
+    paths
+}
+
+fn is_eh_cache_archive_artifact(path: &std::path::Path) -> bool {
+    path.extension().and_then(|e| e.to_str()) == Some("zip")
+        || path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with(".zip.part"))
+}
+
+fn final_eh_cache_zip_path(path: &std::path::Path) -> std::path::PathBuf {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return path.to_path_buf();
+    };
+    if let Some(final_name) = name.strip_suffix(".zip.part") {
+        path.with_file_name(format!("{final_name}.zip"))
+    } else {
+        path.to_path_buf()
     }
 }
 
@@ -2511,6 +2554,84 @@ mod tests {
 
         let bytes = repo.get_eh_downloaded_bytes_in_window(24).await.unwrap();
         assert_eq!(bytes, 2100);
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_eh_cache_orphans_removes_partial_without_active_zip() {
+        let repo = tests_helpers::setup_test_db().await.unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let cache_dir = temp.path();
+
+        let orphan_zip = cache_dir.join("orphan.zip");
+        let orphan_part = cache_dir.join("orphan.zip.part");
+        let active_zip = cache_dir.join("active.zip");
+        let active_part = cache_dir.join("active.zip.part");
+        let unrelated = cache_dir.join("note.txt");
+        std::fs::write(&orphan_zip, b"zip").unwrap();
+        std::fs::write(&orphan_part, b"partial").unwrap();
+        std::fs::write(&active_zip, b"zip").unwrap();
+        std::fs::write(&active_part, b"partial").unwrap();
+        std::fs::write(&unrelated, b"keep").unwrap();
+
+        let model = repo
+            .enqueue_eh_download(-100, 77, "tok", "Title", false, SOURCE_DIRECT)
+            .await
+            .unwrap();
+        let claimed = repo.get_next_for_download().await.unwrap().unwrap();
+        assert_eq!(claimed.id, model.id);
+        repo.mark_eh_download_downloaded(model.id, 5000, active_zip.to_str().unwrap())
+            .await
+            .unwrap();
+
+        repo.cleanup_eh_cache_orphans(cache_dir).await.unwrap();
+
+        assert!(!orphan_zip.exists(), "orphan final ZIP should be removed");
+        assert!(
+            !orphan_part.exists(),
+            "orphan partial ZIP should be removed"
+        );
+        assert!(active_zip.exists(), "active final ZIP should be kept");
+        assert!(active_part.exists(), "active partial ZIP should be kept");
+        assert!(unrelated.exists(), "unrelated files should be ignored");
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_eh_cache_orphans_keeps_pending_resume_partial() {
+        let repo = tests_helpers::setup_test_db().await.unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let cache_dir = temp.path();
+
+        let model = repo
+            .enqueue_eh_download(-100, 88, "tok", "Title", false, SOURCE_DIRECT)
+            .await
+            .unwrap();
+        let claimed = repo.get_next_for_download().await.unwrap().unwrap();
+        assert_eq!(claimed.id, model.id);
+
+        let part = cache_dir.join("88_tok.zip.part");
+        std::fs::write(&part, b"partial").unwrap();
+
+        let reset = repo.reset_stale_eh_downloads().await.unwrap();
+        assert_eq!(reset, 1);
+        repo.cleanup_eh_cache_orphans(cache_dir).await.unwrap();
+
+        assert!(
+            part.exists(),
+            "pending retry partial should be kept for resumable download"
+        );
+
+        Entity::update_many()
+            .col_expr(Column::Status, Expr::value(STATUS_CANCELED))
+            .filter(Column::Id.eq(model.id))
+            .exec(&repo.db)
+            .await
+            .unwrap();
+
+        repo.cleanup_eh_cache_orphans(cache_dir).await.unwrap();
+        assert!(
+            !part.exists(),
+            "canceled queue partial should be removed as orphan"
+        );
     }
 
     #[tokio::test]

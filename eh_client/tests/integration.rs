@@ -279,10 +279,10 @@ async fn test_download_archive_full_flow() {
         .await;
 
     // Step 2: the download URL returns ZIP bytes
-    let zip_bytes = b"PK\x03\x04fake_zip_content";
+    let zip_bytes = test_zip_bytes("image.jpg", b"fake_zip_content");
     Mock::given(method("GET"))
         .and(path("/archive/123456/abcdef0123/abcdef0123/0"))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(zip_bytes.to_vec()))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(zip_bytes.clone()))
         .mount(&server)
         .await;
 
@@ -337,8 +337,10 @@ async fn test_download_archive_resumes_existing_partial_file() {
         .mount(&server)
         .await;
 
-    let first = b"PK\x03\x04partial_";
-    let rest = b"zip_content";
+    let zip_bytes = test_zip_bytes("image.jpg", b"zip_content");
+    let split_at = 12;
+    let first = &zip_bytes[..split_at];
+    let rest = &zip_bytes[split_at..];
     Mock::given(method("GET"))
         .and(path("/archive/123456/abcdef0123/abcdef0123/0"))
         .and(header("range", format!("bytes={}-", first.len())))
@@ -372,10 +374,8 @@ async fn test_download_archive_resumes_existing_partial_file() {
         .await
         .expect("download should resume and succeed");
 
-    assert_eq!(bytes as usize, first.len() + rest.len());
-    let mut expected = first.to_vec();
-    expected.extend_from_slice(rest);
-    assert_eq!(std::fs::read(dest).unwrap(), expected);
+    assert_eq!(bytes as usize, zip_bytes.len());
+    assert_eq!(std::fs::read(dest).unwrap(), zip_bytes);
 }
 
 #[tokio::test]
@@ -598,7 +598,7 @@ async fn test_prepare_and_download_archive_form_flow() {
         r#"<script>document.location = "{}/archive/4034806/fedcba9876/archive/0?autostart=1";</script>"#,
         server.uri()
     );
-    let zip_bytes = b"PK\x03\x04live_form_zip";
+    let zip_bytes = test_zip_bytes("image.jpg", b"live_form_zip");
 
     Mock::given(method("GET"))
         .and(path("/g/4034806/e13b7d119b/"))
@@ -626,7 +626,7 @@ async fn test_prepare_and_download_archive_form_flow() {
         .await;
     Mock::given(method("GET"))
         .and(path("/archive/4034806/fedcba9876/archive/0"))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(zip_bytes.to_vec()))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(zip_bytes.clone()))
         .expect(1)
         .mount(&server)
         .await;
@@ -713,6 +713,42 @@ async fn test_download_archive_invalid_zip_response_cleans_up() {
     assert!(
         !dest.with_extension("zip.part").exists(),
         "temp zip should not exist after invalid ZIP"
+    );
+}
+
+#[tokio::test]
+async fn test_download_archive_rejects_corrupt_pk_prefixed_zip() {
+    let server = MockServer::start().await;
+    let redirect_html = format!(
+        r#"<script>document.location = "{}/archive/123456/abcdef0123/abcdef0123/0?autostart=1";</script>"#,
+        server.uri()
+    );
+
+    Mock::given(method("POST"))
+        .and(path("/archiver.php"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(redirect_html))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/archive/123456/abcdef0123/abcdef0123/0"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_bytes(b"PK\x03\x04not_a_complete_zip".to_vec()),
+        )
+        .mount(&server)
+        .await;
+
+    let client = client_at(&server);
+    let temp_dir = tempfile::tempdir().unwrap();
+    let dest = temp_dir.path().join("archive.zip");
+    let result = client
+        .download_archive(123456, "abcdef0123", "123456--abc123def456", "780x", &dest)
+        .await;
+
+    assert!(result.is_err());
+    assert!(!dest.exists(), "dest should not exist after corrupt ZIP");
+    assert!(
+        !dest.with_extension("zip.part").exists(),
+        "temp zip should be removed after corrupt ZIP"
     );
 }
 
