@@ -180,9 +180,9 @@ impl BotHandler {
 
 fn booru_post_image_urls(post: &booru_client::BooruPost) -> Vec<&str> {
     [
-        post.sample_url.as_deref(),
-        post.jpeg_url.as_deref(),
         post.file_url.as_deref(),
+        post.jpeg_url.as_deref(),
+        post.sample_url.as_deref(),
         post.preview_url.as_deref(),
     ]
     .into_iter()
@@ -245,11 +245,11 @@ mod tests {
     }
 
     #[test]
-    fn booru_download_url_priority_prefers_sample_jpeg_file_preview() {
+    fn booru_download_url_priority_prefers_file_jpeg_sample_preview() {
         let post = make_post();
         assert_eq!(
             booru_post_image_urls(&post),
-            ["sample", "jpeg", "file", "preview"]
+            ["file", "jpeg", "sample", "preview"]
         );
     }
 
