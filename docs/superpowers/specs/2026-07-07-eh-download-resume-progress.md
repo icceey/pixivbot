@@ -53,24 +53,25 @@ fn made_progress(new_bytes: u64, elapsed_secs: f64) -> bool {
 - `>` 严格大于，恰好 10KB/s 不算进展
 - `elapsed_secs == 0.0` 返回 `false`（防除零）
 
-`download_archive_response_resumable` 改造：
+`download_archive_response_resumable` 改造（相对原代码的差异：新增 `before_len`/`start` 计时、`had_progress` 跟踪、attempt 间 1s sleep 避免 burst、最终错误包装）：
 
 ```rust
 pub async fn download_archive_response_resumable(
+    &self,
     download_url: &str,
     temp_path: &Path,
-) -> Result<(), Error> {
+) -> Result<()> {
     let mut had_progress = false;
     let mut last_error: Option<Error> = None;
 
-    for _ in 1..=ARCHIVE_DOWNLOAD_MAX_ATTEMPTS {
+    for attempt in 1..=ARCHIVE_DOWNLOAD_MAX_ATTEMPTS {
         let before_len = tokio::fs::metadata(temp_path)
             .await
             .map(|m| m.len())
             .unwrap_or(0);
         let start = Instant::now();
 
-        match download_archive_response_once(download_url, temp_path).await {
+        match self.download_archive_response_once(download_url, temp_path).await {
             Ok(()) => return Ok(()),
             Err(e) => {
                 let elapsed = start.elapsed().as_secs_f64();
@@ -82,6 +83,10 @@ pub async fn download_archive_response_resumable(
                 if made_progress(new_bytes, elapsed) {
                     had_progress = true;
                 }
+                tracing::warn!(
+                    "archive download attempt {}/{} failed; made_progress={}: {}",
+                    attempt, ARCHIVE_DOWNLOAD_MAX_ATTEMPTS, had_progress, e
+                );
                 last_error = Some(e);
                 sleep(Duration::from_secs(1)).await;
             }
@@ -91,18 +96,24 @@ pub async fn download_archive_response_resumable(
     match last_error {
         Some(e) if had_progress => Err(Error::DownloadInProgress { inner: Box::new(e) }),
         Some(e) => Err(e),
-        None => Err(Error::Other("no attempts made".to_string())),
+        None => Err(Error::Other("archive download failed".into())),
     }
 }
 ```
+
+- `sleep(Duration::from_secs(1))` 是新增：避免 4 次 attempt 全部立即失败时形成请求 burst；1s 足够短，不影响断点续传的快速重试
+- 方法签名是 `&self` 方法（与原代码一致），spec 第 1 节伪代码漏了 `&self`，以此处为准
 
 ### 3. Scheduler 检测与 defer 路径
 
 `EhDownloadWorker::tick()` 中 `process()` 失败时：
 
 ```rust
+// process() 用 .context() 包装 anyhow，downcast_ref 只检查最外层会 miss；
+// 必须用 chain().find_map() 遍历错误链
 let is_in_progress = e
-    .downcast_ref::<eh_client::Error>()
+    .chain()
+    .find_map(|c| c.downcast_ref::<eh_client::Error>())
     .map(|client_err| matches!(client_err, eh_client::Error::DownloadInProgress { .. }))
     .unwrap_or(false);
 
@@ -153,4 +164,4 @@ if is_in_progress {
 - **风险**：网络持续慢速（如 9KB/s）会无限 defer 不累计 retry_count。
   **缓解**：这是预期行为——慢速有进展即应续传；若需限制可后续引入超时上限，但当前 YAGNI。
 - **风险**：`DownloadInProgress` 错误经 anyhow 传播后 downcast 失败。
-  **缓解**：`process()` 用 `.context()` 包装 anyhow，但底层 `eh_client::Error` 仍在错误链中，downcast_ref 应能命中。
+  **缓解**：`process()` 用 `.context()` 包装 anyhow，`downcast_ref` 只检查最外层会 miss。**必须用 `e.chain().find_map(|c| c.downcast_ref::<eh_client::Error>())` 遍历错误链**。已在第 3 节代码示例中体现。
