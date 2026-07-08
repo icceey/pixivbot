@@ -265,6 +265,19 @@ async fn main() -> Result<()> {
         if let Err(e) = repo.reset_stale_eh_downloads().await {
             tracing::warn!("Failed to reset stale EH entries: {:#}", e);
         }
+        if config.ehentai.background_download_enabled {
+            if let Err(e) = repo
+                .reset_stale_background_downloads(config.ehentai.background_download_stale_sec)
+                .await
+            {
+                tracing::warn!("Failed to reset stale EH background downloads: {:#}", e);
+            }
+        } else if let Err(e) = repo.release_background_downloads_to_main_queue().await {
+            tracing::warn!(
+                "Failed to release EH background downloads to main queue: {:#}",
+                e
+            );
+        }
         match repo.cancel_legacy_eh_subscription_queue_entries().await {
             Ok(count) if count > 0 => warn!(
                 "Canceled {} legacy EH subscription queue entries without owner tracking",
@@ -318,6 +331,24 @@ async fn main() -> Result<()> {
         );
         info!("✅ E-Hentai download worker initialized");
         Some(tokio::spawn(async move { worker.run().await }))
+    } else {
+        None
+    };
+
+    let eh_background_download_worker_handle = if let Some(ref eh_client) = eh_client {
+        if config.ehentai.background_download_enabled {
+            let worker = scheduler::EhBackgroundDownloadWorker::new(
+                repo.clone(),
+                std::sync::Arc::clone(eh_client),
+                std::sync::Arc::new(config.ehentai.clone()),
+                eh_cache_dir.clone(),
+            );
+            info!("✅ E-Hentai background download worker initialized");
+            Some(tokio::spawn(async move { worker.run().await }))
+        } else {
+            info!("E-Hentai background download worker disabled");
+            None
+        }
     } else {
         None
     };
@@ -414,6 +445,9 @@ async fn main() -> Result<()> {
         handle.abort();
     }
     if let Some(handle) = eh_download_worker_handle {
+        handle.abort();
+    }
+    if let Some(handle) = eh_background_download_worker_handle {
         handle.abort();
     }
     if let Some(handle) = eh_upload_worker_handle {

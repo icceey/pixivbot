@@ -477,10 +477,17 @@ impl EhClient {
         download_url: &str,
         temp_path: &Path,
     ) -> Result<()> {
+        let initial_len = tokio::fs::metadata(temp_path)
+            .await
+            .map(|m| m.len())
+            .unwrap_or(0);
+        let total_start = Instant::now();
+        let mut attempts = 0usize;
         let mut had_progress = false;
         let mut last_error: Option<Error> = None;
 
         for attempt in 1..=ARCHIVE_DOWNLOAD_MAX_ATTEMPTS {
+            attempts = attempt;
             let before_len = tokio::fs::metadata(temp_path)
                 .await
                 .map(|m| m.len())
@@ -522,7 +529,18 @@ impl EhClient {
         }
 
         match last_error {
-            Some(e) if had_progress => Err(Error::DownloadInProgress { inner: Box::new(e) }),
+            Some(e) if had_progress => {
+                let final_len = tokio::fs::metadata(temp_path)
+                    .await
+                    .map(|m| m.len())
+                    .unwrap_or(initial_len);
+                Err(Error::DownloadInProgress {
+                    inner: Box::new(e),
+                    attempts,
+                    bytes_delta: final_len.saturating_sub(initial_len),
+                    elapsed: total_start.elapsed(),
+                })
+            }
             Some(e) => Err(e),
             None => Err(Error::Other("archive download failed".into())),
         }

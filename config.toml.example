@@ -114,6 +114,8 @@ download_original_threshold = 1
 # gateway_url = "https://ipfs.io/ipfs"
 # key_prefix = "eh"
 # path_style = true
+# # Send non-blocking HEAD requests to gateway_url after upload to warm IPFS gateway cache.
+# warm_public_gateway_after_upload = false
 #
 # [image_upload.catbox]
 # # Catbox uploads are public; userhash is optional. Anonymous uploads cannot be
@@ -156,6 +158,11 @@ download_original_threshold = 1
 # # telegraph_access_token = "your_telegraph_token"
 # # Max galleries to push per tick (default: 3)
 # max_push_per_tick = 3
+# # Run repeated slow archive downloads in background so the main queue can continue.
+# background_download_enabled = true
+# background_download_concurrency = 2
+# background_download_max_attempts = 6
+# background_download_stale_sec = 3600
 # # Max retry count for failed pushes (default: 3)
 # max_retry_count = 3
 # # 48h scan window for rating-filtered subscriptions (default: 48)

@@ -11,7 +11,9 @@ use chrono::Local;
 use eh_client::{EhClient, EhGallery, ImageUploadInput, ImageUploader, TelegraphClient};
 use rand::RngExt;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc;
+use tokio::task::JoinSet;
 use tracing::{error, info, warn};
 
 use crate::db::repo::eh_download_queue::{
@@ -27,7 +29,161 @@ const MAX_METADATA_BATCH: usize = 25;
 /// Search rate limit: minimum delay between search requests (3s + buffer).
 const SEARCH_RATE_LIMIT_MS: u64 = 3500;
 const EH_UPLOAD_IMAGE_CHANNEL_CAPACITY: usize = 1;
+const SLOW_DOWNLOAD_BYTES_PER_SEC: u64 = 1024 * 1024;
 
+fn should_schedule_background_download(failures: i32, bytes_delta: u64, elapsed: Duration) -> bool {
+    failures > 3
+        && elapsed.as_secs() > 0
+        && bytes_delta / elapsed.as_secs() < SLOW_DOWNLOAD_BYTES_PER_SEC
+}
+
+pub struct EhBackgroundDownloadWorker {
+    repo: Arc<Repo>,
+    client: Arc<EhClient>,
+    config: Arc<EhentaiConfig>,
+    cache_dir: std::path::PathBuf,
+}
+
+impl EhBackgroundDownloadWorker {
+    pub fn new(
+        repo: Arc<Repo>,
+        client: Arc<EhClient>,
+        config: Arc<EhentaiConfig>,
+        cache_dir: std::path::PathBuf,
+    ) -> Self {
+        Self {
+            repo,
+            client,
+            config,
+            cache_dir,
+        }
+    }
+
+    pub async fn run(self) {
+        let poll = self.config.download_poll_interval_sec.max(10);
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(poll));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        loop {
+            interval.tick().await;
+            if let Err(e) = self.tick().await {
+                error!("EhBackgroundDownloadWorker tick error: {:#}", e);
+            }
+        }
+    }
+
+    async fn tick(&self) -> Result<()> {
+        let concurrency = self.config.background_download_concurrency.max(1);
+        let mut tasks = JoinSet::new();
+        for _ in 0..concurrency {
+            let Some(entry) = self.repo.get_next_for_background_download().await? else {
+                break;
+            };
+            let worker = Self::new(
+                Arc::clone(&self.repo),
+                Arc::clone(&self.client),
+                Arc::clone(&self.config),
+                self.cache_dir.clone(),
+            );
+            tasks.spawn(async move { worker.process_claimed(entry).await });
+        }
+
+        drain_background_download_tasks(&mut tasks).await
+    }
+
+    async fn process_claimed(&self, entry: eh_download_queue::Model) -> Result<()> {
+        match self.download_claimed(&entry).await {
+            Ok((file_size, zip_path)) => {
+                self.repo
+                    .mark_eh_background_download_downloaded(
+                        entry.id,
+                        file_size as i64,
+                        &zip_path.to_string_lossy(),
+                    )
+                    .await?;
+            }
+            Err(e) => {
+                let (_, permanent) = self
+                    .repo
+                    .schedule_eh_background_download_retry(
+                        entry.id,
+                        &e.to_string(),
+                        self.config.background_download_max_attempts,
+                    )
+                    .await?;
+                if permanent {
+                    warn!(
+                        "Permanent background EH download failure for gid={}: {}",
+                        entry.gid, e
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn download_claimed(
+        &self,
+        entry: &eh_download_queue::Model,
+    ) -> Result<(u64, std::path::PathBuf)> {
+        let gid = entry.gid as u64;
+        let token = &entry.token;
+        let eh_cache = self.cache_dir.join("eh_cache");
+        tokio::fs::create_dir_all(&eh_cache).await?;
+        let zip_path = eh_cache.join(format!("{}_{}.zip", gid, token));
+
+        let file_size = if self.client.is_logged_in() {
+            let resolution = if entry.source == "direct" {
+                &self.config.download_resolution
+            } else {
+                &self.config.subscription_resolution
+            };
+            let archive_request = self
+                .client
+                .prepare_archive_download(gid, token, resolution)
+                .await
+                .context("Failed to prepare archive download")?;
+            self.client
+                .download_archive_with_request(&archive_request, &zip_path)
+                .await
+                .context("Failed to download archive")?
+        } else {
+            self.client
+                .download_gallery_images(gid, token, &zip_path)
+                .await
+                .context("Failed to download gallery images")?
+        };
+        Ok((file_size, zip_path))
+    }
+}
+
+async fn drain_background_download_tasks(tasks: &mut JoinSet<Result<()>>) -> Result<()> {
+    let mut first_error = None;
+    while let Some(result) = tasks.join_next().await {
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                error!("EH background download task failed: {:#}", e);
+                if first_error.is_none() {
+                    first_error = Some(e);
+                }
+            }
+            Err(e) => {
+                let err = anyhow::Error::new(e).context("background download task failed");
+                error!("EH background download task join failed: {:#}", err);
+                if first_error.is_none() {
+                    first_error = Some(err);
+                }
+            }
+        }
+    }
+
+    if let Some(err) = first_error {
+        Err(err.context("one or more EH background download tasks failed"))
+    } else {
+        Ok(())
+    }
+}
 // ============================================================================
 // Stage 1: EhEngine — Collect (search → metadata → filter → enqueue downloads)
 // ============================================================================
@@ -611,22 +767,46 @@ impl EhDownloadWorker {
 
             // process() wraps errors with .context(); downcast_ref only checks the
             // outermost layer. Must traverse the error chain to find eh_client::Error.
-            let is_in_progress = e
+            let download_progress = e
                 .chain()
                 .find_map(|c| c.downcast_ref::<eh_client::Error>())
-                .map(|client_err| matches!(client_err, eh_client::Error::DownloadInProgress { .. }))
-                .unwrap_or(false);
+                .and_then(|client_err| match client_err {
+                    eh_client::Error::DownloadInProgress {
+                        attempts,
+                        bytes_delta,
+                        elapsed,
+                        ..
+                    } => Some((*attempts, *bytes_delta, *elapsed)),
+                    _ => None,
+                });
 
-            if is_in_progress {
+            if let Some((attempts, bytes_delta, elapsed)) = download_progress {
                 // Transfer made real progress (>10KB/s): don't increment retry_count,
                 // preserve .part file for resumption on the next tick.
-                self.repo
-                    .defer_eh_download(
-                        entry.id,
-                        STATUS_PENDING,
-                        self.config.download_poll_interval_sec as i64,
-                    )
-                    .await?;
+                let failures = attempts as i32;
+                if self.config.background_download_enabled
+                    && should_schedule_background_download(failures, bytes_delta, elapsed)
+                {
+                    info!(
+                        "Scheduling EH gid={} for background download after {} failed attempts, {} bytes in {:?} over {} archive attempts",
+                        entry.gid, failures, bytes_delta, elapsed, attempts
+                    );
+                    self.repo
+                        .schedule_eh_background_download_from(
+                            entry.id,
+                            &entry.status,
+                            &e.to_string(),
+                        )
+                        .await?;
+                } else {
+                    self.repo
+                        .defer_eh_download(
+                            entry.id,
+                            STATUS_PENDING,
+                            self.config.download_poll_interval_sec as i64,
+                        )
+                        .await?;
+                }
             } else {
                 let (_, permanent) = self
                     .repo
@@ -1305,6 +1485,57 @@ mod tests {
         assert_eq!(Repo::backoff_delay_secs(3), 900);
         assert_eq!(Repo::backoff_delay_secs(4), 3600);
         assert_eq!(Repo::backoff_delay_secs(99), 3600);
+    }
+
+    #[test]
+    fn test_should_schedule_background_download_after_slow_repeated_resume_attempts() {
+        assert!(should_schedule_background_download(
+            4,
+            2 * 1024 * 1024,
+            Duration::from_secs(5)
+        ));
+        assert!(!should_schedule_background_download(
+            3,
+            2 * 1024 * 1024,
+            Duration::from_secs(5)
+        ));
+        assert!(!should_schedule_background_download(
+            4,
+            10 * 1024 * 1024,
+            Duration::from_secs(5)
+        ));
+        assert!(!should_schedule_background_download(
+            4,
+            1,
+            Duration::from_secs(0)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_drain_background_download_tasks_waits_for_siblings_after_error() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let sibling_completed = Arc::new(AtomicBool::new(false));
+        let mut tasks = JoinSet::new();
+        tasks.spawn(async { anyhow::bail!("first task failed") });
+        let sibling_completed_for_task = Arc::clone(&sibling_completed);
+        tasks.spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            sibling_completed_for_task.store(true, Ordering::SeqCst);
+            Ok(())
+        });
+
+        let err = drain_background_download_tasks(&mut tasks)
+            .await
+            .expect_err("drain should return the first task error after all tasks finish");
+
+        assert!(err
+            .to_string()
+            .contains("one or more EH background download tasks failed"));
+        assert!(
+            sibling_completed.load(Ordering::SeqCst),
+            "drain must not abort sibling tasks after the first error"
+        );
     }
 }
 
@@ -2244,6 +2475,9 @@ mod integration_tests {
         let inner = eh_client::Error::Other("simulated failure".into());
         let client_err = eh_client::Error::DownloadInProgress {
             inner: Box::new(inner),
+            attempts: 4,
+            bytes_delta: 12_345,
+            elapsed: Duration::from_secs(10),
         };
         // Context trait is implemented on Result<T, E>, not bare E.
         // Wrap in Err to match how process() propagates the error.
@@ -2293,10 +2527,12 @@ mod integration_tests {
         let zip_bytes = std::fs::read(&zip_path).unwrap();
         mock_eh_archive_download(&eh_server, "/archive/123456/token/0", zip_bytes).await;
 
+        let mut config = make_config();
+        config.background_download_enabled = false;
         let worker = EhDownloadWorker::new(
             Arc::clone(&repo),
             make_eh_client(&eh_server),
-            Arc::new(make_config()),
+            Arc::new(config),
             temp.path().to_path_buf(),
         );
 
@@ -2357,10 +2593,12 @@ mod integration_tests {
         )
         .await;
 
+        let mut config = make_config();
+        config.background_download_enabled = false;
         let worker = EhDownloadWorker::new(
             Arc::clone(&repo),
             make_eh_client(&eh_server),
-            Arc::new(make_config()),
+            Arc::new(config),
             temp.path().to_path_buf(),
         );
         worker.tick().await.unwrap();
@@ -2396,10 +2634,12 @@ mod integration_tests {
         )
         .await;
 
+        let mut config = make_config();
+        config.background_download_enabled = false;
         let worker = EhDownloadWorker::new(
             Arc::clone(&repo),
             make_eh_client(&eh_server),
-            Arc::new(make_config()),
+            Arc::new(config),
             temp.path().to_path_buf(),
         );
         worker.tick().await.unwrap();
@@ -2452,10 +2692,12 @@ mod integration_tests {
             .mount(&eh_server)
             .await;
 
+        let mut config = make_config();
+        config.background_download_enabled = false;
         let worker = EhDownloadWorker::new(
             Arc::clone(&repo),
             make_eh_client(&eh_server),
-            Arc::new(make_config()),
+            Arc::new(config),
             temp.path().to_path_buf(),
         );
         worker.tick().await.unwrap();
@@ -2588,10 +2830,12 @@ mod integration_tests {
             .mount(&eh_server)
             .await;
 
+        let mut config = make_config();
+        config.background_download_enabled = false;
         let worker = EhDownloadWorker::new(
             Arc::clone(&repo),
             make_eh_client(&eh_server),
-            Arc::new(make_config()),
+            Arc::new(config),
             temp.path().to_path_buf(),
         );
         worker.tick().await.unwrap();
@@ -2625,6 +2869,69 @@ mod integration_tests {
             ".part should contain 20001 bytes (1 pre-seeded + 20000 written on first attempt), got {}",
             part_size
         );
+    }
+
+    #[tokio::test]
+    async fn test_download_worker_schedules_slow_progress_for_background_download() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        let eh_server = MockServer::start().await;
+        let temp = tempfile::tempdir().unwrap();
+
+        setup_chat(&repo, -100, true).await;
+        let entry = insert_queue_entry(
+            &repo,
+            -100,
+            123456,
+            "abcdef0123",
+            "Test",
+            false,
+            "pending",
+            None,
+            None,
+        )
+        .await;
+
+        mock_eh_gallery_page(&eh_server, 123456, "abcdef0123").await;
+        let download_url = format!("{}/archive/123456/token/0", eh_server.uri());
+        mock_eh_archiver_post(&eh_server, &download_url).await;
+
+        let eh_cache = temp.path().join("eh_cache");
+        tokio::fs::create_dir_all(&eh_cache).await.unwrap();
+        let part_path = eh_cache.join("123456_abcdef0123.zip.part");
+        tokio::fs::write(&part_path, b"x").await.unwrap();
+
+        Mock::given(method("GET"))
+            .and(path("/archive/123456/token/0"))
+            .respond_with(
+                ResponseTemplate::new(206)
+                    .insert_header("Content-Range", "bytes 1-99999/100000")
+                    .set_body_bytes(vec![0u8; 20000]),
+            )
+            .expect(4)
+            .mount(&eh_server)
+            .await;
+
+        let worker = EhDownloadWorker::new(
+            Arc::clone(&repo),
+            make_eh_client(&eh_server),
+            Arc::new(make_config()),
+            temp.path().to_path_buf(),
+        );
+        worker.tick().await.unwrap();
+
+        let updated = eh_download_queue::Entity::find_by_id(entry.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.status, STATUS_PENDING);
+        assert_eq!(updated.retry_count, 0);
+        assert_eq!(
+            updated.background_download_status.as_deref(),
+            Some(crate::db::repo::eh_download_queue::BACKGROUND_STATUS_PENDING)
+        );
+        assert!(updated.background_download_next_retry_at.is_some());
+        assert!(part_path.exists());
     }
 
     // === Upload Worker Tests ===

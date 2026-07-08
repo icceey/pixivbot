@@ -20,6 +20,9 @@ pub enum Error {
     /// Preserve `.part` file for resumption instead of incrementing retry_count.
     DownloadInProgress {
         inner: Box<Error>,
+        attempts: usize,
+        bytes_delta: u64,
+        elapsed: std::time::Duration,
     },
 }
 
@@ -36,7 +39,7 @@ impl fmt::Display for Error {
                 write!(f, "Rate limited (429), retry after {:?}", retry_after_secs)
             }
             Error::Other(msg) => write!(f, "{}", msg),
-            Error::DownloadInProgress { inner } => {
+            Error::DownloadInProgress { inner, .. } => {
                 write!(f, "download failed but made progress: {}", inner)
             }
         }
@@ -49,7 +52,7 @@ impl std::error::Error for Error {
             Error::Http(e) => Some(e),
             Error::Json(e) => Some(e),
             Error::Io(e) => Some(e),
-            Error::DownloadInProgress { inner } => Some(inner.as_ref()),
+            Error::DownloadInProgress { inner, .. } => Some(inner.as_ref()),
             _ => None,
         }
     }
