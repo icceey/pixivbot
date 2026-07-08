@@ -44,6 +44,8 @@ pub const STATUS_UPLOADING: &str = "uploading";
 pub const STATUS_UPLOADED: &str = "uploaded";
 pub const STATUS_PUBLISHING: &str = "publishing";
 pub const STATUS_CANCELED: &str = "canceled";
+pub const BACKGROUND_STATUS_PENDING: &str = "pending";
+pub const BACKGROUND_STATUS_RUNNING: &str = "running";
 
 /// Source constants for eh_download_queue.
 pub const SOURCE_SUBSCRIPTION: &str = "subscription";
@@ -390,6 +392,26 @@ impl Repo {
                     .col_expr(
                         eh_download_queue::Column::TelegraphSentAt,
                         Expr::value(None::<DateTime>),
+                    )
+                    .col_expr(
+                        eh_download_queue::Column::BackgroundDownloadStatus,
+                        Expr::value(None::<String>),
+                    )
+                    .col_expr(
+                        eh_download_queue::Column::BackgroundDownloadStartedAt,
+                        Expr::value(None::<DateTime>),
+                    )
+                    .col_expr(
+                        eh_download_queue::Column::BackgroundDownloadNextRetryAt,
+                        Expr::value(None::<DateTime>),
+                    )
+                    .col_expr(
+                        eh_download_queue::Column::BackgroundDownloadAttemptCount,
+                        Expr::value(0),
+                    )
+                    .col_expr(
+                        eh_download_queue::Column::BackgroundDownloadError,
+                        Expr::value(None::<String>),
                     )
                     .filter(eh_download_queue::Column::Id.eq(id))
                     .filter(eh_download_queue::Column::Status.eq(&expected_status))
@@ -818,6 +840,46 @@ impl Repo {
                         row.next_retry_at
                     } else {
                         None::<DateTime>
+                    }),
+                )
+                .col_expr(
+                    eh_download_queue::Column::BackgroundDownloadStatus,
+                    Expr::value(if canceled {
+                        None::<String>
+                    } else {
+                        row.background_download_status.clone()
+                    }),
+                )
+                .col_expr(
+                    eh_download_queue::Column::BackgroundDownloadStartedAt,
+                    Expr::value(if canceled {
+                        None::<DateTime>
+                    } else {
+                        row.background_download_started_at
+                    }),
+                )
+                .col_expr(
+                    eh_download_queue::Column::BackgroundDownloadNextRetryAt,
+                    Expr::value(if canceled {
+                        None::<DateTime>
+                    } else {
+                        row.background_download_next_retry_at
+                    }),
+                )
+                .col_expr(
+                    eh_download_queue::Column::BackgroundDownloadAttemptCount,
+                    Expr::value(if canceled {
+                        0
+                    } else {
+                        row.background_download_attempt_count
+                    }),
+                )
+                .col_expr(
+                    eh_download_queue::Column::BackgroundDownloadError,
+                    Expr::value(if canceled {
+                        None::<String>
+                    } else {
+                        row.background_download_error.clone()
                     }),
                 )
                 .filter(eh_download_queue::Column::Id.eq(row.id))
@@ -1337,6 +1399,7 @@ impl Repo {
         let now = Local::now().naive_local();
         let entry = eh_download_queue::Entity::find()
             .filter(eh_download_queue::Column::Status.eq(STATUS_PENDING))
+            .filter(eh_download_queue::Column::BackgroundDownloadStatus.is_null())
             .filter(
                 eh_download_queue::Column::NextRetryAt
                     .is_null()
@@ -1365,6 +1428,7 @@ impl Repo {
             )
             .filter(eh_download_queue::Column::Id.eq(model.id))
             .filter(eh_download_queue::Column::Status.eq(STATUS_PENDING))
+            .filter(eh_download_queue::Column::BackgroundDownloadStatus.is_null())
             .filter(
                 sea_orm::Condition::any()
                     .add(eh_download_queue::Column::NextRetryAt.is_null())
@@ -1764,6 +1828,391 @@ impl Repo {
             .await?
             .context("Entry disappeared after retry")?;
         Ok((model, false))
+    }
+
+    pub async fn schedule_eh_background_download_from(
+        &self,
+        id: i32,
+        expected_status: &str,
+        error: &str,
+    ) -> Result<eh_download_queue::Model> {
+        let now = Local::now().naive_local();
+        let result = eh_download_queue::Entity::update_many()
+            .col_expr(
+                eh_download_queue::Column::Status,
+                Expr::value(STATUS_PENDING),
+            )
+            .col_expr(
+                eh_download_queue::Column::StartedAt,
+                Expr::value(None::<DateTime>),
+            )
+            .col_expr(
+                eh_download_queue::Column::NextRetryAt,
+                Expr::value(None::<DateTime>),
+            )
+            .col_expr(
+                eh_download_queue::Column::Error,
+                Expr::value(Some(error.to_string())),
+            )
+            .col_expr(
+                eh_download_queue::Column::BackgroundDownloadStatus,
+                Expr::value(Some(BACKGROUND_STATUS_PENDING.to_string())),
+            )
+            .col_expr(
+                eh_download_queue::Column::BackgroundDownloadStartedAt,
+                Expr::value(None::<DateTime>),
+            )
+            .col_expr(
+                eh_download_queue::Column::BackgroundDownloadNextRetryAt,
+                Expr::value(Some(now)),
+            )
+            .col_expr(
+                eh_download_queue::Column::BackgroundDownloadAttemptCount,
+                Expr::value(0),
+            )
+            .col_expr(
+                eh_download_queue::Column::BackgroundDownloadError,
+                Expr::value(None::<String>),
+            )
+            .filter(eh_download_queue::Column::Id.eq(id))
+            .filter(eh_download_queue::Column::Status.eq(expected_status))
+            .exec(&self.db)
+            .await
+            .context("Failed to schedule EH background download")?;
+
+        if result.rows_affected != 1 {
+            anyhow::bail!(
+                "Cannot schedule EH background download {}: expected status '{}', but it was changed",
+                id,
+                expected_status
+            );
+        }
+
+        let model = eh_download_queue::Entity::find_by_id(id)
+            .one(&self.db)
+            .await?
+            .context("Entry disappeared after background handoff")?;
+        Ok(model)
+    }
+
+    pub async fn reset_stale_background_downloads(&self, stale_sec: u64) -> Result<u64> {
+        let cutoff = Local::now().naive_local() - chrono::Duration::seconds(stale_sec as i64);
+        let result = eh_download_queue::Entity::update_many()
+            .col_expr(
+                eh_download_queue::Column::BackgroundDownloadStatus,
+                Expr::value(Some(BACKGROUND_STATUS_PENDING.to_string())),
+            )
+            .col_expr(
+                eh_download_queue::Column::BackgroundDownloadStartedAt,
+                Expr::value(None::<DateTime>),
+            )
+            .filter(eh_download_queue::Column::Status.eq(STATUS_PENDING))
+            .filter(
+                eh_download_queue::Column::BackgroundDownloadStatus.eq(BACKGROUND_STATUS_RUNNING),
+            )
+            .filter(
+                eh_download_queue::Column::BackgroundDownloadStartedAt
+                    .is_null()
+                    .or(eh_download_queue::Column::BackgroundDownloadStartedAt.lte(cutoff)),
+            )
+            .exec(&self.db)
+            .await
+            .context("Failed to reset stale EH background downloads")?;
+        Ok(result.rows_affected)
+    }
+
+    pub async fn release_background_downloads_to_main_queue(&self) -> Result<u64> {
+        let result = eh_download_queue::Entity::update_many()
+            .col_expr(
+                eh_download_queue::Column::BackgroundDownloadStatus,
+                Expr::value(None::<String>),
+            )
+            .col_expr(
+                eh_download_queue::Column::BackgroundDownloadStartedAt,
+                Expr::value(None::<DateTime>),
+            )
+            .col_expr(
+                eh_download_queue::Column::BackgroundDownloadNextRetryAt,
+                Expr::value(None::<DateTime>),
+            )
+            .col_expr(
+                eh_download_queue::Column::BackgroundDownloadAttemptCount,
+                Expr::value(0),
+            )
+            .col_expr(
+                eh_download_queue::Column::BackgroundDownloadError,
+                Expr::value(None::<String>),
+            )
+            .filter(eh_download_queue::Column::Status.eq(STATUS_PENDING))
+            .filter(eh_download_queue::Column::BackgroundDownloadStatus.is_not_null())
+            .exec(&self.db)
+            .await
+            .context("Failed to release EH background downloads to main queue")?;
+        Ok(result.rows_affected)
+    }
+
+    async fn clear_background_download_if_inactive(&self, id: i32) -> Result<()> {
+        let Some(row) = eh_download_queue::Entity::find_by_id(id)
+            .one(&self.db)
+            .await?
+        else {
+            return Ok(());
+        };
+        if row.background_download_status.is_none()
+            || matches!(row.status.as_str(), STATUS_PENDING | STATUS_DOWNLOADING)
+        {
+            return Ok(());
+        }
+        eh_download_queue::Entity::update_many()
+            .col_expr(
+                eh_download_queue::Column::BackgroundDownloadStatus,
+                Expr::value(None::<String>),
+            )
+            .col_expr(
+                eh_download_queue::Column::BackgroundDownloadStartedAt,
+                Expr::value(None::<DateTime>),
+            )
+            .col_expr(
+                eh_download_queue::Column::BackgroundDownloadNextRetryAt,
+                Expr::value(None::<DateTime>),
+            )
+            .col_expr(
+                eh_download_queue::Column::BackgroundDownloadAttemptCount,
+                Expr::value(0),
+            )
+            .col_expr(
+                eh_download_queue::Column::BackgroundDownloadError,
+                Expr::value(None::<String>),
+            )
+            .filter(eh_download_queue::Column::Id.eq(id))
+            .filter(eh_download_queue::Column::Status.eq(row.status))
+            .filter(eh_download_queue::Column::BackgroundDownloadStatus.is_not_null())
+            .exec(&self.db)
+            .await
+            .context("Failed to clear stale EH background download state")?;
+        Ok(())
+    }
+
+    pub async fn get_next_for_background_download(
+        &self,
+    ) -> Result<Option<eh_download_queue::Model>> {
+        let now = Local::now().naive_local();
+        let entry = eh_download_queue::Entity::find()
+            .filter(eh_download_queue::Column::Status.eq(STATUS_PENDING))
+            .filter(
+                eh_download_queue::Column::BackgroundDownloadStatus.eq(BACKGROUND_STATUS_PENDING),
+            )
+            .filter(
+                eh_download_queue::Column::BackgroundDownloadNextRetryAt
+                    .is_null()
+                    .or(eh_download_queue::Column::BackgroundDownloadNextRetryAt.lte(now)),
+            )
+            .order_by(eh_download_queue::Column::CreatedAt, Order::Asc)
+            .one(&self.db)
+            .await
+            .context("Failed to fetch next background EH download")?;
+
+        let Some(model) = entry else {
+            return Ok(None);
+        };
+
+        let result = eh_download_queue::Entity::update_many()
+            .col_expr(
+                eh_download_queue::Column::BackgroundDownloadStatus,
+                Expr::value(Some(BACKGROUND_STATUS_RUNNING.to_string())),
+            )
+            .col_expr(
+                eh_download_queue::Column::BackgroundDownloadStartedAt,
+                Expr::value(Some(now)),
+            )
+            .filter(eh_download_queue::Column::Id.eq(model.id))
+            .filter(eh_download_queue::Column::Status.eq(STATUS_PENDING))
+            .filter(
+                eh_download_queue::Column::BackgroundDownloadStatus.eq(BACKGROUND_STATUS_PENDING),
+            )
+            .filter(
+                sea_orm::Condition::any()
+                    .add(eh_download_queue::Column::BackgroundDownloadNextRetryAt.is_null())
+                    .add(eh_download_queue::Column::BackgroundDownloadNextRetryAt.lte(now)),
+            )
+            .exec(&self.db)
+            .await
+            .context("Failed to atomically claim background EH download")?;
+
+        if result.rows_affected == 0 {
+            return Ok(None);
+        }
+
+        let updated = eh_download_queue::Entity::find_by_id(model.id)
+            .one(&self.db)
+            .await?
+            .context("Entry disappeared after background claim")?;
+        Ok(Some(updated))
+    }
+
+    pub async fn mark_eh_background_download_downloaded(
+        &self,
+        id: i32,
+        file_size: i64,
+        zip_path: &str,
+    ) -> Result<eh_download_queue::Model> {
+        let now = Local::now().naive_local();
+        let result = eh_download_queue::Entity::update_many()
+            .col_expr(
+                eh_download_queue::Column::Status,
+                Expr::value(STATUS_DOWNLOADED),
+            )
+            .col_expr(eh_download_queue::Column::FileSize, Expr::value(file_size))
+            .col_expr(
+                eh_download_queue::Column::ZipPath,
+                Expr::value(Some(zip_path.to_string())),
+            )
+            .col_expr(eh_download_queue::Column::CompletedAt, Expr::value(now))
+            .col_expr(
+                eh_download_queue::Column::StartedAt,
+                Expr::value(None::<DateTime>),
+            )
+            .col_expr(
+                eh_download_queue::Column::Error,
+                Expr::value(None::<String>),
+            )
+            .col_expr(
+                eh_download_queue::Column::NextRetryAt,
+                Expr::value(None::<DateTime>),
+            )
+            .col_expr(
+                eh_download_queue::Column::BackgroundDownloadStatus,
+                Expr::value(None::<String>),
+            )
+            .col_expr(
+                eh_download_queue::Column::BackgroundDownloadStartedAt,
+                Expr::value(None::<DateTime>),
+            )
+            .col_expr(
+                eh_download_queue::Column::BackgroundDownloadNextRetryAt,
+                Expr::value(None::<DateTime>),
+            )
+            .col_expr(
+                eh_download_queue::Column::BackgroundDownloadError,
+                Expr::value(None::<String>),
+            )
+            .col_expr(
+                eh_download_queue::Column::BackgroundDownloadAttemptCount,
+                Expr::value(0),
+            )
+            .filter(eh_download_queue::Column::Id.eq(id))
+            .filter(eh_download_queue::Column::Status.eq(STATUS_PENDING))
+            .filter(
+                eh_download_queue::Column::BackgroundDownloadStatus.eq(BACKGROUND_STATUS_RUNNING),
+            )
+            .exec(&self.db)
+            .await
+            .context("Failed to mark background EH download as downloaded")?;
+
+        if result.rows_affected != 1 {
+            self.clear_background_download_if_inactive(id).await?;
+            anyhow::bail!("Cannot mark background EH download {} as downloaded", id);
+        }
+
+        let model = eh_download_queue::Entity::find_by_id(id)
+            .one(&self.db)
+            .await?
+            .context("Entry disappeared after mark background downloaded")?;
+        Ok(model)
+    }
+
+    pub async fn schedule_eh_background_download_retry(
+        &self,
+        id: i32,
+        error: &str,
+        max_attempts: u8,
+    ) -> Result<(eh_download_queue::Model, bool)> {
+        let entry = eh_download_queue::Entity::find_by_id(id)
+            .one(&self.db)
+            .await
+            .context("Failed to fetch background EH download")?
+            .ok_or_else(|| anyhow::anyhow!("EH download {} not found", id))?;
+        let new_attempts = entry.background_download_attempt_count + 1;
+        let permanent = new_attempts >= max_attempts as i32;
+        let now = Local::now().naive_local();
+
+        let mut update = eh_download_queue::Entity::update_many();
+        if permanent {
+            update = update
+                .col_expr(
+                    eh_download_queue::Column::Status,
+                    Expr::value(STATUS_FAILED),
+                )
+                .col_expr(eh_download_queue::Column::CompletedAt, Expr::value(now))
+                .col_expr(
+                    eh_download_queue::Column::Error,
+                    Expr::value(Some(error.to_string())),
+                )
+                .col_expr(
+                    eh_download_queue::Column::BackgroundDownloadStatus,
+                    Expr::value(None::<String>),
+                )
+                .col_expr(
+                    eh_download_queue::Column::BackgroundDownloadStartedAt,
+                    Expr::value(None::<DateTime>),
+                )
+                .col_expr(
+                    eh_download_queue::Column::BackgroundDownloadNextRetryAt,
+                    Expr::value(None::<DateTime>),
+                )
+                .col_expr(
+                    eh_download_queue::Column::BackgroundDownloadError,
+                    Expr::value(None::<String>),
+                )
+                .col_expr(
+                    eh_download_queue::Column::BackgroundDownloadAttemptCount,
+                    Expr::value(0),
+                );
+        } else {
+            let delay = Self::backoff_delay_secs(new_attempts);
+            update = update
+                .col_expr(
+                    eh_download_queue::Column::BackgroundDownloadStatus,
+                    Expr::value(Some(BACKGROUND_STATUS_PENDING.to_string())),
+                )
+                .col_expr(
+                    eh_download_queue::Column::BackgroundDownloadStartedAt,
+                    Expr::value(None::<DateTime>),
+                )
+                .col_expr(
+                    eh_download_queue::Column::BackgroundDownloadNextRetryAt,
+                    Expr::value(Some(now + chrono::Duration::seconds(delay))),
+                )
+                .col_expr(
+                    eh_download_queue::Column::BackgroundDownloadError,
+                    Expr::value(Some(error.to_string())),
+                )
+                .col_expr(
+                    eh_download_queue::Column::BackgroundDownloadAttemptCount,
+                    Expr::value(new_attempts),
+                );
+        }
+
+        let result = update
+            .filter(eh_download_queue::Column::Id.eq(id))
+            .filter(eh_download_queue::Column::Status.eq(STATUS_PENDING))
+            .filter(
+                eh_download_queue::Column::BackgroundDownloadStatus.eq(BACKGROUND_STATUS_RUNNING),
+            )
+            .exec(&self.db)
+            .await
+            .context("Failed to schedule background EH download retry")?;
+
+        if result.rows_affected != 1 {
+            self.clear_background_download_if_inactive(id).await?;
+            anyhow::bail!("Cannot schedule background EH download retry {}", id);
+        }
+
+        let model = eh_download_queue::Entity::find_by_id(id)
+            .one(&self.db)
+            .await?
+            .context("Entry disappeared after background retry")?;
+        Ok((model, permanent))
     }
 
     /// Delete ZIP/partial ZIP files in the cache dir that have no corresponding
@@ -2760,6 +3209,294 @@ mod tests {
             .unwrap();
         assert_eq!(reloaded.retry_count, 0);
         assert!(reloaded.next_retry_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_background_owned_item_is_excluded_from_main_download_queue() {
+        let repo = tests_helpers::setup_test_db().await.unwrap();
+        let slow = repo
+            .enqueue_eh_download(-100, 40, "slow", "Slow", false, SOURCE_DIRECT)
+            .await
+            .unwrap();
+        let fast = repo
+            .enqueue_eh_download(-100, 41, "fast", "Fast", false, SOURCE_DIRECT)
+            .await
+            .unwrap();
+
+        let claimed = repo.get_next_for_download().await.unwrap().unwrap();
+        assert_eq!(claimed.id, slow.id);
+        let background = repo
+            .schedule_eh_background_download_from(claimed.id, STATUS_DOWNLOADING, "too slow")
+            .await
+            .unwrap();
+        assert_eq!(background.status, STATUS_PENDING);
+        assert_eq!(
+            background.background_download_status.as_deref(),
+            Some(BACKGROUND_STATUS_PENDING)
+        );
+
+        let next = repo.get_next_for_download().await.unwrap().unwrap();
+        assert_eq!(next.id, fast.id);
+    }
+
+    #[tokio::test]
+    async fn test_background_download_lifecycle_success_retry_and_stale_reset() {
+        let repo = tests_helpers::setup_test_db().await.unwrap();
+        let model = repo
+            .enqueue_eh_download(-100, 45, "tok", "Title", false, SOURCE_DIRECT)
+            .await
+            .unwrap();
+
+        let claimed = repo.get_next_for_download().await.unwrap().unwrap();
+        assert_eq!(claimed.id, model.id);
+        repo.schedule_eh_background_download_from(claimed.id, STATUS_DOWNLOADING, "slow")
+            .await
+            .unwrap();
+
+        let bg_claim = repo
+            .get_next_for_background_download()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(bg_claim.id, model.id);
+        assert_eq!(
+            bg_claim.background_download_status.as_deref(),
+            Some(BACKGROUND_STATUS_RUNNING)
+        );
+
+        let (retry, permanent) = repo
+            .schedule_eh_background_download_retry(bg_claim.id, "still slow", 6)
+            .await
+            .unwrap();
+        assert!(!permanent);
+        assert_eq!(retry.status, STATUS_PENDING);
+        assert_eq!(retry.background_download_attempt_count, 1);
+        assert_eq!(
+            retry.background_download_status.as_deref(),
+            Some(BACKGROUND_STATUS_PENDING)
+        );
+        assert!(retry.background_download_next_retry_at.is_some());
+
+        Entity::update_many()
+            .col_expr(
+                Column::BackgroundDownloadStatus,
+                Expr::value(Some(BACKGROUND_STATUS_RUNNING.to_string())),
+            )
+            .col_expr(
+                Column::BackgroundDownloadStartedAt,
+                Expr::value(Some(
+                    Local::now().naive_local() - chrono::Duration::seconds(7200),
+                )),
+            )
+            .filter(Column::Id.eq(model.id))
+            .exec(&repo.db)
+            .await
+            .unwrap();
+        let reset = repo.reset_stale_background_downloads(3600).await.unwrap();
+        assert_eq!(reset, 1);
+        let reset_row = Entity::find_by_id(model.id)
+            .one(&repo.db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            reset_row.background_download_status.as_deref(),
+            Some(BACKGROUND_STATUS_PENDING)
+        );
+        assert!(reset_row.background_download_started_at.is_none());
+
+        Entity::update_many()
+            .col_expr(
+                Column::BackgroundDownloadNextRetryAt,
+                Expr::value(Some(
+                    Local::now().naive_local() - chrono::Duration::seconds(1),
+                )),
+            )
+            .filter(Column::Id.eq(model.id))
+            .exec(&repo.db)
+            .await
+            .unwrap();
+
+        let bg_claim = repo
+            .get_next_for_background_download()
+            .await
+            .unwrap()
+            .unwrap();
+        let done = repo
+            .mark_eh_background_download_downloaded(bg_claim.id, 1234, "/tmp/bg.zip")
+            .await
+            .unwrap();
+        assert_eq!(done.status, STATUS_DOWNLOADED);
+        assert_eq!(done.file_size, 1234);
+        assert_eq!(done.zip_path.as_deref(), Some("/tmp/bg.zip"));
+        assert!(done.background_download_status.is_none());
+        assert!(done.background_download_error.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_release_background_downloads_to_main_queue_clears_pending_background_state() {
+        let repo = tests_helpers::setup_test_db().await.unwrap();
+        let model = repo
+            .enqueue_eh_download(-100, 46, "tok", "Title", false, SOURCE_DIRECT)
+            .await
+            .unwrap();
+
+        let claimed = repo.get_next_for_download().await.unwrap().unwrap();
+        repo.schedule_eh_background_download_from(claimed.id, STATUS_DOWNLOADING, "slow")
+            .await
+            .unwrap();
+
+        let released = repo
+            .release_background_downloads_to_main_queue()
+            .await
+            .unwrap();
+        assert_eq!(released, 1);
+        let row = Entity::find_by_id(model.id)
+            .one(&repo.db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, STATUS_PENDING);
+        assert!(row.background_download_status.is_none());
+        assert_eq!(row.background_download_attempt_count, 0);
+
+        let next = repo.get_next_for_download().await.unwrap().unwrap();
+        assert_eq!(next.id, model.id);
+    }
+
+    #[tokio::test]
+    async fn test_cancel_subscription_queue_entries_clears_background_state() {
+        let repo = tests_helpers::setup_test_db().await.unwrap();
+        let model = repo
+            .enqueue_eh_subscription_download(-100, 123, 47, "tok", "Title", false)
+            .await
+            .unwrap();
+
+        let claimed = repo.get_next_for_download().await.unwrap().unwrap();
+        repo.schedule_eh_background_download_from(claimed.id, STATUS_DOWNLOADING, "slow")
+            .await
+            .unwrap();
+
+        repo.cancel_eh_subscription_queue_entries(123)
+            .await
+            .unwrap();
+        let row = Entity::find_by_id(model.id)
+            .one(&repo.db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, STATUS_CANCELED);
+        assert!(row.background_download_status.is_none());
+        assert_eq!(row.background_download_attempt_count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_reenqueue_terminal_row_clears_background_state() {
+        let repo = tests_helpers::setup_test_db().await.unwrap();
+        let model = repo
+            .enqueue_eh_download(-100, 48, "tok", "Title", false, SOURCE_DIRECT)
+            .await
+            .unwrap();
+        Entity::update_many()
+            .col_expr(Column::Status, Expr::value(STATUS_FAILED))
+            .col_expr(
+                Column::BackgroundDownloadStatus,
+                Expr::value(Some(BACKGROUND_STATUS_PENDING.to_string())),
+            )
+            .col_expr(Column::BackgroundDownloadAttemptCount, Expr::value(5))
+            .filter(Column::Id.eq(model.id))
+            .exec(&repo.db)
+            .await
+            .unwrap();
+
+        let reenqueued = repo
+            .enqueue_eh_download(-100, 48, "tok2", "Title 2", false, SOURCE_DIRECT)
+            .await
+            .unwrap();
+        assert_eq!(reenqueued.status, STATUS_PENDING);
+        assert!(reenqueued.background_download_status.is_none());
+        assert_eq!(reenqueued.background_download_attempt_count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_background_completion_cleans_canceled_race_state() {
+        let repo = tests_helpers::setup_test_db().await.unwrap();
+        let model = repo
+            .enqueue_eh_download(-100, 49, "tok", "Title", false, SOURCE_DIRECT)
+            .await
+            .unwrap();
+
+        let claimed = repo.get_next_for_download().await.unwrap().unwrap();
+        repo.schedule_eh_background_download_from(claimed.id, STATUS_DOWNLOADING, "slow")
+            .await
+            .unwrap();
+        let bg_claim = repo
+            .get_next_for_background_download()
+            .await
+            .unwrap()
+            .unwrap();
+        Entity::update_many()
+            .col_expr(Column::Status, Expr::value(STATUS_CANCELED))
+            .filter(Column::Id.eq(bg_claim.id))
+            .exec(&repo.db)
+            .await
+            .unwrap();
+
+        let err = repo
+            .mark_eh_background_download_downloaded(bg_claim.id, 10, "/tmp/bg.zip")
+            .await
+            .expect_err("canceled row should not be overwritten by background completion");
+        assert!(err
+            .to_string()
+            .contains("Cannot mark background EH download"));
+
+        let row = Entity::find_by_id(model.id)
+            .one(&repo.db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, STATUS_CANCELED);
+        assert!(row.background_download_status.is_none());
+        assert_eq!(row.background_download_attempt_count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_background_retry_permanent_failure_clears_background_state() {
+        let repo = tests_helpers::setup_test_db().await.unwrap();
+        let model = repo
+            .enqueue_eh_download(-100, 50, "tok", "Title", false, SOURCE_DIRECT)
+            .await
+            .unwrap();
+
+        let claimed = repo.get_next_for_download().await.unwrap().unwrap();
+        repo.schedule_eh_background_download_from(claimed.id, STATUS_DOWNLOADING, "slow")
+            .await
+            .unwrap();
+        let bg_claim = repo
+            .get_next_for_background_download()
+            .await
+            .unwrap()
+            .unwrap();
+
+        let (failed, permanent) = repo
+            .schedule_eh_background_download_retry(bg_claim.id, "exhausted", 1)
+            .await
+            .unwrap();
+        assert!(permanent);
+        assert_eq!(failed.status, STATUS_FAILED);
+        assert_eq!(failed.error.as_deref(), Some("exhausted"));
+        assert!(failed.background_download_status.is_none());
+        assert!(failed.background_download_started_at.is_none());
+        assert!(failed.background_download_next_retry_at.is_none());
+        assert!(failed.background_download_error.is_none());
+        assert_eq!(failed.background_download_attempt_count, 0);
+
+        let row = Entity::find_by_id(model.id)
+            .one(&repo.db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.background_download_attempt_count, 0);
     }
 
     #[tokio::test]

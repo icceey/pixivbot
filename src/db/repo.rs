@@ -131,6 +131,11 @@ pub mod tests_helpers {
                 next_retry_at TIMESTAMP,
                 archive_sent_at TIMESTAMP NULL,
                 telegraph_sent_at TIMESTAMP NULL,
+                background_download_status TEXT,
+                background_download_started_at TIMESTAMP,
+                background_download_next_retry_at TIMESTAMP,
+                background_download_attempt_count INTEGER NOT NULL DEFAULT 0,
+                background_download_error TEXT,
                 UNIQUE(chat_id, gid)
             )
             "#,

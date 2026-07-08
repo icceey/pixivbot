@@ -379,6 +379,14 @@ pub struct EhentaiConfig {
     pub download_rate_window_hours: u64,
     #[serde(default = "default_eh_download_poll_interval_sec")]
     pub download_poll_interval_sec: u64,
+    #[serde(default = "default_eh_background_download_enabled")]
+    pub background_download_enabled: bool,
+    #[serde(default = "default_eh_background_download_concurrency")]
+    pub background_download_concurrency: usize,
+    #[serde(default = "default_eh_background_download_max_attempts")]
+    pub background_download_max_attempts: u8,
+    #[serde(default = "default_eh_background_download_stale_sec")]
+    pub background_download_stale_sec: u64,
     #[serde(default = "default_eh_pushed_cap")]
     pub pushed_cap: usize,
 }
@@ -404,6 +412,10 @@ impl Default for EhentaiConfig {
             download_rate_limit_gb: default_eh_download_rate_limit_gb(),
             download_rate_window_hours: default_eh_download_rate_window_hours(),
             download_poll_interval_sec: default_eh_download_poll_interval_sec(),
+            background_download_enabled: default_eh_background_download_enabled(),
+            background_download_concurrency: default_eh_background_download_concurrency(),
+            background_download_max_attempts: default_eh_background_download_max_attempts(),
+            background_download_stale_sec: default_eh_background_download_stale_sec(),
             pushed_cap: default_eh_pushed_cap(),
         }
     }
@@ -486,6 +498,22 @@ fn default_eh_download_rate_window_hours() -> u64 {
 
 fn default_eh_download_poll_interval_sec() -> u64 {
     60
+}
+
+fn default_eh_background_download_enabled() -> bool {
+    true
+}
+
+fn default_eh_background_download_concurrency() -> usize {
+    2
+}
+
+fn default_eh_background_download_max_attempts() -> u8 {
+    6
+}
+
+fn default_eh_background_download_stale_sec() -> u64 {
+    3600
 }
 
 fn default_eh_pushed_cap() -> usize {

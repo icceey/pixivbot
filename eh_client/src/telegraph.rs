@@ -266,6 +266,8 @@ pub struct IpfS3UploaderConfig {
     pub key_prefix: String,
     #[serde(default = "default_s3_path_style")]
     pub path_style: bool,
+    #[serde(default)]
+    pub warm_public_gateway_after_upload: bool,
 }
 
 impl IpfS3UploaderConfig {
@@ -293,6 +295,7 @@ impl IpfS3UploaderConfig {
             .to_string(),
             key_prefix: self.key_prefix.trim_matches('/').to_string(),
             path_style: self.path_style,
+            warm_public_gateway_after_upload: self.warm_public_gateway_after_upload,
         })
     }
 }
@@ -307,6 +310,7 @@ struct ResolvedIpfS3UploaderConfig {
     gateway_url: String,
     key_prefix: String,
     path_style: bool,
+    warm_public_gateway_after_upload: bool,
 }
 
 fn required_config(name: &str, value: &Option<String>) -> Result<String> {
@@ -623,6 +627,7 @@ impl ImageUploader for S3Uploader {
 pub struct IpfS3Uploader {
     bucket: Box<Bucket>,
     config: ResolvedIpfS3UploaderConfig,
+    http: reqwest::Client,
 }
 
 impl IpfS3Uploader {
@@ -645,7 +650,14 @@ impl IpfS3Uploader {
         if config.path_style {
             bucket = bucket.with_path_style();
         }
-        Ok(Self { bucket, config })
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()?;
+        Ok(Self {
+            bucket,
+            config,
+            http,
+        })
     }
 
     fn object_key(&self, index: usize, input: &ImageUploadInput<'_>) -> String {
@@ -658,6 +670,24 @@ impl IpfS3Uploader {
         } else {
             format!("{}/{}", self.config.key_prefix, filename)
         }
+    }
+
+    fn warm_public_gateway(&self, cid: &str) {
+        if !self.config.warm_public_gateway_after_upload {
+            return;
+        }
+
+        let url = format!("{}/{}", self.config.gateway_url, cid);
+        let http = self.http.clone();
+        tokio::spawn(async move {
+            match http.head(&url).send().await {
+                Ok(resp) if !resp.status().is_success() => {
+                    tracing::debug!("IPFS gateway warmup returned {} for {}", resp.status(), url);
+                }
+                Ok(_) => {}
+                Err(e) => tracing::debug!("IPFS gateway warmup failed for {}: {}", url, e),
+            }
+        });
     }
 }
 
@@ -699,6 +729,7 @@ impl ImageUploader for IpfS3Uploader {
                      cannot build public URL"
                 )));
             }
+            self.warm_public_gateway(cid);
             urls.push(format!("{}/{cid}", self.config.gateway_url));
         }
         Ok(urls)
@@ -1292,6 +1323,7 @@ mod tests {
             gateway_url: Some(gateway_url.to_string()),
             key_prefix: "eh".to_string(),
             path_style: true,
+            warm_public_gateway_after_upload: false,
         }
     }
 
@@ -1399,6 +1431,50 @@ mod tests {
 
         assert_eq!(urls.len(), 1);
         assert_eq!(urls[0], format!("https://ipfs.io/ipfs/{cid}"));
+    }
+
+    #[tokio::test]
+    async fn ipfs3_uploader_warms_public_gateway_after_upload_without_blocking_result() {
+        use wiremock::matchers::{method, path, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let cid = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi";
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path_regex(r"^/bucket/eh/\d{14}-0001-[0-9a-f]{8}\.png$"))
+            .respond_with(ResponseTemplate::new(200).insert_header("etag", format!("\"{cid}\"")))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("HEAD"))
+            .and(path(format!("/ipfs/{cid}")))
+            .respond_with(ResponseTemplate::new(503).set_body_bytes(vec![b'x'; 1024 * 1024]))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut config = complete_ipfs3_config(&server.uri(), &format!("{}/ipfs", server.uri()));
+        config.warm_public_gateway_after_upload = true;
+        let uploader = IpfS3Uploader::from_config(&config).unwrap();
+        let urls = uploader
+            .upload_images(&[ImageUploadInput {
+                filename: "image.png",
+                bytes: b"\x89PNG\r\n\x1a\n",
+            }])
+            .await
+            .unwrap();
+
+        assert_eq!(urls, vec![format!("{}/ipfs/{cid}", server.uri())]);
+        for _ in 0..20 {
+            let received = server.received_requests().await.unwrap();
+            if received.iter().any(|request| {
+                request.method.as_str() == "HEAD" && request.url.path() == format!("/ipfs/{cid}")
+            }) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        panic!("expected non-blocking IPFS gateway warmup HEAD request");
     }
 
     #[tokio::test]

@@ -55,6 +55,16 @@ pub struct Model {
     /// Timestamp when the Telegraph link was sent to the chat (publish stage).
     #[sea_orm(nullable)]
     pub telegraph_sent_at: Option<DateTime>,
+    #[sea_orm(nullable)]
+    pub background_download_status: Option<String>,
+    #[sea_orm(nullable)]
+    pub background_download_started_at: Option<DateTime>,
+    #[sea_orm(nullable)]
+    pub background_download_next_retry_at: Option<DateTime>,
+    #[sea_orm(default = 0)]
+    pub background_download_attempt_count: i32,
+    #[sea_orm(nullable)]
+    pub background_download_error: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
