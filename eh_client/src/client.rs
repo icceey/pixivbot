@@ -601,12 +601,20 @@ impl EhClient {
         // copy_buf reads from the stream and writes to BufWriter. Writes are
         // memcpy until the 2MB buffer fills, so the read loop runs almost
         // continuously, keeping the TCP receive window open.
-        //
-        // On error, flush buffered bytes before propagating so the .part file
-        // advances and the resume Range / made_progress check reflect real data.
-        let copy_result = tokio::io::copy_buf(&mut reader, &mut writer).await;
-        let _ = writer.flush().await;
-        let copied = copy_result?;
+        let copied = match tokio::io::copy_buf(&mut reader, &mut writer).await {
+            Ok(n) => {
+                // On success, flush must succeed so written reflects bytes on disk.
+                writer.flush().await?;
+                n
+            }
+            Err(e) => {
+                // On stream error, flush best-effort to persist buffered bytes
+                // so the .part file advances and resume Range/made_progress
+                // reflect real downloaded data.
+                let _ = writer.flush().await;
+                return Err(e.into());
+            }
+        };
         let written = if append {
             existing_len + copied
         } else {
