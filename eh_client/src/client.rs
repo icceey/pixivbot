@@ -1,14 +1,17 @@
 use crate::error::{Error, Result};
 use crate::models::{EhCookies, EhGallery, EhGalleryRef, RawApiResponse, RawGalleryMetaEntry};
 use crate::parser;
+use futures_util::StreamExt;
 use reqwest::header::{CONTENT_LENGTH, CONTENT_RANGE, COOKIE, RANGE};
 use std::path::Path;
 use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
 use tokio::time::sleep;
+use tokio_util::io::StreamReader;
 
 const USER_AGENT_STR: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
-const ARCHIVE_DOWNLOAD_TIMEOUT_SECS: u64 = 300;
+const ARCHIVE_CONNECT_TIMEOUT_SECS: u64 = 30;
+const ARCHIVE_READ_TIMEOUT_SECS: u64 = 60;
 const ARCHIVE_DOWNLOAD_MAX_ATTEMPTS: usize = 4;
 
 /// Threshold for "made progress": strictly greater than 10 KiB/s.
@@ -195,7 +198,8 @@ impl EhClient {
     pub fn new(base_url: &str, api_url: &str, cookies: EhCookies) -> Result<Self> {
         let mut builder = reqwest::Client::builder()
             .user_agent(USER_AGENT_STR)
-            .timeout(std::time::Duration::from_secs(60));
+            .connect_timeout(std::time::Duration::from_secs(ARCHIVE_CONNECT_TIMEOUT_SECS))
+            .read_timeout(std::time::Duration::from_secs(ARCHIVE_READ_TIMEOUT_SECS));
 
         // For exhentai, bind to IPv4 to avoid CloudFlare blocks
         if base_url.contains("exhentai") {
@@ -534,12 +538,7 @@ impl EhClient {
             .map(|m| m.len())
             .unwrap_or(0);
 
-        let mut request = self
-            .http
-            .get(download_url)
-            .timeout(std::time::Duration::from_secs(
-                ARCHIVE_DOWNLOAD_TIMEOUT_SECS,
-            ));
+        let mut request = self.http.get(download_url);
         if existing_len > 0 {
             request = request.header(RANGE, format!("bytes={existing_len}-"));
         }
@@ -547,7 +546,7 @@ impl EhClient {
             request = request.header(COOKIE, self.cookies.to_header());
         }
 
-        let mut resp = request.send().await?;
+        let resp = request.send().await?;
         let status = resp.status();
         if existing_len > 0 && status.as_u16() == 416 {
             let _ = tokio::fs::remove_file(temp_path).await;
@@ -589,13 +588,38 @@ impl EhClient {
             options.truncate(true);
         }
 
-        let mut file = options.open(temp_path).await?;
-        let mut written = if append { existing_len } else { 0 };
-        while let Some(chunk) = resp.chunk().await? {
-            file.write_all(&chunk).await?;
-            written += chunk.len() as u64;
-        }
-        file.flush().await?;
+        let file = options.open(temp_path).await?;
+        let mut writer = tokio::io::BufWriter::with_capacity(2 * 1024 * 1024, file);
+
+        // Convert the response byte stream into an AsyncRead, mapping reqwest
+        // errors to io::Error so StreamReader can surface them.
+        let stream = resp
+            .bytes_stream()
+            .map(|r| r.map_err(std::io::Error::other));
+        let mut reader = StreamReader::new(stream);
+
+        // copy_buf reads from the stream and writes to BufWriter. Writes are
+        // memcpy until the 2MB buffer fills, so the read loop runs almost
+        // continuously, keeping the TCP receive window open.
+        let copied = match tokio::io::copy_buf(&mut reader, &mut writer).await {
+            Ok(n) => {
+                // On success, flush must succeed so written reflects bytes on disk.
+                writer.flush().await?;
+                n
+            }
+            Err(e) => {
+                // On stream error, flush best-effort to persist buffered bytes
+                // so the .part file advances and resume Range/made_progress
+                // reflect real downloaded data.
+                let _ = writer.flush().await;
+                return Err(e.into());
+            }
+        };
+        let written = if append {
+            existing_len + copied
+        } else {
+            copied
+        };
 
         if let Some(expected_total) = expected_total {
             if written < expected_total {
