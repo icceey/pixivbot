@@ -6,13 +6,39 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 /// A Telegraph content node.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Node {
     pub tag: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub attrs: Option<serde_json::Map<String, serde_json::Value>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub children: Option<Vec<serde_json::Value>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TelegraphImageUrlPair {
+    pub preview_url: String,
+    pub public_url: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TelegraphRewritePage {
+    pub path: String,
+    pub title: String,
+    pub content: Vec<Node>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TelegraphRewriteData {
+    pub pages: Vec<TelegraphRewritePage>,
+    pub preview_gateway_url: String,
+    pub public_gateway_url: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TelegraphGalleryPageResult {
+    pub first_page_url: String,
+    pub rewrite_data: Option<TelegraphRewriteData>,
 }
 
 impl Node {
@@ -48,6 +74,40 @@ impl Node {
 /// Estimate serialized content size in bytes.
 pub fn estimate_content_size(nodes: &[Node]) -> usize {
     serde_json::to_vec(nodes).map(|v| v.len()).unwrap_or(0)
+}
+
+pub fn node_attr_str<'a>(node: &'a Node, key: &str) -> Option<&'a str> {
+    node.attrs.as_ref()?.get(key)?.as_str()
+}
+
+fn set_node_attr_string(node: &mut Node, key: &str, value: String) {
+    if let Some(attrs) = node.attrs.as_mut() {
+        attrs.insert(key.to_string(), serde_json::Value::String(value));
+    }
+}
+
+pub fn rewrite_ipfs_gateway_nodes(
+    nodes: &[Node],
+    preview_gateway_url: &str,
+    public_gateway_url: &str,
+) -> Vec<Node> {
+    let preview_prefix = format!("{}/", preview_gateway_url.trim_end_matches('/'));
+    let public_gateway = public_gateway_url.trim_end_matches('/');
+    nodes
+        .iter()
+        .cloned()
+        .map(|mut node| {
+            if node.tag == "img" {
+                if let Some(cid) = node_attr_str(&node, "src")
+                    .and_then(|src| src.strip_prefix(&preview_prefix))
+                    .map(str::to_string)
+                {
+                    set_node_attr_string(&mut node, "src", format!("{public_gateway}/{cid}"));
+                }
+            }
+            node
+        })
+        .collect()
 }
 
 /// Maximum content size per Telegraph page (64KB minus overhead).
@@ -175,6 +235,23 @@ impl ImageUploadConfig {
             ImageUploadProvider::Catbox => Ok(Arc::new(CatboxUploader::from_config(&self.catbox)?)),
         }
     }
+
+    pub fn ipfs3_preview_rewrite_config(&self) -> Option<IpfS3PreviewRewriteConfig> {
+        if self.provider != ImageUploadProvider::IpfS3 {
+            return None;
+        }
+        let ipfs3 = self.ipfs3.as_ref()?;
+        let resolved = ipfs3.required().ok()?;
+        let preview = resolved.preview_gateway_url?;
+        if preview == resolved.gateway_url {
+            return None;
+        }
+        Some(IpfS3PreviewRewriteConfig {
+            preview_gateway_url: preview,
+            public_gateway_url: resolved.gateway_url,
+            delay_sec: resolved.preview_rewrite_delay_sec,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -262,12 +339,27 @@ pub struct IpfS3UploaderConfig {
     pub secret_access_key: Option<String>,
     #[serde(default)]
     pub gateway_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview_gateway_url: Option<String>,
+    #[serde(default = "default_ipfs_preview_rewrite_delay_sec")]
+    pub preview_rewrite_delay_sec: u64,
     #[serde(default)]
     pub key_prefix: String,
     #[serde(default = "default_s3_path_style")]
     pub path_style: bool,
     #[serde(default)]
     pub warm_public_gateway_after_upload: bool,
+}
+
+fn default_ipfs_preview_rewrite_delay_sec() -> u64 {
+    600
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IpfS3PreviewRewriteConfig {
+    pub preview_gateway_url: String,
+    pub public_gateway_url: String,
+    pub delay_sec: u64,
 }
 
 impl IpfS3UploaderConfig {
@@ -293,6 +385,13 @@ impl IpfS3UploaderConfig {
             )?
             .trim_end_matches('/')
             .to_string(),
+            preview_gateway_url: self
+                .preview_gateway_url
+                .as_ref()
+                .map(|url| validate_http_url("image_upload.ipfs3.preview_gateway_url", url))
+                .transpose()?
+                .map(|url| url.trim_end_matches('/').to_string()),
+            preview_rewrite_delay_sec: self.preview_rewrite_delay_sec,
             key_prefix: self.key_prefix.trim_matches('/').to_string(),
             path_style: self.path_style,
             warm_public_gateway_after_upload: self.warm_public_gateway_after_upload,
@@ -308,6 +407,8 @@ struct ResolvedIpfS3UploaderConfig {
     access_key_id: String,
     secret_access_key: String,
     gateway_url: String,
+    preview_gateway_url: Option<String>,
+    preview_rewrite_delay_sec: u64,
     key_prefix: String,
     path_style: bool,
     warm_public_gateway_after_upload: bool,
@@ -362,6 +463,21 @@ pub struct ImageUploadInput<'a> {
 #[async_trait]
 pub trait ImageUploader: Send + Sync {
     async fn upload_images(&self, images: &[ImageUploadInput<'_>]) -> Result<Vec<String>>;
+
+    async fn upload_images_with_url_pairs(
+        &self,
+        images: &[ImageUploadInput<'_>],
+    ) -> Result<Vec<TelegraphImageUrlPair>> {
+        Ok(self
+            .upload_images(images)
+            .await?
+            .into_iter()
+            .map(|url| TelegraphImageUrlPair {
+                preview_url: url.clone(),
+                public_url: url,
+            })
+            .collect())
+    }
 }
 
 pub struct PixiUploader {
@@ -689,11 +805,25 @@ impl IpfS3Uploader {
             }
         });
     }
-}
 
-#[async_trait]
-impl ImageUploader for IpfS3Uploader {
-    async fn upload_images(&self, images: &[ImageUploadInput<'_>]) -> Result<Vec<String>> {
+    fn url_pair_for_cid(&self, cid: &str) -> TelegraphImageUrlPair {
+        let public_url = format!("{}/{cid}", self.config.gateway_url);
+        let preview_url = self
+            .config
+            .preview_gateway_url
+            .as_ref()
+            .map(|gateway| format!("{gateway}/{cid}"))
+            .unwrap_or_else(|| public_url.clone());
+        TelegraphImageUrlPair {
+            preview_url,
+            public_url,
+        }
+    }
+
+    pub async fn upload_images_with_url_pairs(
+        &self,
+        images: &[ImageUploadInput<'_>],
+    ) -> Result<Vec<TelegraphImageUrlPair>> {
         let mut urls = Vec::with_capacity(images.len());
         for (index, image) in images.iter().enumerate() {
             let key = self.object_key(index + 1, image);
@@ -710,10 +840,6 @@ impl ImageUploader for IpfS3Uploader {
                     status,
                 });
             }
-            // rust-s3's put_object path extracts the ETag header into the
-            // response body (see response_data(etag=true)), so the IPFS CID
-            // lives in `response.as_str()`, not in the headers map. The value
-            // retains its surrounding double quotes, which we strip.
             let cid = response
                 .as_str()
                 .map_err(|e| {
@@ -730,9 +856,27 @@ impl ImageUploader for IpfS3Uploader {
                 )));
             }
             self.warm_public_gateway(cid);
-            urls.push(format!("{}/{cid}", self.config.gateway_url));
+            urls.push(self.url_pair_for_cid(cid));
         }
         Ok(urls)
+    }
+}
+
+#[async_trait]
+impl ImageUploader for IpfS3Uploader {
+    async fn upload_images(&self, images: &[ImageUploadInput<'_>]) -> Result<Vec<String>> {
+        Ok(IpfS3Uploader::upload_images_with_url_pairs(self, images)
+            .await?
+            .into_iter()
+            .map(|pair| pair.preview_url)
+            .collect())
+    }
+
+    async fn upload_images_with_url_pairs(
+        &self,
+        images: &[ImageUploadInput<'_>],
+    ) -> Result<Vec<TelegraphImageUrlPair>> {
+        IpfS3Uploader::upload_images_with_url_pairs(self, images).await
     }
 }
 
@@ -973,6 +1117,46 @@ impl TelegraphClient {
         })
     }
 
+    pub async fn edit_page(&self, path: &str, title: &str, content: &[Node]) -> Result<String> {
+        let content_json = serde_json::to_value(content)?;
+        let content_str = content_json.to_string();
+        let form = vec![
+            ("access_token", self.telegraph_token.as_str()),
+            ("path", path),
+            ("title", title),
+            ("content", content_str.as_str()),
+            ("return_content", "false"),
+        ];
+
+        let resp = self
+            .http
+            .post(format!("{}/editPage", self.api_url))
+            .form(&form)
+            .send()
+            .await?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(Error::Api {
+                message: format!("editPage returned {}", status),
+                status: status.as_u16(),
+            });
+        }
+
+        let telegraph_resp: TelegraphResponse<PageResult> = resp.json().await?;
+        if telegraph_resp.ok {
+            if let Some(result) = telegraph_resp.result {
+                return Ok(result.url);
+            }
+        }
+        Err(Error::Api {
+            message: telegraph_resp
+                .error
+                .unwrap_or_else(|| "unknown error".into()),
+            status: 0,
+        })
+    }
+
     /// Create a gallery page from image URLs. Splits into multiple pages if needed.
     /// Returns the first page URL (with "Next Page" links to subsequent pages).
     ///
@@ -980,14 +1164,63 @@ impl TelegraphClient {
     /// created page URL (if any) instead of erroring, so the user can still
     /// access the partial gallery.
     pub async fn create_gallery_page(&self, title: &str, image_urls: &[String]) -> Result<String> {
+        let pairs: Vec<TelegraphImageUrlPair> = image_urls
+            .iter()
+            .map(|url| TelegraphImageUrlPair {
+                preview_url: url.clone(),
+                public_url: url.clone(),
+            })
+            .collect();
+        Ok(self
+            .create_gallery_page_with_url_pairs(title, &pairs, None, None)
+            .await?
+            .first_page_url)
+    }
+
+    pub async fn create_gallery_page_with_url_pairs(
+        &self,
+        title: &str,
+        image_urls: &[TelegraphImageUrlPair],
+        preview_gateway_url: Option<&str>,
+        public_gateway_url: Option<&str>,
+    ) -> Result<TelegraphGalleryPageResult> {
         if image_urls.is_empty() {
             return Err(Error::Other("no images to upload".into()));
         }
 
-        let chunks = split_for_pages(image_urls, MAX_PAGE_CONTENT_BYTES);
+        let preview_urls: Vec<String> = image_urls
+            .iter()
+            .map(|pair| pair.preview_url.clone())
+            .collect();
+        let chunks = split_for_pages(&preview_urls, MAX_PAGE_CONTENT_BYTES);
+        let should_rewrite =
+            preview_gateway_url
+                .zip(public_gateway_url)
+                .is_some_and(|(preview, public)| {
+                    preview.trim_end_matches('/') != public.trim_end_matches('/')
+                });
+        let mut rewrite_pages = Vec::new();
+
         if chunks.len() == 1 {
             let nodes: Vec<Node> = chunks[0].iter().map(|url| Node::img(url)).collect();
-            return self.create_page(title, &nodes).await;
+            let url = self.create_page(title, &nodes).await?;
+            if should_rewrite {
+                if let Some(path) = telegraph_path_from_url(&url) {
+                    rewrite_pages.push(TelegraphRewritePage {
+                        path,
+                        title: title.to_string(),
+                        content: nodes,
+                    });
+                }
+            }
+            return Ok(TelegraphGalleryPageResult {
+                first_page_url: url,
+                rewrite_data: build_rewrite_data(
+                    rewrite_pages,
+                    preview_gateway_url,
+                    public_gateway_url,
+                ),
+            });
         }
 
         // Multi-page: create in reverse order, linking to the next page.
@@ -1008,7 +1241,18 @@ impl TelegraphClient {
                 format!("{} (continued)", title)
             };
             match self.create_page(&page_title, &nodes).await {
-                Ok(url) => next_url = Some(url),
+                Ok(url) => {
+                    if should_rewrite {
+                        if let Some(path) = telegraph_path_from_url(&url) {
+                            rewrite_pages.push(TelegraphRewritePage {
+                                path,
+                                title: page_title,
+                                content: nodes,
+                            });
+                        }
+                    }
+                    next_url = Some(url)
+                }
                 Err(e) => {
                     // If we have at least one page created, return it instead of failing
                     if let Some(ref url) = next_url {
@@ -1017,15 +1261,53 @@ impl TelegraphClient {
                             idx,
                             e
                         );
-                        return Ok(url.clone());
+                        return Ok(TelegraphGalleryPageResult {
+                            first_page_url: url.clone(),
+                            rewrite_data: build_rewrite_data(
+                                rewrite_pages,
+                                preview_gateway_url,
+                                public_gateway_url,
+                            ),
+                        });
                     }
                     return Err(e);
                 }
             }
         }
 
-        Ok(next_url.unwrap_or_else(|| image_urls[0].clone()))
+        Ok(TelegraphGalleryPageResult {
+            first_page_url: next_url.unwrap_or_else(|| image_urls[0].preview_url.clone()),
+            rewrite_data: build_rewrite_data(
+                rewrite_pages,
+                preview_gateway_url,
+                public_gateway_url,
+            ),
+        })
     }
+}
+
+fn telegraph_path_from_url(url: &str) -> Option<String> {
+    reqwest::Url::parse(url)
+        .ok()?
+        .path_segments()?
+        .next_back()
+        .map(str::to_string)
+}
+
+fn build_rewrite_data(
+    pages: Vec<TelegraphRewritePage>,
+    preview_gateway_url: Option<&str>,
+    public_gateway_url: Option<&str>,
+) -> Option<TelegraphRewriteData> {
+    let (preview, public) = preview_gateway_url.zip(public_gateway_url)?;
+    if pages.is_empty() || preview.trim_end_matches('/') == public.trim_end_matches('/') {
+        return None;
+    }
+    Some(TelegraphRewriteData {
+        pages,
+        preview_gateway_url: preview.trim_end_matches('/').to_string(),
+        public_gateway_url: public.trim_end_matches('/').to_string(),
+    })
 }
 
 #[cfg(test)]
@@ -1096,6 +1378,34 @@ mod tests {
                 max_bytes
             );
         }
+    }
+
+    #[test]
+    fn rewrite_ipfs_gateway_nodes_rewrites_only_preview_image_sources() {
+        let nodes = vec![
+            Node::img("https://preview.example/ipfs/cid-one"),
+            Node::link("https://preview.example/ipfs/not-an-image", "Next"),
+            Node::img("https://public.example/ipfs/cid-two"),
+        ];
+
+        let rewritten = rewrite_ipfs_gateway_nodes(
+            &nodes,
+            "https://preview.example/ipfs/",
+            "https://public.example/ipfs/",
+        );
+
+        assert_eq!(
+            node_attr_str(&rewritten[0], "src"),
+            Some("https://public.example/ipfs/cid-one")
+        );
+        assert_eq!(
+            node_attr_str(&rewritten[1], "href"),
+            Some("https://preview.example/ipfs/not-an-image")
+        );
+        assert_eq!(
+            node_attr_str(&rewritten[2], "src"),
+            Some("https://public.example/ipfs/cid-two")
+        );
     }
 
     #[tokio::test]
@@ -1249,6 +1559,35 @@ mod tests {
     }
 
     #[test]
+    fn ipfs3_preview_rewrite_config_normalizes_and_skips_same_gateway() {
+        let mut cfg = ImageUploadConfig {
+            provider: ImageUploadProvider::IpfS3,
+            ipfs3: Some(complete_ipfs3_config(
+                "http://localhost:9000",
+                "https://public.example/ipfs/",
+            )),
+            ..Default::default()
+        };
+        cfg.ipfs3.as_mut().unwrap().preview_gateway_url =
+            Some("https://preview.example/ipfs/".to_string());
+        cfg.ipfs3.as_mut().unwrap().preview_rewrite_delay_sec = 42;
+
+        let rewrite = cfg.ipfs3_preview_rewrite_config().unwrap();
+        assert_eq!(rewrite.preview_gateway_url, "https://preview.example/ipfs");
+        assert_eq!(rewrite.public_gateway_url, "https://public.example/ipfs");
+        assert_eq!(rewrite.delay_sec, 42);
+
+        cfg.ipfs3.as_mut().unwrap().preview_gateway_url =
+            Some("https://public.example/ipfs/".to_string());
+        assert!(cfg.ipfs3_preview_rewrite_config().is_none());
+
+        cfg.provider = ImageUploadProvider::Pixi;
+        cfg.ipfs3.as_mut().unwrap().preview_gateway_url =
+            Some("https://preview.example/ipfs/".to_string());
+        assert!(cfg.ipfs3_preview_rewrite_config().is_none());
+    }
+
+    #[test]
     fn catbox_config_rejects_unsafe_api_url() {
         let err = CatboxUploader::from_config(&CatboxUploaderConfig {
             api_url: "ftp://catbox.moe/user/api.php".to_string(),
@@ -1321,6 +1660,8 @@ mod tests {
             access_key_id: Some("key".to_string()),
             secret_access_key: Some("secret".to_string()),
             gateway_url: Some(gateway_url.to_string()),
+            preview_gateway_url: None,
+            preview_rewrite_delay_sec: default_ipfs_preview_rewrite_delay_sec(),
             key_prefix: "eh".to_string(),
             path_style: true,
             warm_public_gateway_after_upload: false,
@@ -1431,6 +1772,43 @@ mod tests {
 
         assert_eq!(urls.len(), 1);
         assert_eq!(urls[0], format!("https://ipfs.io/ipfs/{cid}"));
+    }
+
+    #[tokio::test]
+    async fn ipfs3_uploader_returns_preview_and_public_url_pairs() {
+        use wiremock::matchers::{body_bytes, method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let cid = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi";
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path_regex(r"^/bucket/eh/\d{14}-0001-[0-9a-f]{8}\.png$"))
+            .and(body_bytes(vec![
+                0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n',
+            ]))
+            .respond_with(ResponseTemplate::new(200).insert_header("etag", format!("\"{cid}\"")))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut cfg = complete_ipfs3_config(&server.uri(), "https://public.example/ipfs/");
+        cfg.preview_gateway_url = Some("https://preview.example/ipfs/".to_string());
+        let uploader = IpfS3Uploader::from_config(&cfg).unwrap();
+        let pairs = uploader
+            .upload_images_with_url_pairs(&[ImageUploadInput {
+                filename: "image.png",
+                bytes: b"\x89PNG\r\n\x1a\n",
+            }])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            pairs,
+            vec![TelegraphImageUrlPair {
+                preview_url: format!("https://preview.example/ipfs/{cid}"),
+                public_url: format!("https://public.example/ipfs/{cid}"),
+            }]
+        );
     }
 
     #[tokio::test]
@@ -1598,5 +1976,101 @@ mod tests {
             .unwrap_err();
 
         assert!(err.to_string().contains("non-url response"));
+    }
+
+    #[tokio::test]
+    async fn edit_page_posts_path_title_and_content() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/editPage"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "url": "https://telegra.ph/Page-Path" }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = TelegraphClient::new_with_urls(
+            "token".to_string(),
+            "https://pixi.example/api".to_string(),
+            server.uri(),
+        );
+        let url = client
+            .edit_page(
+                "Page-Path",
+                "Title",
+                &[Node::img("https://img.example/a.jpg")],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(url, "https://telegra.ph/Page-Path");
+        let requests = server.received_requests().await.unwrap();
+        let body = String::from_utf8_lossy(&requests[0].body);
+        assert!(body.contains("access_token=token"));
+        assert!(body.contains("path=Page-Path"));
+        assert!(body.contains("title=Title"));
+        assert!(body.contains("return_content=false"));
+        assert!(body.contains("content="));
+    }
+
+    #[tokio::test]
+    async fn create_gallery_page_with_url_pairs_returns_rewrite_metadata() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/createPage"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "url": "https://telegra.ph/Gallery-Path" }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = TelegraphClient::new_with_urls(
+            "token".to_string(),
+            "https://pixi.example/api".to_string(),
+            server.uri(),
+        );
+        let result = client
+            .create_gallery_page_with_url_pairs(
+                "Gallery",
+                &[TelegraphImageUrlPair {
+                    preview_url: "https://preview.example/ipfs/cid-one".to_string(),
+                    public_url: "https://public.example/ipfs/cid-one".to_string(),
+                }],
+                Some("https://preview.example/ipfs/"),
+                Some("https://public.example/ipfs/"),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.first_page_url, "https://telegra.ph/Gallery-Path");
+        let rewrite = result.rewrite_data.unwrap();
+        assert_eq!(rewrite.preview_gateway_url, "https://preview.example/ipfs");
+        assert_eq!(rewrite.public_gateway_url, "https://public.example/ipfs");
+        assert_eq!(rewrite.pages.len(), 1);
+        assert_eq!(rewrite.pages[0].path, "Gallery-Path");
+        assert_eq!(rewrite.pages[0].title, "Gallery");
+        assert_eq!(
+            node_attr_str(&rewrite.pages[0].content[0], "src"),
+            Some("https://preview.example/ipfs/cid-one")
+        );
+        let public_nodes = rewrite_ipfs_gateway_nodes(
+            &rewrite.pages[0].content,
+            &rewrite.preview_gateway_url,
+            &rewrite.public_gateway_url,
+        );
+        assert_eq!(
+            node_attr_str(&public_nodes[0], "src"),
+            Some("https://public.example/ipfs/cid-one")
+        );
     }
 }

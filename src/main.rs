@@ -259,11 +259,24 @@ async fn main() -> Result<()> {
     } else {
         None
     };
+    let eh_telegraph_rewrite_config = config.image_upload.ipfs3_preview_rewrite_config();
+    let eh_telegraph_rewrite_enabled =
+        telegraph_client.is_some() && eh_telegraph_rewrite_config.is_some();
 
     // Reset stale EH entries before spawning workers (crash recovery for all stages)
     if eh_client.is_some() {
         if let Err(e) = repo.reset_stale_eh_downloads().await {
             tracing::warn!("Failed to reset stale EH entries: {:#}", e);
+        }
+        if eh_telegraph_rewrite_enabled {
+            if let Err(e) = repo
+                .reset_stale_eh_telegraph_rewrites(
+                    config.ehentai.background_download_stale_sec as i64,
+                )
+                .await
+            {
+                tracing::warn!("Failed to reset stale EH Telegraph rewrites: {:#}", e);
+            }
         }
         if config.ehentai.background_download_enabled {
             if let Err(e) = repo
@@ -361,6 +374,7 @@ async fn main() -> Result<()> {
                 notifier.clone(),
                 std::sync::Arc::clone(telegraph),
                 image_uploader,
+                eh_telegraph_rewrite_config.clone(),
                 std::sync::Arc::new(config.ehentai.clone()),
             );
             info!("✅ E-Hentai upload worker initialized");
@@ -378,10 +392,38 @@ async fn main() -> Result<()> {
             repo.clone(),
             notifier.clone(),
             std::sync::Arc::clone(eh_client),
+            if eh_telegraph_rewrite_enabled {
+                eh_telegraph_rewrite_config
+                    .as_ref()
+                    .map(|rewrite| rewrite.delay_sec)
+            } else {
+                None
+            },
             std::sync::Arc::new(config.ehentai.clone()),
         );
         info!("✅ E-Hentai publish worker initialized");
         Some(tokio::spawn(async move { worker.run().await }))
+    } else {
+        None
+    };
+
+    let eh_telegraph_rewrite_worker_handle = if eh_client.is_some() {
+        if eh_telegraph_rewrite_enabled {
+            if let Some(ref telegraph) = telegraph_client {
+                let worker = scheduler::EhTelegraphRewriteWorker::new(
+                    repo.clone(),
+                    std::sync::Arc::clone(telegraph),
+                    std::sync::Arc::new(config.ehentai.clone()),
+                );
+                info!("✅ E-Hentai Telegraph rewrite worker initialized");
+                Some(tokio::spawn(async move { worker.run().await }))
+            } else {
+                None
+            }
+        } else {
+            info!("E-Hentai Telegraph rewrite worker disabled (no preview gateway rewrite config)");
+            None
+        }
     } else {
         None
     };
@@ -454,6 +496,9 @@ async fn main() -> Result<()> {
         handle.abort();
     }
     if let Some(handle) = eh_publish_worker_handle {
+        handle.abort();
+    }
+    if let Some(handle) = eh_telegraph_rewrite_worker_handle {
         handle.abort();
     }
 

@@ -8,7 +8,8 @@ pub use client::{EhClient, EhClientBuilder};
 pub use error::{Error, Result};
 pub use models::{EhCategory, EhCookies, EhGallery, EhGalleryRef};
 pub use telegraph::{
-    CatboxUploader, CatboxUploaderConfig, ImageUploadConfig, ImageUploadInput, ImageUploadProvider,
-    ImageUploader, IpfS3Uploader, IpfS3UploaderConfig, PixiUploader, S3Uploader, S3UploaderConfig,
-    TelegraphClient,
+    rewrite_ipfs_gateway_nodes, CatboxUploader, CatboxUploaderConfig, ImageUploadConfig,
+    ImageUploadInput, ImageUploadProvider, ImageUploader, IpfS3PreviewRewriteConfig, IpfS3Uploader,
+    IpfS3UploaderConfig, PixiUploader, S3Uploader, S3UploaderConfig, TelegraphClient,
+    TelegraphGalleryPageResult, TelegraphImageUrlPair, TelegraphRewriteData, TelegraphRewritePage,
 };

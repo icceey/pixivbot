@@ -1,0 +1,138 @@
+use sea_orm_migration::prelude::*;
+
+#[derive(DeriveMigrationName)]
+pub struct Migration;
+
+#[async_trait::async_trait]
+impl MigrationTrait for Migration {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(EhDownloadQueue::Table)
+                    .add_column(
+                        ColumnDef::new(EhDownloadQueue::TelegraphRewriteData)
+                            .text()
+                            .null(),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(EhDownloadQueue::Table)
+                    .add_column(
+                        ColumnDef::new(EhDownloadQueue::TelegraphRewriteStatus)
+                            .string()
+                            .null(),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(EhDownloadQueue::Table)
+                    .add_column(
+                        ColumnDef::new(EhDownloadQueue::TelegraphRewriteAfter)
+                            .timestamp()
+                            .null(),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(EhDownloadQueue::Table)
+                    .add_column(
+                        ColumnDef::new(EhDownloadQueue::TelegraphRewriteStartedAt)
+                            .timestamp()
+                            .null(),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(EhDownloadQueue::Table)
+                    .add_column(
+                        ColumnDef::new(EhDownloadQueue::TelegraphRewriteNextRetryAt)
+                            .timestamp()
+                            .null(),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(EhDownloadQueue::Table)
+                    .add_column(
+                        ColumnDef::new(EhDownloadQueue::TelegraphRewriteRetryCount)
+                            .integer()
+                            .not_null()
+                            .default(0),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(EhDownloadQueue::Table)
+                    .add_column(
+                        ColumnDef::new(EhDownloadQueue::TelegraphRewriteError)
+                            .string()
+                            .null(),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(EhDownloadQueue::Table)
+                    .add_column(
+                        ColumnDef::new(EhDownloadQueue::TelegraphRewrittenAt)
+                            .timestamp()
+                            .null(),
+                    )
+                    .to_owned(),
+            )
+            .await
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(EhDownloadQueue::Table)
+                    .drop_column(EhDownloadQueue::TelegraphRewrittenAt)
+                    .drop_column(EhDownloadQueue::TelegraphRewriteError)
+                    .drop_column(EhDownloadQueue::TelegraphRewriteRetryCount)
+                    .drop_column(EhDownloadQueue::TelegraphRewriteNextRetryAt)
+                    .drop_column(EhDownloadQueue::TelegraphRewriteStartedAt)
+                    .drop_column(EhDownloadQueue::TelegraphRewriteAfter)
+                    .drop_column(EhDownloadQueue::TelegraphRewriteStatus)
+                    .drop_column(EhDownloadQueue::TelegraphRewriteData)
+                    .to_owned(),
+            )
+            .await
+    }
+}
+
+#[derive(DeriveIden)]
+enum EhDownloadQueue {
+    Table,
+    TelegraphRewriteData,
+    TelegraphRewriteStatus,
+    TelegraphRewriteAfter,
+    TelegraphRewriteStartedAt,
+    TelegraphRewriteNextRetryAt,
+    TelegraphRewriteRetryCount,
+    TelegraphRewriteError,
+    TelegraphRewrittenAt,
+}

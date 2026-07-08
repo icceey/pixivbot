@@ -8,7 +8,10 @@ use crate::db::types::{
 use crate::scheduler::helpers::{eh_tag_subscription_state, get_chat_if_should_notify};
 use anyhow::{Context, Result};
 use chrono::Local;
-use eh_client::{EhClient, EhGallery, ImageUploadInput, ImageUploader, TelegraphClient};
+use eh_client::{
+    rewrite_ipfs_gateway_nodes, EhClient, EhGallery, ImageUploadInput, ImageUploader,
+    IpfS3PreviewRewriteConfig, TelegraphClient, TelegraphImageUrlPair, TelegraphRewriteData,
+};
 use rand::RngExt;
 use std::sync::Arc;
 use std::time::Duration;
@@ -941,6 +944,7 @@ pub struct EhUploadWorker {
     notifier: Notifier,
     telegraph: Arc<TelegraphClient>,
     image_uploader: Arc<dyn ImageUploader>,
+    rewrite_config: Option<IpfS3PreviewRewriteConfig>,
     config: Arc<EhentaiConfig>,
 }
 
@@ -963,6 +967,7 @@ impl EhUploadWorker {
         notifier: Notifier,
         telegraph: Arc<TelegraphClient>,
         image_uploader: Arc<dyn ImageUploader>,
+        rewrite_config: Option<IpfS3PreviewRewriteConfig>,
         config: Arc<EhentaiConfig>,
     ) -> Self {
         Self {
@@ -970,6 +975,7 @@ impl EhUploadWorker {
             notifier,
             telegraph,
             image_uploader,
+            rewrite_config,
             config,
         }
     }
@@ -1126,7 +1132,7 @@ impl EhUploadWorker {
             Ok(())
         });
 
-        let mut all_urls = Vec::new();
+        let mut all_url_pairs: Vec<TelegraphImageUrlPair> = Vec::new();
         while let Some(image) = image_rx.recv().await {
             let input = ImageUploadInput {
                 filename: &image.filename,
@@ -1134,15 +1140,15 @@ impl EhUploadWorker {
             };
             let urls = self
                 .image_uploader
-                .upload_images(&[input])
+                .upload_images_with_url_pairs(&[input])
                 .await
                 .context("Failed to upload images for Telegraph page")?;
-            all_urls.extend(urls);
+            all_url_pairs.extend(urls);
         }
 
         reader.await.context("spawn_blocking failed")??;
 
-        if all_urls.is_empty() {
+        if all_url_pairs.is_empty() {
             anyhow::bail!("No images uploaded by configured image uploader");
         }
 
@@ -1153,16 +1159,36 @@ impl EhUploadWorker {
             &entry.title
         };
 
-        let page_url = self
+        let result = self
             .telegraph
-            .create_gallery_page(title, &all_urls)
+            .create_gallery_page_with_url_pairs(
+                title,
+                &all_url_pairs,
+                self.rewrite_config
+                    .as_ref()
+                    .map(|config| config.preview_gateway_url.as_str()),
+                self.rewrite_config
+                    .as_ref()
+                    .map(|config| config.public_gateway_url.as_str()),
+            )
             .await
             .context("Failed to create telegraph page")?;
+        let rewrite_data_json = result
+            .rewrite_data
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .context("Failed to serialize Telegraph rewrite data")?;
+        let page_url = result.first_page_url;
 
         info!("Created telegraph page for gid={}: {}", entry.gid, page_url);
 
         self.repo
-            .mark_eh_download_uploaded(entry.id, &page_url)
+            .mark_eh_download_uploaded_with_rewrite(
+                entry.id,
+                &page_url,
+                rewrite_data_json.as_deref(),
+            )
             .await?;
 
         Ok(())
@@ -1201,6 +1227,7 @@ pub struct EhPublishWorker {
     repo: Arc<Repo>,
     notifier: Notifier,
     client: Arc<EhClient>,
+    rewrite_delay_sec: Option<u64>,
     config: Arc<EhentaiConfig>,
 }
 
@@ -1209,12 +1236,14 @@ impl EhPublishWorker {
         repo: Arc<Repo>,
         notifier: Notifier,
         client: Arc<EhClient>,
+        rewrite_delay_sec: Option<u64>,
         config: Arc<EhentaiConfig>,
     ) -> Self {
         Self {
             repo,
             notifier,
             client,
+            rewrite_delay_sec,
             config,
         }
     }
@@ -1337,6 +1366,13 @@ impl EhPublishWorker {
         // If both markers are already set, just mark done.
         if !archive_required && !telegraph_required {
             if entry.archive_sent_at.is_some() || entry.telegraph_sent_at.is_some() {
+                if entry.telegraph_sent_at.is_some() {
+                    if let Some(delay_sec) = self.rewrite_delay_sec {
+                        self.repo
+                            .schedule_eh_telegraph_rewrite_after_send(entry.id, delay_sec as i64)
+                            .await?;
+                    }
+                }
                 // At least one marker is set — the work is complete.
                 self.repo
                     .mark_eh_download_done(entry.id, entry.file_size)
@@ -1399,7 +1435,12 @@ impl EhPublishWorker {
             if !self.ensure_entry_active(entry).await? {
                 return Ok(());
             }
-            self.repo.mark_eh_telegraph_sent(entry.id).await?;
+            self.repo
+                .mark_eh_telegraph_sent_and_schedule_rewrite(
+                    entry.id,
+                    self.rewrite_delay_sec.map(|delay| delay as i64),
+                )
+                .await?;
         }
 
         // Both surfaces are now sent — mark done and clean up ZIP.
@@ -1453,6 +1494,98 @@ impl EhPublishWorker {
         );
         let url_escaped = teloxide::utils::markdown::escape_link_url(&gallery_url);
         format!("📦 {}\n\n🔗 [来源]({})", title, url_escaped)
+    }
+}
+
+// ============================================================================
+// Stage 5: EhTelegraphRewriteWorker — Rewrite Telegraph image URLs after send
+// ============================================================================
+
+pub struct EhTelegraphRewriteWorker {
+    repo: Arc<Repo>,
+    telegraph: Arc<TelegraphClient>,
+    config: Arc<EhentaiConfig>,
+}
+
+impl EhTelegraphRewriteWorker {
+    pub fn new(
+        repo: Arc<Repo>,
+        telegraph: Arc<TelegraphClient>,
+        config: Arc<EhentaiConfig>,
+    ) -> Self {
+        Self {
+            repo,
+            telegraph,
+            config,
+        }
+    }
+
+    pub async fn run(self) {
+        let poll = self.config.download_poll_interval_sec.max(10);
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(poll));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        loop {
+            interval.tick().await;
+            if let Err(e) = self.tick().await {
+                error!("EhTelegraphRewriteWorker tick error: {:#}", e);
+            }
+        }
+    }
+
+    async fn tick(&self) -> Result<()> {
+        let entry = self.repo.get_next_for_telegraph_rewrite().await?;
+        let Some(entry) = entry else {
+            return Ok(());
+        };
+
+        if let Err(e) = self.process(&entry).await {
+            error!("Telegraph rewrite failed for entry {}: {:#}", entry.id, e);
+            let permanent = self
+                .repo
+                .schedule_eh_telegraph_rewrite_retry(
+                    entry.id,
+                    &e.to_string(),
+                    self.config.max_retry_count,
+                )
+                .await?;
+            if permanent {
+                warn!(
+                    "Telegraph rewrite permanently failed for entry {} after retries",
+                    entry.id
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn process(&self, entry: &eh_download_queue::Model) -> Result<()> {
+        let data_json = entry
+            .telegraph_rewrite_data
+            .as_deref()
+            .context("telegraph_rewrite_data missing for claimed rewrite")?;
+        let data: TelegraphRewriteData = serde_json::from_str(data_json)
+            .context("Failed to deserialize Telegraph rewrite data")?;
+
+        for page in &data.pages {
+            let content = rewrite_ipfs_gateway_nodes(
+                &page.content,
+                &data.preview_gateway_url,
+                &data.public_gateway_url,
+            );
+            self.telegraph
+                .edit_page(&page.path, &page.title, &content)
+                .await
+                .with_context(|| format!("Failed to edit Telegraph page {}", page.path))?;
+        }
+
+        self.repo.mark_eh_telegraph_rewritten(entry.id).await?;
+        info!(
+            "Rewrote Telegraph page URLs for EH gid={} entry {}",
+            entry.gid, entry.id
+        );
+        Ok(())
     }
 }
 
@@ -2970,6 +3103,7 @@ mod integration_tests {
             make_notifier(&tg_server),
             make_telegraph_client(&tg_server),
             make_image_uploader(&tg_server),
+            None,
             Arc::new(make_config()),
         );
         worker.tick().await.unwrap();
@@ -3025,6 +3159,7 @@ mod integration_tests {
             make_notifier(&tg_server),
             make_telegraph_client(&tg_server),
             make_image_uploader(&tg_server),
+            None,
             Arc::new(make_config()),
         );
         worker.tick().await.unwrap();
@@ -3075,6 +3210,7 @@ mod integration_tests {
             make_notifier(&tg_server),
             make_telegraph_client(&tg_server),
             make_image_uploader(&tg_server),
+            None,
             Arc::new(make_config()),
         );
         worker.tick().await.unwrap();
@@ -3125,6 +3261,7 @@ mod integration_tests {
             Arc::clone(&repo),
             make_notifier(&tg_server),
             make_eh_client(&eh_server),
+            None,
             Arc::new(make_config()),
         );
         worker.tick().await.unwrap();
@@ -3172,6 +3309,7 @@ mod integration_tests {
             Arc::clone(&repo),
             make_notifier(&tg_server),
             make_eh_client(&eh_server),
+            None,
             Arc::new(make_config()),
         );
         worker.tick().await.unwrap();
@@ -3223,6 +3361,7 @@ mod integration_tests {
             Arc::clone(&repo),
             make_notifier(&tg_server),
             make_eh_client(&eh_server),
+            None,
             Arc::new(make_config()),
         );
         worker.tick().await.unwrap();
@@ -3289,6 +3428,7 @@ mod integration_tests {
             Arc::clone(&repo),
             notifier,
             make_eh_client(&eh_server),
+            None,
             config,
         );
         worker.tick().await.unwrap();
@@ -3327,6 +3467,7 @@ mod integration_tests {
             Arc::clone(&repo),
             notifier,
             make_eh_client(&eh_server),
+            None,
             config,
         );
         worker.tick().await.unwrap();
@@ -3374,6 +3515,7 @@ mod integration_tests {
             Arc::clone(&repo),
             notifier,
             make_eh_client(&MockServer::start().await),
+            None,
             config,
         );
         worker.process(&claimed).await.unwrap();
@@ -3402,6 +3544,7 @@ mod integration_tests {
             Arc::clone(&repo),
             notifier,
             make_eh_client(&MockServer::start().await),
+            None,
             config,
         );
         let temp_dir = tempfile::tempdir().unwrap();
@@ -3458,6 +3601,7 @@ mod integration_tests {
             Arc::clone(&repo),
             notifier,
             make_eh_client(&eh_server),
+            None,
             config,
         );
         worker.tick().await.unwrap();
@@ -3502,6 +3646,7 @@ mod integration_tests {
             notifier,
             make_telegraph_client(&tg_server),
             make_image_uploader(&tg_server),
+            None,
             config,
         );
         worker.tick().await.unwrap();
@@ -3548,6 +3693,7 @@ mod integration_tests {
             notifier,
             make_telegraph_client(&tg_server),
             make_image_uploader(&tg_server),
+            None,
             config,
         );
         worker.tick().await.unwrap();
@@ -3589,6 +3735,7 @@ mod integration_tests {
             notifier,
             make_telegraph_client(&tg_server),
             make_image_uploader(&tg_server),
+            None,
             config,
         );
         worker.tick().await.unwrap();
@@ -3646,6 +3793,7 @@ mod integration_tests {
             Arc::clone(&repo),
             notifier,
             make_eh_client(&eh_server),
+            None,
             config,
         );
         worker.tick().await.unwrap();

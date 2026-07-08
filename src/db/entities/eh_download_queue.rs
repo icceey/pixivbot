@@ -65,6 +65,22 @@ pub struct Model {
     pub background_download_attempt_count: i32,
     #[sea_orm(nullable)]
     pub background_download_error: Option<String>,
+    #[sea_orm(nullable)]
+    pub telegraph_rewrite_data: Option<String>,
+    #[sea_orm(nullable)]
+    pub telegraph_rewrite_status: Option<String>,
+    #[sea_orm(nullable)]
+    pub telegraph_rewrite_after: Option<DateTime>,
+    #[sea_orm(nullable)]
+    pub telegraph_rewrite_started_at: Option<DateTime>,
+    #[sea_orm(nullable)]
+    pub telegraph_rewrite_next_retry_at: Option<DateTime>,
+    #[sea_orm(default = 0)]
+    pub telegraph_rewrite_retry_count: i32,
+    #[sea_orm(nullable)]
+    pub telegraph_rewrite_error: Option<String>,
+    #[sea_orm(nullable)]
+    pub telegraph_rewritten_at: Option<DateTime>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

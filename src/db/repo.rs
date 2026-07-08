@@ -136,6 +136,14 @@ pub mod tests_helpers {
                 background_download_next_retry_at TIMESTAMP,
                 background_download_attempt_count INTEGER NOT NULL DEFAULT 0,
                 background_download_error TEXT,
+                telegraph_rewrite_data TEXT,
+                telegraph_rewrite_status TEXT,
+                telegraph_rewrite_after TIMESTAMP,
+                telegraph_rewrite_started_at TIMESTAMP,
+                telegraph_rewrite_next_retry_at TIMESTAMP,
+                telegraph_rewrite_retry_count INTEGER NOT NULL DEFAULT 0,
+                telegraph_rewrite_error TEXT,
+                telegraph_rewritten_at TIMESTAMP,
                 UNIQUE(chat_id, gid)
             )
             "#,
