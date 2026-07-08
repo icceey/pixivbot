@@ -88,10 +88,7 @@ impl EhBackgroundDownloadWorker {
             tasks.spawn(async move { worker.process_claimed(entry).await });
         }
 
-        while let Some(result) = tasks.join_next().await {
-            result.context("background download task failed")??;
-        }
-        Ok(())
+        drain_background_download_tasks(&mut tasks).await
     }
 
     async fn process_claimed(&self, entry: eh_download_queue::Model) -> Result<()> {
@@ -160,6 +157,33 @@ impl EhBackgroundDownloadWorker {
     }
 }
 
+async fn drain_background_download_tasks(tasks: &mut JoinSet<Result<()>>) -> Result<()> {
+    let mut first_error = None;
+    while let Some(result) = tasks.join_next().await {
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                error!("EH background download task failed: {:#}", e);
+                if first_error.is_none() {
+                    first_error = Some(e);
+                }
+            }
+            Err(e) => {
+                let err = anyhow::Error::new(e).context("background download task failed");
+                error!("EH background download task join failed: {:#}", err);
+                if first_error.is_none() {
+                    first_error = Some(err);
+                }
+            }
+        }
+    }
+
+    if let Some(err) = first_error {
+        Err(err.context("one or more EH background download tasks failed"))
+    } else {
+        Ok(())
+    }
+}
 // ============================================================================
 // Stage 1: EhEngine — Collect (search → metadata → filter → enqueue downloads)
 // ============================================================================
@@ -1485,6 +1509,33 @@ mod tests {
             1,
             Duration::from_secs(0)
         ));
+    }
+
+    #[tokio::test]
+    async fn test_drain_background_download_tasks_waits_for_siblings_after_error() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let sibling_completed = Arc::new(AtomicBool::new(false));
+        let mut tasks = JoinSet::new();
+        tasks.spawn(async { anyhow::bail!("first task failed") });
+        let sibling_completed_for_task = Arc::clone(&sibling_completed);
+        tasks.spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            sibling_completed_for_task.store(true, Ordering::SeqCst);
+            Ok(())
+        });
+
+        let err = drain_background_download_tasks(&mut tasks)
+            .await
+            .expect_err("drain should return the first task error after all tasks finish");
+
+        assert!(err
+            .to_string()
+            .contains("one or more EH background download tasks failed"));
+        assert!(
+            sibling_completed.load(Ordering::SeqCst),
+            "drain must not abort sibling tasks after the first error"
+        );
     }
 }
 
