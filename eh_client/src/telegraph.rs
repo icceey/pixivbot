@@ -144,6 +144,38 @@ pub fn split_for_pages(urls: &[String], max_bytes: usize) -> Vec<Vec<String>> {
     chunks
 }
 
+fn split_url_pairs_for_pages(
+    urls: &[TelegraphImageUrlPair],
+    max_bytes: usize,
+) -> Vec<Vec<TelegraphImageUrlPair>> {
+    if urls.is_empty() {
+        return vec![];
+    }
+    let max_page_size = max_bytes.saturating_sub(CONTINUATION_LINK_BUDGET);
+    let mut chunks = Vec::new();
+    let mut current = Vec::new();
+    let mut current_size = 0;
+    for pair in urls {
+        let preview_size = serde_json::to_vec(&Node::img(&pair.preview_url))
+            .map(|v| v.len())
+            .unwrap_or(100);
+        let public_size = serde_json::to_vec(&Node::img(&pair.public_url))
+            .map(|v| v.len())
+            .unwrap_or(100);
+        let node_size = preview_size.max(public_size);
+        if current_size + node_size > max_page_size && !current.is_empty() {
+            chunks.push(std::mem::take(&mut current));
+            current_size = 0;
+        }
+        current_size += node_size;
+        current.push(pair.clone());
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
+}
+
 #[derive(Debug, Deserialize)]
 struct TelegraphResponse<T> {
     ok: bool,
@@ -1188,11 +1220,7 @@ impl TelegraphClient {
             return Err(Error::Other("no images to upload".into()));
         }
 
-        let preview_urls: Vec<String> = image_urls
-            .iter()
-            .map(|pair| pair.preview_url.clone())
-            .collect();
-        let chunks = split_for_pages(&preview_urls, MAX_PAGE_CONTENT_BYTES);
+        let chunks = split_url_pairs_for_pages(image_urls, MAX_PAGE_CONTENT_BYTES);
         let should_rewrite =
             preview_gateway_url
                 .zip(public_gateway_url)
@@ -1202,7 +1230,10 @@ impl TelegraphClient {
         let mut rewrite_pages = Vec::new();
 
         if chunks.len() == 1 {
-            let nodes: Vec<Node> = chunks[0].iter().map(|url| Node::img(url)).collect();
+            let nodes: Vec<Node> = chunks[0]
+                .iter()
+                .map(|pair| Node::img(&pair.preview_url))
+                .collect();
             let url = self.create_page(title, &nodes).await?;
             if should_rewrite {
                 if let Some(path) = telegraph_path_from_url(&url) {
@@ -1229,8 +1260,8 @@ impl TelegraphClient {
         let mut next_url: Option<String> = None;
         for (idx, chunk) in chunks.iter().rev().enumerate() {
             let mut nodes: Vec<Node> = Vec::new();
-            for url in chunk {
-                nodes.push(Node::img(url));
+            for pair in chunk {
+                nodes.push(Node::img(&pair.preview_url));
             }
             if let Some(ref next) = next_url {
                 nodes.push(Node::link(next, "Next Page →"));
@@ -1376,6 +1407,38 @@ mod tests {
                 idx,
                 size,
                 max_bytes
+            );
+        }
+    }
+
+    #[test]
+    fn split_url_pairs_for_pages_accounts_for_longer_public_urls() {
+        let pairs: Vec<TelegraphImageUrlPair> = (0..6)
+            .map(|i| TelegraphImageUrlPair {
+                preview_url: format!("https://p.example/ipfs/cid-{i}"),
+                public_url: format!("https://public.example/ipfs/{}-cid-{i}", "x".repeat(210)),
+            })
+            .collect();
+        let preview_urls: Vec<String> = pairs.iter().map(|pair| pair.preview_url.clone()).collect();
+
+        assert_eq!(split_for_pages(&preview_urls, 1024).len(), 1);
+
+        let pages = split_url_pairs_for_pages(&pairs, 1024);
+        assert!(
+            pages.len() > 1,
+            "expected public URL size to force multiple pages"
+        );
+        for (idx, page) in pages.iter().enumerate() {
+            let mut nodes: Vec<Node> = page
+                .iter()
+                .map(|pair| Node::img(&pair.public_url))
+                .collect();
+            if idx + 1 < pages.len() {
+                nodes.push(Node::link("https://telegra.ph/next", "Next Page →"));
+            }
+            assert!(
+                estimate_content_size(&nodes) <= 1024,
+                "rewritten page {idx} should fit Telegraph content budget"
             );
         }
     }
