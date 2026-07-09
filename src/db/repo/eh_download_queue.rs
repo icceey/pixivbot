@@ -46,6 +46,9 @@ pub const STATUS_PUBLISHING: &str = "publishing";
 pub const STATUS_CANCELED: &str = "canceled";
 pub const BACKGROUND_STATUS_PENDING: &str = "pending";
 pub const BACKGROUND_STATUS_RUNNING: &str = "running";
+pub const TELEGRAPH_REWRITE_STATUS_PENDING: &str = "pending";
+pub const TELEGRAPH_REWRITE_STATUS_REWRITING: &str = "rewriting";
+pub const TELEGRAPH_REWRITE_STATUS_FAILED: &str = "failed";
 
 /// Source constants for eh_download_queue.
 pub const SOURCE_SUBSCRIPTION: &str = "subscription";
@@ -413,6 +416,38 @@ impl Repo {
                         eh_download_queue::Column::BackgroundDownloadError,
                         Expr::value(None::<String>),
                     )
+                    .col_expr(
+                        eh_download_queue::Column::TelegraphRewriteData,
+                        Expr::value(None::<String>),
+                    )
+                    .col_expr(
+                        eh_download_queue::Column::TelegraphRewriteStatus,
+                        Expr::value(None::<String>),
+                    )
+                    .col_expr(
+                        eh_download_queue::Column::TelegraphRewriteAfter,
+                        Expr::value(None::<DateTime>),
+                    )
+                    .col_expr(
+                        eh_download_queue::Column::TelegraphRewriteStartedAt,
+                        Expr::value(None::<DateTime>),
+                    )
+                    .col_expr(
+                        eh_download_queue::Column::TelegraphRewriteNextRetryAt,
+                        Expr::value(None::<DateTime>),
+                    )
+                    .col_expr(
+                        eh_download_queue::Column::TelegraphRewriteRetryCount,
+                        Expr::value(0),
+                    )
+                    .col_expr(
+                        eh_download_queue::Column::TelegraphRewriteError,
+                        Expr::value(None::<String>),
+                    )
+                    .col_expr(
+                        eh_download_queue::Column::TelegraphRewrittenAt,
+                        Expr::value(None::<DateTime>),
+                    )
                     .filter(eh_download_queue::Column::Id.eq(id))
                     .filter(eh_download_queue::Column::Status.eq(&expected_status))
                     .filter(eh_download_queue::Column::Telegraph.eq(expected_telegraph))
@@ -697,6 +732,38 @@ impl Repo {
                 eh_download_queue::Column::TelegraphSentAt,
                 Expr::value(None::<DateTime>),
             )
+            .col_expr(
+                eh_download_queue::Column::TelegraphRewriteData,
+                Expr::value(None::<String>),
+            )
+            .col_expr(
+                eh_download_queue::Column::TelegraphRewriteStatus,
+                Expr::value(None::<String>),
+            )
+            .col_expr(
+                eh_download_queue::Column::TelegraphRewriteAfter,
+                Expr::value(None::<DateTime>),
+            )
+            .col_expr(
+                eh_download_queue::Column::TelegraphRewriteStartedAt,
+                Expr::value(None::<DateTime>),
+            )
+            .col_expr(
+                eh_download_queue::Column::TelegraphRewriteNextRetryAt,
+                Expr::value(None::<DateTime>),
+            )
+            .col_expr(
+                eh_download_queue::Column::TelegraphRewriteRetryCount,
+                Expr::value(0),
+            )
+            .col_expr(
+                eh_download_queue::Column::TelegraphRewriteError,
+                Expr::value(None::<String>),
+            )
+            .col_expr(
+                eh_download_queue::Column::TelegraphRewrittenAt,
+                Expr::value(None::<DateTime>),
+            )
             .filter(eh_download_queue::Column::Source.eq(SOURCE_SUBSCRIPTION))
             .filter(eh_download_queue::Column::SubscriptionIds.is_null())
             .filter(eh_download_queue::Column::Status.is_in([
@@ -882,6 +949,70 @@ impl Repo {
                         row.background_download_error.clone()
                     }),
                 )
+                .col_expr(
+                    eh_download_queue::Column::TelegraphRewriteData,
+                    Expr::value(if telegraph_still_required {
+                        row.telegraph_rewrite_data.clone()
+                    } else {
+                        None::<String>
+                    }),
+                )
+                .col_expr(
+                    eh_download_queue::Column::TelegraphRewriteStatus,
+                    Expr::value(if telegraph_still_required {
+                        row.telegraph_rewrite_status.clone()
+                    } else {
+                        None::<String>
+                    }),
+                )
+                .col_expr(
+                    eh_download_queue::Column::TelegraphRewriteAfter,
+                    Expr::value(if telegraph_still_required {
+                        row.telegraph_rewrite_after
+                    } else {
+                        None::<DateTime>
+                    }),
+                )
+                .col_expr(
+                    eh_download_queue::Column::TelegraphRewriteStartedAt,
+                    Expr::value(if telegraph_still_required {
+                        row.telegraph_rewrite_started_at
+                    } else {
+                        None::<DateTime>
+                    }),
+                )
+                .col_expr(
+                    eh_download_queue::Column::TelegraphRewriteNextRetryAt,
+                    Expr::value(if telegraph_still_required {
+                        row.telegraph_rewrite_next_retry_at
+                    } else {
+                        None::<DateTime>
+                    }),
+                )
+                .col_expr(
+                    eh_download_queue::Column::TelegraphRewriteRetryCount,
+                    Expr::value(if telegraph_still_required {
+                        row.telegraph_rewrite_retry_count
+                    } else {
+                        0
+                    }),
+                )
+                .col_expr(
+                    eh_download_queue::Column::TelegraphRewriteError,
+                    Expr::value(if telegraph_still_required {
+                        row.telegraph_rewrite_error.clone()
+                    } else {
+                        None::<String>
+                    }),
+                )
+                .col_expr(
+                    eh_download_queue::Column::TelegraphRewrittenAt,
+                    Expr::value(if telegraph_still_required {
+                        row.telegraph_rewritten_at
+                    } else {
+                        None::<DateTime>
+                    }),
+                )
                 .filter(eh_download_queue::Column::Id.eq(row.id))
                 .filter(eh_download_queue::Column::Status.eq(&row.status))
                 .filter(eh_download_queue::Column::Source.eq(SOURCE_SUBSCRIPTION))
@@ -984,6 +1115,38 @@ impl Repo {
                 )
                 .col_expr(
                     eh_download_queue::Column::TelegraphSentAt,
+                    Expr::value(None::<DateTime>),
+                )
+                .col_expr(
+                    eh_download_queue::Column::TelegraphRewriteData,
+                    Expr::value(None::<String>),
+                )
+                .col_expr(
+                    eh_download_queue::Column::TelegraphRewriteStatus,
+                    Expr::value(None::<String>),
+                )
+                .col_expr(
+                    eh_download_queue::Column::TelegraphRewriteAfter,
+                    Expr::value(None::<DateTime>),
+                )
+                .col_expr(
+                    eh_download_queue::Column::TelegraphRewriteStartedAt,
+                    Expr::value(None::<DateTime>),
+                )
+                .col_expr(
+                    eh_download_queue::Column::TelegraphRewriteNextRetryAt,
+                    Expr::value(None::<DateTime>),
+                )
+                .col_expr(
+                    eh_download_queue::Column::TelegraphRewriteRetryCount,
+                    Expr::value(0),
+                )
+                .col_expr(
+                    eh_download_queue::Column::TelegraphRewriteError,
+                    Expr::value(None::<String>),
+                )
+                .col_expr(
+                    eh_download_queue::Column::TelegraphRewrittenAt,
                     Expr::value(None::<DateTime>),
                 )
                 .filter(eh_download_queue::Column::Id.eq(row.id))
@@ -1090,6 +1253,35 @@ impl Repo {
         Ok(count)
     }
 
+    /// Reset stale Telegraph rewrite claims back to pending rewrite work.
+    pub async fn reset_stale_eh_telegraph_rewrites(&self, stale_sec: i64) -> Result<u64> {
+        let cutoff = Local::now().naive_local() - chrono::Duration::seconds(stale_sec);
+        let result = eh_download_queue::Entity::update_many()
+            .col_expr(
+                eh_download_queue::Column::TelegraphRewriteStatus,
+                Expr::value(Some(TELEGRAPH_REWRITE_STATUS_PENDING.to_string())),
+            )
+            .col_expr(
+                eh_download_queue::Column::TelegraphRewriteStartedAt,
+                Expr::value(None::<DateTime>),
+            )
+            .filter(
+                eh_download_queue::Column::TelegraphRewriteStatus
+                    .eq(TELEGRAPH_REWRITE_STATUS_REWRITING),
+            )
+            .filter(eh_download_queue::Column::TelegraphRewriteData.is_not_null())
+            .filter(
+                sea_orm::Condition::any()
+                    .add(eh_download_queue::Column::TelegraphRewriteStartedAt.is_null())
+                    .add(eh_download_queue::Column::TelegraphRewriteStartedAt.lte(cutoff)),
+            )
+            .exec(&self.db)
+            .await
+            .context("Failed to reset stale EH Telegraph rewrites")?;
+
+        Ok(result.rows_affected)
+    }
+
     /// Reset failed downloads back to pending if they haven't exceeded max_retry_count.
     #[allow(dead_code)]
     pub async fn retry_failed_eh_downloads(&self, max_retry_count: u8) -> Result<u64> {
@@ -1182,10 +1374,22 @@ impl Repo {
 
     /// Mark a download as uploaded (Telegraph page created). Transitions to `uploaded` status.
     /// Only allowed when current status is `STATUS_UPLOADING`.
+    #[allow(dead_code)]
     pub async fn mark_eh_download_uploaded(
         &self,
         id: i32,
         telegraph_url: &str,
+    ) -> Result<eh_download_queue::Model> {
+        self.mark_eh_download_uploaded_with_rewrite(id, telegraph_url, None)
+            .await
+    }
+
+    /// Mark a download as uploaded and store optional post-send Telegraph rewrite metadata.
+    pub async fn mark_eh_download_uploaded_with_rewrite(
+        &self,
+        id: i32,
+        telegraph_url: &str,
+        rewrite_data_json: Option<&str>,
     ) -> Result<eh_download_queue::Model> {
         let result = eh_download_queue::Entity::update_many()
             .col_expr(
@@ -1202,6 +1406,38 @@ impl Repo {
             )
             .col_expr(
                 eh_download_queue::Column::NextRetryAt,
+                Expr::value(None::<DateTime>),
+            )
+            .col_expr(
+                eh_download_queue::Column::TelegraphRewriteData,
+                Expr::value(rewrite_data_json.map(str::to_string)),
+            )
+            .col_expr(
+                eh_download_queue::Column::TelegraphRewriteStatus,
+                Expr::value(None::<String>),
+            )
+            .col_expr(
+                eh_download_queue::Column::TelegraphRewriteAfter,
+                Expr::value(None::<DateTime>),
+            )
+            .col_expr(
+                eh_download_queue::Column::TelegraphRewriteStartedAt,
+                Expr::value(None::<DateTime>),
+            )
+            .col_expr(
+                eh_download_queue::Column::TelegraphRewriteNextRetryAt,
+                Expr::value(None::<DateTime>),
+            )
+            .col_expr(
+                eh_download_queue::Column::TelegraphRewriteRetryCount,
+                Expr::value(0),
+            )
+            .col_expr(
+                eh_download_queue::Column::TelegraphRewriteError,
+                Expr::value(None::<String>),
+            )
+            .col_expr(
+                eh_download_queue::Column::TelegraphRewrittenAt,
                 Expr::value(None::<DateTime>),
             )
             .filter(eh_download_queue::Column::Id.eq(id))
@@ -1266,6 +1502,38 @@ impl Repo {
                 eh_download_queue::Column::TelegraphSentAt,
                 Expr::value(None::<DateTime>),
             )
+            .col_expr(
+                eh_download_queue::Column::TelegraphRewriteData,
+                Expr::value(None::<String>),
+            )
+            .col_expr(
+                eh_download_queue::Column::TelegraphRewriteStatus,
+                Expr::value(None::<String>),
+            )
+            .col_expr(
+                eh_download_queue::Column::TelegraphRewriteAfter,
+                Expr::value(None::<DateTime>),
+            )
+            .col_expr(
+                eh_download_queue::Column::TelegraphRewriteStartedAt,
+                Expr::value(None::<DateTime>),
+            )
+            .col_expr(
+                eh_download_queue::Column::TelegraphRewriteNextRetryAt,
+                Expr::value(None::<DateTime>),
+            )
+            .col_expr(
+                eh_download_queue::Column::TelegraphRewriteRetryCount,
+                Expr::value(0),
+            )
+            .col_expr(
+                eh_download_queue::Column::TelegraphRewriteError,
+                Expr::value(None::<String>),
+            )
+            .col_expr(
+                eh_download_queue::Column::TelegraphRewrittenAt,
+                Expr::value(None::<DateTime>),
+            )
             .filter(eh_download_queue::Column::Id.eq(id))
             .filter(eh_download_queue::Column::Status.eq(STATUS_UPLOADING))
             .exec(&self.db)
@@ -1323,6 +1591,38 @@ impl Repo {
                 eh_download_queue::Column::NextRetryAt,
                 Expr::value(None::<DateTime>),
             )
+            .col_expr(
+                eh_download_queue::Column::TelegraphRewriteData,
+                Expr::value(None::<String>),
+            )
+            .col_expr(
+                eh_download_queue::Column::TelegraphRewriteStatus,
+                Expr::value(None::<String>),
+            )
+            .col_expr(
+                eh_download_queue::Column::TelegraphRewriteAfter,
+                Expr::value(None::<DateTime>),
+            )
+            .col_expr(
+                eh_download_queue::Column::TelegraphRewriteStartedAt,
+                Expr::value(None::<DateTime>),
+            )
+            .col_expr(
+                eh_download_queue::Column::TelegraphRewriteNextRetryAt,
+                Expr::value(None::<DateTime>),
+            )
+            .col_expr(
+                eh_download_queue::Column::TelegraphRewriteRetryCount,
+                Expr::value(0),
+            )
+            .col_expr(
+                eh_download_queue::Column::TelegraphRewriteError,
+                Expr::value(None::<String>),
+            )
+            .col_expr(
+                eh_download_queue::Column::TelegraphRewrittenAt,
+                Expr::value(None::<DateTime>),
+            )
             .filter(eh_download_queue::Column::Telegraph.eq(true))
             .filter(eh_download_queue::Column::TelegraphUrl.is_null())
             .filter(eh_download_queue::Column::Status.is_in([STATUS_PENDING, STATUS_DOWNLOADING]))
@@ -1358,6 +1658,38 @@ impl Repo {
                 eh_download_queue::Column::NextRetryAt,
                 Expr::value(None::<DateTime>),
             )
+            .col_expr(
+                eh_download_queue::Column::TelegraphRewriteData,
+                Expr::value(None::<String>),
+            )
+            .col_expr(
+                eh_download_queue::Column::TelegraphRewriteStatus,
+                Expr::value(None::<String>),
+            )
+            .col_expr(
+                eh_download_queue::Column::TelegraphRewriteAfter,
+                Expr::value(None::<DateTime>),
+            )
+            .col_expr(
+                eh_download_queue::Column::TelegraphRewriteStartedAt,
+                Expr::value(None::<DateTime>),
+            )
+            .col_expr(
+                eh_download_queue::Column::TelegraphRewriteNextRetryAt,
+                Expr::value(None::<DateTime>),
+            )
+            .col_expr(
+                eh_download_queue::Column::TelegraphRewriteRetryCount,
+                Expr::value(0),
+            )
+            .col_expr(
+                eh_download_queue::Column::TelegraphRewriteError,
+                Expr::value(None::<String>),
+            )
+            .col_expr(
+                eh_download_queue::Column::TelegraphRewrittenAt,
+                Expr::value(None::<DateTime>),
+            )
             .filter(eh_download_queue::Column::Telegraph.eq(true))
             .filter(eh_download_queue::Column::TelegraphUrl.is_null())
             .filter(eh_download_queue::Column::Status.is_in([
@@ -1378,6 +1710,38 @@ impl Repo {
             .col_expr(
                 eh_download_queue::Column::TelegraphSubscriptionIds,
                 Expr::value(None::<String>),
+            )
+            .col_expr(
+                eh_download_queue::Column::TelegraphRewriteData,
+                Expr::value(None::<String>),
+            )
+            .col_expr(
+                eh_download_queue::Column::TelegraphRewriteStatus,
+                Expr::value(None::<String>),
+            )
+            .col_expr(
+                eh_download_queue::Column::TelegraphRewriteAfter,
+                Expr::value(None::<DateTime>),
+            )
+            .col_expr(
+                eh_download_queue::Column::TelegraphRewriteStartedAt,
+                Expr::value(None::<DateTime>),
+            )
+            .col_expr(
+                eh_download_queue::Column::TelegraphRewriteNextRetryAt,
+                Expr::value(None::<DateTime>),
+            )
+            .col_expr(
+                eh_download_queue::Column::TelegraphRewriteRetryCount,
+                Expr::value(0),
+            )
+            .col_expr(
+                eh_download_queue::Column::TelegraphRewriteError,
+                Expr::value(None::<String>),
+            )
+            .col_expr(
+                eh_download_queue::Column::TelegraphRewrittenAt,
+                Expr::value(None::<DateTime>),
             )
             .filter(eh_download_queue::Column::Telegraph.eq(true))
             .filter(eh_download_queue::Column::Status.is_in([
@@ -1604,13 +1968,82 @@ impl Repo {
     /// Only updates rows currently in `STATUS_PUBLISHING`.
     #[allow(dead_code)]
     pub async fn mark_eh_telegraph_sent(&self, id: i32) -> Result<()> {
+        self.mark_eh_telegraph_sent_and_schedule_rewrite(id, None)
+            .await
+    }
+
+    /// Mark the Telegraph link as sent and schedule rewrite metadata in the same DB update.
+    pub async fn mark_eh_telegraph_sent_and_schedule_rewrite(
+        &self,
+        id: i32,
+        rewrite_delay_secs: Option<i64>,
+    ) -> Result<()> {
+        let now = Local::now().naive_local();
+        if rewrite_delay_secs.is_none() {
+            let result = eh_download_queue::Entity::update_many()
+                .col_expr(eh_download_queue::Column::TelegraphSentAt, Expr::value(now))
+                .filter(eh_download_queue::Column::Id.eq(id))
+                .filter(eh_download_queue::Column::Status.eq(STATUS_PUBLISHING))
+                .exec(&self.db)
+                .await?;
+
+            if result.rows_affected != 1 {
+                anyhow::bail!(
+                    "Cannot mark telegraph sent for EH download {}: expected status '{}', but it was changed",
+                    id,
+                    STATUS_PUBLISHING
+                );
+            }
+            return Ok(());
+        }
+
+        if let Some(delay_secs) = rewrite_delay_secs {
+            let result = eh_download_queue::Entity::update_many()
+                .col_expr(eh_download_queue::Column::TelegraphSentAt, Expr::value(now))
+                .col_expr(
+                    eh_download_queue::Column::TelegraphRewriteStatus,
+                    Expr::value(Some(TELEGRAPH_REWRITE_STATUS_PENDING.to_string())),
+                )
+                .col_expr(
+                    eh_download_queue::Column::TelegraphRewriteAfter,
+                    Expr::value(now + chrono::Duration::seconds(delay_secs)),
+                )
+                .col_expr(
+                    eh_download_queue::Column::TelegraphRewriteStartedAt,
+                    Expr::value(None::<DateTime>),
+                )
+                .col_expr(
+                    eh_download_queue::Column::TelegraphRewriteNextRetryAt,
+                    Expr::value(None::<DateTime>),
+                )
+                .col_expr(
+                    eh_download_queue::Column::TelegraphRewriteRetryCount,
+                    Expr::value(0),
+                )
+                .col_expr(
+                    eh_download_queue::Column::TelegraphRewriteError,
+                    Expr::value(None::<String>),
+                )
+                .col_expr(
+                    eh_download_queue::Column::TelegraphRewrittenAt,
+                    Expr::value(None::<DateTime>),
+                )
+                .filter(eh_download_queue::Column::Id.eq(id))
+                .filter(eh_download_queue::Column::Status.eq(STATUS_PUBLISHING))
+                .filter(eh_download_queue::Column::TelegraphRewriteData.is_not_null())
+                .exec(&self.db)
+                .await
+                .context("Failed to mark EH Telegraph sent and schedule rewrite")?;
+            if result.rows_affected == 1 {
+                return Ok(());
+            }
+        }
+
         let result = eh_download_queue::Entity::update_many()
-            .col_expr(
-                eh_download_queue::Column::TelegraphSentAt,
-                Expr::value(Local::now().naive_local()),
-            )
+            .col_expr(eh_download_queue::Column::TelegraphSentAt, Expr::value(now))
             .filter(eh_download_queue::Column::Id.eq(id))
             .filter(eh_download_queue::Column::Status.eq(STATUS_PUBLISHING))
+            .filter(eh_download_queue::Column::TelegraphRewriteData.is_null())
             .exec(&self.db)
             .await?;
 
@@ -1622,6 +2055,285 @@ impl Repo {
             );
         }
         Ok(())
+    }
+
+    /// Schedule stored Telegraph rewrite data after the link has been sent.
+    pub async fn schedule_eh_telegraph_rewrite_after_send(
+        &self,
+        id: i32,
+        delay_secs: i64,
+    ) -> Result<()> {
+        let now = Local::now().naive_local();
+        eh_download_queue::Entity::update_many()
+            .col_expr(
+                eh_download_queue::Column::TelegraphRewriteStatus,
+                Expr::value(Some(TELEGRAPH_REWRITE_STATUS_PENDING.to_string())),
+            )
+            .col_expr(
+                eh_download_queue::Column::TelegraphRewriteAfter,
+                Expr::value(now + chrono::Duration::seconds(delay_secs)),
+            )
+            .col_expr(
+                eh_download_queue::Column::TelegraphRewriteStartedAt,
+                Expr::value(None::<DateTime>),
+            )
+            .col_expr(
+                eh_download_queue::Column::TelegraphRewriteNextRetryAt,
+                Expr::value(None::<DateTime>),
+            )
+            .col_expr(
+                eh_download_queue::Column::TelegraphRewriteRetryCount,
+                Expr::value(0),
+            )
+            .col_expr(
+                eh_download_queue::Column::TelegraphRewriteError,
+                Expr::value(None::<String>),
+            )
+            .col_expr(
+                eh_download_queue::Column::TelegraphRewrittenAt,
+                Expr::value(None::<DateTime>),
+            )
+            .filter(eh_download_queue::Column::Id.eq(id))
+            .filter(eh_download_queue::Column::Status.eq(STATUS_PUBLISHING))
+            .filter(eh_download_queue::Column::TelegraphSentAt.is_not_null())
+            .filter(eh_download_queue::Column::TelegraphRewriteData.is_not_null())
+            .filter(eh_download_queue::Column::TelegraphRewriteStatus.is_null())
+            .filter(eh_download_queue::Column::TelegraphRewriteAfter.is_null())
+            .filter(eh_download_queue::Column::TelegraphRewriteNextRetryAt.is_null())
+            .filter(eh_download_queue::Column::TelegraphRewrittenAt.is_null())
+            .exec(&self.db)
+            .await
+            .context("Failed to schedule EH Telegraph rewrite")?;
+        Ok(())
+    }
+
+    /// Claim the next due Telegraph rewrite job.
+    pub async fn get_next_for_telegraph_rewrite(&self) -> Result<Option<eh_download_queue::Model>> {
+        let now = Local::now().naive_local();
+        let entry = eh_download_queue::Entity::find()
+            .filter(
+                eh_download_queue::Column::TelegraphRewriteStatus
+                    .eq(TELEGRAPH_REWRITE_STATUS_PENDING),
+            )
+            .filter(eh_download_queue::Column::TelegraphRewriteData.is_not_null())
+            .filter(eh_download_queue::Column::TelegraphSentAt.is_not_null())
+            .filter(eh_download_queue::Column::TelegraphRewrittenAt.is_null())
+            .filter(
+                eh_download_queue::Column::TelegraphRewriteAfter
+                    .is_null()
+                    .or(eh_download_queue::Column::TelegraphRewriteAfter.lte(now)),
+            )
+            .filter(
+                eh_download_queue::Column::TelegraphRewriteNextRetryAt
+                    .is_null()
+                    .or(eh_download_queue::Column::TelegraphRewriteNextRetryAt.lte(now)),
+            )
+            .order_by(eh_download_queue::Column::TelegraphRewriteAfter, Order::Asc)
+            .one(&self.db)
+            .await
+            .context("Failed to fetch next EH Telegraph rewrite")?;
+
+        let Some(model) = entry else {
+            return Ok(None);
+        };
+
+        let result = eh_download_queue::Entity::update_many()
+            .col_expr(
+                eh_download_queue::Column::TelegraphRewriteStatus,
+                Expr::value(Some(TELEGRAPH_REWRITE_STATUS_REWRITING.to_string())),
+            )
+            .col_expr(
+                eh_download_queue::Column::TelegraphRewriteStartedAt,
+                Expr::value(now),
+            )
+            .col_expr(
+                eh_download_queue::Column::TelegraphRewriteNextRetryAt,
+                Expr::value(None::<DateTime>),
+            )
+            .filter(eh_download_queue::Column::Id.eq(model.id))
+            .filter(
+                eh_download_queue::Column::TelegraphRewriteStatus
+                    .eq(TELEGRAPH_REWRITE_STATUS_PENDING),
+            )
+            .filter(eh_download_queue::Column::TelegraphRewriteData.is_not_null())
+            .filter(
+                sea_orm::Condition::any()
+                    .add(eh_download_queue::Column::TelegraphRewriteAfter.is_null())
+                    .add(eh_download_queue::Column::TelegraphRewriteAfter.lte(now)),
+            )
+            .filter(
+                sea_orm::Condition::any()
+                    .add(eh_download_queue::Column::TelegraphRewriteNextRetryAt.is_null())
+                    .add(eh_download_queue::Column::TelegraphRewriteNextRetryAt.lte(now)),
+            )
+            .exec(&self.db)
+            .await
+            .context("Failed to atomically claim EH Telegraph rewrite")?;
+
+        if result.rows_affected == 0 {
+            return Ok(None);
+        }
+
+        let updated = eh_download_queue::Entity::find_by_id(model.id)
+            .one(&self.db)
+            .await?
+            .context("EH Telegraph rewrite entry disappeared after claim")?;
+        Ok(Some(updated))
+    }
+
+    /// Mark a claimed Telegraph rewrite as complete and clear rewrite payload.
+    pub async fn mark_eh_telegraph_rewritten(&self, id: i32) -> Result<()> {
+        let now = Local::now().naive_local();
+        let result = eh_download_queue::Entity::update_many()
+            .col_expr(
+                eh_download_queue::Column::TelegraphRewriteData,
+                Expr::value(None::<String>),
+            )
+            .col_expr(
+                eh_download_queue::Column::TelegraphRewriteStatus,
+                Expr::value(None::<String>),
+            )
+            .col_expr(
+                eh_download_queue::Column::TelegraphRewriteAfter,
+                Expr::value(None::<DateTime>),
+            )
+            .col_expr(
+                eh_download_queue::Column::TelegraphRewriteStartedAt,
+                Expr::value(None::<DateTime>),
+            )
+            .col_expr(
+                eh_download_queue::Column::TelegraphRewriteNextRetryAt,
+                Expr::value(None::<DateTime>),
+            )
+            .col_expr(
+                eh_download_queue::Column::TelegraphRewriteRetryCount,
+                Expr::value(0),
+            )
+            .col_expr(
+                eh_download_queue::Column::TelegraphRewriteError,
+                Expr::value(None::<String>),
+            )
+            .col_expr(
+                eh_download_queue::Column::TelegraphRewrittenAt,
+                Expr::value(Some(now)),
+            )
+            .filter(eh_download_queue::Column::Id.eq(id))
+            .filter(
+                eh_download_queue::Column::TelegraphRewriteStatus
+                    .eq(TELEGRAPH_REWRITE_STATUS_REWRITING),
+            )
+            .exec(&self.db)
+            .await
+            .context("Failed to mark EH Telegraph rewrite complete")?;
+
+        if result.rows_affected != 1 {
+            anyhow::bail!(
+                "Cannot mark EH Telegraph rewrite {} complete: expected status '{}'",
+                id,
+                TELEGRAPH_REWRITE_STATUS_REWRITING
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Retry a claimed Telegraph rewrite with backoff, or stop retrying after `max_retry_count`.
+    pub async fn schedule_eh_telegraph_rewrite_retry(
+        &self,
+        id: i32,
+        error: &str,
+        max_retry_count: u8,
+    ) -> Result<bool> {
+        let entry = eh_download_queue::Entity::find_by_id(id)
+            .one(&self.db)
+            .await
+            .context("Failed to fetch EH Telegraph rewrite for retry")?
+            .ok_or_else(|| anyhow::anyhow!("EH Telegraph rewrite {} not found", id))?;
+        let retry_count = entry.telegraph_rewrite_retry_count + 1;
+        let is_permanent = retry_count > max_retry_count as i32;
+        let now = Local::now().naive_local();
+
+        if is_permanent {
+            let result = eh_download_queue::Entity::update_many()
+                .col_expr(
+                    eh_download_queue::Column::TelegraphRewriteStatus,
+                    Expr::value(Some(TELEGRAPH_REWRITE_STATUS_FAILED.to_string())),
+                )
+                .col_expr(
+                    eh_download_queue::Column::TelegraphRewriteStartedAt,
+                    Expr::value(None::<DateTime>),
+                )
+                .col_expr(
+                    eh_download_queue::Column::TelegraphRewriteNextRetryAt,
+                    Expr::value(None::<DateTime>),
+                )
+                .col_expr(
+                    eh_download_queue::Column::TelegraphRewriteRetryCount,
+                    Expr::value(retry_count),
+                )
+                .col_expr(
+                    eh_download_queue::Column::TelegraphRewriteError,
+                    Expr::value(Some(error.to_string())),
+                )
+                .filter(eh_download_queue::Column::Id.eq(id))
+                .filter(
+                    eh_download_queue::Column::TelegraphRewriteStatus
+                        .eq(TELEGRAPH_REWRITE_STATUS_REWRITING),
+                )
+                .exec(&self.db)
+                .await
+                .context("Failed to mark EH Telegraph rewrite failed")?;
+
+            if result.rows_affected != 1 {
+                anyhow::bail!(
+                    "Cannot fail EH Telegraph rewrite {}: expected status '{}'",
+                    id,
+                    TELEGRAPH_REWRITE_STATUS_REWRITING
+                );
+            }
+            return Ok(true);
+        }
+
+        let delay = Self::backoff_delay_secs(retry_count);
+        let result = eh_download_queue::Entity::update_many()
+            .col_expr(
+                eh_download_queue::Column::TelegraphRewriteStatus,
+                Expr::value(Some(TELEGRAPH_REWRITE_STATUS_PENDING.to_string())),
+            )
+            .col_expr(
+                eh_download_queue::Column::TelegraphRewriteStartedAt,
+                Expr::value(None::<DateTime>),
+            )
+            .col_expr(
+                eh_download_queue::Column::TelegraphRewriteNextRetryAt,
+                Expr::value(now + chrono::Duration::seconds(delay)),
+            )
+            .col_expr(
+                eh_download_queue::Column::TelegraphRewriteRetryCount,
+                Expr::value(retry_count),
+            )
+            .col_expr(
+                eh_download_queue::Column::TelegraphRewriteError,
+                Expr::value(Some(error.to_string())),
+            )
+            .filter(eh_download_queue::Column::Id.eq(id))
+            .filter(
+                eh_download_queue::Column::TelegraphRewriteStatus
+                    .eq(TELEGRAPH_REWRITE_STATUS_REWRITING),
+            )
+            .exec(&self.db)
+            .await
+            .context("Failed to schedule EH Telegraph rewrite retry")?;
+
+        if result.rows_affected != 1 {
+            anyhow::bail!(
+                "Cannot retry EH Telegraph rewrite {}: expected status '{}'",
+                id,
+                TELEGRAPH_REWRITE_STATUS_REWRITING
+            );
+        }
+
+        Ok(false)
     }
 
     /// Defer an entry: set status to `target_status` and delay next retry by `delay_secs`.
@@ -1766,6 +2478,38 @@ impl Repo {
                 .col_expr(
                     eh_download_queue::Column::RetryCount,
                     Expr::value(new_retry_count),
+                )
+                .col_expr(
+                    eh_download_queue::Column::TelegraphRewriteData,
+                    Expr::value(None::<String>),
+                )
+                .col_expr(
+                    eh_download_queue::Column::TelegraphRewriteStatus,
+                    Expr::value(None::<String>),
+                )
+                .col_expr(
+                    eh_download_queue::Column::TelegraphRewriteAfter,
+                    Expr::value(None::<DateTime>),
+                )
+                .col_expr(
+                    eh_download_queue::Column::TelegraphRewriteStartedAt,
+                    Expr::value(None::<DateTime>),
+                )
+                .col_expr(
+                    eh_download_queue::Column::TelegraphRewriteNextRetryAt,
+                    Expr::value(None::<DateTime>),
+                )
+                .col_expr(
+                    eh_download_queue::Column::TelegraphRewriteRetryCount,
+                    Expr::value(0),
+                )
+                .col_expr(
+                    eh_download_queue::Column::TelegraphRewriteError,
+                    Expr::value(None::<String>),
+                )
+                .col_expr(
+                    eh_download_queue::Column::TelegraphRewrittenAt,
+                    Expr::value(None::<DateTime>),
                 )
                 .filter(eh_download_queue::Column::Id.eq(id))
                 .filter(current_filter)
@@ -4242,5 +4986,185 @@ mod tests {
             .unwrap();
         assert_eq!(reenqueued_done_url.status, STATUS_PENDING);
         assert!(!reenqueued_done_url.telegraph);
+    }
+
+    #[tokio::test]
+    async fn test_telegraph_rewrite_lifecycle_schedule_retry_stale_and_success() {
+        let repo = tests_helpers::setup_test_db().await.unwrap();
+        let model = repo
+            .enqueue_eh_download(-100, 96, "tok", "Title", true, SOURCE_DIRECT)
+            .await
+            .unwrap();
+
+        let claimed = repo.get_next_for_download().await.unwrap().unwrap();
+        assert_eq!(claimed.id, model.id);
+        repo.mark_eh_download_downloaded(model.id, 5000, "/tmp/96.zip")
+            .await
+            .unwrap();
+
+        let upload = repo.get_next_for_upload().await.unwrap().unwrap();
+        assert_eq!(upload.status, STATUS_UPLOADING);
+        let uploaded = repo
+            .mark_eh_download_uploaded_with_rewrite(
+                model.id,
+                "https://telegra.ph/96",
+                Some("{\"pages\":[]}"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(uploaded.status, STATUS_UPLOADED);
+        assert_eq!(
+            uploaded.telegraph_rewrite_data.as_deref(),
+            Some("{\"pages\":[]}")
+        );
+        assert!(uploaded.telegraph_rewrite_status.is_none());
+
+        let publishing = repo.get_next_for_publish().await.unwrap().unwrap();
+        assert_eq!(publishing.status, STATUS_PUBLISHING);
+        repo.mark_eh_telegraph_sent_and_schedule_rewrite(model.id, Some(0))
+            .await
+            .unwrap();
+        let scheduled = Entity::find_by_id(model.id)
+            .one(&repo.db)
+            .await
+            .unwrap()
+            .unwrap();
+        let first_rewrite_after = scheduled.telegraph_rewrite_after;
+        repo.schedule_eh_telegraph_rewrite_after_send(model.id, 3600)
+            .await
+            .unwrap();
+        let still_scheduled = Entity::find_by_id(model.id)
+            .one(&repo.db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(still_scheduled.telegraph_rewrite_after, first_rewrite_after);
+
+        let rewrite = repo
+            .get_next_for_telegraph_rewrite()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(rewrite.id, model.id);
+        assert_eq!(
+            rewrite.telegraph_rewrite_status.as_deref(),
+            Some(TELEGRAPH_REWRITE_STATUS_REWRITING)
+        );
+        assert!(rewrite.telegraph_rewrite_started_at.is_some());
+
+        let permanent = repo
+            .schedule_eh_telegraph_rewrite_retry(model.id, "gateway not ready", 3)
+            .await
+            .unwrap();
+        assert!(!permanent);
+        let retry = Entity::find_by_id(model.id)
+            .one(&repo.db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            retry.telegraph_rewrite_status.as_deref(),
+            Some(TELEGRAPH_REWRITE_STATUS_PENDING)
+        );
+        assert_eq!(retry.telegraph_rewrite_retry_count, 1);
+        assert!(retry.telegraph_rewrite_next_retry_at.is_some());
+
+        Entity::update_many()
+            .col_expr(
+                Column::TelegraphRewriteStatus,
+                Expr::value(Some(TELEGRAPH_REWRITE_STATUS_REWRITING.to_string())),
+            )
+            .col_expr(
+                Column::TelegraphRewriteStartedAt,
+                Expr::value(Some(
+                    Local::now().naive_local() - chrono::Duration::seconds(7200),
+                )),
+            )
+            .filter(Column::Id.eq(model.id))
+            .exec(&repo.db)
+            .await
+            .unwrap();
+        let reset = repo.reset_stale_eh_telegraph_rewrites(3600).await.unwrap();
+        assert_eq!(reset, 1);
+
+        Entity::update_many()
+            .col_expr(
+                Column::TelegraphRewriteNextRetryAt,
+                Expr::value(None::<DateTime>),
+            )
+            .filter(Column::Id.eq(model.id))
+            .exec(&repo.db)
+            .await
+            .unwrap();
+        let rewrite = repo
+            .get_next_for_telegraph_rewrite()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(rewrite.id, model.id);
+        repo.mark_eh_telegraph_rewritten(model.id).await.unwrap();
+
+        let done = Entity::find_by_id(model.id)
+            .one(&repo.db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(done.telegraph_rewrite_data.is_none());
+        assert!(done.telegraph_rewrite_status.is_none());
+        assert_eq!(done.telegraph_rewrite_retry_count, 0);
+        assert!(done.telegraph_rewritten_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_telegraph_rewrite_retry_exhaustion_marks_failed() {
+        let repo = tests_helpers::setup_test_db().await.unwrap();
+        let model = repo
+            .enqueue_eh_download(-100, 97, "tok", "Title", true, SOURCE_DIRECT)
+            .await
+            .unwrap();
+
+        let claimed = repo.get_next_for_download().await.unwrap().unwrap();
+        repo.mark_eh_download_downloaded(claimed.id, 5000, "/tmp/97.zip")
+            .await
+            .unwrap();
+        repo.get_next_for_upload().await.unwrap().unwrap();
+        repo.mark_eh_download_uploaded_with_rewrite(
+            model.id,
+            "https://telegra.ph/97",
+            Some("{\"pages\":[]}"),
+        )
+        .await
+        .unwrap();
+        repo.get_next_for_publish().await.unwrap().unwrap();
+        repo.mark_eh_telegraph_sent_and_schedule_rewrite(model.id, Some(0))
+            .await
+            .unwrap();
+        repo.get_next_for_telegraph_rewrite()
+            .await
+            .unwrap()
+            .unwrap();
+
+        let permanent = repo
+            .schedule_eh_telegraph_rewrite_retry(model.id, "edit denied", 0)
+            .await
+            .unwrap();
+        assert!(permanent);
+
+        let failed = Entity::find_by_id(model.id)
+            .one(&repo.db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            failed.telegraph_rewrite_status.as_deref(),
+            Some(TELEGRAPH_REWRITE_STATUS_FAILED)
+        );
+        assert_eq!(failed.telegraph_rewrite_retry_count, 1);
+        assert!(failed.telegraph_rewrite_next_retry_at.is_none());
+        assert!(repo
+            .get_next_for_telegraph_rewrite()
+            .await
+            .unwrap()
+            .is_none());
     }
 }

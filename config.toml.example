@@ -112,6 +112,13 @@ download_original_threshold = 1
 # access_key_id = "test"
 # secret_access_key = "test"
 # gateway_url = "https://ipfs.io/ipfs"
+# # Optional: create Telegraph pages with this preview gateway first, then rewrite
+# # them to gateway_url after Telegram has sent the Telegraph link. This is useful
+# # when Telegram previews one gateway more reliably than your public gateway.
+# # Only applies when image_upload.provider = "ipfs3" and the preview gateway
+# # differs from gateway_url.
+# preview_gateway_url = "https://preview.example/ipfs"
+# preview_rewrite_delay_sec = 600
 # key_prefix = "eh"
 # path_style = true
 # # Send non-blocking HEAD requests to gateway_url after upload to warm IPFS gateway cache.
