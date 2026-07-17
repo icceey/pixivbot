@@ -381,6 +381,8 @@ pub struct IpfS3UploaderConfig {
     pub path_style: bool,
     #[serde(default)]
     pub warm_public_gateway_after_upload: bool,
+    #[serde(default)]
+    pub zip_extract_enabled: bool,
 }
 
 fn default_ipfs_preview_rewrite_delay_sec() -> u64 {
@@ -427,6 +429,7 @@ impl IpfS3UploaderConfig {
             key_prefix: self.key_prefix.trim_matches('/').to_string(),
             path_style: self.path_style,
             warm_public_gateway_after_upload: self.warm_public_gateway_after_upload,
+            zip_extract_enabled: self.zip_extract_enabled,
         })
     }
 }
@@ -444,6 +447,7 @@ struct ResolvedIpfS3UploaderConfig {
     key_prefix: String,
     path_style: bool,
     warm_public_gateway_after_upload: bool,
+    zip_extract_enabled: bool,
 }
 
 fn required_config(name: &str, value: &Option<String>) -> Result<String> {
@@ -492,8 +496,18 @@ pub struct ImageUploadInput<'a> {
     pub bytes: &'a [u8],
 }
 
+pub struct ZipArchiveUploadInput<'a> {
+    pub filename: &'a str,
+    pub bytes: &'a [u8],
+    pub entry_names: &'a [String],
+}
+
 #[async_trait]
 pub trait ImageUploader: Send + Sync {
+    fn supports_zip_archive_upload(&self) -> bool {
+        false
+    }
+
     async fn upload_images(&self, images: &[ImageUploadInput<'_>]) -> Result<Vec<String>>;
 
     async fn upload_images_with_url_pairs(
@@ -509,6 +523,13 @@ pub trait ImageUploader: Send + Sync {
                 public_url: url,
             })
             .collect())
+    }
+
+    async fn upload_zip_archive_with_url_pairs(
+        &self,
+        _archive: ZipArchiveUploadInput<'_>,
+    ) -> Result<Option<Vec<TelegraphImageUrlPair>>> {
+        Ok(None)
     }
 }
 
@@ -892,10 +913,71 @@ impl IpfS3Uploader {
         }
         Ok(urls)
     }
+
+    fn archive_object_key(&self, input: &ZipArchiveUploadInput<'_>) -> String {
+        let timestamp = chrono::Utc::now().format("%Y%m%d%H%M%S");
+        let hash = short_hash_hex(input.bytes);
+        let filename = format!("{timestamp}-archive-{hash}.zip");
+        if self.config.key_prefix.is_empty() {
+            filename
+        } else {
+            format!("{}/{}", self.config.key_prefix, filename)
+        }
+    }
+
+    pub async fn upload_zip_archive_with_url_pairs(
+        &self,
+        archive: ZipArchiveUploadInput<'_>,
+    ) -> Result<Option<Vec<TelegraphImageUrlPair>>> {
+        if !self.config.zip_extract_enabled {
+            return Ok(None);
+        }
+        if archive.entry_names.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+        let key = self.archive_object_key(&archive);
+        let response = self
+            .bucket
+            .put_object_with_content_type(&key, archive.bytes, "application/zip")
+            .await
+            .map_err(|e| Error::Other(format!("ipfS3 ZIP put_object failed for key {key}: {e}")))?;
+        let status = response.status_code();
+        if !(200..300).contains(&status) {
+            return Err(Error::Api {
+                message: format!("ipfS3 ZIP put_object returned {status} for key {key}"),
+                status,
+            });
+        }
+        let cid = response
+            .as_str()
+            .map_err(|e| {
+                Error::Other(format!(
+                    "ipfS3 ZIP put_object for key {key} returned non-UTF-8 ETag: {e}"
+                ))
+            })?
+            .trim_matches('"')
+            .trim();
+        if cid.is_empty() {
+            return Err(Error::Other(format!(
+                "ipfS3 ZIP put_object for key {key} returned no ETag (CID); \
+                 cannot build public URL"
+            )));
+        }
+        self.warm_public_gateway(cid);
+        Ok(Some(ipfs3_zip_entry_url_pairs(
+            &self.config,
+            cid,
+            archive.entry_names,
+        )))
+    }
 }
 
 #[async_trait]
 impl ImageUploader for IpfS3Uploader {
+    fn supports_zip_archive_upload(&self) -> bool {
+        self.config.zip_extract_enabled
+    }
+
     async fn upload_images(&self, images: &[ImageUploadInput<'_>]) -> Result<Vec<String>> {
         Ok(IpfS3Uploader::upload_images_with_url_pairs(self, images)
             .await?
@@ -909,6 +991,13 @@ impl ImageUploader for IpfS3Uploader {
         images: &[ImageUploadInput<'_>],
     ) -> Result<Vec<TelegraphImageUrlPair>> {
         IpfS3Uploader::upload_images_with_url_pairs(self, images).await
+    }
+
+    async fn upload_zip_archive_with_url_pairs(
+        &self,
+        archive: ZipArchiveUploadInput<'_>,
+    ) -> Result<Option<Vec<TelegraphImageUrlPair>>> {
+        IpfS3Uploader::upload_zip_archive_with_url_pairs(self, archive).await
     }
 }
 
@@ -976,6 +1065,36 @@ fn public_url_for_key(public_base_url: &str, key: &str) -> String {
         .collect::<Vec<_>>()
         .join("/");
     format!("{base}/{encoded_key}")
+}
+
+fn gateway_url_for_zip_entry(gateway_url: &str, cid: &str, entry_name: &str) -> String {
+    let encoded_entry = entry_name
+        .split('/')
+        .map(urlencoding::encode)
+        .collect::<Vec<_>>()
+        .join("/");
+    format!(
+        "{}/{cid}/{encoded_entry}",
+        gateway_url.trim_end_matches('/')
+    )
+}
+
+fn ipfs3_zip_entry_url_pairs(
+    config: &ResolvedIpfS3UploaderConfig,
+    cid: &str,
+    entry_names: &[String],
+) -> Vec<TelegraphImageUrlPair> {
+    let preview_gateway = config
+        .preview_gateway_url
+        .as_deref()
+        .unwrap_or(&config.gateway_url);
+    entry_names
+        .iter()
+        .map(|entry| TelegraphImageUrlPair {
+            preview_url: gateway_url_for_zip_entry(preview_gateway, cid, entry),
+            public_url: gateway_url_for_zip_entry(&config.gateway_url, cid, entry),
+        })
+        .collect()
 }
 
 pub struct TelegraphClient {
@@ -1728,6 +1847,7 @@ mod tests {
             key_prefix: "eh".to_string(),
             path_style: true,
             warm_public_gateway_after_upload: false,
+            zip_extract_enabled: false,
         }
     }
 
@@ -2135,5 +2255,153 @@ mod tests {
             node_attr_str(&public_nodes[0], "src"),
             Some("https://public.example/ipfs/cid-one")
         );
+    }
+
+    #[test]
+    fn ipfs3_zip_extract_disabled_by_default() {
+        let config = IpfS3UploaderConfig::default();
+        assert!(!config.zip_extract_enabled);
+    }
+
+    #[test]
+    fn ipfs3_zip_extract_entry_url_pairs_encode_each_path_segment() {
+        let config = ResolvedIpfS3UploaderConfig {
+            endpoint_url: "https://s3.example".into(),
+            bucket: "bucket".into(),
+            region: "auto".into(),
+            access_key_id: "ak".into(),
+            secret_access_key: "sk".into(),
+            gateway_url: "https://public.example/ipfs".into(),
+            preview_gateway_url: Some("https://preview.example/ipfs".into()),
+            preview_rewrite_delay_sec: 600,
+            key_prefix: "eh".into(),
+            path_style: true,
+            warm_public_gateway_after_upload: false,
+            zip_extract_enabled: true,
+        };
+
+        let pairs = ipfs3_zip_entry_url_pairs(
+            &config,
+            "bafyRoot",
+            &["001 cover.jpg".to_string(), "dir/page#2.png".to_string()],
+        );
+
+        assert_eq!(
+            pairs[0].preview_url,
+            "https://preview.example/ipfs/bafyRoot/001%20cover.jpg"
+        );
+        assert_eq!(
+            pairs[0].public_url,
+            "https://public.example/ipfs/bafyRoot/001%20cover.jpg"
+        );
+        assert_eq!(
+            pairs[1].preview_url,
+            "https://preview.example/ipfs/bafyRoot/dir/page%232.png"
+        );
+        assert_eq!(
+            pairs[1].public_url,
+            "https://public.example/ipfs/bafyRoot/dir/page%232.png"
+        );
+    }
+
+    struct DefaultZipCapabilityUploader;
+
+    #[async_trait::async_trait]
+    impl ImageUploader for DefaultZipCapabilityUploader {
+        async fn upload_images(&self, _images: &[ImageUploadInput<'_>]) -> Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[tokio::test]
+    async fn default_zip_archive_upload_capability_returns_none() {
+        let uploader = DefaultZipCapabilityUploader;
+        let entries = vec!["page001.jpg".to_string()];
+        let result = uploader
+            .upload_zip_archive_with_url_pairs(ZipArchiveUploadInput {
+                filename: "gallery.zip",
+                bytes: b"zip bytes",
+                entry_names: &entries,
+            })
+            .await
+            .unwrap();
+
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn ipfs3_zip_archive_upload_disabled_returns_none_without_put() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("unexpected-cid"))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let uploader = IpfS3Uploader::from_config(&IpfS3UploaderConfig {
+            endpoint_url: Some(server.uri()),
+            bucket: Some("bucket".into()),
+            region: Some("auto".into()),
+            access_key_id: Some("ak".into()),
+            secret_access_key: Some("sk".into()),
+            gateway_url: Some("https://public.example/ipfs".into()),
+            zip_extract_enabled: false,
+            path_style: true,
+            ..Default::default()
+        })
+        .unwrap();
+        let entries = vec!["page001.jpg".to_string()];
+
+        let result = uploader
+            .upload_zip_archive_with_url_pairs(ZipArchiveUploadInput {
+                filename: "gallery.zip",
+                bytes: b"zip bytes",
+                entry_names: &entries,
+            })
+            .await
+            .unwrap();
+
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn ipfs3_zip_archive_upload_rejects_empty_cid() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(""))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let uploader = IpfS3Uploader::from_config(&IpfS3UploaderConfig {
+            endpoint_url: Some(server.uri()),
+            bucket: Some("bucket".into()),
+            region: Some("auto".into()),
+            access_key_id: Some("ak".into()),
+            secret_access_key: Some("sk".into()),
+            gateway_url: Some("https://public.example/ipfs".into()),
+            zip_extract_enabled: true,
+            path_style: true,
+            ..Default::default()
+        })
+        .unwrap();
+        let entries = vec!["page001.jpg".to_string()];
+
+        let err = uploader
+            .upload_zip_archive_with_url_pairs(ZipArchiveUploadInput {
+                filename: "gallery.zip",
+                bytes: b"zip bytes",
+                entry_names: &entries,
+            })
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("returned no ETag (CID)"));
     }
 }

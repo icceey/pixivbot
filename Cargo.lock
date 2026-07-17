@@ -2487,6 +2487,7 @@ name = "pixivbot"
 version = "0.3.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "booru_client",
  "chrono",
  "config",

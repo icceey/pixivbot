@@ -11,6 +11,7 @@ use chrono::Local;
 use eh_client::{
     rewrite_ipfs_gateway_nodes, EhClient, EhGallery, ImageUploadInput, ImageUploader,
     IpfS3PreviewRewriteConfig, TelegraphClient, TelegraphImageUrlPair, TelegraphRewriteData,
+    ZipArchiveUploadInput,
 };
 use rand::RngExt;
 use std::sync::Arc;
@@ -38,6 +39,46 @@ fn should_schedule_background_download(failures: i32, bytes_delta: u64, elapsed:
     failures > 3
         && elapsed.as_secs() > 0
         && bytes_delta / elapsed.as_secs() < SLOW_DOWNLOAD_BYTES_PER_SEC
+}
+
+/// Convert a byte count to whole MiB, rounding up so partial MiB is not under-reported.
+fn format_mib(bytes: u64) -> u64 {
+    bytes.div_ceil(1024 * 1024)
+}
+
+/// Pre-archive size gate for logged-in EH archive downloads.
+///
+/// Runs before `prepare_archive_download()` / `download_archive_with_request()` so an
+/// over-size gallery is rejected without spending EH archive points or hitting
+/// `archiver.php`. The gate is a no-op when `max_archive_size_bytes()` is `None`
+/// (i.e. `max_archive_size_mb = 0`), when metadata is missing, or when the reported
+/// `filesize` is `0`. Only a strict `filesize > limit` rejects; equal size is allowed.
+async fn ensure_eh_archive_under_size_limit(
+    client: &EhClient,
+    config: &EhentaiConfig,
+    gid: u64,
+    token: &str,
+) -> Result<()> {
+    let Some(limit_bytes) = config.max_archive_size_bytes() else {
+        return Ok(());
+    };
+
+    let metadata = client
+        .get_metadata(&[(gid, token)])
+        .await
+        .context("Failed to fetch EH metadata for archive size check")?;
+    let Some(gallery) = metadata.first() else {
+        return Ok(());
+    };
+    if gallery.filesize == 0 || gallery.filesize <= limit_bytes {
+        return Ok(());
+    }
+
+    anyhow::bail!(
+        "EH gallery archive is too large: {} MiB exceeds configured {} MiB limit",
+        format_mib(gallery.filesize),
+        format_mib(limit_bytes)
+    );
 }
 
 pub struct EhBackgroundDownloadWorker {
@@ -141,6 +182,8 @@ impl EhBackgroundDownloadWorker {
             } else {
                 &self.config.subscription_resolution
             };
+            ensure_eh_archive_under_size_limit(self.client.as_ref(), &self.config, gid, token)
+                .await?;
             let archive_request = self
                 .client
                 .prepare_archive_download(gid, token, resolution)
@@ -888,6 +931,9 @@ impl EhDownloadWorker {
                 &self.config.subscription_resolution
             };
 
+            ensure_eh_archive_under_size_limit(self.client.as_ref(), &self.config, gid, token)
+                .await?;
+
             let archive_request = self
                 .client
                 .prepare_archive_download(gid, token, resolution)
@@ -959,6 +1005,27 @@ fn is_uploadable_zip_image_name(name: &str) -> bool {
         || name.ends_with(".png")
         || name.ends_with(".gif")
         || name.ends_with(".webp")
+}
+
+/// Collect the entry names of uploadable image files inside a ZIP archive,
+/// preserving archive order.
+///
+/// Entry names are normalized to use forward slashes so they can be embedded
+/// into gateway URLs regardless of the platform that produced the archive.
+/// Non-image entries (directories, metadata, thumbnails) are skipped.
+fn collect_uploadable_zip_entry_names(zip_path: &std::path::Path) -> Result<Vec<String>> {
+    let zip_file = std::fs::File::open(zip_path).context("Failed to open zip")?;
+    let mut archive = zip::ZipArchive::new(zip_file).context("Failed to read zip archive")?;
+    let mut names = Vec::new();
+    for i in 0..archive.len() {
+        let file = archive.by_index(i).context("Failed to read zip entry")?;
+        let raw_name = file.name();
+        if !file.is_dir() && is_uploadable_zip_image_name(&raw_name.to_lowercase()) {
+            let name = raw_name.replace('\\', "/");
+            names.push(name);
+        }
+    }
+    Ok(names)
 }
 
 impl EhUploadWorker {
@@ -1098,6 +1165,49 @@ impl EhUploadWorker {
             .context("zip_path is None for downloaded entry")?;
         let zip_path = std::path::Path::new(zip_path);
 
+        // Collect uploadable image entry names once, preserving archive order.
+        // This drives both the ZIP-first upload capability and the empty-ZIP
+        // guard, so an archive with no uploadable images fails fast instead of
+        // creating an empty Telegraph page.
+        let entry_names = collect_uploadable_zip_entry_names(zip_path)?;
+        if entry_names.is_empty() {
+            anyhow::bail!("No images found in downloaded EH ZIP");
+        }
+
+        // ZIP-first path: if the configured uploader can accept the whole
+        // archive, upload it once and build Telegraph URLs from the returned
+        // root CID instead of extracting and uploading each image separately.
+        if self.image_uploader.supports_zip_archive_upload() {
+            let zip_bytes = tokio::fs::read(zip_path)
+                .await
+                .context("Failed to read zip for archive upload")?;
+            let archive_input = ZipArchiveUploadInput {
+                filename: zip_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("gallery.zip"),
+                bytes: zip_bytes.as_slice(),
+                entry_names: &entry_names,
+            };
+            if let Some(url_pairs) = self
+                .image_uploader
+                .upload_zip_archive_with_url_pairs(archive_input)
+                .await
+                .context("Failed to upload EH ZIP archive for Telegraph page")?
+            {
+                if url_pairs.len() != entry_names.len() {
+                    anyhow::bail!(
+                        "ZIP archive uploader returned {} URLs for {} image entries",
+                        url_pairs.len(),
+                        entry_names.len()
+                    );
+                }
+                self.create_telegraph_page_for_entry(entry, &url_pairs)
+                    .await?;
+                return Ok(());
+            }
+        }
+
         let (image_tx, mut image_rx) = mpsc::channel(EH_UPLOAD_IMAGE_CHANNEL_CAPACITY);
         let zip_path_owned = zip_path.to_path_buf();
         let reader = tokio::task::spawn_blocking(move || -> Result<()> {
@@ -1152,7 +1262,23 @@ impl EhUploadWorker {
             anyhow::bail!("No images uploaded by configured image uploader");
         }
 
-        // Create Telegraph gallery page
+        self.create_telegraph_page_for_entry(entry, &all_url_pairs)
+            .await?;
+
+        Ok(())
+    }
+
+    /// Create the Telegraph gallery page for a queue entry using the supplied
+    /// image URL pairs, persist the resulting page URL + rewrite data, and mark
+    /// the entry as uploaded.
+    ///
+    /// Shared by the ZIP-first path (when the uploader returns URL pairs for
+    /// the whole archive) and the per-image extraction path.
+    async fn create_telegraph_page_for_entry(
+        &self,
+        entry: &eh_download_queue::Model,
+        all_url_pairs: &[TelegraphImageUrlPair],
+    ) -> Result<()> {
         let title = if entry.title.is_empty() {
             "Gallery"
         } else {
@@ -1163,7 +1289,7 @@ impl EhUploadWorker {
             .telegraph
             .create_gallery_page_with_url_pairs(
                 title,
-                &all_url_pairs,
+                all_url_pairs,
                 self.rewrite_config
                     .as_ref()
                     .map(|config| config.preview_gateway_url.as_str()),
@@ -1854,6 +1980,35 @@ mod integration_tests {
         Mock::given(method("GET"))
             .and(path(path_str))
             .respond_with(ResponseTemplate::new(200).set_body_bytes(zip_bytes))
+            .mount(server)
+            .await;
+    }
+
+    /// Mock the `/api.php` metadata endpoint for a single gallery with the given
+    /// `filesize`. Mounted with `expect(1)` so a missing request fails the test.
+    async fn mock_eh_metadata(server: &MockServer, gid: u64, token: &str, filesize: u64) {
+        let body = serde_json::json!({
+            "gmetadata": [{
+                "gid": gid,
+                "token": token,
+                "title": "Size Test Gallery",
+                "title_jpn": "",
+                "category": "Doujinshi",
+                "thumb": "",
+                "uploader": "tester",
+                "posted": "1700000000",
+                "filecount": "2",
+                "filesize": filesize,
+                "expunged": false,
+                "rating": "4.5",
+                "torrentcount": "0",
+                "tags": []
+            }]
+        });
+        Mock::given(method("POST"))
+            .and(path("/api.php"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .expect(1)
             .mount(server)
             .await;
     }
@@ -2651,6 +2806,7 @@ mod integration_tests {
         .await;
 
         mock_eh_gallery_page(&eh_server, 123456, "abcdef0123").await;
+        mock_eh_metadata(&eh_server, 123456, "abcdef0123", 10 * 1024 * 1024).await;
         let download_url = format!("{}/archive/123456/token/0", eh_server.uri());
         mock_eh_archiver_post(&eh_server, &download_url).await;
 
@@ -2818,6 +2974,7 @@ mod integration_tests {
         .await;
 
         mock_eh_gallery_page(&eh_server, 123456, "abcdef0123").await;
+        mock_eh_metadata(&eh_server, 123456, "abcdef0123", 10 * 1024 * 1024).await;
         // archiver.php POST returns 500
         Mock::given(method("POST"))
             .and(path("/archiver.php"))
@@ -2889,6 +3046,7 @@ mod integration_tests {
         std::fs::write(&part_path, b"PK\x03\x04partial").unwrap();
 
         mock_eh_gallery_page(&eh_server, 123456, "abcdef0123").await;
+        mock_eh_metadata(&eh_server, 123456, "abcdef0123", 10 * 1024 * 1024).await;
         Mock::given(method("POST"))
             .and(path("/archiver.php"))
             .respond_with(ResponseTemplate::new(500))
@@ -2934,6 +3092,7 @@ mod integration_tests {
         .await;
 
         mock_eh_gallery_page(&eh_server, 123456, "abcdef0123").await;
+        mock_eh_metadata(&eh_server, 123456, "abcdef0123", 10 * 1024 * 1024).await;
         let download_url = format!("{}/archive/123456/token/0", eh_server.uri());
         mock_eh_archiver_post(&eh_server, &download_url).await;
 
@@ -3025,6 +3184,7 @@ mod integration_tests {
         .await;
 
         mock_eh_gallery_page(&eh_server, 123456, "abcdef0123").await;
+        mock_eh_metadata(&eh_server, 123456, "abcdef0123", 10 * 1024 * 1024).await;
         let download_url = format!("{}/archive/123456/token/0", eh_server.uri());
         mock_eh_archiver_post(&eh_server, &download_url).await;
 
@@ -3065,6 +3225,144 @@ mod integration_tests {
         );
         assert!(updated.background_download_next_retry_at.is_some());
         assert!(part_path.exists());
+    }
+
+    #[tokio::test]
+    async fn test_download_size_limit_blocks_before_archive_post() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        setup_chat(&repo, -100, true).await;
+        let eh_server = MockServer::start().await;
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        // Metadata reports a gallery larger than the configured 300 MiB limit.
+        // Token must be hex (matches archiver_url regex in eh_client::parser).
+        mock_eh_metadata(&eh_server, 900, "abcdef0123", 301 * 1024 * 1024).await;
+        // Any POST to /archiver.php (the paid archive request) must never happen.
+        Mock::given(method("POST"))
+            .and(path("/archiver.php"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("unexpected"))
+            .expect(0)
+            .mount(&eh_server)
+            .await;
+
+        let mut cfg = make_config();
+        cfg.max_archive_size_mb = 300;
+        cfg.max_retry_count = 0;
+        let entry = insert_queue_entry(
+            &repo,
+            -100,
+            900,
+            "abcdef0123",
+            "Title",
+            false,
+            STATUS_PENDING,
+            None,
+            None,
+        )
+        .await;
+        let worker = EhDownloadWorker::new(
+            Arc::clone(&repo),
+            make_eh_client(&eh_server),
+            Arc::new(cfg),
+            temp_dir.path().to_path_buf(),
+        );
+
+        worker.tick().await.unwrap();
+
+        let model = eh_download_queue::Entity::find_by_id(entry.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(model.status, STATUS_FAILED);
+        assert!(
+            model
+                .error
+                .as_ref()
+                .is_some_and(|e| e.contains("exceeds configured 300 MiB limit")),
+            "error should mention the configured limit, got: {:?}",
+            model.error
+        );
+    }
+
+    #[tokio::test]
+    async fn test_download_size_limit_allows_equal_size() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        setup_chat(&repo, -100, true).await;
+        let eh_server = MockServer::start().await;
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        // filesize == limit must be allowed (strict `>` rejects, `<=` allows).
+        // Token must be hex (matches archiver_url regex in eh_client::parser).
+        mock_eh_metadata(&eh_server, 901, "abcdef0123", 300 * 1024 * 1024).await;
+        mock_eh_gallery_page(&eh_server, 901, "abcdef0123").await;
+        let download_url = format!("{}/archive/901/token/0", eh_server.uri());
+        mock_eh_archiver_post(&eh_server, &download_url).await;
+
+        let zip_temp = tempfile::tempdir().unwrap();
+        let zip_path = zip_temp.path().join("equal_size.zip");
+        create_test_zip(&zip_path, 2);
+        let zip_bytes = std::fs::read(&zip_path).unwrap();
+        mock_eh_archive_download(&eh_server, "/archive/901/token/0", zip_bytes).await;
+
+        let mut cfg = make_config();
+        cfg.max_archive_size_mb = 300;
+        cfg.background_download_enabled = false;
+        let entry = insert_queue_entry(
+            &repo,
+            -100,
+            901,
+            "abcdef0123",
+            "Title",
+            false,
+            STATUS_PENDING,
+            None,
+            None,
+        )
+        .await;
+        let worker = EhDownloadWorker::new(
+            Arc::clone(&repo),
+            make_eh_client(&eh_server),
+            Arc::new(cfg),
+            temp_dir.path().to_path_buf(),
+        );
+
+        worker.tick().await.unwrap();
+
+        let model = eh_download_queue::Entity::find_by_id(entry.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(model.status, STATUS_DOWNLOADED);
+        assert!(model.zip_path.is_some());
+        assert!(model.file_size > 0);
+    }
+
+    #[tokio::test]
+    async fn test_shared_size_limit_guard_rejects_oversized_metadata() {
+        // `ensure_eh_archive_under_size_limit()` is the shared guard used by both
+        // `EhDownloadWorker::process` and `EhBackgroundDownloadWorker::process`
+        // before any archive request. This covers the background path's guard
+        // without needing a full background worker harness.
+        let eh_server = MockServer::start().await;
+        mock_eh_metadata(&eh_server, 902, "abcdef0123", 301 * 1024 * 1024).await;
+        let mut cfg = make_config();
+        cfg.max_archive_size_mb = 300;
+
+        let err = ensure_eh_archive_under_size_limit(
+            make_eh_client(&eh_server).as_ref(),
+            &cfg,
+            902,
+            "abcdef0123",
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("exceeds configured 300 MiB limit"),
+            "error should mention the configured limit, got: {err}"
+        );
     }
 
     // === Upload Worker Tests ===
@@ -3225,6 +3523,109 @@ mod integration_tests {
             "should be back to downloaded for retry"
         );
         assert_eq!(updated.retry_count, 1);
+    }
+
+    // === ZIP-archive uploader tests ===
+
+    /// Mock uploader that records whether the ZIP-archive path or the per-image
+    /// path was used, and remembers the entry names it observed.
+    #[derive(Default)]
+    struct ZipFirstMockUploader {
+        zip_calls: std::sync::atomic::AtomicUsize,
+        image_calls: std::sync::atomic::AtomicUsize,
+        seen_entries: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ImageUploader for ZipFirstMockUploader {
+        fn supports_zip_archive_upload(&self) -> bool {
+            true
+        }
+
+        async fn upload_images(
+            &self,
+            _images: &[ImageUploadInput<'_>],
+        ) -> eh_client::Result<Vec<String>> {
+            self.image_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Vec::new())
+        }
+
+        async fn upload_zip_archive_with_url_pairs(
+            &self,
+            archive: ZipArchiveUploadInput<'_>,
+        ) -> eh_client::Result<Option<Vec<TelegraphImageUrlPair>>> {
+            self.zip_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            *self.seen_entries.lock().unwrap() = archive.entry_names.to_vec();
+            Ok(Some(
+                archive
+                    .entry_names
+                    .iter()
+                    .map(|name| TelegraphImageUrlPair {
+                        preview_url: format!("https://preview.example/ipfs/root/{name}"),
+                        public_url: format!("https://public.example/ipfs/root/{name}"),
+                    })
+                    .collect(),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_upload_worker_prefers_zip_archive_uploader() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        setup_chat(&repo, -100, true).await;
+        let tg_server = MockServer::start().await;
+        mock_telegraph_create_page(&tg_server).await;
+        let notifier = make_notifier(&tg_server);
+        let temp_dir = tempfile::tempdir().unwrap();
+        let zip_path = temp_dir.path().join("zip_first.zip");
+        create_test_zip(&zip_path, 2);
+        let zip_path_str = zip_path.to_string_lossy().to_string();
+        let entry = insert_queue_entry(
+            &repo,
+            -100,
+            700,
+            "tok",
+            "Title",
+            true,
+            STATUS_DOWNLOADED,
+            Some(&zip_path_str),
+            None,
+        )
+        .await;
+        let uploader = Arc::new(ZipFirstMockUploader::default());
+        let worker = EhUploadWorker::new(
+            Arc::clone(&repo),
+            notifier,
+            make_telegraph_client(&tg_server),
+            uploader.clone(),
+            None,
+            Arc::new(make_config()),
+        );
+
+        worker.tick().await.unwrap();
+
+        assert_eq!(
+            uploader.zip_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            uploader
+                .image_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert_eq!(
+            *uploader.seen_entries.lock().unwrap(),
+            vec!["page000.jpg".to_string(), "page001.jpg".to_string()]
+        );
+        let model = eh_download_queue::Entity::find_by_id(entry.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(model.status, STATUS_UPLOADED);
     }
 
     // === Publish Worker Tests ===

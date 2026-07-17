@@ -377,6 +377,11 @@ pub struct EhentaiConfig {
     pub download_rate_limit_gb: u64,
     #[serde(default = "default_eh_download_rate_window_hours")]
     pub download_rate_window_hours: u64,
+    /// Maximum EH gallery metadata size allowed for logged-in archive downloads, in MiB.
+    /// The check runs before the archive request that can spend EH archive points.
+    /// `0` disables this per-gallery archive gate.
+    #[serde(default = "default_eh_max_archive_size_mb")]
+    pub max_archive_size_mb: u64,
     #[serde(default = "default_eh_download_poll_interval_sec")]
     pub download_poll_interval_sec: u64,
     #[serde(default = "default_eh_background_download_enabled")]
@@ -411,6 +416,7 @@ impl Default for EhentaiConfig {
             scan_window_hours: default_eh_scan_window_hours(),
             download_rate_limit_gb: default_eh_download_rate_limit_gb(),
             download_rate_window_hours: default_eh_download_rate_window_hours(),
+            max_archive_size_mb: default_eh_max_archive_size_mb(),
             download_poll_interval_sec: default_eh_download_poll_interval_sec(),
             background_download_enabled: default_eh_background_download_enabled(),
             background_download_concurrency: default_eh_background_download_concurrency(),
@@ -445,6 +451,17 @@ impl EhentaiConfig {
     /// Download rate limit in bytes.
     pub fn download_rate_limit_bytes(&self) -> u64 {
         self.download_rate_limit_gb * 1024 * 1024 * 1024
+    }
+
+    /// Maximum EH gallery archive size in bytes, or `None` when the gate is disabled.
+    ///
+    /// `max_archive_size_mb = 0` disables the per-gallery archive size gate.
+    pub fn max_archive_size_bytes(&self) -> Option<u64> {
+        if self.max_archive_size_mb == 0 {
+            None
+        } else {
+            Some(self.max_archive_size_mb.saturating_mul(1024 * 1024))
+        }
     }
 }
 
@@ -494,6 +511,10 @@ fn default_eh_download_rate_limit_gb() -> u64 {
 
 fn default_eh_download_rate_window_hours() -> u64 {
     168
+}
+
+fn default_eh_max_archive_size_mb() -> u64 {
+    300
 }
 
 fn default_eh_download_poll_interval_sec() -> u64 {
@@ -607,5 +628,21 @@ mod tests {
             ..Default::default()
         };
         assert!(!cfg.is_enabled());
+    }
+
+    #[test]
+    fn test_eh_max_archive_size_defaults_to_300_mib() {
+        let cfg = EhentaiConfig::default();
+        assert_eq!(cfg.max_archive_size_mb, 300);
+        assert_eq!(cfg.max_archive_size_bytes(), Some(300 * 1024 * 1024));
+    }
+
+    #[test]
+    fn test_eh_max_archive_size_zero_disables_limit() {
+        let cfg = EhentaiConfig {
+            max_archive_size_mb: 0,
+            ..Default::default()
+        };
+        assert_eq!(cfg.max_archive_size_bytes(), None);
     }
 }

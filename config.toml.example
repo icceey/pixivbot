@@ -123,6 +123,11 @@ download_original_threshold = 1
 # path_style = true
 # # Send non-blocking HEAD requests to gateway_url after upload to warm IPFS gateway cache.
 # warm_public_gateway_after_upload = false
+# # If your ipfS3 deployment expands uploaded ZIP archives into addressable files
+# # under the returned root CID, EH Telegraph uploads can upload the ZIP once and
+# # use {gateway}/{CID}/{zip-entry-path} URLs instead of uploading every image.
+# # Leave disabled unless your provider supports this behavior.
+# zip_extract_enabled = false
 #
 # [image_upload.catbox]
 # # Catbox uploads are public; userhash is optional. Anonymous uploads cannot be
@@ -177,6 +182,10 @@ download_original_threshold = 1
 # # Download rate limiting (default: 7 GB per 7 days / 168 hours)
 # download_rate_limit_gb = 7
 # download_rate_window_hours = 168
+# # Maximum EH gallery metadata size for logged-in archive downloads, in MiB.
+# # The check runs before the archive request that can spend EH archive points.
+# # Set to 0 to disable this per-gallery limit.
+# max_archive_size_mb = 300
 # # Poll interval for download processor (seconds, default: 60)
 # download_poll_interval_sec = 60
 # # Max pushed GIDs to remember per subscription (default: 500)
