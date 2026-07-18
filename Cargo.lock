@@ -1061,6 +1061,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "futures-util",
+ "quick-xml",
  "regex",
  "reqwest",
  "rust-s3",

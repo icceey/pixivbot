@@ -123,10 +123,11 @@ download_original_threshold = 1
 # path_style = true
 # # Send non-blocking HEAD requests to gateway_url after upload to warm IPFS gateway cache.
 # warm_public_gateway_after_upload = false
-# # If your ipfS3 deployment expands uploaded ZIP archives into addressable files
-# # under the returned root CID, EH Telegraph uploads can upload the ZIP once and
-# # use {gateway}/{CID}/{zip-entry-path} URLs instead of uploading every image.
-# # Leave disabled unless your provider supports this behavior.
+# # If your ipfS3 deployment supports the signed `decompress-zip` PutObject
+# # extension, EH Telegraph uploads can upload one ZIP and use each extracted
+# # entry's returned CID as {gateway}/{entry-CID}. The client derives an isolated
+# # extraction prefix and requires the default DecompressZipResult XML response.
+# # Leave disabled unless your provider implements this protocol.
 # zip_extract_enabled = false
 #
 # [image_upload.catbox]
