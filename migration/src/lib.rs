@@ -12,6 +12,7 @@ mod m20260629_000000_eh_review_fixes;
 mod m20260630_000200_eh_queue_subscription_id;
 mod m20260707_000300_eh_background_download;
 mod m20260707_000400_eh_telegraph_rewrite;
+mod m20260718_000000_eh_download_gp_cost;
 
 pub struct Migrator;
 
@@ -31,6 +32,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260630_000200_eh_queue_subscription_id::Migration),
             Box::new(m20260707_000300_eh_background_download::Migration),
             Box::new(m20260707_000400_eh_telegraph_rewrite::Migration),
+            Box::new(m20260718_000000_eh_download_gp_cost::Migration),
         ]
     }
 }

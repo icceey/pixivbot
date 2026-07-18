@@ -31,6 +31,11 @@ pub struct Model {
     pub status: String,
     #[sea_orm(default = 0)]
     pub file_size: i64,
+    /// GP spent to download this archive (0 for free / unlocked downloads).
+    /// Set by the download stage when the entry is marked downloaded, and
+    /// aggregated by `get_eh_gp_cost_in_window()` for the GP rate-limit check.
+    #[sea_orm(default = 0)]
+    pub gp_cost: i64,
     #[sea_orm(nullable)]
     pub error: Option<String>,
     #[sea_orm(default = 0)]

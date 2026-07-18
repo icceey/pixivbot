@@ -683,6 +683,29 @@ impl Repo {
         Ok(result.iter().map(|e| e.file_size).sum())
     }
 
+    /// Get total GP spent on archive downloads in the last `hours` window.
+    /// Uses the same `completed_at` semantics as `get_eh_downloaded_bytes_in_window`
+    /// so free / unlocked downloads (gp_cost = 0) do not inflate the sum.
+    pub async fn get_eh_gp_cost_in_window(&self, hours: u64) -> Result<i64> {
+        let cutoff = Local::now().naive_local() - chrono::Duration::hours(hours as i64);
+
+        let result = eh_download_queue::Entity::find()
+            .filter(eh_download_queue::Column::Status.is_in([
+                STATUS_DOWNLOADED,
+                STATUS_UPLOADING,
+                STATUS_UPLOADED,
+                STATUS_PUBLISHING,
+                STATUS_DONE,
+                STATUS_FAILED,
+            ]))
+            .filter(eh_download_queue::Column::CompletedAt.gte(cutoff))
+            .all(&self.db)
+            .await
+            .context("Failed to fetch eh gp cost in window")?;
+
+        Ok(result.iter().map(|e| e.gp_cost).sum())
+    }
+
     /// Count pending downloads in the queue.
     #[allow(dead_code)]
     pub async fn count_pending_eh_downloads(&self) -> Result<u64> {
@@ -1320,11 +1343,15 @@ impl Repo {
 
     /// Mark a download as downloaded (ZIP saved to cache). Transitions to `downloaded` status.
     /// Only allowed when current status is `STATUS_DOWNLOADING`.
+    ///
+    /// `gp_cost` is the GP spent for this download (0 for free / unlocked).
+    /// Aggregated by `get_eh_gp_cost_in_window` for the GP rate-limit check.
     pub async fn mark_eh_download_downloaded(
         &self,
         id: i32,
         file_size: i64,
         zip_path: &str,
+        gp_cost: i64,
     ) -> Result<eh_download_queue::Model> {
         let now = Local::now().naive_local();
 
@@ -1334,6 +1361,7 @@ impl Repo {
                 Expr::value(STATUS_DOWNLOADED),
             )
             .col_expr(eh_download_queue::Column::FileSize, Expr::value(file_size))
+            .col_expr(eh_download_queue::Column::GpCost, Expr::value(gp_cost))
             .col_expr(
                 eh_download_queue::Column::ZipPath,
                 Expr::value(Some(zip_path.to_string())),
@@ -2639,6 +2667,68 @@ impl Repo {
         Ok(model)
     }
 
+    /// Defer a background download that is currently running without treating
+    /// the defer as a retryable failure.
+    ///
+    /// Sets `background_download_status` back to `pending`, schedules
+    /// `background_download_next_retry_at = now + delay_secs`, and crucially
+    /// does NOT increment `background_download_attempt_count` and does NOT
+    /// mark the entry as failed. Used by the background worker when the GP /
+    /// byte-rate guard defers a download - the entry should wait out the
+    /// configured window, not burn retry attempts.
+    ///
+    /// Requires `status = STATUS_PENDING` and
+    /// `background_download_status = BACKGROUND_STATUS_RUNNING` (i.e. the
+    /// background worker currently owns the entry). Returns the updated model.
+    pub async fn defer_eh_background_download(
+        &self,
+        id: i32,
+        delay_secs: i64,
+        reason: &str,
+    ) -> Result<eh_download_queue::Model> {
+        let now = Local::now().naive_local();
+        let result = eh_download_queue::Entity::update_many()
+            .col_expr(
+                eh_download_queue::Column::BackgroundDownloadStatus,
+                Expr::value(Some(BACKGROUND_STATUS_PENDING.to_string())),
+            )
+            .col_expr(
+                eh_download_queue::Column::BackgroundDownloadStartedAt,
+                Expr::value(None::<DateTime>),
+            )
+            .col_expr(
+                eh_download_queue::Column::BackgroundDownloadNextRetryAt,
+                Expr::value(Some(now + chrono::Duration::seconds(delay_secs))),
+            )
+            .col_expr(
+                eh_download_queue::Column::BackgroundDownloadError,
+                Expr::value(Some(reason.to_string())),
+            )
+            .filter(eh_download_queue::Column::Id.eq(id))
+            .filter(eh_download_queue::Column::Status.eq(STATUS_PENDING))
+            .filter(
+                eh_download_queue::Column::BackgroundDownloadStatus.eq(BACKGROUND_STATUS_RUNNING),
+            )
+            .exec(&self.db)
+            .await
+            .context("Failed to defer EH background download")?;
+
+        if result.rows_affected != 1 {
+            anyhow::bail!(
+                "Cannot defer EH background download {}: expected status '{}' with background_download_status='{}', but it was changed by another worker",
+                id,
+                STATUS_PENDING,
+                BACKGROUND_STATUS_RUNNING
+            );
+        }
+
+        let model = eh_download_queue::Entity::find_by_id(id)
+            .one(&self.db)
+            .await?
+            .context("Entry disappeared after background defer")?;
+        Ok(model)
+    }
+
     pub async fn reset_stale_background_downloads(&self, stale_sec: u64) -> Result<u64> {
         let cutoff = Local::now().naive_local() - chrono::Duration::seconds(stale_sec as i64);
         let result = eh_download_queue::Entity::update_many()
@@ -2799,6 +2889,7 @@ impl Repo {
         id: i32,
         file_size: i64,
         zip_path: &str,
+        gp_cost: i64,
     ) -> Result<eh_download_queue::Model> {
         let now = Local::now().naive_local();
         let result = eh_download_queue::Entity::update_many()
@@ -2807,6 +2898,7 @@ impl Repo {
                 Expr::value(STATUS_DOWNLOADED),
             )
             .col_expr(eh_download_queue::Column::FileSize, Expr::value(file_size))
+            .col_expr(eh_download_queue::Column::GpCost, Expr::value(gp_cost))
             .col_expr(
                 eh_download_queue::Column::ZipPath,
                 Expr::value(Some(zip_path.to_string())),
@@ -3584,7 +3676,7 @@ mod tests {
 
         // Stale worker tries to mark the old claimed row as downloaded — must fail
         let err = repo
-            .mark_eh_download_downloaded(claimed.id, 9999, "/tmp/40.zip")
+            .mark_eh_download_downloaded(claimed.id, 9999, "/tmp/40.zip", 0)
             .await;
         assert!(
             err.is_err(),
@@ -3612,7 +3704,7 @@ mod tests {
         // Download stage: claim -> downloading -> downloaded
         let claimed = repo.get_next_for_download().await.unwrap().unwrap();
         assert_eq!(claimed.id, model.id);
-        repo.mark_eh_download_downloaded(model.id, 5000, "/tmp/45.zip")
+        repo.mark_eh_download_downloaded(model.id, 5000, "/tmp/45.zip", 0)
             .await
             .unwrap();
 
@@ -3772,7 +3864,7 @@ mod tests {
             .unwrap();
         let claimed = repo.get_next_for_download().await.unwrap().unwrap();
         assert_eq!(claimed.id, model.id);
-        repo.mark_eh_download_downloaded(model.id, 5000, active_zip.to_str().unwrap())
+        repo.mark_eh_download_downloaded(model.id, 5000, active_zip.to_str().unwrap(), 0)
             .await
             .unwrap();
 
@@ -3839,7 +3931,7 @@ mod tests {
         // download: claim -> downloading -> downloaded
         let claimed = repo.get_next_for_download().await.unwrap().unwrap();
         assert_eq!(claimed.id, model.id);
-        repo.mark_eh_download_downloaded(model.id, 5000, "/tmp/20.zip")
+        repo.mark_eh_download_downloaded(model.id, 5000, "/tmp/20.zip", 0)
             .await
             .unwrap();
 
@@ -4067,7 +4159,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let done = repo
-            .mark_eh_background_download_downloaded(bg_claim.id, 1234, "/tmp/bg.zip")
+            .mark_eh_background_download_downloaded(bg_claim.id, 1234, "/tmp/bg.zip", 0)
             .await
             .unwrap();
         assert_eq!(done.status, STATUS_DOWNLOADED);
@@ -4187,7 +4279,7 @@ mod tests {
             .unwrap();
 
         let err = repo
-            .mark_eh_background_download_downloaded(bg_claim.id, 10, "/tmp/bg.zip")
+            .mark_eh_background_download_downloaded(bg_claim.id, 10, "/tmp/bg.zip", 0)
             .await
             .expect_err("canceled row should not be overwritten by background completion");
         assert!(err
@@ -4287,7 +4379,7 @@ mod tests {
         // Download stage: claim -> downloading -> downloaded
         let claimed = repo.get_next_for_download().await.unwrap().unwrap();
         assert_eq!(claimed.id, model.id);
-        repo.mark_eh_download_downloaded(model.id, 50000, "/tmp/1.zip")
+        repo.mark_eh_download_downloaded(model.id, 50000, "/tmp/1.zip", 0)
             .await
             .unwrap();
 
@@ -4336,7 +4428,7 @@ mod tests {
             .unwrap();
         let c1 = repo.get_next_for_download().await.unwrap().unwrap();
         assert_eq!(c1.id, m1.id);
-        repo.mark_eh_download_downloaded(m1.id, 10000, "/tmp/1.zip")
+        repo.mark_eh_download_downloaded(m1.id, 10000, "/tmp/1.zip", 0)
             .await
             .unwrap();
         let p1 = repo.get_next_for_publish().await.unwrap().unwrap();
@@ -4349,7 +4441,7 @@ mod tests {
             .unwrap();
         let c2 = repo.get_next_for_download().await.unwrap().unwrap();
         assert_eq!(c2.id, m2.id);
-        repo.mark_eh_download_downloaded(m2.id, 20000, "/tmp/2.zip")
+        repo.mark_eh_download_downloaded(m2.id, 20000, "/tmp/2.zip", 0)
             .await
             .unwrap();
         let p2 = repo.get_next_for_publish().await.unwrap().unwrap();
@@ -4461,7 +4553,7 @@ mod tests {
 
         let download_claim = repo.get_next_for_download().await.unwrap().unwrap();
         assert_eq!(download_claim.status, STATUS_DOWNLOADING);
-        repo.mark_eh_download_downloaded(model.id, 5000, "/tmp/61.zip")
+        repo.mark_eh_download_downloaded(model.id, 5000, "/tmp/61.zip", 0)
             .await
             .unwrap();
 
@@ -4512,7 +4604,7 @@ mod tests {
         // Download: claim -> downloading -> downloaded (telegraph=false)
         let claimed = repo.get_next_for_download().await.unwrap().unwrap();
         assert_eq!(claimed.id, model.id);
-        repo.mark_eh_download_downloaded(model.id, 5000, "/tmp/65.zip")
+        repo.mark_eh_download_downloaded(model.id, 5000, "/tmp/65.zip", 0)
             .await
             .unwrap();
 
@@ -4543,7 +4635,7 @@ mod tests {
         // Re-download and verify the pipeline now respects telegraph=true
         let re_claimed = repo.get_next_for_download().await.unwrap().unwrap();
         assert_eq!(re_claimed.id, model.id);
-        repo.mark_eh_download_downloaded(model.id, 5000, "/tmp/65b.zip")
+        repo.mark_eh_download_downloaded(model.id, 5000, "/tmp/65b.zip", 0)
             .await
             .unwrap();
 
@@ -4844,7 +4936,7 @@ mod tests {
             .unwrap();
         let claimed = repo.get_next_for_download().await.unwrap().unwrap();
         assert_eq!(claimed.id, model.id);
-        repo.mark_eh_download_downloaded(model.id, 5000, "/tmp/91.zip")
+        repo.mark_eh_download_downloaded(model.id, 5000, "/tmp/91.zip", 0)
             .await
             .unwrap();
 
@@ -4878,7 +4970,7 @@ mod tests {
             .unwrap();
         let claimed = repo.get_next_for_download().await.unwrap().unwrap();
         assert_eq!(claimed.id, model.id);
-        repo.mark_eh_download_downloaded(model.id, 5000, "/tmp/92.zip")
+        repo.mark_eh_download_downloaded(model.id, 5000, "/tmp/92.zip", 0)
             .await
             .unwrap();
         let upload = repo.get_next_for_upload().await.unwrap().unwrap();
@@ -4998,7 +5090,7 @@ mod tests {
 
         let claimed = repo.get_next_for_download().await.unwrap().unwrap();
         assert_eq!(claimed.id, model.id);
-        repo.mark_eh_download_downloaded(model.id, 5000, "/tmp/96.zip")
+        repo.mark_eh_download_downloaded(model.id, 5000, "/tmp/96.zip", 0)
             .await
             .unwrap();
 
@@ -5124,7 +5216,7 @@ mod tests {
             .unwrap();
 
         let claimed = repo.get_next_for_download().await.unwrap().unwrap();
-        repo.mark_eh_download_downloaded(claimed.id, 5000, "/tmp/97.zip")
+        repo.mark_eh_download_downloaded(claimed.id, 5000, "/tmp/97.zip", 0)
             .await
             .unwrap();
         repo.get_next_for_upload().await.unwrap().unwrap();

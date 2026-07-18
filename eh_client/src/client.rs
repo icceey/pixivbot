@@ -35,6 +35,10 @@ pub struct EhClient {
 pub struct ArchiveDownloadRequest {
     action_url: String,
     form_data: Vec<(String, String)>,
+    /// Cost classification parsed from the archiver.php page for this form.
+    /// Set by `prepare_archive_download()` so callers can gate the POST
+    /// (`download_archive_with_request`) on their GP budget without spending GP.
+    cost: parser::DownloadCost,
 }
 
 impl ArchiveDownloadRequest {
@@ -51,16 +55,32 @@ impl ArchiveDownloadRequest {
                 base_url, gid, token, archiver_key
             ),
             form_data: archive_form_data_for_resolution(resolution),
+            // The archiver_key path is only used when the page already contained
+            // an unlocked-key URL (e.g. `or={key}` in the form action), which
+            // means the download is free / already unlocked.
+            cost: parser::DownloadCost::Unlocked,
         }
     }
 
-    fn from_archiver_form(base_url: &str, form: parser::ArchiverForm, resolution: &str) -> Self {
+    fn from_archiver_form(
+        base_url: &str,
+        form: parser::ArchiverForm,
+        resolution: &str,
+        cost: parser::DownloadCost,
+    ) -> Self {
         let mut form_data = form.fields;
         apply_resolution_to_form_data(&mut form_data, resolution);
         Self {
             action_url: resolve_url(base_url, &form.action),
             form_data,
+            cost,
         }
+    }
+
+    /// The parsed download cost for this request. Callers should check this
+    /// before calling `download_archive_with_request()` to avoid spending GP.
+    pub fn cost(&self) -> &parser::DownloadCost {
+        &self.cost
     }
 }
 
@@ -367,6 +387,10 @@ impl EhClient {
     }
 
     /// Prepare the POST request needed to initiate an archive download.
+    ///
+    /// Also parses the archiver.php page for the download cost (Free / Unlocked
+    /// / `N GP` / Insufficient / N/A / Unknown) and attaches it to the returned
+    /// request so callers can decide whether to POST without spending GP.
     pub async fn prepare_archive_download(
         &self,
         gid: u64,
@@ -376,14 +400,29 @@ impl EhClient {
         let (archiver_gid, archiver_token, archiver_html) =
             self.fetch_archiver_page(gid, token).await?;
 
+        // Parse the cost from the archiver page for the requested resolution.
+        // This happens before any POST, so it does not spend GP. The cost is
+        // attached to the returned request regardless of whether we take the
+        // archiver-key path or the form path below, so callers can gate the
+        // POST on the configured GP budget even when the page contains an
+        // archiver_key (a key-shaped token alone does NOT prove the download
+        // is free - only the Download Cost text or the unlocked marker does).
+        let cost = parser::parse_archive_download_cost(&archiver_html, resolution);
+
         if let Some(archiver_key) = parser::parse_archiver_key(&archiver_html) {
-            return Ok(ArchiveDownloadRequest::from_archiver_key(
+            let mut request = ArchiveDownloadRequest::from_archiver_key(
                 &self.base_url,
                 archiver_gid,
                 &archiver_token,
                 &archiver_key,
                 resolution,
-            ));
+            );
+            // Override the default Unlocked cost set by from_archiver_key with
+            // the cost actually parsed from the page. This preserves the
+            // conservative "Unknown => defer" behavior when the page contains
+            // a key but the Download Cost text cannot be recognized.
+            request.cost = cost;
+            return Ok(request);
         }
 
         let form = parser::parse_archiver_form(&archiver_html).ok_or_else(|| {
@@ -393,6 +432,7 @@ impl EhClient {
             &self.base_url,
             form,
             resolution,
+            cost,
         ))
     }
 

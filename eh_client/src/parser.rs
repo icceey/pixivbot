@@ -184,6 +184,152 @@ pub fn parse_archive_redirect(html: &str) -> Option<String> {
         })
 }
 
+/// Cost classification for an archiver.php download form.
+///
+/// Returned by `parse_archive_download_cost`. The caller decides whether to
+/// POST based on this cost and the configured GP guard threshold.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DownloadCost {
+    /// `Free!` - no GP will be charged.
+    Free,
+    /// `You unlocked a resample download of this archive on <date>` was present
+    /// and the requested resolution is a resample. POST is safe; no GP charged.
+    Unlocked,
+    /// `{n} GP` - POST will charge `n` GP (auto-converts credits if GP insufficient).
+    Gp(u64),
+    /// `Insufficient Funds` - account lacks GP and credits to auto-convert.
+    /// POST would still be attempted by EH and likely fail; we reject early.
+    Insufficient,
+    /// `N/A` - resolution not available (donor-only or too large).
+    Unavailable,
+    /// Could not parse the cost text. Callers should conservatively reject.
+    Unknown,
+}
+
+impl DownloadCost {
+    /// Returns true if POSTing this form will not charge GP.
+    pub fn is_free(&self) -> bool {
+        matches!(self, DownloadCost::Free | DownloadCost::Unlocked)
+    }
+
+    /// Returns the GP cost if this variant is `Gp(n)`, else None.
+    pub fn gp_amount(&self) -> Option<u64> {
+        match self {
+            DownloadCost::Gp(n) => Some(*n),
+            _ => None,
+        }
+    }
+}
+
+fn unlocked_resample_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        // `You unlocked a <strong>resample</strong> download of this archive on <strong>{date}</strong>`
+        Regex::new(
+            r#"(?is)You unlocked a\s*<strong>\s*resample\s*</strong>\s*download of this archive"#,
+        )
+        .expect("invalid unlocked_resample regex")
+    })
+}
+
+/// Match `Download Cost: &nbsp; <strong>{cost}</strong>` text and return the inner cost string.
+fn download_cost_strong_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r#"(?is)Download Cost:\s*(?:&nbsp;)?\s*<strong[^>]*>(.*?)</strong>"#)
+            .expect("invalid download_cost_strong regex")
+    })
+}
+
+/// Match a `dltype` hidden input value inside a form.
+fn dltype_value_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r#"(?is)<input[^>]*name=["']dltype["'][^>]*value=["']([^"']+)["']"#)
+            .expect("invalid dltype_value regex")
+    })
+}
+
+fn parse_cost_text(text: &str) -> DownloadCost {
+    let trimmed = text.trim();
+    if trimmed.eq_ignore_ascii_case("Free!") || trimmed.eq_ignore_ascii_case("Free") {
+        DownloadCost::Free
+    } else if trimmed.eq_ignore_ascii_case("Insufficient Funds") {
+        DownloadCost::Insufficient
+    } else if trimmed.eq_ignore_ascii_case("N/A") || trimmed.is_empty() {
+        DownloadCost::Unavailable
+    } else {
+        // Pattern: `{n} GP` where n may contain thousand separators (commas).
+        let gp_re = Regex::new(r"(?i)^\s*([\d,]+)\s*GP\s*$").expect("invalid gp text regex");
+        if let Some(cap) = gp_re.captures(trimmed) {
+            if let Some(m) = cap.get(1) {
+                let digits: String = m.as_str().chars().filter(|c| c.is_ascii_digit()).collect();
+                if let Ok(n) = digits.parse::<u64>() {
+                    return DownloadCost::Gp(n);
+                }
+            }
+        }
+        DownloadCost::Unknown
+    }
+}
+
+/// Parse the GP/cost status of an archiver.php page for the given resolution.
+///
+/// `resolution` follows the config convention:
+/// - `"original"` or `""` -> the original-archive form (`dltype=org`)
+/// - any resample (`"780x"`, `"980x"`, `"1280x"`, `"1600x"`, `"2400x"`) ->
+///   the resample-archive form (`dltype=res`)
+///
+/// Resolution selection matches the form that `prepare_archive_download` will
+/// actually POST, so the returned cost reflects what the server will charge.
+///
+/// Returns `DownloadCost::Unknown` if the page structure cannot be recognized
+/// (e.g. neither `dltype=org` nor `dltype=res` form is present). Callers should
+/// conservatively reject in that case to avoid accidental GP charges when EH
+/// changes the page structure.
+pub fn parse_archive_download_cost(html: &str, resolution: &str) -> DownloadCost {
+    let want_original = resolution == "original" || resolution.is_empty();
+
+    // 1. Resample-unlocked marker: if the user has unlocked a resample download
+    //    and we are requesting a resample, the POST is free.
+    if !want_original && unlocked_resample_re().is_match(html) {
+        return DownloadCost::Unlocked;
+    }
+
+    // 2. Find all Download Cost <strong> blocks. The page has two: the first
+    //    precedes the original form (`dltype=org`), the second precedes the
+    //    resample form (`dltype=res`).
+    let cost_caps: Vec<_> = download_cost_strong_re().captures_iter(html).collect();
+    let dltype_caps: Vec<_> = dltype_value_re().captures_iter(html).collect();
+
+    // Pair each cost with the next dltype form that follows it. The page layout
+    // is: cost-div -> form(with dltype) -> size-p -> next-cost-div -> form(with dltype).
+    // We pick the pair whose dltype matches `want_original`.
+    let target_dltype = if want_original { "org" } else { "res" };
+
+    for cost_cap in &cost_caps {
+        let cost_end = cost_cap.get(0).unwrap().end();
+        // Find the first dltype form that appears at or after this cost block.
+        if let Some(dltype_cap) = dltype_caps
+            .iter()
+            .find(|dc| dc.get(0).unwrap().start() >= cost_end)
+        {
+            let dltype = dltype_cap.get(1).unwrap().as_str();
+            if dltype == target_dltype {
+                return parse_cost_text(cost_cap.get(1).unwrap().as_str());
+            }
+        }
+    }
+
+    // 3. Fallback: if no paired form was found but exactly one cost block exists,
+    //    return that cost. This handles simplified test fixtures.
+    if cost_caps.len() == 1 {
+        return parse_cost_text(cost_caps[0].get(1).unwrap().as_str());
+    }
+
+    DownloadCost::Unknown
+}
+
 fn image_page_urls_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
@@ -479,5 +625,227 @@ mod tests {
     #[test]
     fn test_parse_page_count_not_found() {
         assert!(parse_page_count("<html></html>").is_none());
+    }
+
+    // ---- parse_archive_download_cost tests ----
+
+    const ARCHIVER_FREE_RESAMPLE_UNLOCKED: &str = r##"
+<div id="db">
+<div style="position:relative; width:370px; margin:4px auto 4px; padding-top:3px">
+    <div style="width:180px; float:left">
+        <div style="text-align:center; margin-top:4px">Download Cost: &nbsp; <strong>Free!</strong></div>
+        <form action="https://exhentai.org/archiver.php?gid=4053260&amp;token=53ad37062b" method="post">
+            <input type="hidden" name="dltype" value="org" />
+            <div style="margin:3px auto"><input type="submit" name="dlcheck" value="Download Original Archive" style="width:180px" /></div>
+        </form>
+        <p>Estimated Size: &nbsp; <strong>28.52 MiB</strong></p>
+    </div>
+    <div style="width:180px; float:right">
+        <div style="text-align:center; margin-top:4px">Download Cost: &nbsp; <strong>Free!</strong></div>
+        <form action="https://exhentai.org/archiver.php?gid=4053260&amp;token=53ad37062b" method="post">
+            <input type="hidden" name="dltype" value="res" />
+            <div style="margin:3px auto"><input type="submit" name="dlcheck" value="Download Resample Archive" style="width:180px" /></div>
+        </form>
+        <p>Estimated Size: &nbsp; <strong>2.33 MiB</strong></p>
+    </div>
+    <div style="clear:both"></div>
+</div>
+<p>You unlocked a <strong>resample</strong> download of this archive on <strong>2026-07-17 20:26</strong> &nbsp;[<a href="#" onclick="return cancel_sessions()">cancel</a>]</p>
+</div>
+"##;
+
+    const ARCHIVER_FREE_DEFAULT: &str = r#"
+<div id="db">
+<div style="position:relative; width:370px; margin:4px auto 4px; padding-top:3px">
+    <div style="width:180px; float:left">
+        <div style="text-align:center; margin-top:4px">Download Cost: &nbsp; <strong>Free!</strong></div>
+        <form action="https://exhentai.org/archiver.php?gid=3635201&amp;token=30c972f597" method="post">
+            <input type="hidden" name="dltype" value="org" />
+            <div style="margin:3px auto"><input type="submit" name="dlcheck" value="Download Original Archive" style="width:180px" /></div>
+        </form>
+        <p>Estimated Size: &nbsp; <strong>40.98 MiB</strong></p>
+    </div>
+    <div style="width:180px; float:right">
+        <div style="text-align:center; margin-top:4px">Download Cost: &nbsp; <strong>Free!</strong></div>
+        <form action="https://exhentai.org/archiver.php?gid=3635201&amp;token=30c972f597" method="post">
+            <input type="hidden" name="dltype" value="res" />
+            <div style="margin:3px auto"><input type="submit" name="dlcheck" value="Download Resample Archive" style="width:180px" /></div>
+        </form>
+        <p>Estimated Size: &nbsp; <strong>3.60 MiB</strong></p>
+    </div>
+    <div style="clear:both"></div>
+</div>
+</div>
+"#;
+
+    const ARCHIVER_EHENTAI_FUNDS: &str = r#"
+<div id="db">
+<p>Current Funds:</p><p>13,468,433 GP [<a href="https://ehwiki.org/wiki/Gallery_Points" target="ehwiki">?</a>] &nbsp; 5,199 Credits [<a href="https://ehwiki.org/wiki/Credits" target="ehwiki">?</a>]</p>
+<div style="position:relative; width:370px; margin:4px auto 4px; padding-top:3px">
+    <div style="width:180px; float:left">
+        <div style="text-align:center; margin-top:4px">Download Cost: &nbsp; <strong>Free!</strong></div>
+        <form action="https://e-hentai.org/archiver.php?gid=4006273&amp;token=d2ccf02433" method="post">
+            <input type="hidden" name="dltype" value="org" />
+            <div style="margin:3px auto"><input type="submit" name="dlcheck" value="Download Original Archive" style="width:180px" /></div>
+        </form>
+        <p>Estimated Size: &nbsp; <strong>127.0 MiB</strong></p>
+    </div>
+    <div style="width:180px; float:right">
+        <div style="text-align:center; margin-top:4px">Download Cost: &nbsp; <strong>Free!</strong></div>
+        <form action="https://e-hentai.org/archiver.php?gid=4006273&amp;token=d2ccf02433" method="post">
+            <input type="hidden" name="dltype" value="res" />
+            <div style="margin:3px auto"><input type="submit" name="dlcheck" value="Download Resample Archive" style="width:180px" /></div>
+        </form>
+        <p>Estimated Size: &nbsp; <strong>7.29 MiB</strong></p>
+    </div>
+    <div style="clear:both"></div>
+</div>
+</div>
+"#;
+
+    const ARCHIVER_GP_REQUIRED: &str = r#"
+<div id="db">
+<div style="position:relative; width:370px; margin:4px auto 4px; padding-top:3px">
+    <div style="width:180px; float:left">
+        <div style="text-align:center; margin-top:4px">Download Cost: &nbsp; <strong>8,800 GP</strong></div>
+        <form action="https://exhentai.org/archiver.php?gid=2284788&amp;token=7841d194d4" method="post">
+            <input type="hidden" name="dltype" value="org" />
+            <div style="margin:3px auto"><input type="submit" name="dlcheck" value="Download Original Archive" style="width:180px" /></div>
+        </form>
+        <p>Estimated Size: &nbsp; <strong>419.6 MiB</strong></p>
+    </div>
+    <div style="width:180px; float:right">
+        <div style="text-align:center; margin-top:4px">Download Cost: &nbsp; <strong>218 GP</strong></div>
+        <form action="https://exhentai.org/archiver.php?gid=2284788&amp;token=7841d194d4" method="post">
+            <input type="hidden" name="dltype" value="res" />
+            <div style="margin:3px auto"><input type="submit" name="dlcheck" value="Download Resample Archive" style="width:180px" /></div>
+        </form>
+        <p>Estimated Size: &nbsp; <strong>10.38 MiB</strong></p>
+    </div>
+    <div style="clear:both"></div>
+</div>
+</div>
+"#;
+
+    #[test]
+    fn test_parse_archive_download_cost_free_original() {
+        let cost = parse_archive_download_cost(ARCHIVER_FREE_DEFAULT, "original");
+        assert_eq!(cost, DownloadCost::Free);
+    }
+
+    #[test]
+    fn test_parse_archive_download_cost_free_resample() {
+        let cost = parse_archive_download_cost(ARCHIVER_FREE_DEFAULT, "1280x");
+        assert_eq!(cost, DownloadCost::Free);
+    }
+
+    #[test]
+    fn test_parse_archive_download_cost_empty_resolution_uses_original() {
+        let cost = parse_archive_download_cost(ARCHIVER_FREE_DEFAULT, "");
+        assert_eq!(cost, DownloadCost::Free);
+    }
+
+    #[test]
+    fn test_parse_archive_download_cost_unlocked_resample() {
+        let cost = parse_archive_download_cost(ARCHIVER_FREE_RESAMPLE_UNLOCKED, "1280x");
+        assert_eq!(cost, DownloadCost::Unlocked);
+    }
+
+    #[test]
+    fn test_parse_archive_download_cost_unlocked_marker_ignored_for_original() {
+        // Even though the resample is unlocked, original downloads are NOT
+        // automatically free. We fall through to the original form cost.
+        let cost = parse_archive_download_cost(ARCHIVER_FREE_RESAMPLE_UNLOCKED, "original");
+        assert_eq!(cost, DownloadCost::Free);
+    }
+
+    #[test]
+    fn test_parse_archive_download_cost_ehentai_funds_original() {
+        let cost = parse_archive_download_cost(ARCHIVER_EHENTAI_FUNDS, "original");
+        assert_eq!(cost, DownloadCost::Free);
+    }
+
+    #[test]
+    fn test_parse_archive_download_cost_gp_required_original() {
+        let cost = parse_archive_download_cost(ARCHIVER_GP_REQUIRED, "original");
+        assert_eq!(cost, DownloadCost::Gp(8800));
+    }
+
+    #[test]
+    fn test_parse_archive_download_cost_gp_required_resample() {
+        let cost = parse_archive_download_cost(ARCHIVER_GP_REQUIRED, "1280x");
+        assert_eq!(cost, DownloadCost::Gp(218));
+    }
+
+    #[test]
+    fn test_parse_archive_download_cost_strips_thousand_separators() {
+        let html = r#"
+<div>Download Cost: &nbsp; <strong>747,708 GP</strong></div>
+<form action="/archiver.php?gid=1&amp;token=abc" method="post">
+    <input type="hidden" name="dltype" value="org" />
+</form>
+"#;
+        let cost = parse_archive_download_cost(html, "original");
+        assert_eq!(cost, DownloadCost::Gp(747708));
+    }
+
+    #[test]
+    fn test_parse_archive_download_cost_insufficient_funds() {
+        let html = r#"
+<div>Download Cost: &nbsp; <strong>Insufficient Funds</strong></div>
+<form action="/archiver.php?gid=1&amp;token=abc" method="post">
+    <input type="hidden" name="dltype" value="org" />
+</form>
+"#;
+        let cost = parse_archive_download_cost(html, "original");
+        assert_eq!(cost, DownloadCost::Insufficient);
+    }
+
+    #[test]
+    fn test_parse_archive_download_cost_na() {
+        let html = r#"
+<div>Download Cost: &nbsp; <strong>N/A</strong></div>
+<form action="/archiver.php?gid=1&amp;token=abc" method="post">
+    <input type="hidden" name="dltype" value="org" />
+</form>
+"#;
+        let cost = parse_archive_download_cost(html, "original");
+        assert_eq!(cost, DownloadCost::Unavailable);
+    }
+
+    #[test]
+    fn test_parse_archive_download_cost_unknown_text() {
+        let html = r#"
+<div>Download Cost: &nbsp; <strong>Somewhere Over The Rainbow</strong></div>
+<form action="/archiver.php?gid=1&amp;token=abc" method="post">
+    <input type="hidden" name="dltype" value="org" />
+</form>
+"#;
+        let cost = parse_archive_download_cost(html, "original");
+        assert_eq!(cost, DownloadCost::Unknown);
+    }
+
+    #[test]
+    fn test_parse_archive_download_cost_missing_returns_unknown() {
+        let html = "<html><body>No archiver content</body></html>";
+        let cost = parse_archive_download_cost(html, "original");
+        assert_eq!(cost, DownloadCost::Unknown);
+    }
+
+    #[test]
+    fn test_download_cost_is_free() {
+        assert!(DownloadCost::Free.is_free());
+        assert!(DownloadCost::Unlocked.is_free());
+        assert!(!DownloadCost::Gp(0).is_free());
+        assert!(!DownloadCost::Insufficient.is_free());
+        assert!(!DownloadCost::Unavailable.is_free());
+        assert!(!DownloadCost::Unknown.is_free());
+    }
+
+    #[test]
+    fn test_download_cost_gp_amount() {
+        assert_eq!(DownloadCost::Gp(218).gp_amount(), Some(218));
+        assert_eq!(DownloadCost::Free.gp_amount(), None);
+        assert_eq!(DownloadCost::Unknown.gp_amount(), None);
     }
 }

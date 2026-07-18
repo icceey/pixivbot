@@ -186,6 +186,18 @@ download_original_threshold = 1
 # # The check runs before the archive request that can spend EH archive points.
 # # Set to 0 to disable this per-gallery limit.
 # max_archive_size_mb = 300
+# # Maximum GP cost allowed for a single archive download (default: 0).
+# # 0 = only Free / Unlocked archives are downloaded; any gallery that would
+# # cost GP is deferred until the cost changes (e.g. resample unlocked).
+# # Set to a positive value to allow paid downloads up to that amount.
+# # Insufficient Funds / N/A / Unknown always defer regardless of this setting.
+# max_archive_gp_cost = 0
+# # Maximum total GP that can be spent on archive downloads within the rolling
+# # window configured by `gp_rate_window_hours` (default: 0 = no daily GP budget
+# # beyond the per-archive `max_archive_gp_cost` check).
+# gp_rate_limit = 0
+# # Rolling window length (in hours) for `gp_rate_limit` (default: 24).
+# gp_rate_window_hours = 24
 # # Poll interval for download processor (seconds, default: 60)
 # download_poll_interval_sec = 60
 # # Max pushed GIDs to remember per subscription (default: 500)
