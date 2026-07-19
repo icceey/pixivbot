@@ -31,6 +31,11 @@ pub struct Model {
     pub status: String,
     #[sea_orm(default = 0)]
     pub file_size: i64,
+    /// Compatibility/display metadata for the most recent successful archive
+    /// download (0 for free / unlocked downloads). The append-only
+    /// `eh_gp_spend_attempts` ledger calculates rolling GP budgets.
+    #[sea_orm(default = 0)]
+    pub gp_cost: i64,
     #[sea_orm(nullable)]
     pub error: Option<String>,
     #[sea_orm(default = 0)]

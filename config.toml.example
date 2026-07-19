@@ -123,6 +123,12 @@ download_original_threshold = 1
 # path_style = true
 # # Send non-blocking HEAD requests to gateway_url after upload to warm IPFS gateway cache.
 # warm_public_gateway_after_upload = false
+# # If your ipfS3 deployment supports the signed `decompress-zip` PutObject
+# # extension, EH Telegraph uploads can upload one ZIP and use each extracted
+# # entry's returned CID as {gateway}/{entry-CID}. The client derives an isolated
+# # extraction prefix and requires the default DecompressZipResult XML response.
+# # Leave disabled unless your provider implements this protocol.
+# zip_extract_enabled = false
 #
 # [image_upload.catbox]
 # # Catbox uploads are public; userhash is optional. Anonymous uploads cannot be
@@ -177,6 +183,22 @@ download_original_threshold = 1
 # # Download rate limiting (default: 7 GB per 7 days / 168 hours)
 # download_rate_limit_gb = 7
 # download_rate_window_hours = 168
+# # Maximum selected EH archive estimate for logged-in archive downloads, in MiB.
+# # Parsed from the archiver page before the GP-spending archive POST.
+# # Set to 0 to disable this selected archive limit.
+# max_archive_size_mb = 300
+# # Maximum GP cost allowed for a single archive download (default: 0).
+# # 0 = only Free / Unlocked archives are downloaded; any gallery that would
+# # cost GP is deferred until the cost changes (e.g. resample unlocked).
+# # Set to a positive value to allow paid downloads up to that amount.
+# # Insufficient Funds / N/A / Unknown always defer regardless of this setting.
+# max_archive_gp_cost = 0
+# # Maximum total GP that can be spent on archive downloads within the rolling
+# # window configured by `gp_rate_window_hours` (default: 0 = no daily GP budget
+# # beyond the per-archive `max_archive_gp_cost` check).
+# gp_rate_limit = 0
+# # Rolling window length (in hours) for `gp_rate_limit` (default: 24).
+# gp_rate_window_hours = 24
 # # Poll interval for download processor (seconds, default: 60)
 # download_poll_interval_sec = 60
 # # Max pushed GIDs to remember per subscription (default: 500)

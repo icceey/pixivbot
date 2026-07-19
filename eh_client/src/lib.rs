@@ -12,4 +12,5 @@ pub use telegraph::{
     ImageUploadInput, ImageUploadProvider, ImageUploader, IpfS3PreviewRewriteConfig, IpfS3Uploader,
     IpfS3UploaderConfig, PixiUploader, S3Uploader, S3UploaderConfig, TelegraphClient,
     TelegraphGalleryPageResult, TelegraphImageUrlPair, TelegraphRewriteData, TelegraphRewritePage,
+    ZipArchiveUploadInput,
 };

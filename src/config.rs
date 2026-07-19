@@ -377,6 +377,27 @@ pub struct EhentaiConfig {
     pub download_rate_limit_gb: u64,
     #[serde(default = "default_eh_download_rate_window_hours")]
     pub download_rate_window_hours: u64,
+    /// Maximum selected EH archive estimate allowed for logged-in downloads, in MiB.
+    /// The archiver page supplies this estimate before the GP-spending POST.
+    /// `0` disables this per-gallery archive gate.
+    #[serde(default = "default_eh_max_archive_size_mb")]
+    pub max_archive_size_mb: u64,
+    /// Maximum GP cost allowed for a single archive download. `0` (default) means
+    /// only Free / Unlocked archives are downloaded; any gallery that would cost
+    /// GP is deferred. Set to a positive value to allow paid downloads up to that
+    /// amount. Insufficient Funds / N/A / Unknown always defer regardless of this
+    /// setting.
+    #[serde(default = "default_eh_max_archive_gp_cost")]
+    pub max_archive_gp_cost: u64,
+    /// Maximum total GP that can be spent on archive downloads within the rolling
+    /// window configured by `gp_rate_window_hours`. `0` (default) means no daily
+    /// GP budget beyond the per-archive `max_archive_gp_cost` check.
+    #[serde(default = "default_eh_gp_rate_limit")]
+    pub gp_rate_limit: u64,
+    /// Rolling window length (in hours) for the `gp_rate_limit` GP budget.
+    /// Default: 24 (one day).
+    #[serde(default = "default_eh_gp_rate_window_hours")]
+    pub gp_rate_window_hours: u64,
     #[serde(default = "default_eh_download_poll_interval_sec")]
     pub download_poll_interval_sec: u64,
     #[serde(default = "default_eh_background_download_enabled")]
@@ -411,6 +432,10 @@ impl Default for EhentaiConfig {
             scan_window_hours: default_eh_scan_window_hours(),
             download_rate_limit_gb: default_eh_download_rate_limit_gb(),
             download_rate_window_hours: default_eh_download_rate_window_hours(),
+            max_archive_size_mb: default_eh_max_archive_size_mb(),
+            max_archive_gp_cost: default_eh_max_archive_gp_cost(),
+            gp_rate_limit: default_eh_gp_rate_limit(),
+            gp_rate_window_hours: default_eh_gp_rate_window_hours(),
             download_poll_interval_sec: default_eh_download_poll_interval_sec(),
             background_download_enabled: default_eh_background_download_enabled(),
             background_download_concurrency: default_eh_background_download_concurrency(),
@@ -445,6 +470,48 @@ impl EhentaiConfig {
     /// Download rate limit in bytes.
     pub fn download_rate_limit_bytes(&self) -> u64 {
         self.download_rate_limit_gb * 1024 * 1024 * 1024
+    }
+
+    /// Maximum selected EH archive estimate in bytes, or `None` when the gate is disabled.
+    ///
+    /// `max_archive_size_mb = 0` disables the selected archive-size gate.
+    pub fn max_archive_size_bytes(&self) -> Option<u64> {
+        if self.max_archive_size_mb == 0 {
+            None
+        } else {
+            Some(self.max_archive_size_mb.saturating_mul(1024 * 1024))
+        }
+    }
+
+    /// Returns true if a download with the given GP cost is allowed by the
+    /// per-archive `max_archive_gp_cost` setting.
+    ///
+    /// - Free / Unlocked: always allowed (no GP spent).
+    /// - `Gp(n)` with `n > 0`: allowed iff `n <= max_archive_gp_cost`.
+    ///   When `max_archive_gp_cost == 0` (default), any non-zero GP cost is
+    ///   rejected, since 0 means "only free downloads".
+    /// - `Gp(0)`: treated as a non-free variant (the page said "0 GP" rather
+    ///   than "Free!"), so it is rejected when `max_archive_gp_cost == 0`.
+    /// - Insufficient / Unavailable / Unknown: never allowed (conservative reject).
+    pub fn allows_archive_gp_cost(&self, cost: &eh_client::parser::DownloadCost) -> bool {
+        use eh_client::parser::DownloadCost;
+        match cost {
+            DownloadCost::Free | DownloadCost::Unlocked => true,
+            DownloadCost::Gp(n) => {
+                if self.max_archive_gp_cost == 0 {
+                    false
+                } else {
+                    *n <= self.max_archive_gp_cost
+                }
+            }
+            DownloadCost::Insufficient | DownloadCost::Unavailable | DownloadCost::Unknown => false,
+        }
+    }
+
+    /// Rolling GP rate window in hours, clamped to a minimum of 1 to avoid
+    /// divide-by-zero and meaningless zero-length windows.
+    pub fn gp_rate_window_hours_clamped(&self) -> u64 {
+        self.gp_rate_window_hours.max(1)
     }
 }
 
@@ -494,6 +561,22 @@ fn default_eh_download_rate_limit_gb() -> u64 {
 
 fn default_eh_download_rate_window_hours() -> u64 {
     168
+}
+
+fn default_eh_max_archive_size_mb() -> u64 {
+    300
+}
+
+fn default_eh_max_archive_gp_cost() -> u64 {
+    0
+}
+
+fn default_eh_gp_rate_limit() -> u64 {
+    0
+}
+
+fn default_eh_gp_rate_window_hours() -> u64 {
+    24
 }
 
 fn default_eh_download_poll_interval_sec() -> u64 {
@@ -607,5 +690,21 @@ mod tests {
             ..Default::default()
         };
         assert!(!cfg.is_enabled());
+    }
+
+    #[test]
+    fn test_eh_max_archive_size_defaults_to_300_mib() {
+        let cfg = EhentaiConfig::default();
+        assert_eq!(cfg.max_archive_size_mb, 300);
+        assert_eq!(cfg.max_archive_size_bytes(), Some(300 * 1024 * 1024));
+    }
+
+    #[test]
+    fn test_eh_max_archive_size_zero_disables_limit() {
+        let cfg = EhentaiConfig {
+            max_archive_size_mb: 0,
+            ..Default::default()
+        };
+        assert_eq!(cfg.max_archive_size_bytes(), None);
     }
 }

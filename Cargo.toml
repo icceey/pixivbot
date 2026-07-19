@@ -50,4 +50,5 @@ url = "2.5.8"
 zip = "8.6.0"
 
 [dev-dependencies]
+async-trait = "0.1.89"
 wiremock = "0.6"

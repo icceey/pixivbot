@@ -1,6 +1,8 @@
 use crate::error::{Error, Result};
 use async_trait::async_trait;
+use s3::command::Command;
 use s3::creds::Credentials;
+use s3::request::{tokio_backend::ReqwestRequest, Request};
 use s3::{Bucket, Region};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -381,6 +383,8 @@ pub struct IpfS3UploaderConfig {
     pub path_style: bool,
     #[serde(default)]
     pub warm_public_gateway_after_upload: bool,
+    #[serde(default)]
+    pub zip_extract_enabled: bool,
 }
 
 fn default_ipfs_preview_rewrite_delay_sec() -> u64 {
@@ -427,6 +431,7 @@ impl IpfS3UploaderConfig {
             key_prefix: self.key_prefix.trim_matches('/').to_string(),
             path_style: self.path_style,
             warm_public_gateway_after_upload: self.warm_public_gateway_after_upload,
+            zip_extract_enabled: self.zip_extract_enabled,
         })
     }
 }
@@ -444,6 +449,7 @@ struct ResolvedIpfS3UploaderConfig {
     key_prefix: String,
     path_style: bool,
     warm_public_gateway_after_upload: bool,
+    zip_extract_enabled: bool,
 }
 
 fn required_config(name: &str, value: &Option<String>) -> Result<String> {
@@ -492,8 +498,18 @@ pub struct ImageUploadInput<'a> {
     pub bytes: &'a [u8],
 }
 
+pub struct ZipArchiveUploadInput<'a> {
+    pub filename: &'a str,
+    pub bytes: &'a [u8],
+    pub entry_names: &'a [String],
+}
+
 #[async_trait]
 pub trait ImageUploader: Send + Sync {
+    fn supports_zip_archive_upload(&self) -> bool {
+        false
+    }
+
     async fn upload_images(&self, images: &[ImageUploadInput<'_>]) -> Result<Vec<String>>;
 
     async fn upload_images_with_url_pairs(
@@ -509,6 +525,13 @@ pub trait ImageUploader: Send + Sync {
                 public_url: url,
             })
             .collect())
+    }
+
+    async fn upload_zip_archive_with_url_pairs(
+        &self,
+        _archive: ZipArchiveUploadInput<'_>,
+    ) -> Result<Option<Vec<TelegraphImageUrlPair>>> {
+        Ok(None)
     }
 }
 
@@ -892,10 +915,86 @@ impl IpfS3Uploader {
         }
         Ok(urls)
     }
+
+    fn archive_object_key(&self, input: &ZipArchiveUploadInput<'_>) -> String {
+        let timestamp = chrono::Utc::now().format("%Y%m%d%H%M%S");
+        let hash = short_hash_hex(input.bytes);
+        let filename = format!("{timestamp}-archive-{hash}.zip");
+        if self.config.key_prefix.is_empty() {
+            filename
+        } else {
+            format!("{}/{}", self.config.key_prefix, filename)
+        }
+    }
+
+    pub async fn upload_zip_archive_with_url_pairs(
+        &self,
+        archive: ZipArchiveUploadInput<'_>,
+    ) -> Result<Option<Vec<TelegraphImageUrlPair>>> {
+        if !self.config.zip_extract_enabled {
+            return Ok(None);
+        }
+        if archive.entry_names.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+
+        let key = self.archive_object_key(&archive);
+        let archive_stem = key.strip_suffix(".zip").ok_or_else(|| {
+            Error::Other(format!("ipfS3 ZIP object key {key} does not end in .zip"))
+        })?;
+        let extraction_prefix = format!("{archive_stem}/");
+        let mut upload_bucket = self.bucket.clone();
+        upload_bucket.add_query("decompress-zip", &extraction_prefix);
+
+        let command = Command::PutObject {
+            content: archive.bytes,
+            content_type: "application/zip",
+            custom_headers: None,
+            multipart: None,
+        };
+        let request = ReqwestRequest::new(upload_bucket.as_ref(), &key, command)
+            .await
+            .map_err(|error| {
+                Error::Other(format!(
+                    "failed to build ipfS3 ZIP put_object request for key {key}: {error}"
+                ))
+            })?;
+        let response = request.response_data(false).await.map_err(|error| {
+            Error::Other(format!(
+                "ipfS3 ZIP put_object failed for key {key}: {error}"
+            ))
+        })?;
+        let status = response.status_code();
+        if !(200..300).contains(&status) {
+            return Err(Error::Api {
+                message: format!("ipfS3 ZIP put_object returned {status} for key {key}"),
+                status,
+            });
+        }
+
+        let extract_result = parse_ipfs3_zip_extract_result(response.bytes()).map_err(|error| {
+            Error::Other(format!(
+                "ipfS3 ZIP put_object for key {key} returned {error}"
+            ))
+        })?;
+        let cids = ipfs3_zip_entry_cids(&extraction_prefix, archive.entry_names, extract_result)?;
+        let pairs = cids
+            .into_iter()
+            .map(|cid| {
+                self.warm_public_gateway(&cid);
+                self.url_pair_for_cid(&cid)
+            })
+            .collect();
+        Ok(Some(pairs))
+    }
 }
 
 #[async_trait]
 impl ImageUploader for IpfS3Uploader {
+    fn supports_zip_archive_upload(&self) -> bool {
+        self.config.zip_extract_enabled
+    }
+
     async fn upload_images(&self, images: &[ImageUploadInput<'_>]) -> Result<Vec<String>> {
         Ok(IpfS3Uploader::upload_images_with_url_pairs(self, images)
             .await?
@@ -910,6 +1009,219 @@ impl ImageUploader for IpfS3Uploader {
     ) -> Result<Vec<TelegraphImageUrlPair>> {
         IpfS3Uploader::upload_images_with_url_pairs(self, images).await
     }
+
+    async fn upload_zip_archive_with_url_pairs(
+        &self,
+        archive: ZipArchiveUploadInput<'_>,
+    ) -> Result<Option<Vec<TelegraphImageUrlPair>>> {
+        IpfS3Uploader::upload_zip_archive_with_url_pairs(self, archive).await
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename = "DecompressZipResult")]
+struct IpfS3ZipExtractResult {
+    #[serde(rename = "ArchiveKey")]
+    _archive_key: String,
+    #[serde(rename = "ArchiveETag")]
+    _archive_etag: String,
+    #[serde(rename = "ArchiveSize")]
+    _archive_size: u64,
+    #[serde(rename = "ExtractedCount")]
+    extracted_count: usize,
+    #[serde(rename = "FailedCount")]
+    failed_count: usize,
+    #[serde(rename = "Entries", default)]
+    entries: IpfS3ZipExtractEntries,
+    #[serde(rename = "Failures", default)]
+    failures: IpfS3ZipExtractFailures,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct IpfS3ZipExtractEntries {
+    #[serde(rename = "Entry", default)]
+    entries: Vec<IpfS3ZipExtractEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename = "Entry")]
+struct IpfS3ZipExtractEntry {
+    #[serde(rename = "Key")]
+    key: String,
+    #[serde(rename = "ETag")]
+    etag: String,
+    #[serde(rename = "Size")]
+    _size: u64,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct IpfS3ZipExtractFailures {
+    #[serde(rename = "Failure", default)]
+    failures: Vec<IpfS3ZipExtractFailure>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename = "Failure")]
+struct IpfS3ZipExtractFailure {
+    #[serde(rename = "EntryName")]
+    entry_name: String,
+    #[serde(rename = "Code")]
+    code: String,
+    #[serde(rename = "Message")]
+    message: String,
+}
+
+fn validate_ipfs3_zip_extract_result_xml(body: &[u8]) -> Result<()> {
+    const ROOT_ELEMENT: &[u8] = b"DecompressZipResult";
+
+    let mut reader = quick_xml::Reader::from_reader(body);
+    let mut buffer = Vec::new();
+    let root_is_empty = loop {
+        buffer.clear();
+        match reader.read_event_into(&mut buffer) {
+            Ok(quick_xml::events::Event::Start(element)) => {
+                if element.name().as_ref() != ROOT_ELEMENT {
+                    return Err(Error::Other(
+                        "invalid DecompressZipResult XML: expected DecompressZipResult root element"
+                            .into(),
+                    ));
+                }
+                break false;
+            }
+            Ok(quick_xml::events::Event::Empty(element)) => {
+                if element.name().as_ref() != ROOT_ELEMENT {
+                    return Err(Error::Other(
+                        "invalid DecompressZipResult XML: expected DecompressZipResult root element"
+                            .into(),
+                    ));
+                }
+                break true;
+            }
+            Ok(
+                quick_xml::events::Event::Decl(_)
+                | quick_xml::events::Event::Comment(_)
+                | quick_xml::events::Event::PI(_)
+                | quick_xml::events::Event::DocType(_),
+            ) => {}
+            Ok(quick_xml::events::Event::Text(text))
+                if text.iter().all(u8::is_ascii_whitespace) => {}
+            Ok(quick_xml::events::Event::Eof) | Ok(_) => {
+                return Err(Error::Other(
+                    "invalid DecompressZipResult XML: expected DecompressZipResult root element"
+                        .into(),
+                ));
+            }
+            Err(error) => {
+                return Err(Error::Other(format!(
+                    "invalid DecompressZipResult XML: {error}"
+                )));
+            }
+        }
+    };
+
+    if !root_is_empty {
+        buffer.clear();
+        reader
+            .read_to_end(quick_xml::name::QName(ROOT_ELEMENT))
+            .map_err(|error| Error::Other(format!("invalid DecompressZipResult XML: {error}")))?;
+    }
+
+    loop {
+        buffer.clear();
+        match reader.read_event_into(&mut buffer) {
+            Ok(quick_xml::events::Event::Eof) => return Ok(()),
+            Ok(quick_xml::events::Event::Comment(_) | quick_xml::events::Event::PI(_)) => {}
+            Ok(quick_xml::events::Event::Text(text))
+                if text.iter().all(u8::is_ascii_whitespace) => {}
+            Ok(quick_xml::events::Event::Start(_) | quick_xml::events::Event::Empty(_)) => {
+                return Err(Error::Other(
+                    "invalid DecompressZipResult XML: trailing XML content after root element"
+                        .into(),
+                ));
+            }
+            Ok(_) => {
+                return Err(Error::Other(
+                    "invalid DecompressZipResult XML: trailing XML content after root element"
+                        .into(),
+                ));
+            }
+            Err(error) => {
+                return Err(Error::Other(format!(
+                    "invalid DecompressZipResult XML: {error}"
+                )));
+            }
+        }
+    }
+}
+
+fn parse_ipfs3_zip_extract_result(body: &[u8]) -> Result<IpfS3ZipExtractResult> {
+    if body.iter().all(|byte| byte.is_ascii_whitespace()) {
+        return Err(Error::Other(
+            "invalid DecompressZipResult XML: empty response body".into(),
+        ));
+    }
+
+    validate_ipfs3_zip_extract_result_xml(body)?;
+    quick_xml::de::from_reader(std::io::Cursor::new(body))
+        .map_err(|e| Error::Other(format!("invalid DecompressZipResult XML: {e}")))
+}
+
+fn ipfs3_zip_entry_cids(
+    extraction_prefix: &str,
+    entry_names: &[String],
+    result: IpfS3ZipExtractResult,
+) -> Result<Vec<String>> {
+    if result.extracted_count != result.entries.entries.len() {
+        return Err(Error::Other(format!(
+            "ipfS3 ZIP extraction ExtractedCount {} does not match {} entries",
+            result.extracted_count,
+            result.entries.entries.len()
+        )));
+    }
+    if result.failed_count != result.failures.failures.len() {
+        return Err(Error::Other(format!(
+            "ipfS3 ZIP extraction FailedCount {} does not match {} failures",
+            result.failed_count,
+            result.failures.failures.len()
+        )));
+    }
+    if let Some(failure) = result.failures.failures.first() {
+        return Err(Error::Other(format!(
+            "ipfS3 ZIP extraction reported {} failed entries; first failure: {}: {} ({})",
+            result.failed_count, failure.entry_name, failure.message, failure.code
+        )));
+    }
+
+    let mut entry_cids = std::collections::HashMap::new();
+    for entry in result.entries.entries {
+        entry_cids.insert(entry.key, entry.etag);
+    }
+    let mut requested_names = std::collections::HashSet::new();
+    let mut cids = Vec::with_capacity(entry_names.len());
+
+    for entry_name in entry_names {
+        if !requested_names.insert(entry_name) {
+            return Err(Error::Other(format!(
+                "ipfS3 ZIP extraction has duplicate requested entry name {entry_name}"
+            )));
+        }
+
+        let key = format!("{extraction_prefix}{entry_name}");
+        let cid = entry_cids.get(&key).ok_or_else(|| {
+            Error::Other(format!(
+                "ipfS3 ZIP extraction missing requested extraction key {key}"
+            ))
+        })?;
+        let cid = cid.trim().trim_matches('"').trim();
+        if cid.is_empty() {
+            return Err(Error::Other(format!(
+                "ipfS3 ZIP extraction requested extraction key {key} returned an empty CID"
+            )));
+        }
+        cids.push(cid.to_string());
+    }
+
+    Ok(cids)
 }
 
 fn extension_for_content_type(content_type: &str) -> &'static str {
@@ -1728,6 +2040,7 @@ mod tests {
             key_prefix: "eh".to_string(),
             path_style: true,
             warm_public_gateway_after_upload: false,
+            zip_extract_enabled: false,
         }
     }
 
@@ -2135,5 +2448,492 @@ mod tests {
             node_attr_str(&public_nodes[0], "src"),
             Some("https://public.example/ipfs/cid-one")
         );
+    }
+
+    #[test]
+    fn ipfs3_zip_extract_disabled_by_default() {
+        let config = IpfS3UploaderConfig::default();
+        assert!(!config.zip_extract_enabled);
+    }
+
+    fn ipfs3_zip_extract_result_xml(
+        entries: &[(&str, &str)],
+        failures: &[(&str, &str, &str)],
+        extracted_count: usize,
+        failed_count: usize,
+    ) -> Vec<u8> {
+        let entries = entries
+            .iter()
+            .map(|(key, etag)| {
+                format!("<Entry><Key>{key}</Key><ETag>{etag}</ETag><Size>123</Size></Entry>")
+            })
+            .collect::<String>();
+        let failures = failures
+            .iter()
+            .map(|(entry_name, code, message)| {
+                format!(
+                    "<Failure><EntryName>{entry_name}</EntryName><Code>{code}</Code><Message>{message}</Message></Failure>"
+                )
+            })
+            .collect::<String>();
+
+        format!(
+            "<DecompressZipResult><ArchiveKey>archive.zip</ArchiveKey><ArchiveETag>archive-cid</ArchiveETag><ArchiveSize>456</ArchiveSize><ExtractedCount>{extracted_count}</ExtractedCount><FailedCount>{failed_count}</FailedCount><Entries>{entries}</Entries><Failures>{failures}</Failures></DecompressZipResult>"
+        )
+        .into_bytes()
+    }
+
+    struct IpfS3ZipExtractResponder;
+
+    impl wiremock::Respond for IpfS3ZipExtractResponder {
+        fn respond(&self, request: &wiremock::Request) -> wiremock::ResponseTemplate {
+            let archive_key = request
+                .url
+                .path()
+                .strip_prefix("/bucket/")
+                .expect("ZIP extraction request must target the configured bucket");
+            let archive_stem = archive_key
+                .strip_suffix(".zip")
+                .expect("ZIP extraction request must target a ZIP object");
+            let entries = [
+                (format!("{archive_stem}/notes.txt"), "bafyExtra"),
+                (format!("{archive_stem}/dir/page002.png"), "bafySecond"),
+                (format!("{archive_stem}/page001.jpg"), "bafyFirst"),
+            ];
+            let entries = entries
+                .iter()
+                .map(|(key, cid)| (key.as_str(), *cid))
+                .collect::<Vec<_>>();
+
+            wiremock::ResponseTemplate::new(200)
+                .insert_header("etag", "\"bafyHttpArchiveCidMustNotAppear\"")
+                .set_body_bytes(ipfs3_zip_extract_result_xml(&entries, &[], 3, 0))
+        }
+    }
+
+    #[test]
+    fn ipfs3_zip_extract_result_maps_exact_keys_in_requested_order_and_last_key_wins() {
+        let xml = ipfs3_zip_extract_result_xml(
+            &[
+                ("extract/page-001.jpg", "cid-first"),
+                ("extract/page-002.jpg", "cid-two"),
+                ("extract/page-001.jpg", "cid-last"),
+                ("extract/unrequested.jpg", "cid-extra"),
+            ],
+            &[],
+            4,
+            0,
+        );
+        let xml = [
+            b"<?xml version=\"1.0\"?>\n ".as_slice(),
+            xml.as_slice(),
+            b"\n\t",
+        ]
+        .concat();
+        let result = parse_ipfs3_zip_extract_result(&xml).unwrap();
+
+        let cids = ipfs3_zip_entry_cids(
+            "extract/",
+            &["page-002.jpg".to_string(), "page-001.jpg".to_string()],
+            result,
+        )
+        .unwrap();
+
+        assert_eq!(cids, ["cid-two", "cid-last"]);
+    }
+
+    #[test]
+    fn ipfs3_zip_extract_result_rejects_empty_and_malformed_xml() {
+        let err = parse_ipfs3_zip_extract_result(b" \n\t ").unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "invalid DecompressZipResult XML: empty response body"
+        );
+
+        let err = parse_ipfs3_zip_extract_result(b"<DecompressZipResult>").unwrap_err();
+        assert!(err
+            .to_string()
+            .starts_with("invalid DecompressZipResult XML: "));
+    }
+
+    #[test]
+    fn ipfs3_zip_extract_result_rejects_wrong_root_element() {
+        let xml = String::from_utf8(ipfs3_zip_extract_result_xml(&[], &[], 0, 0))
+            .unwrap()
+            .replace("DecompressZipResult", "NotDecompressZipResult");
+
+        let err = parse_ipfs3_zip_extract_result(xml.as_bytes()).unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("expected DecompressZipResult root element"));
+    }
+
+    #[test]
+    fn ipfs3_zip_extract_result_rejects_trailing_document_content() {
+        let mut xml = ipfs3_zip_extract_result_xml(&[], &[], 0, 0);
+        xml.extend_from_slice(b"<Unexpected/>");
+
+        let err = parse_ipfs3_zip_extract_result(&xml).unwrap_err();
+        assert!(err.to_string().contains("trailing XML content"));
+
+        let mut xml = ipfs3_zip_extract_result_xml(&[], &[], 0, 0);
+        xml.extend_from_slice(b"<broken");
+
+        let err = parse_ipfs3_zip_extract_result(&xml).unwrap_err();
+        assert!(err
+            .to_string()
+            .starts_with("invalid DecompressZipResult XML: "));
+    }
+
+    #[test]
+    fn ipfs3_zip_extract_result_rejects_declared_count_inconsistencies() {
+        let result = parse_ipfs3_zip_extract_result(&ipfs3_zip_extract_result_xml(
+            &[("extract/page.jpg", "cid-page")],
+            &[],
+            2,
+            0,
+        ))
+        .unwrap();
+        let err = ipfs3_zip_entry_cids("extract/", &["page.jpg".to_string()], result).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("ExtractedCount 2 does not match 1 entries"));
+
+        let result = parse_ipfs3_zip_extract_result(&ipfs3_zip_extract_result_xml(
+            &[("extract/page.jpg", "cid-page")],
+            &[("page.jpg", "ExtractFailed", "bad archive")],
+            1,
+            0,
+        ))
+        .unwrap();
+        let err = ipfs3_zip_entry_cids("extract/", &["page.jpg".to_string()], result).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("FailedCount 0 does not match 1 failures"));
+    }
+
+    #[test]
+    fn ipfs3_zip_extract_result_rejects_reported_failures() {
+        let result = parse_ipfs3_zip_extract_result(&ipfs3_zip_extract_result_xml(
+            &[("extract/page.jpg", "cid-page")],
+            &[("page.jpg", "ExtractFailed", "bad archive")],
+            1,
+            1,
+        ))
+        .unwrap();
+
+        let err = ipfs3_zip_entry_cids("extract/", &["page.jpg".to_string()], result).unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("1 failed"));
+        assert!(message.contains("page.jpg"));
+        assert!(message.contains("bad archive"));
+        assert!(message.contains("ExtractFailed"));
+    }
+
+    #[test]
+    fn ipfs3_zip_extract_result_rejects_missing_requested_key() {
+        let result = parse_ipfs3_zip_extract_result(&ipfs3_zip_extract_result_xml(
+            &[("extract/page.jpg", "cid-page")],
+            &[],
+            1,
+            0,
+        ))
+        .unwrap();
+
+        let err =
+            ipfs3_zip_entry_cids("extract/", &["missing.jpg".to_string()], result).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("missing requested extraction key extract/missing.jpg"));
+    }
+
+    #[test]
+    fn ipfs3_zip_extract_result_rejects_duplicate_requested_names() {
+        let result = parse_ipfs3_zip_extract_result(&ipfs3_zip_extract_result_xml(
+            &[("extract/page.jpg", "cid-page")],
+            &[],
+            1,
+            0,
+        ))
+        .unwrap();
+
+        let err = ipfs3_zip_entry_cids(
+            "extract/",
+            &["page.jpg".to_string(), "page.jpg".to_string()],
+            result,
+        )
+        .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("duplicate requested entry name page.jpg"));
+    }
+
+    #[test]
+    fn ipfs3_zip_extract_result_rejects_empty_requested_entry_cid() {
+        let result = parse_ipfs3_zip_extract_result(&ipfs3_zip_extract_result_xml(
+            &[("extract/page.jpg", " \"\" ")],
+            &[],
+            1,
+            0,
+        ))
+        .unwrap();
+
+        let err = ipfs3_zip_entry_cids("extract/", &["page.jpg".to_string()], result).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("requested extraction key extract/page.jpg returned an empty CID"));
+    }
+
+    struct DefaultZipCapabilityUploader;
+
+    #[async_trait::async_trait]
+    impl ImageUploader for DefaultZipCapabilityUploader {
+        async fn upload_images(&self, _images: &[ImageUploadInput<'_>]) -> Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[tokio::test]
+    async fn default_zip_archive_upload_capability_returns_none() {
+        let uploader = DefaultZipCapabilityUploader;
+        let entries = vec!["page001.jpg".to_string()];
+        let result = uploader
+            .upload_zip_archive_with_url_pairs(ZipArchiveUploadInput {
+                filename: "gallery.zip",
+                bytes: b"zip bytes",
+                entry_names: &entries,
+            })
+            .await
+            .unwrap();
+
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn ipfs3_zip_archive_upload_disabled_returns_none_without_put() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("unexpected-cid"))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let uploader = IpfS3Uploader::from_config(&IpfS3UploaderConfig {
+            endpoint_url: Some(server.uri()),
+            bucket: Some("bucket".into()),
+            region: Some("auto".into()),
+            access_key_id: Some("ak".into()),
+            secret_access_key: Some("sk".into()),
+            gateway_url: Some("https://public.example/ipfs".into()),
+            zip_extract_enabled: false,
+            path_style: true,
+            ..Default::default()
+        })
+        .unwrap();
+        let entries = vec!["page001.jpg".to_string()];
+
+        let result = uploader
+            .upload_zip_archive_with_url_pairs(ZipArchiveUploadInput {
+                filename: "gallery.zip",
+                bytes: b"zip bytes",
+                entry_names: &entries,
+            })
+            .await
+            .unwrap();
+
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn ipfs3_zip_archive_upload_signs_query_and_uses_ordered_entry_cids() {
+        use wiremock::matchers::{body_bytes, method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path_regex(r"^/bucket/eh/\d{14}-archive-[0-9a-f]{8}\.zip$"))
+            .and(body_bytes(b"zip bytes".to_vec()))
+            .respond_with(IpfS3ZipExtractResponder)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path_regex(r"^/bucket/eh/\d{14}-0001-[0-9a-f]{8}\.png$"))
+            .respond_with(ResponseTemplate::new(200).insert_header("etag", "\"bafyNormalImage\""))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut config = complete_ipfs3_config(&server.uri(), "https://public.example/ipfs/");
+        config.preview_gateway_url = Some("https://preview.example/ipfs/".to_string());
+        config.zip_extract_enabled = true;
+        let uploader = IpfS3Uploader::from_config(&config).unwrap();
+        let entries = vec!["page001.jpg".to_string(), "dir/page002.png".to_string()];
+
+        let pairs = uploader
+            .upload_zip_archive_with_url_pairs(ZipArchiveUploadInput {
+                filename: "gallery.zip",
+                bytes: b"zip bytes",
+                entry_names: &entries,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            pairs,
+            vec![
+                TelegraphImageUrlPair {
+                    preview_url: "https://preview.example/ipfs/bafyFirst".to_string(),
+                    public_url: "https://public.example/ipfs/bafyFirst".to_string(),
+                },
+                TelegraphImageUrlPair {
+                    preview_url: "https://preview.example/ipfs/bafySecond".to_string(),
+                    public_url: "https://public.example/ipfs/bafySecond".to_string(),
+                },
+            ]
+        );
+
+        let normal_pairs = uploader
+            .upload_images_with_url_pairs(&[ImageUploadInput {
+                filename: "normal.png",
+                bytes: b"\x89PNG\r\n\x1a\n",
+            }])
+            .await
+            .unwrap();
+        assert_eq!(
+            normal_pairs,
+            vec![TelegraphImageUrlPair {
+                preview_url: "https://preview.example/ipfs/bafyNormalImage".to_string(),
+                public_url: "https://public.example/ipfs/bafyNormalImage".to_string(),
+            }]
+        );
+
+        let requests = server.received_requests().await.unwrap();
+        let zip_request = requests
+            .iter()
+            .find(|request| request.url.path().ends_with(".zip"))
+            .unwrap();
+        let archive_stem = zip_request
+            .url
+            .path()
+            .strip_prefix("/bucket/")
+            .unwrap()
+            .strip_suffix(".zip")
+            .unwrap();
+        assert_eq!(
+            zip_request
+                .url
+                .query_pairs()
+                .find(|(name, _)| name == "decompress-zip")
+                .map(|(_, value)| value.into_owned()),
+            Some(format!("{archive_stem}/"))
+        );
+        assert!(!zip_request
+            .url
+            .query_pairs()
+            .any(|(name, _)| name == "decompress-zip-result"));
+        assert_eq!(
+            zip_request
+                .headers
+                .get("content-type")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "application/zip"
+        );
+        assert!(zip_request
+            .headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.starts_with("AWS4-HMAC-SHA256 ")));
+
+        let normal_request = requests
+            .iter()
+            .find(|request| request.url.path().ends_with(".png"))
+            .unwrap();
+        assert!(normal_request.url.query().is_none());
+        assert!(!normal_request
+            .url
+            .query_pairs()
+            .any(|(name, _)| name == "decompress-zip"));
+        for url in pairs
+            .iter()
+            .chain(normal_pairs.iter())
+            .flat_map(|pair| [&pair.preview_url, &pair.public_url])
+        {
+            assert!(!url.contains("bafyHttpArchiveCidMustNotAppear"));
+            assert!(!url.contains("page001.jpg"));
+            assert!(!url.contains("dir/page002.png"));
+        }
+    }
+
+    #[tokio::test]
+    async fn ipfs3_zip_archive_upload_rejects_malformed_xml() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path_regex(r"^/bucket/eh/\d{14}-archive-[0-9a-f]{8}\.zip$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("etag", "\"bafyHttpArchiveCidMustNotAppear\"")
+                    .set_body_string("<DecompressZipResult>"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut config = complete_ipfs3_config(&server.uri(), "https://public.example/ipfs/");
+        config.zip_extract_enabled = true;
+        let uploader = IpfS3Uploader::from_config(&config).unwrap();
+        let entries = vec!["page001.jpg".to_string()];
+
+        let err = uploader
+            .upload_zip_archive_with_url_pairs(ZipArchiveUploadInput {
+                filename: "gallery.zip",
+                bytes: b"zip bytes",
+                entry_names: &entries,
+            })
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("invalid DecompressZipResult XML"));
+    }
+
+    #[tokio::test]
+    async fn ipfs3_zip_archive_upload_rejects_non_success_status() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path_regex(r"^/bucket/eh/\d{14}-archive-[0-9a-f]{8}\.zip$"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("unavailable"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut config = complete_ipfs3_config(&server.uri(), "https://public.example/ipfs/");
+        config.zip_extract_enabled = true;
+        let uploader = IpfS3Uploader::from_config(&config).unwrap();
+        let entries = vec!["page001.jpg".to_string()];
+
+        let err = uploader
+            .upload_zip_archive_with_url_pairs(ZipArchiveUploadInput {
+                filename: "gallery.zip",
+                bytes: b"zip bytes",
+                entry_names: &entries,
+            })
+            .await
+            .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("ipfS3 ZIP put_object returned 503"));
     }
 }

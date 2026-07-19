@@ -8,6 +8,14 @@ pub struct ArchiverForm {
     pub fields: Vec<(String, String)>,
 }
 
+fn resolution_dltype(resolution: &str) -> &'static str {
+    if resolution.is_empty() || resolution == "original" {
+        "org"
+    } else {
+        "res"
+    }
+}
+
 fn search_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
@@ -55,6 +63,21 @@ fn input_re() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r#"(?is)<input\b([^>]*)>"#).expect("invalid input regex"))
 }
 
+fn form_fields(body: &str) -> Vec<(String, String)> {
+    input_re()
+        .captures_iter(body)
+        .filter_map(|input| {
+            let attrs = input.get(1)?.as_str();
+            let name = attr_value(attrs, "name")?;
+            if name.is_empty() {
+                return None;
+            }
+            let value = attr_value(attrs, "value").unwrap_or_default();
+            Some((name, value))
+        })
+        .collect()
+}
+
 fn attr_value(attrs: &str, name: &str) -> Option<String> {
     let re = Regex::new(&format!(
         r#"(?is)\b{}\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))"#,
@@ -83,6 +106,30 @@ fn decode_html_attr(value: &str) -> String {
         .replace("&#X27;", "'")
         .replace("&lt;", "<")
         .replace("&gt;", ">")
+}
+
+fn find_hathdl_form(html: &str) -> Option<(ArchiverForm, usize)> {
+    for cap in archiver_form_re().captures_iter(html) {
+        let attrs = cap.get(1)?.as_str();
+        if attr_value(attrs, "id").as_deref() != Some("hathdl_form") {
+            continue;
+        }
+
+        let Some(action) = attr_value(attrs, "action") else {
+            continue;
+        };
+        if !action.contains("archiver.php") {
+            continue;
+        }
+
+        let fields = form_fields(cap.get(2)?.as_str());
+        if !fields.iter().any(|(name, _)| name == "hathdl_xres") {
+            continue;
+        }
+
+        return Some((ArchiverForm { action, fields }, cap.get(0)?.end()));
+    }
+    None
 }
 
 /// Parse search results HTML, extracting gallery references.
@@ -131,32 +178,31 @@ pub fn parse_archiver_key(html: &str) -> Option<String> {
     Some(format!("{}--{}", numeric, hex))
 }
 
-/// Extract the archiver download form from an archiver.php page.
-pub fn parse_archiver_form(html: &str) -> Option<ArchiverForm> {
+/// Extract the archiver download form matching the requested resolution.
+pub fn parse_archiver_form(html: &str, resolution: &str) -> Option<ArchiverForm> {
+    let target_dltype = resolution_dltype(resolution);
+
+    if target_dltype == "res" && hathdl_label_for_resolution(resolution).is_some() {
+        if let Some((form, _)) = find_hathdl_form(html) {
+            return Some(form);
+        }
+    }
+
     for cap in archiver_form_re().captures_iter(html) {
         let attrs = cap.get(1)?.as_str();
         let body = cap.get(2)?.as_str();
-        let action = attr_value(attrs, "action")?;
+        let Some(action) = attr_value(attrs, "action") else {
+            continue;
+        };
         if !action.contains("archiver.php") {
             continue;
         }
 
-        let fields: Vec<(String, String)> = input_re()
-            .captures_iter(body)
-            .filter_map(|input| {
-                let attrs = input.get(1)?.as_str();
-                let name = attr_value(attrs, "name")?;
-                if name.is_empty() {
-                    return None;
-                }
-                let value = attr_value(attrs, "value").unwrap_or_default();
-                Some((name, value))
-            })
-            .collect();
+        let fields = form_fields(body);
 
         if fields
             .iter()
-            .any(|(name, _)| matches!(name.as_str(), "dlcheck" | "dltype" | "hathdl_xres"))
+            .any(|(name, value)| name == "dltype" && value == target_dltype)
         {
             return Some(ArchiverForm { action, fields });
         }
@@ -182,6 +228,380 @@ pub fn parse_archive_redirect(html: &str) -> Option<String> {
                 format!("{url}?start=1")
             }
         })
+}
+
+/// Cost classification for an archiver.php download form.
+///
+/// Returned by `parse_archive_download_cost`. The caller decides whether to
+/// POST based on this cost and the configured GP guard threshold.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DownloadCost {
+    /// `Free!` - no GP will be charged.
+    Free,
+    /// `You unlocked a resample download of this archive on <date>` was present
+    /// and the requested resolution is a resample. POST is safe; no GP charged.
+    Unlocked,
+    /// `{n} GP` - POST will charge `n` GP (auto-converts credits if GP insufficient).
+    Gp(u64),
+    /// `Insufficient Funds` - account lacks GP and credits to auto-convert.
+    /// POST would still be attempted by EH and likely fail; we reject early.
+    Insufficient,
+    /// `N/A` - resolution not available (donor-only or too large).
+    Unavailable,
+    /// Could not parse the cost text. Callers should conservatively reject.
+    Unknown,
+}
+
+impl DownloadCost {
+    /// Returns true if POSTing this form will not charge GP.
+    pub fn is_free(&self) -> bool {
+        matches!(self, DownloadCost::Free | DownloadCost::Unlocked)
+    }
+
+    /// Returns the GP cost if this variant is `Gp(n)`, else None.
+    pub fn gp_amount(&self) -> Option<u64> {
+        match self {
+            DownloadCost::Gp(n) => Some(*n),
+            _ => None,
+        }
+    }
+}
+
+fn unlocked_resample_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        // `You unlocked a <strong>resample</strong> download of this archive on <strong>{date}</strong>`
+        Regex::new(
+            r#"(?is)You unlocked a\s*<strong>\s*resample\s*</strong>\s*download of this archive"#,
+        )
+        .expect("invalid unlocked_resample regex")
+    })
+}
+
+/// Match `Download Cost: &nbsp; <strong>{cost}</strong>` text and return the inner cost string.
+fn download_cost_strong_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r#"(?is)Download Cost:\s*(?:&nbsp;)?\s*<strong[^>]*>(.*?)</strong>"#)
+            .expect("invalid download_cost_strong regex")
+    })
+}
+
+/// Match a `dltype` hidden input value inside a form.
+fn dltype_value_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r#"(?is)<input[^>]*name=["']dltype["'][^>]*value=["']([^"']+)["']"#)
+            .expect("invalid dltype_value regex")
+    })
+}
+
+fn table_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r#"(?is)<table\b[^>]*>(.*?)</table>"#).expect("invalid table regex")
+    })
+}
+
+fn table_cell_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r#"(?is)<td\b[^>]*>(.*?)</td>"#).expect("invalid table cell regex")
+    })
+}
+
+fn paragraph_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r#"(?is)<p\b[^>]*>(.*?)</p>"#).expect("invalid paragraph regex"))
+}
+
+fn html_tag_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r#"(?is)<[^>]+>"#).expect("invalid HTML tag regex"))
+}
+
+fn strip_html_tags(html: &str) -> String {
+    html_tag_re()
+        .replace_all(html, "")
+        .replace("&nbsp;", " ")
+        .replace("&#160;", " ")
+        .replace("&#xA0;", " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn hathdl_table(html: &str) -> Option<&str> {
+    let (_, end_offset) = find_hathdl_form(html)?;
+    let after_form = &html[end_offset..];
+    table_re()
+        .captures(after_form)
+        .and_then(|table| table.get(1).map(|body| body.as_str()))
+}
+
+fn is_hathdl_resolution_label(label: &str) -> bool {
+    matches!(label, "800x" | "1280x" | "1920x" | "2560x")
+}
+
+fn parse_hathdl_cost(html: &str, target_label: &str) -> Option<DownloadCost> {
+    let table = hathdl_table(html)?;
+    let mut has_original = false;
+    let mut has_resolution = false;
+    let mut target_cost = None;
+
+    for cell in table_cell_re().captures_iter(table) {
+        let cell = cell.get(1)?.as_str();
+        let paragraphs: Vec<_> = paragraph_re()
+            .captures_iter(cell)
+            .filter_map(|paragraph| paragraph.get(1).map(|content| content.as_str()))
+            .collect();
+        let (Some(label), Some(cost)) = (paragraphs.first(), paragraphs.last()) else {
+            continue;
+        };
+
+        let label = strip_html_tags(label);
+        has_original |= label.eq_ignore_ascii_case("Original");
+        has_resolution |= is_hathdl_resolution_label(&label);
+        if label.eq_ignore_ascii_case(target_label) {
+            target_cost = Some(parse_cost_text(&strip_html_tags(cost)));
+        }
+    }
+
+    if has_original && has_resolution {
+        Some(target_cost.unwrap_or(DownloadCost::Unknown))
+    } else {
+        Some(DownloadCost::Unknown)
+    }
+}
+
+fn estimated_size_strong_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r#"(?is)Estimated\s+Size\s*:\s*(?:&nbsp;|&#160;|&#xA0;)?\s*<strong[^>]*>\s*([^<]*?)\s*</strong>"#,
+        )
+        .expect("invalid estimated size regex")
+    })
+}
+
+fn mib_size_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r#"^\s*(\d+)(?:\.(\d+))?\s+MiB\s*$"#).expect("invalid MiB size regex")
+    })
+}
+
+/// Convert a decimal MiB value to bytes, rounding up so the caller never
+/// underestimates the displayed archive size.
+fn parse_mib_size_bytes(text: &str) -> Option<u64> {
+    const MIB_BYTES: u128 = 1024 * 1024;
+
+    let captures = mib_size_re().captures(text)?;
+    let whole_mib: u128 = captures.get(1)?.as_str().parse().ok()?;
+    let fraction = captures.get(2).map_or("", |value| value.as_str());
+    let denominator = 10_u128.checked_pow(u32::try_from(fraction.len()).ok()?)?;
+    let fractional_mib: u128 = if fraction.is_empty() {
+        0
+    } else {
+        fraction.parse().ok()?
+    };
+    let numerator = whole_mib
+        .checked_mul(denominator)?
+        .checked_add(fractional_mib)?;
+    let bytes = numerator.checked_mul(MIB_BYTES)?.div_ceil(denominator);
+
+    u64::try_from(bytes).ok()
+}
+
+fn parse_form_estimated_size(html: &str, target_dltype: &str) -> Option<u64> {
+    for form in archiver_form_re().captures_iter(html) {
+        let attrs = form.get(1)?.as_str();
+        let body = form.get(2)?.as_str();
+        let Some(action) = attr_value(attrs, "action") else {
+            continue;
+        };
+        if !action.contains("archiver.php") {
+            continue;
+        }
+        if !form_fields(body)
+            .iter()
+            .any(|(name, value)| name == "dltype" && value == target_dltype)
+        {
+            continue;
+        }
+
+        // `parse_archiver_form` selects the first matching form. Do not bind a
+        // missing size on it to a later form's displayed size.
+        let after_form = &html[form.get(0)?.end()..];
+        let before_next_form = match archiver_form_re().find(after_form) {
+            Some(next_form) => &after_form[..next_form.start()],
+            None => after_form,
+        };
+        return estimated_size_strong_re()
+            .captures(before_next_form)
+            .and_then(|captures| captures.get(1))
+            .and_then(|size| parse_mib_size_bytes(size.as_str()));
+    }
+    None
+}
+
+fn parse_hathdl_estimated_size(html: &str, target_label: &str) -> Option<u64> {
+    let table = hathdl_table(html)?;
+    let mut has_original = false;
+    let mut has_resolution = false;
+    let mut target_size = None;
+
+    for cell in table_cell_re().captures_iter(table) {
+        let cell = cell.get(1)?.as_str();
+        let paragraphs: Vec<_> = paragraph_re()
+            .captures_iter(cell)
+            .filter_map(|paragraph| paragraph.get(1).map(|content| content.as_str()))
+            .collect();
+        let (Some(label), Some(size), Some(_cost)) =
+            (paragraphs.first(), paragraphs.get(1), paragraphs.get(2))
+        else {
+            continue;
+        };
+
+        let label = strip_html_tags(label);
+        has_original |= label.eq_ignore_ascii_case("Original");
+        has_resolution |= is_hathdl_resolution_label(&label);
+        if label.eq_ignore_ascii_case(target_label) {
+            target_size = parse_mib_size_bytes(&strip_html_tags(size));
+        }
+    }
+
+    if has_original && has_resolution {
+        target_size
+    } else {
+        None
+    }
+}
+
+fn hathdl_label_for_resolution(resolution: &str) -> Option<&'static str> {
+    match resolution {
+        "780x" => Some("800x"),
+        "980x" | "1280x" => Some("1280x"),
+        "1600x" => Some("1920x"),
+        "2400x" => Some("2560x"),
+        _ => None,
+    }
+}
+
+fn parse_cost_text(text: &str) -> DownloadCost {
+    let trimmed = text.trim();
+    if trimmed.eq_ignore_ascii_case("Free!") || trimmed.eq_ignore_ascii_case("Free") {
+        DownloadCost::Free
+    } else if trimmed.eq_ignore_ascii_case("Insufficient Funds") {
+        DownloadCost::Insufficient
+    } else if trimmed.eq_ignore_ascii_case("N/A") || trimmed.is_empty() {
+        DownloadCost::Unavailable
+    } else {
+        // Pattern: `{n} GP` where n may contain thousand separators (commas).
+        let gp_re = Regex::new(r"(?i)^\s*([\d,]+)\s*GP\s*$").expect("invalid gp text regex");
+        if let Some(cap) = gp_re.captures(trimmed) {
+            if let Some(m) = cap.get(1) {
+                let digits: String = m.as_str().chars().filter(|c| c.is_ascii_digit()).collect();
+                if let Ok(n) = digits.parse::<u64>() {
+                    return DownloadCost::Gp(n);
+                }
+            }
+        }
+        DownloadCost::Unknown
+    }
+}
+
+fn parse_form_download_cost(html: &str, target_dltype: &str) -> DownloadCost {
+    let cost_caps: Vec<_> = download_cost_strong_re().captures_iter(html).collect();
+    let dltype_caps: Vec<_> = dltype_value_re().captures_iter(html).collect();
+
+    for cost_cap in &cost_caps {
+        let cost_end = cost_cap.get(0).unwrap().end();
+        if let Some(dltype_cap) = dltype_caps
+            .iter()
+            .find(|dltype_cap| dltype_cap.get(0).unwrap().start() >= cost_end)
+        {
+            let dltype = dltype_cap.get(1).unwrap().as_str();
+            if dltype == target_dltype {
+                return parse_cost_text(cost_cap.get(1).unwrap().as_str());
+            }
+        }
+    }
+
+    if cost_caps.len() == 1 {
+        return parse_cost_text(cost_caps[0].get(1).unwrap().as_str());
+    }
+
+    DownloadCost::Unknown
+}
+
+/// Parse the GP/cost status of an archiver.php page for the given resolution.
+///
+/// `resolution` follows the config convention:
+/// - `"original"` or `""` -> the original-archive form (`dltype=org`)
+/// - known resamples (`"780x"`, `"980x"`, `"1280x"`, `"1600x"`, `"2400x"`) ->
+///   the matching H@H table cell when present
+///
+/// Resolution selection matches the form that `prepare_archive_download` will
+/// actually POST, so the returned cost reflects what the server will charge.
+///
+/// Returns `DownloadCost::Unknown` if the page structure cannot be recognized
+/// (e.g. neither `dltype=org` nor `dltype=res` form is present). Callers should
+/// conservatively reject in that case to avoid accidental GP charges when EH
+/// changes the page structure.
+pub fn parse_archive_download_cost(html: &str, resolution: &str) -> DownloadCost {
+    let target_dltype = resolution_dltype(resolution);
+
+    if target_dltype == "res" {
+        let Some(target_label) = hathdl_label_for_resolution(resolution) else {
+            return DownloadCost::Unknown;
+        };
+
+        // An unlocked known resample is free regardless of the page's displayed
+        // H@H price, which may still reflect the original paid request.
+        if unlocked_resample_re().is_match(html) {
+            return DownloadCost::Unlocked;
+        }
+
+        // The resample form's price is only its default tier, so it can understate
+        // what the requested donor resolution will cost.
+        if let Some(cost) = parse_hathdl_cost(html, target_label) {
+            return cost;
+        }
+
+        if matches!(resolution, "780x" | "980x" | "1280x") {
+            return parse_form_download_cost(html, target_dltype);
+        }
+
+        return DownloadCost::Unknown;
+    }
+
+    parse_form_download_cost(html, target_dltype)
+}
+
+/// Parse the selected archive's estimated size in bytes from an archiver.php page.
+///
+/// Selection follows `parse_archiver_form` and `parse_archive_download_cost`:
+/// original downloads use the generic `dltype=org` form; known resamples use
+/// their mapped H@H table cell when a valid H@H form is available. When H@H is
+/// absent, only the low-tier generic resample form can provide a trusted size.
+/// Returned byte counts round the displayed decimal MiB value up.
+pub fn parse_archive_download_estimated_size(html: &str, resolution: &str) -> Option<u64> {
+    let target_dltype = resolution_dltype(resolution);
+    if target_dltype == "org" {
+        return parse_form_estimated_size(html, target_dltype);
+    }
+
+    let target_label = hathdl_label_for_resolution(resolution)?;
+    if find_hathdl_form(html).is_some() {
+        return parse_hathdl_estimated_size(html, target_label);
+    }
+
+    if !matches!(resolution, "780x" | "980x" | "1280x") {
+        return None;
+    }
+
+    parse_form_estimated_size(html, target_dltype)
 }
 
 fn image_page_urls_re() -> &'static Regex {
@@ -341,28 +761,145 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_archiver_form() {
+    fn test_parse_archiver_form_selects_hathdl_for_known_resamples() {
         let html = r#"
-        <form id="hathdl_form" method="post" action="https://exhentai.org/archiver.php?gid=4034806&amp;token=abc123def0">
-          <input type="hidden" name="dltype" value="org" />
-          <input type="submit" name="dlcheck" value="Download Original Archive" />
+        <form id="original" method="post" action="https://exhentai.org/archiver.php?gid=4034806&amp;token=org123def0">
+           <input type="hidden" name="dltype" value="org" />
+           <input type="hidden" name="org_sentinel" value="original-only" />
+           <input type="submit" name="dlcheck" value="Download Original Archive" />
+        </form>
+        <form id="resample" method="post" action="https://exhentai.org/archiver.php?gid=4034806&amp;token=res123def0">
+           <input type="hidden" name="dltype" value="res" />
+           <input type="hidden" name="res_sentinel" value="resample-only" />
+           <input type="submit" name="dlcheck" value="Download Resample Archive" />
+        </form>
+        <form id="hathdl_form" method="post" action="https://exhentai.org/archiver.php?gid=4034806&amp;token=hathdl123def0">
+           <input type="hidden" name="hathdl_sentinel" value="hathdl-only" />
+           <input type="hidden" name="hathdl_xres" value="" />
         </form>
         "#;
-        let form = parse_archiver_form(html).expect("should parse archiver form");
+
+        let form = parse_archiver_form(html, "original").expect("should parse original form");
         assert_eq!(
             form.action,
-            "https://exhentai.org/archiver.php?gid=4034806&token=abc123def0"
+            "https://exhentai.org/archiver.php?gid=4034806&token=org123def0"
         );
         assert_eq!(
             form.fields,
             vec![
                 ("dltype".to_string(), "org".to_string()),
+                ("org_sentinel".to_string(), "original-only".to_string()),
                 (
                     "dlcheck".to_string(),
                     "Download Original Archive".to_string()
                 ),
             ]
         );
+
+        let form =
+            parse_archiver_form(html, "").expect("should parse original form for empty resolution");
+        assert_eq!(
+            form.action,
+            "https://exhentai.org/archiver.php?gid=4034806&token=org123def0"
+        );
+        assert!(form
+            .fields
+            .contains(&("org_sentinel".to_string(), "original-only".to_string())));
+
+        for resolution in ["1280x", "1600x"] {
+            let form = parse_archiver_form(html, resolution).expect("should parse H@H form");
+            assert_eq!(
+                form.action,
+                "https://exhentai.org/archiver.php?gid=4034806&token=hathdl123def0"
+            );
+            assert!(form
+                .fields
+                .contains(&("hathdl_sentinel".to_string(), "hathdl-only".to_string())));
+            assert!(form
+                .fields
+                .contains(&("hathdl_xres".to_string(), String::new())));
+            assert!(!form.fields.iter().any(|(name, _)| name == "res_sentinel"));
+            assert!(!form.fields.iter().any(|(name, _)| name == "dltype"));
+        }
+    }
+
+    #[test]
+    fn test_parse_archiver_form_resample_falls_back_without_hathdl_form() {
+        let html = r#"
+        <div>Download Cost: &nbsp; <strong>218 GP</strong></div>
+        <form method="post" action="https://exhentai.org/archiver.php?gid=4034806&amp;token=res123def0">
+           <input type="hidden" name="dltype" value="res" />
+           <input type="hidden" name="res_sentinel" value="resample-only" />
+           <input type="submit" name="dlcheck" value="Download Resample Archive" />
+        </form>
+        "#;
+
+        let form = parse_archiver_form(html, "1280x").expect("should parse generic resample form");
+        assert!(form
+            .fields
+            .contains(&("res_sentinel".to_string(), "resample-only".to_string())));
+        let donor_form = parse_archiver_form(html, "1600x")
+            .expect("should still prepare generic resample form without H@H");
+        assert!(donor_form
+            .fields
+            .contains(&("res_sentinel".to_string(), "resample-only".to_string())));
+        assert_eq!(
+            parse_archive_download_cost(html, "1600x"),
+            DownloadCost::Unknown
+        );
+    }
+
+    #[test]
+    fn test_invalid_hathdl_form_cannot_select_or_price_resamples() {
+        let prefix = r#"
+<div>Download Cost: &nbsp; <strong>218 GP</strong></div>
+<form method="post" action="https://exhentai.org/archiver.php?gid=1&amp;token=res">
+    <input type="hidden" name="dltype" value="res" />
+    <input type="hidden" name="res_sentinel" value="generic-res" />
+</form>
+"#;
+        let table = r#"
+<table><tr>
+    <td><p>Original</p><p>419.6 MiB</p><p>8,800 GP</p></td>
+    <td><p>800x</p><p>10.38 MiB</p><p>114 GP</p></td>
+    <td><p>1280x</p><p>10.38 MiB</p><p>218 GP</p></td>
+    <td><p>1920x</p><p>10.38 MiB</p><p>376 GP</p></td>
+    <td><p>2560x</p><p>10.38 MiB</p><p>546 GP</p></td>
+</tr></table>
+"#;
+        let invalid_forms = [
+            r#"<form id="hathdl_form"><input name="hathdl_xres" value="" /></form>"#,
+            r#"<form id="hathdl_form" action="https://exhentai.org/archiver.php?gid=1&amp;token=hathdl"><input name="other" value="" /></form>"#,
+        ];
+
+        for invalid_form in invalid_forms {
+            let html = format!("{prefix}{invalid_form}{table}");
+            let form = parse_archiver_form(&html, "1280x")
+                .expect("low resample should fall back to generic form");
+            assert!(form
+                .fields
+                .contains(&("res_sentinel".to_string(), "generic-res".to_string())));
+            assert_eq!(
+                parse_archive_download_cost(&html, "1280x"),
+                DownloadCost::Gp(218)
+            );
+            assert_eq!(
+                parse_archive_download_cost(&html, "1600x"),
+                DownloadCost::Unknown
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_archiver_form_missing_requested_dltype_returns_none() {
+        let html = r#"
+        <form method="post" action="https://exhentai.org/archiver.php?gid=4034806&amp;token=org123def0">
+           <input type="hidden" name="dltype" value="org" />
+           <input type="hidden" name="org_sentinel" value="original-only" />
+        </form>
+        "#;
+
+        assert!(parse_archiver_form(html, "1280x").is_none());
     }
 
     #[test]
@@ -479,5 +1016,557 @@ mod tests {
     #[test]
     fn test_parse_page_count_not_found() {
         assert!(parse_page_count("<html></html>").is_none());
+    }
+
+    // ---- parse_archive_download_cost tests ----
+
+    const ARCHIVER_FREE_RESAMPLE_UNLOCKED: &str = r##"
+<div id="db">
+<div style="position:relative; width:370px; margin:4px auto 4px; padding-top:3px">
+    <div style="width:180px; float:left">
+        <div style="text-align:center; margin-top:4px">Download Cost: &nbsp; <strong>Free!</strong></div>
+        <form action="https://exhentai.org/archiver.php?gid=4053260&amp;token=53ad37062b" method="post">
+            <input type="hidden" name="dltype" value="org" />
+            <div style="margin:3px auto"><input type="submit" name="dlcheck" value="Download Original Archive" style="width:180px" /></div>
+        </form>
+        <p>Estimated Size: &nbsp; <strong>28.52 MiB</strong></p>
+    </div>
+    <div style="width:180px; float:right">
+        <div style="text-align:center; margin-top:4px">Download Cost: &nbsp; <strong>Free!</strong></div>
+        <form action="https://exhentai.org/archiver.php?gid=4053260&amp;token=53ad37062b" method="post">
+            <input type="hidden" name="dltype" value="res" />
+            <div style="margin:3px auto"><input type="submit" name="dlcheck" value="Download Resample Archive" style="width:180px" /></div>
+        </form>
+        <p>Estimated Size: &nbsp; <strong>2.33 MiB</strong></p>
+    </div>
+    <div style="clear:both"></div>
+</div>
+<p>You unlocked a <strong>resample</strong> download of this archive on <strong>2026-07-17 20:26</strong> &nbsp;[<a href="#" onclick="return cancel_sessions()">cancel</a>]</p>
+</div>
+"##;
+
+    const ARCHIVER_FREE_DEFAULT: &str = r#"
+<div id="db">
+<div style="position:relative; width:370px; margin:4px auto 4px; padding-top:3px">
+    <div style="width:180px; float:left">
+        <div style="text-align:center; margin-top:4px">Download Cost: &nbsp; <strong>Free!</strong></div>
+        <form action="https://exhentai.org/archiver.php?gid=3635201&amp;token=30c972f597" method="post">
+            <input type="hidden" name="dltype" value="org" />
+            <div style="margin:3px auto"><input type="submit" name="dlcheck" value="Download Original Archive" style="width:180px" /></div>
+        </form>
+        <p>Estimated Size: &nbsp; <strong>40.98 MiB</strong></p>
+    </div>
+    <div style="width:180px; float:right">
+        <div style="text-align:center; margin-top:4px">Download Cost: &nbsp; <strong>Free!</strong></div>
+        <form action="https://exhentai.org/archiver.php?gid=3635201&amp;token=30c972f597" method="post">
+            <input type="hidden" name="dltype" value="res" />
+            <div style="margin:3px auto"><input type="submit" name="dlcheck" value="Download Resample Archive" style="width:180px" /></div>
+        </form>
+        <p>Estimated Size: &nbsp; <strong>3.60 MiB</strong></p>
+    </div>
+    <div style="clear:both"></div>
+</div>
+</div>
+"#;
+
+    const ARCHIVER_EHENTAI_FUNDS: &str = r#"
+<div id="db">
+<p>Current Funds:</p><p>13,468,433 GP [<a href="https://ehwiki.org/wiki/Gallery_Points" target="ehwiki">?</a>] &nbsp; 5,199 Credits [<a href="https://ehwiki.org/wiki/Credits" target="ehwiki">?</a>]</p>
+<div style="position:relative; width:370px; margin:4px auto 4px; padding-top:3px">
+    <div style="width:180px; float:left">
+        <div style="text-align:center; margin-top:4px">Download Cost: &nbsp; <strong>Free!</strong></div>
+        <form action="https://e-hentai.org/archiver.php?gid=4006273&amp;token=d2ccf02433" method="post">
+            <input type="hidden" name="dltype" value="org" />
+            <div style="margin:3px auto"><input type="submit" name="dlcheck" value="Download Original Archive" style="width:180px" /></div>
+        </form>
+        <p>Estimated Size: &nbsp; <strong>127.0 MiB</strong></p>
+    </div>
+    <div style="width:180px; float:right">
+        <div style="text-align:center; margin-top:4px">Download Cost: &nbsp; <strong>Free!</strong></div>
+        <form action="https://e-hentai.org/archiver.php?gid=4006273&amp;token=d2ccf02433" method="post">
+            <input type="hidden" name="dltype" value="res" />
+            <div style="margin:3px auto"><input type="submit" name="dlcheck" value="Download Resample Archive" style="width:180px" /></div>
+        </form>
+        <p>Estimated Size: &nbsp; <strong>7.29 MiB</strong></p>
+    </div>
+    <div style="clear:both"></div>
+</div>
+</div>
+"#;
+
+    const ARCHIVER_GP_REQUIRED: &str = r#"
+<div id="db">
+<div style="position:relative; width:370px; margin:4px auto 4px; padding-top:3px">
+    <div style="width:180px; float:left">
+        <div style="text-align:center; margin-top:4px">Download Cost: &nbsp; <strong>8,800 GP</strong></div>
+        <form action="https://exhentai.org/archiver.php?gid=2284788&amp;token=7841d194d4" method="post">
+            <input type="hidden" name="dltype" value="org" />
+            <div style="margin:3px auto"><input type="submit" name="dlcheck" value="Download Original Archive" style="width:180px" /></div>
+        </form>
+        <p>Estimated Size: &nbsp; <strong>419.6 MiB</strong></p>
+    </div>
+    <div style="width:180px; float:right">
+        <div style="text-align:center; margin-top:4px">Download Cost: &nbsp; <strong>218 GP</strong></div>
+        <form action="https://exhentai.org/archiver.php?gid=2284788&amp;token=7841d194d4" method="post">
+            <input type="hidden" name="dltype" value="res" />
+            <div style="margin:3px auto"><input type="submit" name="dlcheck" value="Download Resample Archive" style="width:180px" /></div>
+        </form>
+        <p>Estimated Size: &nbsp; <strong>10.38 MiB</strong></p>
+    </div>
+    <div style="clear:both"></div>
+</div>
+</div>
+"#;
+
+    const ARCHIVER_GP_REQUIRED_WITH_HATHDL: &str = r#"
+<div id="db">
+    <div>Download Cost: &nbsp; <strong>8,800 GP</strong></div>
+    <form action="https://exhentai.org/archiver.php?gid=2284788&amp;token=7841d194d4" method="post">
+        <input type="hidden" name="dltype" value="org" />
+    </form>
+    <div>Download Cost: &nbsp; <strong>218 GP</strong></div>
+    <form action="https://exhentai.org/archiver.php?gid=2284788&amp;token=7841d194d4" method="post">
+        <input type="hidden" name="dltype" value="res" />
+    </form>
+    <form id="hathdl_form" action="https://exhentai.org/archiver.php?gid=2284788&amp;token=7841d194d4" method="post">
+        <input type="hidden" id="hathdl_xres" name="hathdl_xres" value="" />
+    </form>
+    <table>
+        <tr>
+            <td><p><strong>Original</strong></p><p>419.6 MiB</p><p><strong>8,800 GP</strong></p></td>
+            <td><p><strong>800x</strong></p><p>10.38 MiB</p><p><strong>114 GP</strong></p></td>
+            <td><p><strong>1280x</strong></p><p>10.38 MiB</p><p><strong>218 GP</strong></p></td>
+            <td><p><strong>1920x</strong></p><p>10.38 MiB</p><p><strong>376 GP</strong></p></td>
+            <td><p><strong>2560x</strong></p><p>10.38 MiB</p><p><strong>546 GP</strong></p></td>
+        </tr>
+    </table>
+</div>
+"#;
+
+    #[test]
+    fn test_parse_archive_download_cost_free_original() {
+        let cost = parse_archive_download_cost(ARCHIVER_FREE_DEFAULT, "original");
+        assert_eq!(cost, DownloadCost::Free);
+    }
+
+    #[test]
+    fn test_parse_archive_download_cost_free_resample() {
+        let cost = parse_archive_download_cost(ARCHIVER_FREE_DEFAULT, "1280x");
+        assert_eq!(cost, DownloadCost::Free);
+    }
+
+    #[test]
+    fn test_parse_archive_download_cost_empty_resolution_uses_original() {
+        let cost = parse_archive_download_cost(ARCHIVER_FREE_DEFAULT, "");
+        assert_eq!(cost, DownloadCost::Free);
+    }
+
+    #[test]
+    fn test_parse_archive_download_cost_unlocked_resample() {
+        let html = format!(
+            r#"{ARCHIVER_FREE_RESAMPLE_UNLOCKED}
+<form id="hathdl_form"><input type="hidden" name="hathdl_xres" value="" /></form>
+<table><tr><td><p>1280x</p><p>2.33 MiB</p><p>218 GP</p></td></tr></table>"#
+        );
+        let cost = parse_archive_download_cost(&html, "1280x");
+        assert_eq!(cost, DownloadCost::Unlocked);
+    }
+
+    #[test]
+    fn test_parse_archive_download_cost_unlocked_marker_ignored_for_original() {
+        // Even though the resample is unlocked, original downloads are NOT
+        // automatically free. We fall through to the original form cost.
+        let cost = parse_archive_download_cost(ARCHIVER_FREE_RESAMPLE_UNLOCKED, "original");
+        assert_eq!(cost, DownloadCost::Free);
+    }
+
+    #[test]
+    fn test_parse_archive_download_cost_ehentai_funds_original() {
+        let cost = parse_archive_download_cost(ARCHIVER_EHENTAI_FUNDS, "original");
+        assert_eq!(cost, DownloadCost::Free);
+    }
+
+    #[test]
+    fn test_parse_archive_download_cost_gp_required_original() {
+        let cost = parse_archive_download_cost(ARCHIVER_GP_REQUIRED, "original");
+        assert_eq!(cost, DownloadCost::Gp(8800));
+    }
+
+    #[test]
+    fn test_parse_archive_download_cost_gp_required_resample() {
+        let cost = parse_archive_download_cost(ARCHIVER_GP_REQUIRED, "1280x");
+        assert_eq!(cost, DownloadCost::Gp(218));
+    }
+
+    #[test]
+    fn test_parse_archive_download_cost_uses_hathdl_resolution_costs() {
+        let html = format!(
+            r#"<table><tr><td><p>1920x</p><p>irrelevant</p><p>Free</p></td></tr></table>{ARCHIVER_GP_REQUIRED_WITH_HATHDL}"#
+        );
+        let cases = [
+            ("1280x", DownloadCost::Gp(218)),
+            ("1600x", DownloadCost::Gp(376)),
+            ("2400x", DownloadCost::Gp(546)),
+            ("780x", DownloadCost::Gp(114)),
+            ("980x", DownloadCost::Gp(218)),
+        ];
+
+        for (resolution, expected) in cases {
+            assert_eq!(
+                parse_archive_download_cost(&html, resolution),
+                expected,
+                "unexpected cost for {resolution}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_archive_download_cost_original_uses_form_cost_with_hathdl_table() {
+        let html = ARCHIVER_GP_REQUIRED_WITH_HATHDL.replacen(
+            r#"<td><p><strong>Original</strong></p><p>419.6 MiB</p><p><strong>8,800 GP</strong></p></td>"#,
+            r#"<td><p><strong>Original</strong></p><p>419.6 MiB</p><p><strong>N/A</strong></p></td>"#,
+            1,
+        );
+
+        assert_eq!(
+            parse_archive_download_cost(&html, "original"),
+            DownloadCost::Gp(8800)
+        );
+        assert_eq!(
+            parse_archive_download_cost(&html, ""),
+            DownloadCost::Gp(8800)
+        );
+    }
+
+    #[test]
+    fn test_parse_archive_download_cost_hathdl_statuses() {
+        let free = ARCHIVER_GP_REQUIRED_WITH_HATHDL.replacen(
+            r#"<td><p><strong>800x</strong></p><p>10.38 MiB</p><p><strong>114 GP</strong></p></td>"#,
+            r#"<td><p><strong>800x</strong></p><p>10.38 MiB</p><p><strong>Free</strong></p></td>"#,
+            1,
+        );
+        assert_eq!(
+            parse_archive_download_cost(&free, "780x"),
+            DownloadCost::Free
+        );
+
+        let free_with_exclamation = ARCHIVER_GP_REQUIRED_WITH_HATHDL.replacen(
+            r#"<td><p><strong>1280x</strong></p><p>10.38 MiB</p><p><strong>218 GP</strong></p></td>"#,
+            r#"<td><p><strong>1280x</strong></p><p>10.38 MiB</p><p><strong>Free!</strong></p></td>"#,
+            1,
+        );
+        assert_eq!(
+            parse_archive_download_cost(&free_with_exclamation, "1280x"),
+            DownloadCost::Free
+        );
+
+        let insufficient = ARCHIVER_GP_REQUIRED_WITH_HATHDL.replacen(
+            r#"<td><p><strong>1920x</strong></p><p>10.38 MiB</p><p><strong>376 GP</strong></p></td>"#,
+            r#"<td><p><strong>1920x</strong></p><p>10.38 MiB</p><p><strong>Insufficient Funds</strong></p></td>"#,
+            1,
+        );
+        assert_eq!(
+            parse_archive_download_cost(&insufficient, "1600x"),
+            DownloadCost::Insufficient
+        );
+
+        let unavailable = ARCHIVER_GP_REQUIRED_WITH_HATHDL.replacen(
+            r#"<td><p><strong>2560x</strong></p><p>10.38 MiB</p><p><strong>546 GP</strong></p></td>"#,
+            r#"<td><p><strong>2560x</strong></p><p>10.38 MiB</p><p><strong>N/A</strong></p></td>"#,
+            1,
+        );
+        assert_eq!(
+            parse_archive_download_cost(&unavailable, "2400x"),
+            DownloadCost::Unavailable
+        );
+
+        let comma_separated = ARCHIVER_GP_REQUIRED_WITH_HATHDL.replacen(
+            r#"<td><p><strong>1920x</strong></p><p>10.38 MiB</p><p><strong>376 GP</strong></p></td>"#,
+            r#"<td><p><strong>1920x</strong></p><p>10.38 MiB</p><p><strong>1,234 GP</strong></p></td>"#,
+            1,
+        );
+        assert_eq!(
+            parse_archive_download_cost(&comma_separated, "1600x"),
+            DownloadCost::Gp(1234)
+        );
+    }
+
+    #[test]
+    fn test_parse_archive_download_cost_missing_hathdl_targets_are_unknown() {
+        let missing_donor = ARCHIVER_GP_REQUIRED_WITH_HATHDL.replacen(
+            r#"<td><p><strong>2560x</strong></p><p>10.38 MiB</p><p><strong>546 GP</strong></p></td>"#,
+            "",
+            1,
+        );
+        assert_eq!(
+            parse_archive_download_cost(&missing_donor, "2400x"),
+            DownloadCost::Unknown
+        );
+    }
+
+    #[test]
+    fn test_parse_archive_download_cost_rejects_non_hathdl_tables() {
+        let prefix = r#"
+<div>Download Cost: &nbsp; <strong>218 GP</strong></div>
+<form action="https://exhentai.org/archiver.php?gid=1&amp;token=res" method="post">
+    <input type="hidden" name="dltype" value="res" />
+</form>
+<form id="hathdl_form" action="https://exhentai.org/archiver.php?gid=1&amp;token=hathdl" method="post">
+    <input type="hidden" name="hathdl_xres" value="" />
+</form>
+"#;
+        let unrelated = format!(
+            r#"{prefix}<table><tr><td><p>Archive status</p><p>unused</p><p>Free</p></td></tr></table>"#
+        );
+        assert_eq!(
+            parse_archive_download_cost(&unrelated, "1600x"),
+            DownloadCost::Unknown
+        );
+
+        let target_without_original = format!(
+            r#"{prefix}<table><tr><td><p>1920x</p><p>10.38 MiB</p><p>376 GP</p></td></tr></table>"#
+        );
+        assert_eq!(
+            parse_archive_download_cost(&target_without_original, "1600x"),
+            DownloadCost::Unknown
+        );
+    }
+
+    #[test]
+    fn test_parse_archive_download_cost_hathdl_absent_uses_only_safe_form_fallbacks() {
+        for resolution in ["780x", "980x", "1280x"] {
+            assert_eq!(
+                parse_archive_download_cost(ARCHIVER_GP_REQUIRED, resolution),
+                DownloadCost::Gp(218),
+                "unexpected fallback for {resolution}"
+            );
+        }
+        for resolution in ["1600x", "2400x", "3200x"] {
+            assert_eq!(
+                parse_archive_download_cost(ARCHIVER_GP_REQUIRED, resolution),
+                DownloadCost::Unknown,
+                "unexpected fallback for {resolution}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_archive_download_cost_strips_thousand_separators() {
+        let html = r#"
+<div>Download Cost: &nbsp; <strong>747,708 GP</strong></div>
+<form action="/archiver.php?gid=1&amp;token=abc" method="post">
+    <input type="hidden" name="dltype" value="org" />
+</form>
+"#;
+        let cost = parse_archive_download_cost(html, "original");
+        assert_eq!(cost, DownloadCost::Gp(747708));
+    }
+
+    #[test]
+    fn test_parse_archive_download_cost_insufficient_funds() {
+        let html = r#"
+<div>Download Cost: &nbsp; <strong>Insufficient Funds</strong></div>
+<form action="/archiver.php?gid=1&amp;token=abc" method="post">
+    <input type="hidden" name="dltype" value="org" />
+</form>
+"#;
+        let cost = parse_archive_download_cost(html, "original");
+        assert_eq!(cost, DownloadCost::Insufficient);
+    }
+
+    #[test]
+    fn test_parse_archive_download_cost_na() {
+        let html = r#"
+<div>Download Cost: &nbsp; <strong>N/A</strong></div>
+<form action="/archiver.php?gid=1&amp;token=abc" method="post">
+    <input type="hidden" name="dltype" value="org" />
+</form>
+"#;
+        let cost = parse_archive_download_cost(html, "original");
+        assert_eq!(cost, DownloadCost::Unavailable);
+    }
+
+    #[test]
+    fn test_parse_archive_download_cost_unknown_text() {
+        let html = r#"
+<div>Download Cost: &nbsp; <strong>Somewhere Over The Rainbow</strong></div>
+<form action="/archiver.php?gid=1&amp;token=abc" method="post">
+    <input type="hidden" name="dltype" value="org" />
+</form>
+"#;
+        let cost = parse_archive_download_cost(html, "original");
+        assert_eq!(cost, DownloadCost::Unknown);
+    }
+
+    #[test]
+    fn test_parse_archive_download_cost_missing_returns_unknown() {
+        let html = "<html><body>No archiver content</body></html>";
+        let cost = parse_archive_download_cost(html, "original");
+        assert_eq!(cost, DownloadCost::Unknown);
+    }
+
+    #[test]
+    fn test_parse_archive_download_estimated_size_uses_matching_generic_form() {
+        assert_eq!(
+            parse_archive_download_estimated_size(ARCHIVER_FREE_DEFAULT, "original"),
+            Some(42_970_645),
+        );
+        assert_eq!(
+            parse_archive_download_estimated_size(ARCHIVER_FREE_DEFAULT, "1280x"),
+            Some(3_774_874),
+        );
+    }
+
+    #[test]
+    fn test_parse_archive_download_estimated_size_uses_mapped_hathdl_cell() {
+        let html = r#"
+            <form id="hathdl_form" action="/archiver.php?gid=1&amp;token=abc" method="post">
+                <input type="hidden" name="hathdl_xres" value="" />
+            </form>
+            <table><tr>
+                <td><p>Original</p><p>400.0 MiB</p><p>8,800 GP</p></td>
+                <td><p>800x</p><p>8.0 MiB</p><p>114 GP</p></td>
+                <td><p>1280x</p><p>12.5 MiB</p><p>218 GP</p></td>
+                <td><p>1920x</p><p>19.25 MiB</p><p>376 GP</p></td>
+                <td><p>2560x</p><p>25.0 MiB</p><p>546 GP</p></td>
+            </tr></table>
+        "#;
+
+        assert_eq!(
+            parse_archive_download_estimated_size(html, "980x"),
+            Some(13_107_200),
+        );
+        assert_eq!(
+            parse_archive_download_estimated_size(html, "1600x"),
+            Some(20_185_088),
+        );
+    }
+
+    #[test]
+    fn test_parse_archive_download_estimated_size_rounds_decimal_mib_up() {
+        let html = r#"
+            <form action="/archiver.php?gid=1&amp;token=abc" method="post">
+                <input type="hidden" name="dltype" value="org" />
+            </form>
+            <p>Estimated Size: <strong>1.0000001 MiB</strong></p>
+        "#;
+
+        assert_eq!(
+            parse_archive_download_estimated_size(html, "original"),
+            Some(1_048_577),
+        );
+    }
+
+    #[test]
+    fn test_parse_archive_download_estimated_size_rejects_untrusted_or_invalid_values() {
+        let missing_target = ARCHIVER_GP_REQUIRED_WITH_HATHDL.replacen(
+            r#"<td><p><strong>1920x</strong></p><p>10.38 MiB</p><p><strong>376 GP</strong></p></td>"#,
+            "",
+            1,
+        );
+        assert_eq!(
+            parse_archive_download_estimated_size(&missing_target, "1600x"),
+            None,
+        );
+
+        let invalid_hathdl = r#"
+            <form id="hathdl_form" action="/not-archiver" method="post">
+                <input type="hidden" name="hathdl_xres" value="" />
+            </form>
+            <table><tr>
+                <td><p>Original</p><p>400.0 MiB</p><p>8,800 GP</p></td>
+                <td><p>1280x</p><p>999.0 MiB</p><p>218 GP</p></td>
+            </tr></table>
+            <form action="/archiver.php?gid=1&amp;token=abc" method="post">
+                <input type="hidden" name="dltype" value="res" />
+            </form>
+            <p>Estimated Size: <strong>2.33 MiB</strong></p>
+        "#;
+        assert_eq!(
+            parse_archive_download_estimated_size(invalid_hathdl, "1280x"),
+            Some(2_443_183),
+        );
+        assert_eq!(
+            parse_archive_download_estimated_size(invalid_hathdl, "1600x"),
+            None,
+        );
+
+        let another_table = r#"
+            <form id="hathdl_form" action="/archiver.php?gid=1&amp;token=abc" method="post">
+                <input type="hidden" name="hathdl_xres" value="" />
+            </form>
+            <table><tr><td><p>Archive status</p><p>2.0 MiB</p><p>Free</p></td></tr></table>
+            <table><tr>
+                <td><p>Original</p><p>400.0 MiB</p><p>8,800 GP</p></td>
+                <td><p>1280x</p><p>12.5 MiB</p><p>218 GP</p></td>
+            </tr></table>
+        "#;
+        assert_eq!(
+            parse_archive_download_estimated_size(another_table, "1280x"),
+            None,
+        );
+
+        let invalid_value = r#"
+            <form action="/archiver.php?gid=1&amp;token=abc" method="post">
+                <input type="hidden" name="dltype" value="org" />
+            </form>
+            <p>Estimated Size: <strong>NaN MiB</strong></p>
+        "#;
+        assert_eq!(
+            parse_archive_download_estimated_size(invalid_value, "original"),
+            None,
+        );
+        assert_eq!(
+            parse_archive_download_estimated_size(
+                &invalid_value.replace("NaN MiB", "2.33 MB"),
+                "original",
+            ),
+            None,
+        );
+        assert_eq!(
+            parse_archive_download_estimated_size(
+                &invalid_value.replace("NaN MiB", "-1 MiB"),
+                "original",
+            ),
+            None,
+        );
+        assert_eq!(
+            parse_archive_download_estimated_size(
+                &invalid_value.replace("NaN MiB", "18446744073709551615 MiB"),
+                "original",
+            ),
+            None,
+        );
+
+        let other_form = r#"
+            <form action="/archiver.php?gid=1&amp;token=abc" method="post">
+                <input type="hidden" name="dltype" value="res" />
+            </form>
+            <form action="/archiver.php?gid=1&amp;token=abc" method="post">
+                <input type="hidden" name="dltype" value="res" />
+            </form>
+            <p>Estimated Size: <strong>2.33 MiB</strong></p>
+        "#;
+        assert_eq!(
+            parse_archive_download_estimated_size(other_form, "1280x"),
+            None,
+        );
+    }
+
+    #[test]
+    fn test_download_cost_is_free() {
+        assert!(DownloadCost::Free.is_free());
+        assert!(DownloadCost::Unlocked.is_free());
+        assert!(!DownloadCost::Gp(0).is_free());
+        assert!(!DownloadCost::Insufficient.is_free());
+        assert!(!DownloadCost::Unavailable.is_free());
+        assert!(!DownloadCost::Unknown.is_free());
+    }
+
+    #[test]
+    fn test_download_cost_gp_amount() {
+        assert_eq!(DownloadCost::Gp(218).gp_amount(), Some(218));
+        assert_eq!(DownloadCost::Free.gp_amount(), None);
+        assert_eq!(DownloadCost::Unknown.gp_amount(), None);
     }
 }

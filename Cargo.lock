@@ -1061,6 +1061,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "futures-util",
+ "quick-xml",
  "regex",
  "reqwest",
  "rust-s3",
@@ -2487,6 +2488,7 @@ name = "pixivbot"
 version = "0.3.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "booru_client",
  "chrono",
  "config",

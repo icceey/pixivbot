@@ -173,7 +173,7 @@ async fn test_eh_download_queue_full_lifecycle() {
     assert_eq!(next1.status, "downloading");
 
     // Download m1
-    repo.mark_eh_download_downloaded(m1.id, 50000, "/tmp/100.zip")
+    repo.mark_eh_download_downloaded(m1.id, 50000, "/tmp/100.zip", 0)
         .await
         .unwrap();
 
@@ -225,7 +225,7 @@ async fn test_eh_download_queue_fifo_ordering() {
     // Should be FIFO (oldest first by created_at)
     let next1 = repo.get_next_pending_eh_download().await.unwrap().unwrap();
     assert_eq!(next1.id, m1.id);
-    repo.mark_eh_download_downloaded(m1.id, 100, "/tmp/1.zip")
+    repo.mark_eh_download_downloaded(m1.id, 100, "/tmp/1.zip", 0)
         .await
         .unwrap();
     let pub1 = repo.get_next_for_publish().await.unwrap().unwrap();
@@ -234,7 +234,7 @@ async fn test_eh_download_queue_fifo_ordering() {
 
     let next2 = repo.get_next_pending_eh_download().await.unwrap().unwrap();
     assert_eq!(next2.id, m2.id);
-    repo.mark_eh_download_downloaded(m2.id, 200, "/tmp/2.zip")
+    repo.mark_eh_download_downloaded(m2.id, 200, "/tmp/2.zip", 0)
         .await
         .unwrap();
     let pub2 = repo.get_next_for_publish().await.unwrap().unwrap();
@@ -266,7 +266,7 @@ async fn test_eh_download_queue_reset_stale_then_reprocess() {
     assert_eq!(next.id, m.id);
 
     // Complete through full pipeline
-    repo.mark_eh_download_downloaded(m.id, 1000, "/tmp/1.zip")
+    repo.mark_eh_download_downloaded(m.id, 1000, "/tmp/1.zip", 0)
         .await
         .unwrap();
     let pub_next = repo.get_next_for_publish().await.unwrap().unwrap();
@@ -326,7 +326,7 @@ async fn test_eh_download_queue_rate_limit_window() {
             .unwrap();
         let c = repo.get_next_pending_eh_download().await.unwrap().unwrap();
         assert_eq!(c.id, m.id);
-        repo.mark_eh_download_downloaded(m.id, i * 1000, &format!("/tmp/{}.zip", i))
+        repo.mark_eh_download_downloaded(m.id, i * 1000, &format!("/tmp/{}.zip", i), 0)
             .await
             .unwrap();
         let p = repo.get_next_for_publish().await.unwrap().unwrap();
