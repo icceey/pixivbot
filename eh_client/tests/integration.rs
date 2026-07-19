@@ -804,6 +804,104 @@ async fn test_prepare_archive_download_1280x_uses_resample_form_and_cost() {
 }
 
 #[tokio::test]
+async fn test_prepare_archive_download_1600x_uses_hathdl_cost_and_request_resolution() {
+    let server = MockServer::start().await;
+    let gallery_page_html = r#"
+<html><body>
+<a onclick="return popUp('/archiver.php?gid=4034806&amp;token=fedcba9876',480,320)">Archive Download</a>
+</body></html>
+"#;
+    let archiver_form_html = format!(
+        r#"
+<html><body>
+<div>Download Cost: &nbsp; <strong>8,800 GP</strong></div>
+<form method="post" action="{}/org-archiver.php?form=org">
+  <input type="hidden" name="dltype" value="org" />
+  <input type="hidden" name="org_sentinel" value="org-only" />
+  <input type="submit" name="dlcheck" value="Download Original Archive" />
+</form>
+<div>Download Cost: &nbsp; <strong>218 GP</strong></div>
+<form method="post" action="{}/res-archiver.php?form=res">
+  <input type="hidden" name="dltype" value="res" />
+  <input type="hidden" name="res_sentinel" value="res-only" />
+  <input type="submit" name="dlcheck" value="Download Resample Archive" />
+</form>
+<form id="hathdl_form" method="post" action="{}/archiver.php?form=hathdl">
+  <input type="hidden" id="hathdl_xres" name="hathdl_xres" value="" />
+  <input type="hidden" name="hathdl_sentinel" value="hathdl-only" />
+</form>
+<table><tr>
+  <td><p>Original</p><p>419.6 MiB</p><p>8,800 GP</p></td>
+  <td><p>800x</p><p>10.38 MiB</p><p>114 GP</p></td>
+  <td><p>1280x</p><p>10.38 MiB</p><p>218 GP</p></td>
+  <td><p>1920x</p><p>10.38 MiB</p><p>376 GP</p></td>
+  <td><p>2560x</p><p>10.38 MiB</p><p>546 GP</p></td>
+</tr></table>
+</body></html>
+"#,
+        server.uri(),
+        server.uri(),
+        server.uri()
+    );
+    let redirect_html = format!(
+        r#"<script>document.location = "{}/archive/4034806/fedcba9876/archive/0?autostart=1";</script>"#,
+        server.uri()
+    );
+    let zip_bytes = test_zip_bytes("image.jpg", b"hathdl_cost_zip");
+
+    Mock::given(method("GET"))
+        .and(path("/g/4034806/e13b7d119b/"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(gallery_page_html))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/archiver.php"))
+        .and(query_param("gid", "4034806"))
+        .and(query_param("token", "fedcba9876"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(archiver_form_html))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/archiver.php"))
+        .and(query_param("form", "hathdl"))
+        .and(BodyContains("hathdl_xres=1600"))
+        .and(BodyContains("hathdl_sentinel=hathdl-only"))
+        .and(BodyNotContains("org_sentinel"))
+        .and(BodyNotContains("res_sentinel"))
+        .and(BodyNotContains("dltype=res"))
+        .and(BodyNotContains("dlcheck"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(redirect_html))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/archive/4034806/fedcba9876/archive/0"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(zip_bytes.clone()))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = client_at(&server);
+    let request = client
+        .prepare_archive_download(4034806, "e13b7d119b", "1600x")
+        .await
+        .expect("should prepare H@H-priced resample archive request");
+    assert_eq!(request.cost(), &eh_client::parser::DownloadCost::Gp(376));
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let dest = temp_dir.path().join("archive.zip");
+    let bytes = client
+        .download_archive_with_request(&request, &dest)
+        .await
+        .expect("H@H-priced resample form download should succeed");
+
+    assert_eq!(bytes as usize, zip_bytes.len());
+    assert_eq!(std::fs::read(dest).unwrap(), zip_bytes);
+}
+
+#[tokio::test]
 async fn test_prepare_and_download_archive_form_flow() {
     let server = MockServer::start().await;
     let gallery_page_html = r#"

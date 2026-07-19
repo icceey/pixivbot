@@ -108,6 +108,8 @@ fn archive_form_data_for_resolution(resolution: &str) -> Vec<(String, String)> {
 
 fn apply_resolution_to_form_data(form_data: &mut Vec<(String, String)>, resolution: &str) {
     let want_original = resolution == "original" || resolution.is_empty();
+    let is_hathdl_form = form_data.iter().any(|(name, _)| name == "hathdl_xres")
+        && !form_data.iter().any(|(name, _)| name == "dltype");
     if let Some((_, value)) = form_data.iter_mut().find(|(name, _)| name == "hathdl_xres") {
         *value = if want_original {
             "org".to_string()
@@ -120,7 +122,7 @@ fn apply_resolution_to_form_data(form_data: &mut Vec<(String, String)>, resoluti
             *value = "org".to_string();
         }
     }
-    if !form_data.iter().any(|(name, _)| name == "dlcheck") {
+    if !is_hathdl_form && !form_data.iter().any(|(name, _)| name == "dlcheck") {
         form_data.push((
             "dlcheck".to_string(),
             if want_original {

@@ -63,6 +63,21 @@ fn input_re() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r#"(?is)<input\b([^>]*)>"#).expect("invalid input regex"))
 }
 
+fn form_fields(body: &str) -> Vec<(String, String)> {
+    input_re()
+        .captures_iter(body)
+        .filter_map(|input| {
+            let attrs = input.get(1)?.as_str();
+            let name = attr_value(attrs, "name")?;
+            if name.is_empty() {
+                return None;
+            }
+            let value = attr_value(attrs, "value").unwrap_or_default();
+            Some((name, value))
+        })
+        .collect()
+}
+
 fn attr_value(attrs: &str, name: &str) -> Option<String> {
     let re = Regex::new(&format!(
         r#"(?is)\b{}\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))"#,
@@ -91,6 +106,30 @@ fn decode_html_attr(value: &str) -> String {
         .replace("&#X27;", "'")
         .replace("&lt;", "<")
         .replace("&gt;", ">")
+}
+
+fn find_hathdl_form(html: &str) -> Option<(ArchiverForm, usize)> {
+    for cap in archiver_form_re().captures_iter(html) {
+        let attrs = cap.get(1)?.as_str();
+        if attr_value(attrs, "id").as_deref() != Some("hathdl_form") {
+            continue;
+        }
+
+        let Some(action) = attr_value(attrs, "action") else {
+            continue;
+        };
+        if !action.contains("archiver.php") {
+            continue;
+        }
+
+        let fields = form_fields(cap.get(2)?.as_str());
+        if !fields.iter().any(|(name, _)| name == "hathdl_xres") {
+            continue;
+        }
+
+        return Some((ArchiverForm { action, fields }, cap.get(0)?.end()));
+    }
+    None
 }
 
 /// Parse search results HTML, extracting gallery references.
@@ -143,26 +182,23 @@ pub fn parse_archiver_key(html: &str) -> Option<String> {
 pub fn parse_archiver_form(html: &str, resolution: &str) -> Option<ArchiverForm> {
     let target_dltype = resolution_dltype(resolution);
 
+    if target_dltype == "res" && hathdl_label_for_resolution(resolution).is_some() {
+        if let Some((form, _)) = find_hathdl_form(html) {
+            return Some(form);
+        }
+    }
+
     for cap in archiver_form_re().captures_iter(html) {
         let attrs = cap.get(1)?.as_str();
         let body = cap.get(2)?.as_str();
-        let action = attr_value(attrs, "action")?;
+        let Some(action) = attr_value(attrs, "action") else {
+            continue;
+        };
         if !action.contains("archiver.php") {
             continue;
         }
 
-        let fields: Vec<(String, String)> = input_re()
-            .captures_iter(body)
-            .filter_map(|input| {
-                let attrs = input.get(1)?.as_str();
-                let name = attr_value(attrs, "name")?;
-                if name.is_empty() {
-                    return None;
-                }
-                let value = attr_value(attrs, "value").unwrap_or_default();
-                Some((name, value))
-            })
-            .collect();
+        let fields = form_fields(body);
 
         if fields
             .iter()
@@ -260,6 +296,94 @@ fn dltype_value_re() -> &'static Regex {
     })
 }
 
+fn table_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r#"(?is)<table\b[^>]*>(.*?)</table>"#).expect("invalid table regex")
+    })
+}
+
+fn table_cell_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r#"(?is)<td\b[^>]*>(.*?)</td>"#).expect("invalid table cell regex")
+    })
+}
+
+fn paragraph_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r#"(?is)<p\b[^>]*>(.*?)</p>"#).expect("invalid paragraph regex"))
+}
+
+fn html_tag_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r#"(?is)<[^>]+>"#).expect("invalid HTML tag regex"))
+}
+
+fn strip_html_tags(html: &str) -> String {
+    html_tag_re()
+        .replace_all(html, "")
+        .replace("&nbsp;", " ")
+        .replace("&#160;", " ")
+        .replace("&#xA0;", " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn hathdl_table(html: &str) -> Option<&str> {
+    let (_, end_offset) = find_hathdl_form(html)?;
+    let after_form = &html[end_offset..];
+    table_re()
+        .captures(after_form)
+        .and_then(|table| table.get(1).map(|body| body.as_str()))
+}
+
+fn is_hathdl_resolution_label(label: &str) -> bool {
+    matches!(label, "800x" | "1280x" | "1920x" | "2560x")
+}
+
+fn parse_hathdl_cost(html: &str, target_label: &str) -> Option<DownloadCost> {
+    let table = hathdl_table(html)?;
+    let mut has_original = false;
+    let mut has_resolution = false;
+    let mut target_cost = None;
+
+    for cell in table_cell_re().captures_iter(table) {
+        let cell = cell.get(1)?.as_str();
+        let paragraphs: Vec<_> = paragraph_re()
+            .captures_iter(cell)
+            .filter_map(|paragraph| paragraph.get(1).map(|content| content.as_str()))
+            .collect();
+        let (Some(label), Some(cost)) = (paragraphs.first(), paragraphs.last()) else {
+            continue;
+        };
+
+        let label = strip_html_tags(label);
+        has_original |= label.eq_ignore_ascii_case("Original");
+        has_resolution |= is_hathdl_resolution_label(&label);
+        if label.eq_ignore_ascii_case(target_label) {
+            target_cost = Some(parse_cost_text(&strip_html_tags(cost)));
+        }
+    }
+
+    if has_original && has_resolution {
+        Some(target_cost.unwrap_or(DownloadCost::Unknown))
+    } else {
+        Some(DownloadCost::Unknown)
+    }
+}
+
+fn hathdl_label_for_resolution(resolution: &str) -> Option<&'static str> {
+    match resolution {
+        "780x" => Some("800x"),
+        "980x" | "1280x" => Some("1280x"),
+        "1600x" => Some("1920x"),
+        "2400x" => Some("2560x"),
+        _ => None,
+    }
+}
+
 fn parse_cost_text(text: &str) -> DownloadCost {
     let trimmed = text.trim();
     if trimmed.eq_ignore_ascii_case("Free!") || trimmed.eq_ignore_ascii_case("Free") {
@@ -283,12 +407,36 @@ fn parse_cost_text(text: &str) -> DownloadCost {
     }
 }
 
+fn parse_form_download_cost(html: &str, target_dltype: &str) -> DownloadCost {
+    let cost_caps: Vec<_> = download_cost_strong_re().captures_iter(html).collect();
+    let dltype_caps: Vec<_> = dltype_value_re().captures_iter(html).collect();
+
+    for cost_cap in &cost_caps {
+        let cost_end = cost_cap.get(0).unwrap().end();
+        if let Some(dltype_cap) = dltype_caps
+            .iter()
+            .find(|dltype_cap| dltype_cap.get(0).unwrap().start() >= cost_end)
+        {
+            let dltype = dltype_cap.get(1).unwrap().as_str();
+            if dltype == target_dltype {
+                return parse_cost_text(cost_cap.get(1).unwrap().as_str());
+            }
+        }
+    }
+
+    if cost_caps.len() == 1 {
+        return parse_cost_text(cost_caps[0].get(1).unwrap().as_str());
+    }
+
+    DownloadCost::Unknown
+}
+
 /// Parse the GP/cost status of an archiver.php page for the given resolution.
 ///
 /// `resolution` follows the config convention:
 /// - `"original"` or `""` -> the original-archive form (`dltype=org`)
-/// - any resample (`"780x"`, `"980x"`, `"1280x"`, `"1600x"`, `"2400x"`) ->
-///   the resample-archive form (`dltype=res`)
+/// - known resamples (`"780x"`, `"980x"`, `"1280x"`, `"1600x"`, `"2400x"`) ->
+///   the matching H@H table cell when present
 ///
 /// Resolution selection matches the form that `prepare_archive_download` will
 /// actually POST, so the returned cost reflects what the server will charge.
@@ -300,43 +448,31 @@ fn parse_cost_text(text: &str) -> DownloadCost {
 pub fn parse_archive_download_cost(html: &str, resolution: &str) -> DownloadCost {
     let target_dltype = resolution_dltype(resolution);
 
-    // 1. Resample-unlocked marker: if the user has unlocked a resample download
-    //    and we are requesting a resample, the POST is free.
-    if target_dltype == "res" && unlocked_resample_re().is_match(html) {
-        return DownloadCost::Unlocked;
-    }
+    if target_dltype == "res" {
+        let Some(target_label) = hathdl_label_for_resolution(resolution) else {
+            return DownloadCost::Unknown;
+        };
 
-    // 2. Find all Download Cost <strong> blocks. The page has two: the first
-    //    precedes the original form (`dltype=org`), the second precedes the
-    //    resample form (`dltype=res`).
-    let cost_caps: Vec<_> = download_cost_strong_re().captures_iter(html).collect();
-    let dltype_caps: Vec<_> = dltype_value_re().captures_iter(html).collect();
-
-    // Pair each cost with the next dltype form that follows it. The page layout
-    // is: cost-div -> form(with dltype) -> size-p -> next-cost-div -> form(with dltype).
-    // We pick the pair whose dltype matches the requested resolution.
-
-    for cost_cap in &cost_caps {
-        let cost_end = cost_cap.get(0).unwrap().end();
-        // Find the first dltype form that appears at or after this cost block.
-        if let Some(dltype_cap) = dltype_caps
-            .iter()
-            .find(|dc| dc.get(0).unwrap().start() >= cost_end)
-        {
-            let dltype = dltype_cap.get(1).unwrap().as_str();
-            if dltype == target_dltype {
-                return parse_cost_text(cost_cap.get(1).unwrap().as_str());
-            }
+        // An unlocked known resample is free regardless of the page's displayed
+        // H@H price, which may still reflect the original paid request.
+        if unlocked_resample_re().is_match(html) {
+            return DownloadCost::Unlocked;
         }
+
+        // The resample form's price is only its default tier, so it can understate
+        // what the requested donor resolution will cost.
+        if let Some(cost) = parse_hathdl_cost(html, target_label) {
+            return cost;
+        }
+
+        if matches!(resolution, "780x" | "980x" | "1280x") {
+            return parse_form_download_cost(html, target_dltype);
+        }
+
+        return DownloadCost::Unknown;
     }
 
-    // 3. Fallback: if no paired form was found but exactly one cost block exists,
-    //    return that cost. This handles simplified test fixtures.
-    if cost_caps.len() == 1 {
-        return parse_cost_text(cost_caps[0].get(1).unwrap().as_str());
-    }
-
-    DownloadCost::Unknown
+    parse_form_download_cost(html, target_dltype)
 }
 
 fn image_page_urls_re() -> &'static Regex {
@@ -496,7 +632,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_archiver_form_selects_requested_dltype() {
+    fn test_parse_archiver_form_selects_hathdl_for_known_resamples() {
         let html = r#"
         <form id="original" method="post" action="https://exhentai.org/archiver.php?gid=4034806&amp;token=org123def0">
            <input type="hidden" name="dltype" value="org" />
@@ -507,6 +643,10 @@ mod tests {
            <input type="hidden" name="dltype" value="res" />
            <input type="hidden" name="res_sentinel" value="resample-only" />
            <input type="submit" name="dlcheck" value="Download Resample Archive" />
+        </form>
+        <form id="hathdl_form" method="post" action="https://exhentai.org/archiver.php?gid=4034806&amp;token=hathdl123def0">
+           <input type="hidden" name="hathdl_sentinel" value="hathdl-only" />
+           <input type="hidden" name="hathdl_xres" value="" />
         </form>
         "#;
 
@@ -537,15 +677,88 @@ mod tests {
             .fields
             .contains(&("org_sentinel".to_string(), "original-only".to_string())));
 
-        let form = parse_archiver_form(html, "1280x").expect("should parse resample form");
-        assert_eq!(
-            form.action,
-            "https://exhentai.org/archiver.php?gid=4034806&token=res123def0"
-        );
+        for resolution in ["1280x", "1600x"] {
+            let form = parse_archiver_form(html, resolution).expect("should parse H@H form");
+            assert_eq!(
+                form.action,
+                "https://exhentai.org/archiver.php?gid=4034806&token=hathdl123def0"
+            );
+            assert!(form
+                .fields
+                .contains(&("hathdl_sentinel".to_string(), "hathdl-only".to_string())));
+            assert!(form
+                .fields
+                .contains(&("hathdl_xres".to_string(), String::new())));
+            assert!(!form.fields.iter().any(|(name, _)| name == "res_sentinel"));
+            assert!(!form.fields.iter().any(|(name, _)| name == "dltype"));
+        }
+    }
+
+    #[test]
+    fn test_parse_archiver_form_resample_falls_back_without_hathdl_form() {
+        let html = r#"
+        <div>Download Cost: &nbsp; <strong>218 GP</strong></div>
+        <form method="post" action="https://exhentai.org/archiver.php?gid=4034806&amp;token=res123def0">
+           <input type="hidden" name="dltype" value="res" />
+           <input type="hidden" name="res_sentinel" value="resample-only" />
+           <input type="submit" name="dlcheck" value="Download Resample Archive" />
+        </form>
+        "#;
+
+        let form = parse_archiver_form(html, "1280x").expect("should parse generic resample form");
         assert!(form
             .fields
             .contains(&("res_sentinel".to_string(), "resample-only".to_string())));
-        assert!(!form.fields.iter().any(|(name, _)| name == "org_sentinel"));
+        let donor_form = parse_archiver_form(html, "1600x")
+            .expect("should still prepare generic resample form without H@H");
+        assert!(donor_form
+            .fields
+            .contains(&("res_sentinel".to_string(), "resample-only".to_string())));
+        assert_eq!(
+            parse_archive_download_cost(html, "1600x"),
+            DownloadCost::Unknown
+        );
+    }
+
+    #[test]
+    fn test_invalid_hathdl_form_cannot_select_or_price_resamples() {
+        let prefix = r#"
+<div>Download Cost: &nbsp; <strong>218 GP</strong></div>
+<form method="post" action="https://exhentai.org/archiver.php?gid=1&amp;token=res">
+    <input type="hidden" name="dltype" value="res" />
+    <input type="hidden" name="res_sentinel" value="generic-res" />
+</form>
+"#;
+        let table = r#"
+<table><tr>
+    <td><p>Original</p><p>419.6 MiB</p><p>8,800 GP</p></td>
+    <td><p>800x</p><p>10.38 MiB</p><p>114 GP</p></td>
+    <td><p>1280x</p><p>10.38 MiB</p><p>218 GP</p></td>
+    <td><p>1920x</p><p>10.38 MiB</p><p>376 GP</p></td>
+    <td><p>2560x</p><p>10.38 MiB</p><p>546 GP</p></td>
+</tr></table>
+"#;
+        let invalid_forms = [
+            r#"<form id="hathdl_form"><input name="hathdl_xres" value="" /></form>"#,
+            r#"<form id="hathdl_form" action="https://exhentai.org/archiver.php?gid=1&amp;token=hathdl"><input name="other" value="" /></form>"#,
+        ];
+
+        for invalid_form in invalid_forms {
+            let html = format!("{prefix}{invalid_form}{table}");
+            let form = parse_archiver_form(&html, "1280x")
+                .expect("low resample should fall back to generic form");
+            assert!(form
+                .fields
+                .contains(&("res_sentinel".to_string(), "generic-res".to_string())));
+            assert_eq!(
+                parse_archive_download_cost(&html, "1280x"),
+                DownloadCost::Gp(218)
+            );
+            assert_eq!(
+                parse_archive_download_cost(&html, "1600x"),
+                DownloadCost::Unknown
+            );
+        }
     }
 
     #[test]
@@ -776,6 +989,31 @@ mod tests {
 </div>
 "#;
 
+    const ARCHIVER_GP_REQUIRED_WITH_HATHDL: &str = r#"
+<div id="db">
+    <div>Download Cost: &nbsp; <strong>8,800 GP</strong></div>
+    <form action="https://exhentai.org/archiver.php?gid=2284788&amp;token=7841d194d4" method="post">
+        <input type="hidden" name="dltype" value="org" />
+    </form>
+    <div>Download Cost: &nbsp; <strong>218 GP</strong></div>
+    <form action="https://exhentai.org/archiver.php?gid=2284788&amp;token=7841d194d4" method="post">
+        <input type="hidden" name="dltype" value="res" />
+    </form>
+    <form id="hathdl_form" action="https://exhentai.org/archiver.php?gid=2284788&amp;token=7841d194d4" method="post">
+        <input type="hidden" id="hathdl_xres" name="hathdl_xres" value="" />
+    </form>
+    <table>
+        <tr>
+            <td><p><strong>Original</strong></p><p>419.6 MiB</p><p><strong>8,800 GP</strong></p></td>
+            <td><p><strong>800x</strong></p><p>10.38 MiB</p><p><strong>114 GP</strong></p></td>
+            <td><p><strong>1280x</strong></p><p>10.38 MiB</p><p><strong>218 GP</strong></p></td>
+            <td><p><strong>1920x</strong></p><p>10.38 MiB</p><p><strong>376 GP</strong></p></td>
+            <td><p><strong>2560x</strong></p><p>10.38 MiB</p><p><strong>546 GP</strong></p></td>
+        </tr>
+    </table>
+</div>
+"#;
+
     #[test]
     fn test_parse_archive_download_cost_free_original() {
         let cost = parse_archive_download_cost(ARCHIVER_FREE_DEFAULT, "original");
@@ -796,7 +1034,12 @@ mod tests {
 
     #[test]
     fn test_parse_archive_download_cost_unlocked_resample() {
-        let cost = parse_archive_download_cost(ARCHIVER_FREE_RESAMPLE_UNLOCKED, "1280x");
+        let html = format!(
+            r#"{ARCHIVER_FREE_RESAMPLE_UNLOCKED}
+<form id="hathdl_form"><input type="hidden" name="hathdl_xres" value="" /></form>
+<table><tr><td><p>1280x</p><p>2.33 MiB</p><p>218 GP</p></td></tr></table>"#
+        );
+        let cost = parse_archive_download_cost(&html, "1280x");
         assert_eq!(cost, DownloadCost::Unlocked);
     }
 
@@ -824,6 +1067,158 @@ mod tests {
     fn test_parse_archive_download_cost_gp_required_resample() {
         let cost = parse_archive_download_cost(ARCHIVER_GP_REQUIRED, "1280x");
         assert_eq!(cost, DownloadCost::Gp(218));
+    }
+
+    #[test]
+    fn test_parse_archive_download_cost_uses_hathdl_resolution_costs() {
+        let html = format!(
+            r#"<table><tr><td><p>1920x</p><p>irrelevant</p><p>Free</p></td></tr></table>{ARCHIVER_GP_REQUIRED_WITH_HATHDL}"#
+        );
+        let cases = [
+            ("1280x", DownloadCost::Gp(218)),
+            ("1600x", DownloadCost::Gp(376)),
+            ("2400x", DownloadCost::Gp(546)),
+            ("780x", DownloadCost::Gp(114)),
+            ("980x", DownloadCost::Gp(218)),
+        ];
+
+        for (resolution, expected) in cases {
+            assert_eq!(
+                parse_archive_download_cost(&html, resolution),
+                expected,
+                "unexpected cost for {resolution}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_archive_download_cost_original_uses_form_cost_with_hathdl_table() {
+        let html = ARCHIVER_GP_REQUIRED_WITH_HATHDL.replacen(
+            r#"<td><p><strong>Original</strong></p><p>419.6 MiB</p><p><strong>8,800 GP</strong></p></td>"#,
+            r#"<td><p><strong>Original</strong></p><p>419.6 MiB</p><p><strong>N/A</strong></p></td>"#,
+            1,
+        );
+
+        assert_eq!(
+            parse_archive_download_cost(&html, "original"),
+            DownloadCost::Gp(8800)
+        );
+        assert_eq!(
+            parse_archive_download_cost(&html, ""),
+            DownloadCost::Gp(8800)
+        );
+    }
+
+    #[test]
+    fn test_parse_archive_download_cost_hathdl_statuses() {
+        let free = ARCHIVER_GP_REQUIRED_WITH_HATHDL.replacen(
+            r#"<td><p><strong>800x</strong></p><p>10.38 MiB</p><p><strong>114 GP</strong></p></td>"#,
+            r#"<td><p><strong>800x</strong></p><p>10.38 MiB</p><p><strong>Free</strong></p></td>"#,
+            1,
+        );
+        assert_eq!(
+            parse_archive_download_cost(&free, "780x"),
+            DownloadCost::Free
+        );
+
+        let free_with_exclamation = ARCHIVER_GP_REQUIRED_WITH_HATHDL.replacen(
+            r#"<td><p><strong>1280x</strong></p><p>10.38 MiB</p><p><strong>218 GP</strong></p></td>"#,
+            r#"<td><p><strong>1280x</strong></p><p>10.38 MiB</p><p><strong>Free!</strong></p></td>"#,
+            1,
+        );
+        assert_eq!(
+            parse_archive_download_cost(&free_with_exclamation, "1280x"),
+            DownloadCost::Free
+        );
+
+        let insufficient = ARCHIVER_GP_REQUIRED_WITH_HATHDL.replacen(
+            r#"<td><p><strong>1920x</strong></p><p>10.38 MiB</p><p><strong>376 GP</strong></p></td>"#,
+            r#"<td><p><strong>1920x</strong></p><p>10.38 MiB</p><p><strong>Insufficient Funds</strong></p></td>"#,
+            1,
+        );
+        assert_eq!(
+            parse_archive_download_cost(&insufficient, "1600x"),
+            DownloadCost::Insufficient
+        );
+
+        let unavailable = ARCHIVER_GP_REQUIRED_WITH_HATHDL.replacen(
+            r#"<td><p><strong>2560x</strong></p><p>10.38 MiB</p><p><strong>546 GP</strong></p></td>"#,
+            r#"<td><p><strong>2560x</strong></p><p>10.38 MiB</p><p><strong>N/A</strong></p></td>"#,
+            1,
+        );
+        assert_eq!(
+            parse_archive_download_cost(&unavailable, "2400x"),
+            DownloadCost::Unavailable
+        );
+
+        let comma_separated = ARCHIVER_GP_REQUIRED_WITH_HATHDL.replacen(
+            r#"<td><p><strong>1920x</strong></p><p>10.38 MiB</p><p><strong>376 GP</strong></p></td>"#,
+            r#"<td><p><strong>1920x</strong></p><p>10.38 MiB</p><p><strong>1,234 GP</strong></p></td>"#,
+            1,
+        );
+        assert_eq!(
+            parse_archive_download_cost(&comma_separated, "1600x"),
+            DownloadCost::Gp(1234)
+        );
+    }
+
+    #[test]
+    fn test_parse_archive_download_cost_missing_hathdl_targets_are_unknown() {
+        let missing_donor = ARCHIVER_GP_REQUIRED_WITH_HATHDL.replacen(
+            r#"<td><p><strong>2560x</strong></p><p>10.38 MiB</p><p><strong>546 GP</strong></p></td>"#,
+            "",
+            1,
+        );
+        assert_eq!(
+            parse_archive_download_cost(&missing_donor, "2400x"),
+            DownloadCost::Unknown
+        );
+    }
+
+    #[test]
+    fn test_parse_archive_download_cost_rejects_non_hathdl_tables() {
+        let prefix = r#"
+<div>Download Cost: &nbsp; <strong>218 GP</strong></div>
+<form action="https://exhentai.org/archiver.php?gid=1&amp;token=res" method="post">
+    <input type="hidden" name="dltype" value="res" />
+</form>
+<form id="hathdl_form" action="https://exhentai.org/archiver.php?gid=1&amp;token=hathdl" method="post">
+    <input type="hidden" name="hathdl_xres" value="" />
+</form>
+"#;
+        let unrelated = format!(
+            r#"{prefix}<table><tr><td><p>Archive status</p><p>unused</p><p>Free</p></td></tr></table>"#
+        );
+        assert_eq!(
+            parse_archive_download_cost(&unrelated, "1600x"),
+            DownloadCost::Unknown
+        );
+
+        let target_without_original = format!(
+            r#"{prefix}<table><tr><td><p>1920x</p><p>10.38 MiB</p><p>376 GP</p></td></tr></table>"#
+        );
+        assert_eq!(
+            parse_archive_download_cost(&target_without_original, "1600x"),
+            DownloadCost::Unknown
+        );
+    }
+
+    #[test]
+    fn test_parse_archive_download_cost_hathdl_absent_uses_only_safe_form_fallbacks() {
+        for resolution in ["780x", "980x", "1280x"] {
+            assert_eq!(
+                parse_archive_download_cost(ARCHIVER_GP_REQUIRED, resolution),
+                DownloadCost::Gp(218),
+                "unexpected fallback for {resolution}"
+            );
+        }
+        for resolution in ["1600x", "2400x", "3200x"] {
+            assert_eq!(
+                parse_archive_download_cost(ARCHIVER_GP_REQUIRED, resolution),
+                DownloadCost::Unknown,
+                "unexpected fallback for {resolution}"
+            );
+        }
     }
 
     #[test]

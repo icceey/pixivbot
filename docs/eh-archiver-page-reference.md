@@ -109,20 +109,24 @@ table cells use `Free` without `!`.
 
 ## Resolution -> Cost Mapping
 
-The two `<form>` blocks have `dltype=org` (left) and `dltype=res` (right). The
-H@H table has per-resolution cells.
+The generic forms have `dltype=org` (left) and `dltype=res` (right). The
+separate `form#hathdl_form` carries `hathdl_xres` and is followed by the H@H
+per-resolution table.
 
 | Config `resolution` | Which form POSTs | H@H cell used |
 |---|---|---|
 | `original` / `""` | left (`dltype=org`) | Original column |
-| `780x` | right (`dltype=res`) | 800x column (closest match) |
-| `980x` | right (`dltype=res`) | 800x or 1280x |
-| `1280x` | right (`dltype=res`) | 1280x column |
-| `1600x` | right (`dltype=res`) | 1920x column (donor-only) |
-| `2400x` | right (`dltype=res`) | 2560x column (donor-only) |
+| `780x` | `form#hathdl_form` (`hathdl_xres=780`) | 800x column (closest match) |
+| `980x` | `form#hathdl_form` (`hathdl_xres=980`) | 1280x column (higher tier, conservatively) |
+| `1280x` | `form#hathdl_form` (`hathdl_xres=1280`) | 1280x column |
+| `1600x` | `form#hathdl_form` (`hathdl_xres=1600`) | 1920x column (donor-only) |
+| `2400x` | `form#hathdl_form` (`hathdl_xres=2400`) | 2560x column (donor-only) |
 
-Current code uses the two-form approach (`from_archiver_form` with `dltype`).
-GP cost is read from the matching form's Download Cost div.
+Current code posts the `dltype=org` form for original downloads. For known
+resamples, it prefers `form#hathdl_form` when its action is `archiver.php` and
+it contains `hathdl_xres`; otherwise it retains the generic `dltype=res` form
+fallback. It reads known-resample costs from the mapped H@H table cell when the
+table is present.
 
 ## Parser Strategy
 
@@ -132,17 +136,19 @@ GP cost is read from the matching form's Download Cost div.
    If found AND resolution is a resample (`780x`/`980x`/`1280x`/...), return
    `DownloadCost::Unlocked`. (Original downloads are not free just because
    resample was unlocked.)
-2. Find both `<form>` blocks with `dltype=org` and `dltype=res`. Extract the
-   Download Cost `<strong>` text from each.
-3. Match the cost text:
+2. For `original` / `""`, read the `dltype=org` form's Download Cost. For a known
+   resample, read the mapped cell from the first table after `#hathdl_form`.
+   The table must contain `Original` and at least one recognized resolution
+   label, so an unrelated following table cannot provide a cost.
+   If that table is absent, only `780x`/`980x`/`1280x` may use the generic
+   `dltype=res` form cost; higher or unknown resolutions are `Unknown`.
+3. Match the form or H@H cell cost text:
    - `Free!` -> `DownloadCost::Free`
    - `{n} GP` (strip commas) -> `DownloadCost::Gp(n)`
    - `Insufficient Funds` -> `DownloadCost::Insufficient`
    - `N/A` -> `DownloadCost::Unavailable`
    - anything else -> `DownloadCost::Unknown`
-4. Select the form matching the configured resolution (original -> `dltype=org`,
-   any resample -> `dltype=res`).
-5. If `Unknown`, callers should conservatively reject (do not POST).
+4. If `Unknown`, callers should conservatively reject (do not POST).
 
 ## When POST Charges GP
 
