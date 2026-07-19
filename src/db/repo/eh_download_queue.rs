@@ -683,21 +683,6 @@ impl Repo {
         Ok(result.iter().map(|e| e.file_size).sum())
     }
 
-    /// Get total GP spent on archive downloads in the last `hours` window.
-    /// Uses `completed_at` as the spend-window fact regardless of queue status,
-    /// so free / unlocked downloads (gp_cost = 0) do not inflate the sum.
-    pub async fn get_eh_gp_cost_in_window(&self, hours: u64) -> Result<i64> {
-        let cutoff = Local::now().naive_local() - chrono::Duration::hours(hours as i64);
-
-        let result = eh_download_queue::Entity::find()
-            .filter(eh_download_queue::Column::CompletedAt.gte(cutoff))
-            .all(&self.db)
-            .await
-            .context("Failed to fetch eh gp cost in window")?;
-
-        Ok(result.iter().map(|e| e.gp_cost).sum())
-    }
-
     /// Count pending downloads in the queue.
     #[allow(dead_code)]
     pub async fn count_pending_eh_downloads(&self) -> Result<u64> {
@@ -1336,8 +1321,9 @@ impl Repo {
     /// Mark a download as downloaded (ZIP saved to cache). Transitions to `downloaded` status.
     /// Only allowed when current status is `STATUS_DOWNLOADING`.
     ///
-    /// `gp_cost` is the GP spent for this download (0 for free / unlocked).
-    /// Aggregated by `get_eh_gp_cost_in_window` for the GP rate-limit check.
+    /// `gp_cost` is compatibility/display metadata for the most recent successful
+    /// archive download (0 for free / unlocked). The append-only
+    /// `eh_gp_spend_attempts` ledger calculates rolling GP budgets.
     pub async fn mark_eh_download_downloaded(
         &self,
         id: i32,

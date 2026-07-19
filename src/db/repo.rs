@@ -3,6 +3,7 @@ use sea_orm::DatabaseConnection;
 
 mod chats;
 pub mod eh_download_queue;
+pub mod eh_gp_spend_attempts;
 mod messages;
 mod stats;
 mod subscriptions;
@@ -67,6 +68,28 @@ pub mod tests_helpers {
                 allow_without_mention BOOLEAN NOT NULL DEFAULT 0
             )
             "#,
+        ))
+        .await?;
+
+        db.execute(Statement::from_string(
+            DbBackend::Sqlite,
+            r#"
+            CREATE TABLE eh_gp_spend_attempts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                queue_id INTEGER,
+                gid INTEGER NOT NULL,
+                gp_cost INTEGER NOT NULL CHECK (gp_cost > 0),
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (queue_id) REFERENCES eh_download_queue(id) ON DELETE SET NULL
+            )
+            "#,
+        ))
+        .await?;
+
+        db.execute(Statement::from_string(
+            DbBackend::Sqlite,
+            "CREATE INDEX idx_eh_gp_spend_attempts_created_at ON eh_gp_spend_attempts(created_at)"
+                .to_owned(),
         ))
         .await?;
 

@@ -16,7 +16,7 @@ use eh_client::{
 use rand::RngExt;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
-use tokio::sync::{mpsc, Mutex, OwnedMutexGuard};
+use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinSet;
 use tracing::{debug, error, info, warn};
 
@@ -35,19 +35,14 @@ const SEARCH_RATE_LIMIT_MS: u64 = 3500;
 const EH_UPLOAD_IMAGE_CHANNEL_CAPACITY: usize = 1;
 const SLOW_DOWNLOAD_BYTES_PER_SEC: u64 = 1024 * 1024;
 
-static EH_GP_BUDGET_LOCK: LazyLock<Arc<Mutex<()>>> = LazyLock::new(|| Arc::new(Mutex::new(())));
+static EH_GP_BUDGET_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
-#[derive(Default)]
-struct ArchiveGpPermit {
-    _guard: Option<OwnedMutexGuard<()>>,
-}
-
-impl ArchiveGpPermit {
-    async fn hold_until<T>(self, future: impl std::future::Future<Output = T>) -> T {
-        let result = future.await;
-        drop(self);
-        result
-    }
+fn gp_rate_defer_delay_secs(window_hours: u64) -> i64 {
+    i64::try_from(window_hours)
+        .ok()
+        .and_then(|hours| hours.checked_mul(3600))
+        .map(|seconds| seconds / 4)
+        .unwrap_or(i64::MAX)
 }
 
 fn should_schedule_background_download(failures: i32, bytes_delta: u64, elapsed: Duration) -> bool {
@@ -96,10 +91,10 @@ async fn ensure_eh_archive_under_size_limit(
     );
 }
 
-/// Outcome of `check_archive_cost_or_defer` for a prepared archive request.
+/// Outcome of `check_and_reserve_archive_cost_or_defer` for a prepared archive request.
 enum ArchiveCostCheck {
-    /// Safe to POST `download_archive_with_request`. No GP guard was violated.
-    Proceed { permit: ArchiveGpPermit },
+    /// Safe to POST `download_archive_with_request`.
+    Proceed,
     /// Download should be deferred without POSTing. Caller should NOT retry the
     /// POST in this tick; the entry stays pending so it is retried after backoff.
     Defer { delay_secs: i64, reason: String },
@@ -115,31 +110,33 @@ enum BackgroundDownloadOutcome {
         file_size: u64,
         zip_path: std::path::PathBuf,
         gp_cost: i64,
-        permit: ArchiveGpPermit,
     },
     Deferred {
         reason: String,
     },
 }
 
-/// Shared guard invoked after `prepare_archive_download()` (which GETs the
+/// Shared check-and-reserve gate invoked after `prepare_archive_download()` (which GETs the
 /// archiver.php page without spending GP) and before
 /// `download_archive_with_request()` (which POSTs and spends GP).
 ///
 /// Returns `Proceed` when the POST is safe to attempt, otherwise `Defer` with a
 /// human-readable reason and a suggested delay. Both the main download worker
 /// and the background download worker route through this to keep their GP
-/// guards consistent.
+/// guards consistent. Positive GP attempts are appended to the ledger before
+/// `Proceed`; the ledger is the rolling GP budget source.
 ///
 /// Checks, in order:
 /// 1. Byte rate limit: if `download_rate_window_hours` is saturated, defer.
-/// 2. GP rate limit: if `gp_rate_window_hours` is saturated, defer.
-/// 3. Per-archive GP cost: if the parsed cost exceeds `max_archive_gp_cost`,
+/// 2. Per-archive GP cost: if the parsed cost exceeds `max_archive_gp_cost`,
 ///    defer. Free / Unlocked always pass. Insufficient / Unavailable / Unknown
 ///    always defer (conservative reject, since we cannot determine the cost).
-async fn check_archive_cost_or_defer(
+/// 3. Positive GP costs reserve budget by appending an attempt before POSTing.
+async fn check_and_reserve_archive_cost_or_defer(
     repo: &Repo,
     config: &EhentaiConfig,
+    queue_id: i32,
+    gid: i64,
     cost: &DownloadCost,
 ) -> Result<ArchiveCostCheck> {
     // 1. Byte rate limit
@@ -156,26 +153,7 @@ async fn check_archive_cost_or_defer(
         });
     }
 
-    // 2. GP rate limit (only matters when this download actually costs GP)
-    let mut permit = ArchiveGpPermit::default();
-    if let DownloadCost::Gp(gp) = cost {
-        if config.gp_rate_limit > 0 {
-            permit._guard = Some(Arc::clone(&*EH_GP_BUDGET_LOCK).lock_owned().await);
-            let window_hours = config.gp_rate_window_hours_clamped();
-            let spent = repo.get_eh_gp_cost_in_window(window_hours).await?;
-            if spent + *gp as i64 > config.gp_rate_limit as i64 {
-                return Ok(ArchiveCostCheck::Defer {
-                    delay_secs: window_hours as i64 * 3600 / 4,
-                    reason: format!(
-                        "EH GP rate limit would be exceeded ({} + {} > {} in last {}h)",
-                        spent, gp, config.gp_rate_limit, window_hours
-                    ),
-                });
-            }
-        }
-    }
-
-    // 3. Per-archive GP cost
+    // 2. Per-archive GP cost
     if !config.allows_archive_gp_cost(cost) {
         return Ok(ArchiveCostCheck::Defer {
             delay_secs: config.download_poll_interval_sec.max(60) as i64,
@@ -186,7 +164,35 @@ async fn check_archive_cost_or_defer(
         });
     }
 
-    Ok(ArchiveCostCheck::Proceed { permit })
+    let DownloadCost::Gp(gp) = cost else {
+        return Ok(ArchiveCostCheck::Proceed);
+    };
+    if *gp == 0 {
+        return Ok(ArchiveCostCheck::Proceed);
+    }
+    let gp_cost = i64::try_from(*gp).context("EH archive GP cost exceeds supported range")?;
+
+    if config.gp_rate_limit > 0 {
+        let _budget_lock = EH_GP_BUDGET_LOCK.lock().await;
+        let window_hours = config.gp_rate_window_hours_clamped();
+        let spent = repo.get_eh_gp_cost_in_window(window_hours).await?;
+        if i128::from(spent) + i128::from(gp_cost) > i128::from(config.gp_rate_limit) {
+            return Ok(ArchiveCostCheck::Defer {
+                delay_secs: gp_rate_defer_delay_secs(window_hours),
+                reason: format!(
+                    "EH GP rate limit would be exceeded ({} + {} > {} in last {}h)",
+                    spent, gp_cost, config.gp_rate_limit, window_hours
+                ),
+            });
+        }
+        repo.append_eh_gp_spend_attempt(queue_id, gid, gp_cost)
+            .await?;
+    } else {
+        repo.append_eh_gp_spend_attempt(queue_id, gid, gp_cost)
+            .await?;
+    }
+
+    Ok(ArchiveCostCheck::Proceed)
 }
 
 pub struct EhBackgroundDownloadWorker {
@@ -265,15 +271,14 @@ impl EhBackgroundDownloadWorker {
                 file_size,
                 zip_path,
                 gp_cost,
-                permit,
             }) => {
-                permit
-                    .hold_until(self.repo.mark_eh_background_download_downloaded(
+                self.repo
+                    .mark_eh_background_download_downloaded(
                         entry.id,
                         file_size as i64,
                         &zip_path.to_string_lossy(),
                         gp_cost,
-                    ))
+                    )
                     .await?;
             }
             Ok(BackgroundDownloadOutcome::Deferred { reason }) => {
@@ -318,7 +323,7 @@ impl EhBackgroundDownloadWorker {
         tokio::fs::create_dir_all(&eh_cache).await?;
         let zip_path = eh_cache.join(format!("{}_{}.zip", gid, token));
 
-        let (file_size, gp_cost, permit) = if self.client.is_logged_in() {
+        let (file_size, gp_cost) = if self.client.is_logged_in() {
             let resolution = if entry.source == "direct" {
                 &self.config.download_resolution
             } else {
@@ -332,21 +337,21 @@ impl EhBackgroundDownloadWorker {
                 .await
                 .context("Failed to prepare archive download")?;
 
-            // GP / quota guard: same as main worker. Background downloads must
-            // also respect the GP budget, otherwise slow downloads offloaded to
-            // the background worker would silently burn GP when the main worker
-            // has already deferred.
-            let permit = match check_archive_cost_or_defer(
+            // GP / quota reservation: same as main worker. Background downloads
+            // must also reserve the shared ledger budget before archive POSTs.
+            match check_and_reserve_archive_cost_or_defer(
                 self.repo.as_ref(),
                 self.config.as_ref(),
+                entry.id,
+                entry.gid,
                 archive_request.cost(),
             )
             .await?
             {
-                ArchiveCostCheck::Proceed { permit } => permit,
+                ArchiveCostCheck::Proceed => {}
                 ArchiveCostCheck::Defer { delay_secs, reason } => {
                     info!(
-                        "Deferring EH background download for gid={} ({}), no GP spent",
+                        "Deferring EH background download for gid={} ({}), no reservation or POST",
                         gid, reason
                     );
                     // Non-error defer: keep the entry in the background queue
@@ -367,20 +372,19 @@ impl EhBackgroundDownloadWorker {
                 .await
                 .context("Failed to download archive")?;
             let gp_cost = archive_request.cost().gp_amount().unwrap_or(0) as i64;
-            (downloaded_file_size, gp_cost, permit)
+            (downloaded_file_size, gp_cost)
         } else {
             let file_size = self
                 .client
                 .download_gallery_images(gid, token, &zip_path)
                 .await
                 .context("Failed to download gallery images")?;
-            (file_size, 0, ArchiveGpPermit::default())
+            (file_size, 0)
         };
         Ok(BackgroundDownloadOutcome::Completed {
             file_size,
             zip_path,
             gp_cost,
-            permit,
         })
     }
 }
@@ -1106,7 +1110,7 @@ impl EhDownloadWorker {
         let zip_path_str = zip_path.to_string_lossy().to_string();
 
         // Download
-        let (file_size, gp_cost, permit) = if self.client.is_logged_in() {
+        let (file_size, gp_cost) = if self.client.is_logged_in() {
             let resolution = if entry.source == "direct" {
                 &self.config.download_resolution
             } else {
@@ -1122,21 +1126,21 @@ impl EhDownloadWorker {
                 .await
                 .context("Failed to prepare archive download")?;
 
-            // GP / quota guard: parse the cost from the archiver page (already
-            // fetched by prepare_archive_download, no GP spent) and decide
-            // whether POSTing would exceed the configured GP budget. Defer
-            // without POSTing if any check fails so we do not spend GP.
-            let permit = match check_archive_cost_or_defer(
+            // Parse the archiver-page cost, then reserve any positive GP attempt
+            // in the ledger before POSTing the archive request.
+            match check_and_reserve_archive_cost_or_defer(
                 self.repo.as_ref(),
                 self.config.as_ref(),
+                entry.id,
+                entry.gid,
                 archive_request.cost(),
             )
             .await?
             {
-                ArchiveCostCheck::Proceed { permit } => permit,
+                ArchiveCostCheck::Proceed => {}
                 ArchiveCostCheck::Defer { delay_secs, reason } => {
                     info!(
-                        "Deferring EH download for gid={} ({}), no GP spent",
+                        "Deferring EH download for gid={} ({}), no reservation or POST",
                         gid, reason
                     );
                     self.repo
@@ -1152,7 +1156,7 @@ impl EhDownloadWorker {
                 .await
                 .context("Failed to download archive")?;
             let gp_cost = archive_request.cost().gp_amount().unwrap_or(0) as i64;
-            (downloaded_file_size, gp_cost, permit)
+            (downloaded_file_size, gp_cost)
         } else {
             info!("Not logged in, using direct image download for gid={}", gid);
             let file_size = self
@@ -1162,7 +1166,7 @@ impl EhDownloadWorker {
                 .context("Failed to download gallery images")?;
             // Direct image downloads do not go through archiver.php and do not
             // spend GP; gp_cost is 0.
-            (file_size, 0, ArchiveGpPermit::default())
+            (file_size, 0)
         };
 
         info!(
@@ -1170,13 +1174,8 @@ impl EhDownloadWorker {
             gid, file_size, gp_cost
         );
 
-        permit
-            .hold_until(self.repo.mark_eh_download_downloaded(
-                entry.id,
-                file_size as i64,
-                &zip_path_str,
-                gp_cost,
-            ))
+        self.repo
+            .mark_eh_download_downloaded(entry.id, file_size as i64, &zip_path_str, gp_cost)
             .await?;
 
         Ok(())
@@ -1950,37 +1949,6 @@ fn sanitize_filename(s: &str) -> String {
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn test_archive_gp_permit_holds_lock_until_future_completes() {
-        let lock = Arc::new(Mutex::new(()));
-        let permit = ArchiveGpPermit {
-            _guard: Some(Arc::clone(&lock).lock_owned().await),
-        };
-        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
-        let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
-        let task = tokio::spawn(async move {
-            permit
-                .hold_until(async move {
-                    entered_tx.send(()).expect("test future must signal entry");
-                    finish_rx.await.expect("test future must be released");
-                    "marked"
-                })
-                .await
-        });
-
-        entered_rx.await.expect("test future must start");
-        assert!(
-            lock.try_lock().is_err(),
-            "permit must hold lock during future"
-        );
-        finish_tx.send(()).expect("test future must be releasable");
-        assert_eq!(task.await.unwrap(), "marked");
-        assert!(
-            lock.try_lock().is_ok(),
-            "permit must release lock after future completes"
-        );
-    }
-
     #[test]
     fn test_sanitize_filename() {
         assert_eq!(sanitize_filename("test/file:name"), "test_file_name");
@@ -2056,8 +2024,8 @@ mod integration_tests {
     use crate::bot::notifier::Notifier;
     use crate::cache::FileCacheManager;
     use crate::config::EhentaiConfig;
-    use crate::db::entities::eh_download_queue;
     use crate::db::entities::tasks;
+    use crate::db::entities::{eh_download_queue, eh_gp_spend_attempts};
     use crate::db::repo::eh_download_queue::{
         BACKGROUND_STATUS_PENDING, SOURCE_DIRECT, SOURCE_SUBSCRIPTION, STATUS_CANCELED,
         STATUS_DONE, STATUS_DOWNLOADED, STATUS_FAILED, STATUS_PENDING, STATUS_UPLOADED,
@@ -2445,6 +2413,13 @@ mod integration_tests {
             ..Default::default()
         };
         active.insert(repo.db()).await.unwrap()
+    }
+
+    async fn gp_attempts(repo: &Repo) -> Vec<eh_gp_spend_attempts::Model> {
+        eh_gp_spend_attempts::Entity::find()
+            .all(repo.db())
+            .await
+            .unwrap()
     }
 
     #[tokio::test]
@@ -4733,6 +4708,127 @@ mod integration_tests {
     }
 
     #[tokio::test]
+    async fn test_download_worker_gp_attempt_survives_malformed_archive_redirect() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        let eh_server = MockServer::start().await;
+        let temp = tempfile::tempdir().unwrap();
+
+        setup_chat(&repo, -100, true).await;
+        let entry = insert_queue_entry(
+            &repo,
+            -100,
+            2284788,
+            "7841d194d4",
+            "Paid malformed redirect gallery",
+            false,
+            STATUS_PENDING,
+            None,
+            None,
+        )
+        .await;
+        mock_eh_archiver_page_with_cost(&eh_server, 2284788, "7841d194d4", "8,800 GP", "218 GP")
+            .await;
+        mock_eh_metadata(&eh_server, 2284788, "7841d194d4", 10 * 1024 * 1024).await;
+        Mock::given(method("POST"))
+            .and(path("/archiver.php"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("<html>no redirect</html>"))
+            .expect(1)
+            .mount(&eh_server)
+            .await;
+
+        let mut config = make_config();
+        config.background_download_enabled = false;
+        config.max_archive_gp_cost = 218;
+        let worker = EhDownloadWorker::new(
+            Arc::clone(&repo),
+            make_eh_client(&eh_server),
+            Arc::new(config),
+            temp.path().to_path_buf(),
+        );
+
+        worker.tick().await.unwrap();
+
+        let updated = eh_download_queue::Entity::find_by_id(entry.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.status, STATUS_PENDING);
+        assert_eq!(updated.retry_count, 1);
+        let attempts = gp_attempts(repo.as_ref()).await;
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].gp_cost, 218);
+        let archiver_posts = eh_server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|request| {
+                request.method.as_str() == "POST" && request.url.path() == "/archiver.php"
+            })
+            .count();
+        assert_eq!(archiver_posts, 1);
+    }
+
+    #[tokio::test]
+    async fn test_download_worker_gp_attempt_insert_failure_retries_without_post() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        let eh_server = MockServer::start().await;
+        let temp = tempfile::tempdir().unwrap();
+
+        setup_chat(&repo, -100, true).await;
+        let entry = insert_queue_entry(
+            &repo,
+            -100,
+            2284788,
+            "7841d194d4",
+            "Paid trigger failure gallery",
+            false,
+            STATUS_PENDING,
+            None,
+            None,
+        )
+        .await;
+        mock_eh_archiver_page_with_cost(&eh_server, 2284788, "7841d194d4", "8,800 GP", "218 GP")
+            .await;
+        mock_eh_metadata(&eh_server, 2284788, "7841d194d4", 10 * 1024 * 1024).await;
+        repo.db()
+            .execute(Statement::from_string(
+                DbBackend::Sqlite,
+                "CREATE TRIGGER fail_eh_gp_spend_attempt_insert BEFORE INSERT ON eh_gp_spend_attempts BEGIN SELECT RAISE(FAIL, 'ledger insert blocked'); END;".to_owned(),
+            ))
+            .await
+            .unwrap();
+        Mock::given(method("POST"))
+            .and(path("/archiver.php"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("must not be called"))
+            .expect(0)
+            .mount(&eh_server)
+            .await;
+
+        let mut config = make_config();
+        config.background_download_enabled = false;
+        config.max_archive_gp_cost = 218;
+        let worker = EhDownloadWorker::new(
+            Arc::clone(&repo),
+            make_eh_client(&eh_server),
+            Arc::new(config),
+            temp.path().to_path_buf(),
+        );
+
+        worker.tick().await.unwrap();
+
+        let updated = eh_download_queue::Entity::find_by_id(entry.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.status, STATUS_PENDING);
+        assert_eq!(updated.retry_count, 1);
+        assert!(gp_attempts(repo.as_ref()).await.is_empty());
+    }
+
+    #[tokio::test]
     async fn test_download_worker_gp_rate_limit_defers_without_post() {
         let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
         let eh_server = MockServer::start().await;
@@ -4740,29 +4836,23 @@ mod integration_tests {
 
         setup_chat(&repo, -100, true).await;
 
-        // Pre-fill a done entry that already spent 1000 GP in the last 24h.
-        let now = Local::now().naive_local();
-        let spent = eh_download_queue::ActiveModel {
-            chat_id: Set(-100),
-            gid: Set(999999),
-            token: Set("x".into()),
-            title: Set("Previous".into()),
-            telegraph: Set(false),
-            source: Set(SOURCE_DIRECT.into()),
-            status: Set(STATUS_DONE.into()),
-            file_size: Set(10 * 1024 * 1024),
-            gp_cost: Set(1000),
-            error: Set(None),
-            retry_count: Set(0),
-            created_at: Set(now),
-            started_at: Set(Some(now)),
-            completed_at: Set(Some(now)),
-            zip_path: Set(None),
-            telegraph_url: Set(None),
-            next_retry_at: Set(None),
-            ..Default::default()
-        };
-        spent.insert(repo.db()).await.unwrap();
+        // Pre-fill the append-only ledger with 1000 GP in the current window.
+        // Queue `gp_cost` metadata must not affect the rate-limit calculation.
+        let prior_entry = insert_queue_entry(
+            &repo,
+            -100,
+            999999,
+            "a1b2c3d4",
+            "Previous paid gallery",
+            false,
+            STATUS_DONE,
+            None,
+            None,
+        )
+        .await;
+        repo.append_eh_gp_spend_attempt(prior_entry.id, prior_entry.gid, 1000)
+            .await
+            .unwrap();
 
         let entry = insert_queue_entry(
             &repo,
@@ -4815,159 +4905,265 @@ mod integration_tests {
     }
 
     #[tokio::test]
-    async fn test_check_archive_cost_serializes_paid_budget_until_spend_is_recorded() {
+    async fn test_check_and_reserve_archive_cost_allows_one_concurrent_gp_attempt() {
         let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
-        let mut config = make_config();
-        config.gp_rate_limit = 300;
-        config.max_archive_gp_cost = 300;
-        let config = Arc::new(config);
-
-        let first =
-            check_archive_cost_or_defer(repo.as_ref(), config.as_ref(), &DownloadCost::Gp(200))
-                .await
-                .unwrap();
-        let permit = match first {
-            ArchiveCostCheck::Proceed { permit } => permit,
-            ArchiveCostCheck::Defer { reason, .. } => panic!("first paid check deferred: {reason}"),
-        };
-        assert!(
-            EH_GP_BUDGET_LOCK.try_lock().is_err(),
-            "first paid proceed must retain the GP budget lock"
-        );
-
-        let barrier = Arc::new(tokio::sync::Barrier::new(2));
-        let second_repo = Arc::clone(&repo);
-        let second_config = Arc::clone(&config);
-        let second_barrier = Arc::clone(&barrier);
-        let second = tokio::spawn(async move {
-            second_barrier.wait().await;
-            check_archive_cost_or_defer(
-                second_repo.as_ref(),
-                second_config.as_ref(),
-                &DownloadCost::Gp(200),
-            )
-            .await
-        });
-
-        barrier.wait().await;
-        tokio::task::yield_now().await;
-        assert!(
-            !second.is_finished(),
-            "second paid check must wait for the first permit"
-        );
-
-        insert_gp_cost_entry(
-            repo.as_ref(),
-            1,
-            STATUS_DOWNLOADED,
-            200,
-            Some(Local::now().naive_local()),
+        let first_entry = insert_queue_entry(
+            &repo,
+            -100,
+            1001,
+            "a1b2c3d4",
+            "First paid gallery",
+            false,
+            STATUS_PENDING,
+            None,
+            None,
         )
         .await;
-        drop(permit);
-
-        let second = tokio::time::timeout(Duration::from_secs(1), second)
-            .await
-            .expect("second paid check must finish after the permit is dropped")
-            .unwrap()
-            .unwrap();
-        assert!(matches!(second, ArchiveCostCheck::Defer { .. }));
-        let final_lock = tokio::time::timeout(
-            Duration::from_secs(1),
-            Arc::clone(&*EH_GP_BUDGET_LOCK).lock_owned(),
+        let second_entry = insert_queue_entry(
+            &repo,
+            -100,
+            1002,
+            "e5f6a7b8",
+            "Second paid gallery",
+            false,
+            STATUS_PENDING,
+            None,
+            None,
         )
-        .await
-        .expect("GP budget lock must become available after the deferred check finishes");
-        drop(final_lock);
-    }
+        .await;
+        let mut config = make_config();
+        config.max_archive_gp_cost = 218;
+        config.gp_rate_limit = 218;
 
-    async fn assert_check_bypasses_gp_budget_lock(config: EhentaiConfig, cost: DownloadCost) {
-        let _budget_lock = Arc::clone(&*EH_GP_BUDGET_LOCK).lock_owned().await;
-        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
-        let config = Arc::new(config);
-        let check = tokio::time::timeout(
-            Duration::from_secs(1),
-            check_archive_cost_or_defer(repo.as_ref(), config.as_ref(), &cost),
-        )
-        .await
-        .expect("bypass check must complete while the GP budget lock is held")
-        .unwrap();
-        assert!(matches!(check, ArchiveCostCheck::Proceed { .. }));
-    }
+        let (first, second) = tokio::join!(
+            check_and_reserve_archive_cost_or_defer(
+                repo.as_ref(),
+                &config,
+                first_entry.id,
+                first_entry.gid,
+                &DownloadCost::Gp(218),
+            ),
+            check_and_reserve_archive_cost_or_defer(
+                repo.as_ref(),
+                &config,
+                second_entry.id,
+                second_entry.gid,
+                &DownloadCost::Gp(218),
+            ),
+        );
 
-    #[tokio::test]
-    async fn test_check_archive_cost_bypasses_lock_for_free_and_disabled_gp_rate_limit() {
-        let mut free_config = make_config();
-        free_config.gp_rate_limit = 300;
-        assert_check_bypasses_gp_budget_lock(free_config, DownloadCost::Free).await;
-
-        let mut unlocked_config = make_config();
-        unlocked_config.gp_rate_limit = 300;
-        assert_check_bypasses_gp_budget_lock(unlocked_config, DownloadCost::Unlocked).await;
-
-        let mut disabled_config = make_config();
-        disabled_config.gp_rate_limit = 0;
-        disabled_config.max_archive_gp_cost = 200;
-        assert_check_bypasses_gp_budget_lock(disabled_config, DownloadCost::Gp(200)).await;
-    }
-
-    async fn insert_gp_cost_entry(
-        repo: &Repo,
-        gid: i64,
-        status: &str,
-        gp_cost: i64,
-        completed_at: Option<chrono::NaiveDateTime>,
-    ) {
-        eh_download_queue::ActiveModel {
-            chat_id: Set(-100),
-            gid: Set(gid),
-            token: Set("t".into()),
-            title: Set("GP spend".into()),
-            status: Set(status.into()),
-            gp_cost: Set(gp_cost),
-            completed_at: Set(completed_at),
-            ..Default::default()
+        let mut proceeds = 0;
+        let mut defers = 0;
+        for outcome in [first.unwrap(), second.unwrap()] {
+            match outcome {
+                ArchiveCostCheck::Proceed => proceeds += 1,
+                ArchiveCostCheck::Defer { .. } => defers += 1,
+            }
         }
-        .insert(repo.db())
-        .await
-        .unwrap();
+        assert_eq!(proceeds, 1, "exactly one concurrent attempt may reserve GP");
+        assert_eq!(defers, 1, "the other concurrent attempt must defer");
+
+        let attempts = gp_attempts(repo.as_ref()).await;
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].gp_cost, 218);
+        assert_eq!(repo.get_eh_gp_cost_in_window(24).await.unwrap(), 218);
     }
 
     #[tokio::test]
-    async fn test_get_eh_gp_cost_in_window_counts_pending_completed_spend() {
-        let repo = tests_helpers::setup_test_db().await.unwrap();
-        let now = Local::now().naive_local();
+    async fn test_check_and_reserve_gp_attempt_when_rate_limit_disabled() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        let entry = insert_queue_entry(
+            &repo,
+            -100,
+            1001,
+            "a1b2c3d4",
+            "Paid gallery",
+            false,
+            STATUS_PENDING,
+            None,
+            None,
+        )
+        .await;
+        let mut config = make_config();
+        config.max_archive_gp_cost = 218;
+        config.gp_rate_limit = 0;
 
-        insert_gp_cost_entry(&repo, 1, STATUS_PENDING, 100, Some(now)).await;
-        insert_gp_cost_entry(&repo, 2, STATUS_DONE, 250, Some(now)).await;
+        for _ in 0..2 {
+            let outcome = check_and_reserve_archive_cost_or_defer(
+                repo.as_ref(),
+                &config,
+                entry.id,
+                entry.gid,
+                &DownloadCost::Gp(218),
+            )
+            .await
+            .unwrap();
+            assert!(matches!(outcome, ArchiveCostCheck::Proceed));
+        }
 
-        let total = repo.get_eh_gp_cost_in_window(24).await.unwrap();
+        let attempts = gp_attempts(repo.as_ref()).await;
+        assert_eq!(attempts.len(), 2);
         assert_eq!(
-            total, 350,
-            "should include completed GP spend in pending rows"
+            attempts.iter().map(|attempt| attempt.gp_cost).sum::<i64>(),
+            436
         );
     }
 
     #[tokio::test]
-    async fn test_get_eh_gp_cost_in_window_excludes_null_completed_at() {
-        let repo = tests_helpers::setup_test_db().await.unwrap();
+    async fn test_check_and_reserve_rejects_extreme_gp_window_without_ledger() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        let entry = insert_queue_entry(
+            &repo,
+            -100,
+            1001,
+            "a1b2c3d4",
+            "Paid gallery",
+            false,
+            STATUS_PENDING,
+            None,
+            None,
+        )
+        .await;
+        let mut config = make_config();
+        config.max_archive_gp_cost = 218;
+        config.gp_rate_limit = 218;
+        config.gp_rate_window_hours = u64::MAX;
 
-        insert_gp_cost_entry(&repo, 1, STATUS_DONE, 500, None).await;
+        let result = check_and_reserve_archive_cost_or_defer(
+            repo.as_ref(),
+            &config,
+            entry.id,
+            entry.gid,
+            &DownloadCost::Gp(218),
+        )
+        .await;
 
-        let total = repo.get_eh_gp_cost_in_window(24).await.unwrap();
-        assert_eq!(total, 0, "entry without completed_at must be excluded");
+        assert!(result.is_err());
+        assert!(
+            gp_attempts(repo.as_ref()).await.is_empty(),
+            "window validation must fail before a ledger reservation or archive POST"
+        );
     }
 
     #[tokio::test]
-    async fn test_get_eh_gp_cost_in_window_excludes_old_entries() {
-        let repo = tests_helpers::setup_test_db().await.unwrap();
-        let now = Local::now().naive_local();
-        let old = now - chrono::Duration::hours(48);
+    async fn test_check_and_reserve_keeps_24_hour_gp_defer_delay() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        let entry = insert_queue_entry(
+            &repo,
+            -100,
+            1001,
+            "a1b2c3d4",
+            "Paid gallery",
+            false,
+            STATUS_PENDING,
+            None,
+            None,
+        )
+        .await;
+        repo.append_eh_gp_spend_attempt(entry.id, entry.gid, 218)
+            .await
+            .unwrap();
+        let mut config = make_config();
+        config.max_archive_gp_cost = 218;
+        config.gp_rate_limit = 218;
+        config.gp_rate_window_hours = 24;
 
-        insert_gp_cost_entry(&repo, 1, STATUS_DONE, 500, Some(old)).await;
+        let outcome = check_and_reserve_archive_cost_or_defer(
+            repo.as_ref(),
+            &config,
+            entry.id,
+            entry.gid,
+            &DownloadCost::Gp(218),
+        )
+        .await
+        .unwrap();
 
-        let total = repo.get_eh_gp_cost_in_window(24).await.unwrap();
-        assert_eq!(total, 0, "entry older than window must be excluded");
+        match outcome {
+            ArchiveCostCheck::Defer { delay_secs, .. } => {
+                assert_eq!(delay_secs, 24 * 3600 / 4);
+            }
+            ArchiveCostCheck::Proceed => panic!("exhausted 24-hour GP budget must defer"),
+        }
+        assert_eq!(gp_attempts(repo.as_ref()).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_check_and_reserve_non_positive_or_free_costs_skip_ledger() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        let entry = insert_queue_entry(
+            &repo,
+            -100,
+            1001,
+            "a1b2c3d4",
+            "Free gallery",
+            false,
+            STATUS_PENDING,
+            None,
+            None,
+        )
+        .await;
+        let mut config = make_config();
+        config.max_archive_gp_cost = 218;
+        config.gp_rate_limit = 218;
+
+        for cost in [
+            DownloadCost::Free,
+            DownloadCost::Unlocked,
+            DownloadCost::Gp(0),
+        ] {
+            let outcome = check_and_reserve_archive_cost_or_defer(
+                repo.as_ref(),
+                &config,
+                entry.id,
+                entry.gid,
+                &cost,
+            )
+            .await
+            .unwrap();
+            assert!(matches!(outcome, ArchiveCostCheck::Proceed));
+        }
+
+        assert!(gp_attempts(repo.as_ref()).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_check_and_reserve_rejects_unallowed_costs_without_ledger() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        let entry = insert_queue_entry(
+            &repo,
+            -100,
+            1001,
+            "a1b2c3d4",
+            "Rejected gallery",
+            false,
+            STATUS_PENDING,
+            None,
+            None,
+        )
+        .await;
+        let mut config = make_config();
+        config.max_archive_gp_cost = 218;
+        config.gp_rate_limit = 218;
+
+        for cost in [
+            DownloadCost::Gp(219),
+            DownloadCost::Unknown,
+            DownloadCost::Unavailable,
+            DownloadCost::Insufficient,
+        ] {
+            let outcome = check_and_reserve_archive_cost_or_defer(
+                repo.as_ref(),
+                &config,
+                entry.id,
+                entry.gid,
+                &cost,
+            )
+            .await
+            .unwrap();
+            assert!(matches!(outcome, ArchiveCostCheck::Defer { .. }));
+        }
+
+        assert!(gp_attempts(repo.as_ref()).await.is_empty());
     }
 
     #[test]
@@ -5005,6 +5201,13 @@ mod integration_tests {
             1,
             "zero must clamp to 1"
         );
+    }
+
+    #[test]
+    fn test_gp_rate_defer_delay_saturates_extreme_windows() {
+        assert_eq!(gp_rate_defer_delay_secs(24), 24 * 3600 / 4);
+        assert_eq!(gp_rate_defer_delay_secs(i64::MAX as u64), i64::MAX);
+        assert_eq!(gp_rate_defer_delay_secs(u64::MAX), i64::MAX);
     }
 
     /// Verify the background worker's GP guard: when the archiver page reports
@@ -5085,6 +5288,75 @@ mod integration_tests {
             updated.background_download_next_retry_at.is_some(),
             "bg defer must schedule a future retry"
         );
+    }
+
+    #[tokio::test]
+    async fn test_background_worker_gp_attempt_survives_malformed_archive_redirect() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        let eh_server = MockServer::start().await;
+        let temp = tempfile::tempdir().unwrap();
+        let entry = insert_queue_entry(
+            &repo,
+            -100,
+            2284788,
+            "7841d194d4",
+            "Background paid malformed redirect gallery",
+            false,
+            STATUS_PENDING,
+            None,
+            None,
+        )
+        .await;
+        repo.schedule_eh_background_download_from(entry.id, STATUS_PENDING, "test setup")
+            .await
+            .unwrap();
+        mock_eh_archiver_page_with_cost(&eh_server, 2284788, "7841d194d4", "8,800 GP", "218 GP")
+            .await;
+        mock_eh_metadata(&eh_server, 2284788, "7841d194d4", 10 * 1024 * 1024).await;
+        Mock::given(method("POST"))
+            .and(path("/archiver.php"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("<html>no redirect</html>"))
+            .expect(1)
+            .mount(&eh_server)
+            .await;
+
+        let mut config = make_config();
+        config.background_download_enabled = true;
+        config.background_download_concurrency = 1;
+        config.max_archive_gp_cost = 218;
+        let worker = EhBackgroundDownloadWorker::new(
+            Arc::clone(&repo),
+            make_eh_client(&eh_server),
+            Arc::new(config),
+            temp.path().to_path_buf(),
+        );
+
+        worker.tick().await.unwrap();
+
+        let updated = eh_download_queue::Entity::find_by_id(entry.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.status, STATUS_PENDING);
+        assert_eq!(
+            updated.background_download_status.as_deref(),
+            Some(BACKGROUND_STATUS_PENDING)
+        );
+        assert_eq!(updated.background_download_attempt_count, 1);
+        let attempts = gp_attempts(repo.as_ref()).await;
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].gp_cost, 218);
+        let archiver_posts = eh_server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|request| {
+                request.method.as_str() == "POST" && request.url.path() == "/archiver.php"
+            })
+            .count();
+        assert_eq!(archiver_posts, 1);
     }
 
     #[tokio::test]
@@ -5179,6 +5451,7 @@ mod integration_tests {
             Some(BACKGROUND_STATUS_PENDING),
             "deferred background entry must remain eligible for a later tick"
         );
+        assert_eq!(gp_attempts(repo.as_ref()).await.len(), 1);
         assert_eq!(repo.get_eh_gp_cost_in_window(24).await.unwrap(), 218);
 
         let archiver_posts = eh_server
@@ -5307,6 +5580,7 @@ mod integration_tests {
             );
             assert!(background_entry.background_download_next_retry_at.is_some());
         }
+        assert_eq!(gp_attempts(repo.as_ref()).await.len(), 1);
         assert_eq!(repo.get_eh_gp_cost_in_window(24).await.unwrap(), 218);
 
         let archiver_posts = eh_server
