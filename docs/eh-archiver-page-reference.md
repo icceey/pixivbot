@@ -1,7 +1,7 @@
 # E-Hentai archiver.php Page Reference
 
 Source: real captures provided by user (2026-07-18). Used by `eh_client/parser.rs`
-and `src/scheduler/eh_engine.rs` to gate GP-spending downloads.
+and `src/scheduler/eh_engine.rs` to gate archive size and GP-spending downloads.
 
 ## Page Structure (consistent across all 4 samples)
 
@@ -107,7 +107,7 @@ table cells use `Free` without `!`.
 - POSTing either form WILL charge GP (auto-converts credits if GP insufficient)
 - This is the case that needs the GP guard
 
-## Resolution -> Cost Mapping
+## Resolution -> Form, Cost, and Estimated-Size Mapping
 
 The generic forms have `dltype=org` (left) and `dltype=res` (right). The
 separate `form#hathdl_form` carries `hathdl_xres` and is followed by the H@H
@@ -126,7 +126,11 @@ Current code posts the `dltype=org` form for original downloads. For known
 resamples, it prefers `form#hathdl_form` when its action is `archiver.php` and
 it contains `hathdl_xres`; otherwise it retains the generic `dltype=res` form
 fallback. It reads known-resample costs from the mapped H@H table cell when the
-table is present.
+table is present. The selected archive-size estimate uses that exact same
+selection: generic original/resample forms use their own nearby `Estimated Size`
+paragraph; valid H@H selections use the mapped cell's size paragraph. The
+displayed decimal MiB value is converted to bytes by rounding up, so the size
+guard cannot underestimate an archive.
 
 ## Parser Strategy
 
@@ -150,6 +154,13 @@ table is present.
    - anything else -> `DownloadCost::Unknown`
 4. If `Unknown`, callers should conservatively reject (do not POST).
 
+`parse_archive_download_estimated_size(html, resolution) -> Option<u64>` uses
+the same form/cell selection. It returns `None` for missing, malformed, or
+untrusted estimates: invalid H@H forms and unrelated tables are not allowed to
+bind a size to a request. With no H@H form, only `780x`/`980x`/`1280x` use the
+generic resample estimate fallback; donor resolutions require a trusted mapped
+H@H cell. `None` (and a parsed zero) does not block a download.
+
 ## When POST Charges GP
 
 Only `download_archive_with_request()` (the POST to `archiver.php?...` with
@@ -158,8 +169,13 @@ archiver page) do not charge GP.
 
 This means:
 - `prepare_archive_download()` (GETs + parse) is always safe.
-- `download_archive_with_request()` (POST) is the GP-spending step.
-- The guard must run between them.
+- Logged-in workers first call `prepare_archive_download()` and then check the
+  selected archive estimate against `max_archive_size_mb`. An estimate strictly
+  greater than the limit rejects; an equal, missing, or zero estimate passes.
+- The GP cost guard and any GP ledger reservation run after the selected-size
+  check and before `download_archive_with_request()`.
+- `download_archive_with_request()` (POST) is the GP-spending step. The
+  unauthenticated direct-image path does not use the archive-size gate.
 
 ## Account GP Balance (when shown)
 

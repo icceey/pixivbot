@@ -39,6 +39,9 @@ pub struct ArchiveDownloadRequest {
     /// Set by `prepare_archive_download()` so callers can gate the POST
     /// (`download_archive_with_request`) on their GP budget without spending GP.
     cost: parser::DownloadCost,
+    /// Estimated bytes for the archive selected by this request's form.
+    /// `None` means the archiver page did not provide a trustworthy size.
+    estimated_size_bytes: Option<u64>,
 }
 
 impl ArchiveDownloadRequest {
@@ -59,6 +62,7 @@ impl ArchiveDownloadRequest {
             // an unlocked-key URL (e.g. `or={key}` in the form action), which
             // means the download is free / already unlocked.
             cost: parser::DownloadCost::Unlocked,
+            estimated_size_bytes: None,
         }
     }
 
@@ -67,6 +71,7 @@ impl ArchiveDownloadRequest {
         form: parser::ArchiverForm,
         resolution: &str,
         cost: parser::DownloadCost,
+        estimated_size_bytes: Option<u64>,
     ) -> Self {
         let mut form_data = form.fields;
         apply_resolution_to_form_data(&mut form_data, resolution);
@@ -74,6 +79,7 @@ impl ArchiveDownloadRequest {
             action_url: resolve_url(base_url, &form.action),
             form_data,
             cost,
+            estimated_size_bytes,
         }
     }
 
@@ -81,6 +87,12 @@ impl ArchiveDownloadRequest {
     /// before calling `download_archive_with_request()` to avoid spending GP.
     pub fn cost(&self) -> &parser::DownloadCost {
         &self.cost
+    }
+
+    /// Estimated bytes for this request's selected archive, if the archiver
+    /// page supplied a trustworthy value.
+    pub fn estimated_size_bytes(&self) -> Option<u64> {
+        self.estimated_size_bytes
     }
 }
 
@@ -410,6 +422,8 @@ impl EhClient {
         // archiver_key (a key-shaped token alone does NOT prove the download
         // is free - only the Download Cost text or the unlocked marker does).
         let cost = parser::parse_archive_download_cost(&archiver_html, resolution);
+        let estimated_size_bytes =
+            parser::parse_archive_download_estimated_size(&archiver_html, resolution);
 
         if let Some(archiver_key) = parser::parse_archiver_key(&archiver_html) {
             let mut request = ArchiveDownloadRequest::from_archiver_key(
@@ -424,6 +438,7 @@ impl EhClient {
             // conservative "Unknown => defer" behavior when the page contains
             // a key but the Download Cost text cannot be recognized.
             request.cost = cost;
+            request.estimated_size_bytes = estimated_size_bytes;
             return Ok(request);
         }
 
@@ -435,6 +450,7 @@ impl EhClient {
             form,
             resolution,
             cost,
+            estimated_size_bytes,
         ))
     }
 
@@ -1229,5 +1245,18 @@ mod tests {
         assert!(made_progress(20000, 0.5));
         // Small transfer, large elapsed → no progress
         assert!(!made_progress(100, 10.0));
+    }
+
+    #[test]
+    fn archiver_key_request_has_no_estimated_size_without_page_html() {
+        let request = ArchiveDownloadRequest::from_archiver_key(
+            "https://e-hentai.org",
+            123456,
+            "abcdef0123",
+            "123456--abc123def456",
+            "1280x",
+        );
+
+        assert_eq!(request.estimated_size_bytes(), None);
     }
 }

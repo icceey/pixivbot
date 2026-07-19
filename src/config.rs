@@ -377,8 +377,8 @@ pub struct EhentaiConfig {
     pub download_rate_limit_gb: u64,
     #[serde(default = "default_eh_download_rate_window_hours")]
     pub download_rate_window_hours: u64,
-    /// Maximum EH gallery metadata size allowed for logged-in archive downloads, in MiB.
-    /// The check runs before the archive request that can spend EH archive points.
+    /// Maximum selected EH archive estimate allowed for logged-in downloads, in MiB.
+    /// The archiver page supplies this estimate before the GP-spending POST.
     /// `0` disables this per-gallery archive gate.
     #[serde(default = "default_eh_max_archive_size_mb")]
     pub max_archive_size_mb: u64,
@@ -472,9 +472,9 @@ impl EhentaiConfig {
         self.download_rate_limit_gb * 1024 * 1024 * 1024
     }
 
-    /// Maximum EH gallery archive size in bytes, or `None` when the gate is disabled.
+    /// Maximum selected EH archive estimate in bytes, or `None` when the gate is disabled.
     ///
-    /// `max_archive_size_mb = 0` disables the per-gallery archive size gate.
+    /// `max_archive_size_mb = 0` disables the selected archive-size gate.
     pub fn max_archive_size_bytes(&self) -> Option<u64> {
         if self.max_archive_size_mb == 0 {
             None

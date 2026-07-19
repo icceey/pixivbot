@@ -374,6 +374,110 @@ fn parse_hathdl_cost(html: &str, target_label: &str) -> Option<DownloadCost> {
     }
 }
 
+fn estimated_size_strong_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r#"(?is)Estimated\s+Size\s*:\s*(?:&nbsp;|&#160;|&#xA0;)?\s*<strong[^>]*>\s*([^<]*?)\s*</strong>"#,
+        )
+        .expect("invalid estimated size regex")
+    })
+}
+
+fn mib_size_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r#"^\s*(\d+)(?:\.(\d+))?\s+MiB\s*$"#).expect("invalid MiB size regex")
+    })
+}
+
+/// Convert a decimal MiB value to bytes, rounding up so the caller never
+/// underestimates the displayed archive size.
+fn parse_mib_size_bytes(text: &str) -> Option<u64> {
+    const MIB_BYTES: u128 = 1024 * 1024;
+
+    let captures = mib_size_re().captures(text)?;
+    let whole_mib: u128 = captures.get(1)?.as_str().parse().ok()?;
+    let fraction = captures.get(2).map_or("", |value| value.as_str());
+    let denominator = 10_u128.checked_pow(u32::try_from(fraction.len()).ok()?)?;
+    let fractional_mib: u128 = if fraction.is_empty() {
+        0
+    } else {
+        fraction.parse().ok()?
+    };
+    let numerator = whole_mib
+        .checked_mul(denominator)?
+        .checked_add(fractional_mib)?;
+    let bytes = numerator.checked_mul(MIB_BYTES)?.div_ceil(denominator);
+
+    u64::try_from(bytes).ok()
+}
+
+fn parse_form_estimated_size(html: &str, target_dltype: &str) -> Option<u64> {
+    for form in archiver_form_re().captures_iter(html) {
+        let attrs = form.get(1)?.as_str();
+        let body = form.get(2)?.as_str();
+        let Some(action) = attr_value(attrs, "action") else {
+            continue;
+        };
+        if !action.contains("archiver.php") {
+            continue;
+        }
+        if !form_fields(body)
+            .iter()
+            .any(|(name, value)| name == "dltype" && value == target_dltype)
+        {
+            continue;
+        }
+
+        // `parse_archiver_form` selects the first matching form. Do not bind a
+        // missing size on it to a later form's displayed size.
+        let after_form = &html[form.get(0)?.end()..];
+        let before_next_form = match archiver_form_re().find(after_form) {
+            Some(next_form) => &after_form[..next_form.start()],
+            None => after_form,
+        };
+        return estimated_size_strong_re()
+            .captures(before_next_form)
+            .and_then(|captures| captures.get(1))
+            .and_then(|size| parse_mib_size_bytes(size.as_str()));
+    }
+    None
+}
+
+fn parse_hathdl_estimated_size(html: &str, target_label: &str) -> Option<u64> {
+    let table = hathdl_table(html)?;
+    let mut has_original = false;
+    let mut has_resolution = false;
+    let mut target_size = None;
+
+    for cell in table_cell_re().captures_iter(table) {
+        let cell = cell.get(1)?.as_str();
+        let paragraphs: Vec<_> = paragraph_re()
+            .captures_iter(cell)
+            .filter_map(|paragraph| paragraph.get(1).map(|content| content.as_str()))
+            .collect();
+        let (Some(label), Some(size), Some(_cost)) =
+            (paragraphs.first(), paragraphs.get(1), paragraphs.get(2))
+        else {
+            continue;
+        };
+
+        let label = strip_html_tags(label);
+        has_original |= label.eq_ignore_ascii_case("Original");
+        has_resolution |= is_hathdl_resolution_label(&label);
+        if label.eq_ignore_ascii_case(target_label) {
+            target_size = parse_mib_size_bytes(&strip_html_tags(size));
+        }
+    }
+
+    if has_original && has_resolution {
+        target_size
+    } else {
+        None
+    }
+}
+
 fn hathdl_label_for_resolution(resolution: &str) -> Option<&'static str> {
     match resolution {
         "780x" => Some("800x"),
@@ -473,6 +577,31 @@ pub fn parse_archive_download_cost(html: &str, resolution: &str) -> DownloadCost
     }
 
     parse_form_download_cost(html, target_dltype)
+}
+
+/// Parse the selected archive's estimated size in bytes from an archiver.php page.
+///
+/// Selection follows `parse_archiver_form` and `parse_archive_download_cost`:
+/// original downloads use the generic `dltype=org` form; known resamples use
+/// their mapped H@H table cell when a valid H@H form is available. When H@H is
+/// absent, only the low-tier generic resample form can provide a trusted size.
+/// Returned byte counts round the displayed decimal MiB value up.
+pub fn parse_archive_download_estimated_size(html: &str, resolution: &str) -> Option<u64> {
+    let target_dltype = resolution_dltype(resolution);
+    if target_dltype == "org" {
+        return parse_form_estimated_size(html, target_dltype);
+    }
+
+    let target_label = hathdl_label_for_resolution(resolution)?;
+    if find_hathdl_form(html).is_some() {
+        return parse_hathdl_estimated_size(html, target_label);
+    }
+
+    if !matches!(resolution, "780x" | "980x" | "1280x") {
+        return None;
+    }
+
+    parse_form_estimated_size(html, target_dltype)
 }
 
 fn image_page_urls_re() -> &'static Regex {
@@ -1274,6 +1403,154 @@ mod tests {
         let html = "<html><body>No archiver content</body></html>";
         let cost = parse_archive_download_cost(html, "original");
         assert_eq!(cost, DownloadCost::Unknown);
+    }
+
+    #[test]
+    fn test_parse_archive_download_estimated_size_uses_matching_generic_form() {
+        assert_eq!(
+            parse_archive_download_estimated_size(ARCHIVER_FREE_DEFAULT, "original"),
+            Some(42_970_645),
+        );
+        assert_eq!(
+            parse_archive_download_estimated_size(ARCHIVER_FREE_DEFAULT, "1280x"),
+            Some(3_774_874),
+        );
+    }
+
+    #[test]
+    fn test_parse_archive_download_estimated_size_uses_mapped_hathdl_cell() {
+        let html = r#"
+            <form id="hathdl_form" action="/archiver.php?gid=1&amp;token=abc" method="post">
+                <input type="hidden" name="hathdl_xres" value="" />
+            </form>
+            <table><tr>
+                <td><p>Original</p><p>400.0 MiB</p><p>8,800 GP</p></td>
+                <td><p>800x</p><p>8.0 MiB</p><p>114 GP</p></td>
+                <td><p>1280x</p><p>12.5 MiB</p><p>218 GP</p></td>
+                <td><p>1920x</p><p>19.25 MiB</p><p>376 GP</p></td>
+                <td><p>2560x</p><p>25.0 MiB</p><p>546 GP</p></td>
+            </tr></table>
+        "#;
+
+        assert_eq!(
+            parse_archive_download_estimated_size(html, "980x"),
+            Some(13_107_200),
+        );
+        assert_eq!(
+            parse_archive_download_estimated_size(html, "1600x"),
+            Some(20_185_088),
+        );
+    }
+
+    #[test]
+    fn test_parse_archive_download_estimated_size_rounds_decimal_mib_up() {
+        let html = r#"
+            <form action="/archiver.php?gid=1&amp;token=abc" method="post">
+                <input type="hidden" name="dltype" value="org" />
+            </form>
+            <p>Estimated Size: <strong>1.0000001 MiB</strong></p>
+        "#;
+
+        assert_eq!(
+            parse_archive_download_estimated_size(html, "original"),
+            Some(1_048_577),
+        );
+    }
+
+    #[test]
+    fn test_parse_archive_download_estimated_size_rejects_untrusted_or_invalid_values() {
+        let missing_target = ARCHIVER_GP_REQUIRED_WITH_HATHDL.replacen(
+            r#"<td><p><strong>1920x</strong></p><p>10.38 MiB</p><p><strong>376 GP</strong></p></td>"#,
+            "",
+            1,
+        );
+        assert_eq!(
+            parse_archive_download_estimated_size(&missing_target, "1600x"),
+            None,
+        );
+
+        let invalid_hathdl = r#"
+            <form id="hathdl_form" action="/not-archiver" method="post">
+                <input type="hidden" name="hathdl_xres" value="" />
+            </form>
+            <table><tr>
+                <td><p>Original</p><p>400.0 MiB</p><p>8,800 GP</p></td>
+                <td><p>1280x</p><p>999.0 MiB</p><p>218 GP</p></td>
+            </tr></table>
+            <form action="/archiver.php?gid=1&amp;token=abc" method="post">
+                <input type="hidden" name="dltype" value="res" />
+            </form>
+            <p>Estimated Size: <strong>2.33 MiB</strong></p>
+        "#;
+        assert_eq!(
+            parse_archive_download_estimated_size(invalid_hathdl, "1280x"),
+            Some(2_443_183),
+        );
+        assert_eq!(
+            parse_archive_download_estimated_size(invalid_hathdl, "1600x"),
+            None,
+        );
+
+        let another_table = r#"
+            <form id="hathdl_form" action="/archiver.php?gid=1&amp;token=abc" method="post">
+                <input type="hidden" name="hathdl_xres" value="" />
+            </form>
+            <table><tr><td><p>Archive status</p><p>2.0 MiB</p><p>Free</p></td></tr></table>
+            <table><tr>
+                <td><p>Original</p><p>400.0 MiB</p><p>8,800 GP</p></td>
+                <td><p>1280x</p><p>12.5 MiB</p><p>218 GP</p></td>
+            </tr></table>
+        "#;
+        assert_eq!(
+            parse_archive_download_estimated_size(another_table, "1280x"),
+            None,
+        );
+
+        let invalid_value = r#"
+            <form action="/archiver.php?gid=1&amp;token=abc" method="post">
+                <input type="hidden" name="dltype" value="org" />
+            </form>
+            <p>Estimated Size: <strong>NaN MiB</strong></p>
+        "#;
+        assert_eq!(
+            parse_archive_download_estimated_size(invalid_value, "original"),
+            None,
+        );
+        assert_eq!(
+            parse_archive_download_estimated_size(
+                &invalid_value.replace("NaN MiB", "2.33 MB"),
+                "original",
+            ),
+            None,
+        );
+        assert_eq!(
+            parse_archive_download_estimated_size(
+                &invalid_value.replace("NaN MiB", "-1 MiB"),
+                "original",
+            ),
+            None,
+        );
+        assert_eq!(
+            parse_archive_download_estimated_size(
+                &invalid_value.replace("NaN MiB", "18446744073709551615 MiB"),
+                "original",
+            ),
+            None,
+        );
+
+        let other_form = r#"
+            <form action="/archiver.php?gid=1&amp;token=abc" method="post">
+                <input type="hidden" name="dltype" value="res" />
+            </form>
+            <form action="/archiver.php?gid=1&amp;token=abc" method="post">
+                <input type="hidden" name="dltype" value="res" />
+            </form>
+            <p>Estimated Size: <strong>2.33 MiB</strong></p>
+        "#;
+        assert_eq!(
+            parse_archive_download_estimated_size(other_form, "1280x"),
+            None,
+        );
     }
 
     #[test]

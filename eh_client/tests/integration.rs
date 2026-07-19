@@ -735,6 +735,7 @@ async fn test_prepare_archive_download_1280x_uses_resample_form_and_cost() {
   <input type="hidden" name="org_sentinel" value="org-only" />
   <input type="submit" name="dlcheck" value="Download Original Archive" />
 </form>
+<p>Estimated Size: <strong>400.0 MiB</strong></p>
 <div>Download Cost: &nbsp; <strong>218 GP</strong></div>
 <form method="post" action="{}/res-archiver.php?form=res">
   <input type="hidden" name="dltype" value="res" />
@@ -742,6 +743,7 @@ async fn test_prepare_archive_download_1280x_uses_resample_form_and_cost() {
   <input type="hidden" name="res_sentinel" value="res-only" />
   <input type="submit" name="dlcheck" value="Download Resample Archive" />
 </form>
+<p>Estimated Size: <strong>5.01 MiB</strong></p>
 </body></html>
 "#,
         server.uri(),
@@ -791,6 +793,7 @@ async fn test_prepare_archive_download_1280x_uses_resample_form_and_cost() {
         .await
         .expect("should prepare resample form-driven archive request");
     assert_eq!(request.cost(), &eh_client::parser::DownloadCost::Gp(218));
+    assert_eq!(request.estimated_size_bytes(), Some(5_253_366));
 
     let temp_dir = tempfile::tempdir().unwrap();
     let dest = temp_dir.path().join("archive.zip");
@@ -833,9 +836,9 @@ async fn test_prepare_archive_download_1600x_uses_hathdl_cost_and_request_resolu
 <table><tr>
   <td><p>Original</p><p>419.6 MiB</p><p>8,800 GP</p></td>
   <td><p>800x</p><p>10.38 MiB</p><p>114 GP</p></td>
-  <td><p>1280x</p><p>10.38 MiB</p><p>218 GP</p></td>
-  <td><p>1920x</p><p>10.38 MiB</p><p>376 GP</p></td>
-  <td><p>2560x</p><p>10.38 MiB</p><p>546 GP</p></td>
+  <td><p>1280x</p><p>12.5 MiB</p><p>218 GP</p></td>
+  <td><p>1920x</p><p>19.25 MiB</p><p>376 GP</p></td>
+  <td><p>2560x</p><p>25.0 MiB</p><p>546 GP</p></td>
 </tr></table>
 </body></html>
 "#,
@@ -889,6 +892,7 @@ async fn test_prepare_archive_download_1600x_uses_hathdl_cost_and_request_resolu
         .await
         .expect("should prepare H@H-priced resample archive request");
     assert_eq!(request.cost(), &eh_client::parser::DownloadCost::Gp(376));
+    assert_eq!(request.estimated_size_bytes(), Some(20_185_088));
 
     let temp_dir = tempfile::tempdir().unwrap();
     let dest = temp_dir.path().join("archive.zip");

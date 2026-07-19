@@ -183,9 +183,9 @@ download_original_threshold = 1
 # # Download rate limiting (default: 7 GB per 7 days / 168 hours)
 # download_rate_limit_gb = 7
 # download_rate_window_hours = 168
-# # Maximum EH gallery metadata size for logged-in archive downloads, in MiB.
-# # The check runs before the archive request that can spend EH archive points.
-# # Set to 0 to disable this per-gallery limit.
+# # Maximum selected EH archive estimate for logged-in archive downloads, in MiB.
+# # Parsed from the archiver page before the GP-spending archive POST.
+# # Set to 0 to disable this selected archive limit.
 # max_archive_size_mb = 300
 # # Maximum GP cost allowed for a single archive download (default: 0).
 # # 0 = only Free / Unlocked archives are downloaded; any gallery that would

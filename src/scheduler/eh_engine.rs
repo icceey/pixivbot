@@ -56,37 +56,30 @@ fn format_mib(bytes: u64) -> u64 {
     bytes.div_ceil(1024 * 1024)
 }
 
-/// Pre-archive size gate for logged-in EH archive downloads.
+/// Selected-archive size gate for logged-in EH archive downloads.
 ///
-/// Runs before `prepare_archive_download()` / `download_archive_with_request()` so an
-/// over-size gallery is rejected without spending EH archive points or hitting
-/// `archiver.php`. The gate is a no-op when `max_archive_size_bytes()` is `None`
-/// (i.e. `max_archive_size_mb = 0`), when metadata is missing, or when the reported
-/// `filesize` is `0`. Only a strict `filesize > limit` rejects; equal size is allowed.
-async fn ensure_eh_archive_under_size_limit(
-    client: &EhClient,
+/// Runs after `prepare_archive_download()` and before the GP reservation / archive
+/// POST. The gate is a no-op when `max_archive_size_bytes()` is `None` (i.e.
+/// `max_archive_size_mb = 0`), the archiver page has no trustworthy estimate, or
+/// that estimate is `0`. Only a strict estimate greater than the limit rejects;
+/// equal size is allowed.
+fn ensure_eh_archive_under_size_limit(
     config: &EhentaiConfig,
-    gid: u64,
-    token: &str,
+    estimated_size_bytes: Option<u64>,
 ) -> Result<()> {
     let Some(limit_bytes) = config.max_archive_size_bytes() else {
         return Ok(());
     };
-
-    let metadata = client
-        .get_metadata(&[(gid, token)])
-        .await
-        .context("Failed to fetch EH metadata for archive size check")?;
-    let Some(gallery) = metadata.first() else {
+    let Some(estimated_size_bytes) = estimated_size_bytes else {
         return Ok(());
     };
-    if gallery.filesize == 0 || gallery.filesize <= limit_bytes {
+    if estimated_size_bytes == 0 || estimated_size_bytes <= limit_bytes {
         return Ok(());
     }
 
     anyhow::bail!(
-        "EH gallery archive is too large: {} MiB exceeds configured {} MiB limit",
-        format_mib(gallery.filesize),
+        "selected EH archive size is too large: {} MiB exceeds configured {} MiB limit",
+        format_mib(estimated_size_bytes),
         format_mib(limit_bytes)
     );
 }
@@ -329,13 +322,15 @@ impl EhBackgroundDownloadWorker {
             } else {
                 &self.config.subscription_resolution
             };
-            ensure_eh_archive_under_size_limit(self.client.as_ref(), &self.config, gid, token)
-                .await?;
             let archive_request = self
                 .client
                 .prepare_archive_download(gid, token, resolution)
                 .await
                 .context("Failed to prepare archive download")?;
+            ensure_eh_archive_under_size_limit(
+                self.config.as_ref(),
+                archive_request.estimated_size_bytes(),
+            )?;
 
             // GP / quota reservation: same as main worker. Background downloads
             // must also reserve the shared ledger budget before archive POSTs.
@@ -1117,14 +1112,15 @@ impl EhDownloadWorker {
                 &self.config.subscription_resolution
             };
 
-            ensure_eh_archive_under_size_limit(self.client.as_ref(), &self.config, gid, token)
-                .await?;
-
             let archive_request = self
                 .client
                 .prepare_archive_download(gid, token, resolution)
                 .await
                 .context("Failed to prepare archive download")?;
+            ensure_eh_archive_under_size_limit(
+                self.config.as_ref(),
+                archive_request.estimated_size_bytes(),
+            )?;
 
             // Parse the archiver-page cost, then reserve any positive GP attempt
             // in the ledger before POSTing the archive request.
@@ -2209,6 +2205,61 @@ mod integration_tests {
             .await;
     }
 
+    async fn mock_eh_archiver_page_with_estimated_sizes(
+        server: &MockServer,
+        gid: u64,
+        token: &str,
+        original_size: &str,
+        resample_size: &str,
+    ) {
+        let gallery_html = format!(
+            r#"<html><body>
+            <a onclick="return popUp('/archiver.php?gid={gid}&amp;token={token}',480,320)">Archive Download</a>
+            </body></html>"#,
+            gid = gid,
+            token = token
+        );
+        Mock::given(method("GET"))
+            .and(path(format!("/g/{}/{}/", gid, token)))
+            .respond_with(ResponseTemplate::new(200).set_body_string(gallery_html))
+            .expect(1)
+            .mount(server)
+            .await;
+
+        let archiver_page_html = format!(
+            r#"<html><body>
+            <div style="width:180px; float:left">
+                <div>Download Cost: &nbsp; <strong>Free!</strong></div>
+                <form action="/archiver.php?gid={gid}&amp;token={token}" method="post">
+                    <input type="hidden" name="dltype" value="org" />
+                    <input type="submit" name="dlcheck" value="Download Original Archive" />
+                </form>
+                <p>Estimated Size: <strong>{original_size}</strong></p>
+            </div>
+            <div style="width:180px; float:right">
+                <div>Download Cost: &nbsp; <strong>Free!</strong></div>
+                <form action="/archiver.php?gid={gid}&amp;token={token}" method="post">
+                    <input type="hidden" name="dltype" value="res" />
+                    <input type="submit" name="dlcheck" value="Download Resample Archive" />
+                </form>
+                <p>Estimated Size: <strong>{resample_size}</strong></p>
+            </div>
+            </body></html>"#,
+            gid = gid,
+            token = token,
+            original_size = original_size,
+            resample_size = resample_size,
+        );
+        Mock::given(method("GET"))
+            .and(path("/archiver.php"))
+            .and(query_param("gid", gid.to_string()))
+            .and(query_param("token", token))
+            .respond_with(ResponseTemplate::new(200).set_body_string(archiver_page_html))
+            .expect(1)
+            .mount(server)
+            .await;
+    }
+
     async fn mock_eh_archiver_post(server: &MockServer, download_url: &str) {
         let html = format!(
             r#"<html><script>function gotonext() {{ document.location = "{}?autostart=1"; }}</script></html>"#,
@@ -2283,35 +2334,6 @@ mod integration_tests {
             .and(query_param("gid", gid.to_string()))
             .and(query_param("token", token))
             .respond_with(ResponseTemplate::new(200).set_body_string(archiver_page_html))
-            .mount(server)
-            .await;
-    }
-
-    /// Mock the `/api.php` metadata endpoint for a single gallery with the given
-    /// `filesize`. Mounted with `expect(1)` so a missing request fails the test.
-    async fn mock_eh_metadata(server: &MockServer, gid: u64, token: &str, filesize: u64) {
-        let body = serde_json::json!({
-            "gmetadata": [{
-                "gid": gid,
-                "token": token,
-                "title": "Size Test Gallery",
-                "title_jpn": "",
-                "category": "Doujinshi",
-                "thumb": "",
-                "uploader": "tester",
-                "posted": "1700000000",
-                "filecount": "2",
-                "filesize": filesize,
-                "expunged": false,
-                "rating": "4.5",
-                "torrentcount": "0",
-                "tags": []
-            }]
-        });
-        Mock::given(method("POST"))
-            .and(path("/api.php"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(body))
-            .expect(1)
             .mount(server)
             .await;
     }
@@ -3126,7 +3148,6 @@ mod integration_tests {
         .await;
 
         mock_eh_gallery_page(&eh_server, 123456, "abcdef0123").await;
-        mock_eh_metadata(&eh_server, 123456, "abcdef0123", 10 * 1024 * 1024).await;
         let download_url = format!("{}/archive/123456/token/0", eh_server.uri());
         mock_eh_archiver_post(&eh_server, &download_url).await;
 
@@ -3294,7 +3315,6 @@ mod integration_tests {
         .await;
 
         mock_eh_gallery_page(&eh_server, 123456, "abcdef0123").await;
-        mock_eh_metadata(&eh_server, 123456, "abcdef0123", 10 * 1024 * 1024).await;
         // archiver.php POST returns 500
         Mock::given(method("POST"))
             .and(path("/archiver.php"))
@@ -3366,7 +3386,6 @@ mod integration_tests {
         std::fs::write(&part_path, b"PK\x03\x04partial").unwrap();
 
         mock_eh_gallery_page(&eh_server, 123456, "abcdef0123").await;
-        mock_eh_metadata(&eh_server, 123456, "abcdef0123", 10 * 1024 * 1024).await;
         Mock::given(method("POST"))
             .and(path("/archiver.php"))
             .respond_with(ResponseTemplate::new(500))
@@ -3412,7 +3431,6 @@ mod integration_tests {
         .await;
 
         mock_eh_gallery_page(&eh_server, 123456, "abcdef0123").await;
-        mock_eh_metadata(&eh_server, 123456, "abcdef0123", 10 * 1024 * 1024).await;
         let download_url = format!("{}/archive/123456/token/0", eh_server.uri());
         mock_eh_archiver_post(&eh_server, &download_url).await;
 
@@ -3504,7 +3522,6 @@ mod integration_tests {
         .await;
 
         mock_eh_gallery_page(&eh_server, 123456, "abcdef0123").await;
-        mock_eh_metadata(&eh_server, 123456, "abcdef0123", 10 * 1024 * 1024).await;
         let download_url = format!("{}/archive/123456/token/0", eh_server.uri());
         mock_eh_archiver_post(&eh_server, &download_url).await;
 
@@ -3548,15 +3565,20 @@ mod integration_tests {
     }
 
     #[tokio::test]
-    async fn test_download_size_limit_blocks_before_archive_post() {
+    async fn test_download_size_limit_blocks_oversized_selected_archive_before_post() {
         let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
         setup_chat(&repo, -100, true).await;
         let eh_server = MockServer::start().await;
         let temp_dir = tempfile::tempdir().unwrap();
 
-        // Metadata reports a gallery larger than the configured 300 MiB limit.
-        // Token must be hex (matches archiver_url regex in eh_client::parser).
-        mock_eh_metadata(&eh_server, 900, "abcdef0123", 301 * 1024 * 1024).await;
+        mock_eh_archiver_page_with_estimated_sizes(
+            &eh_server,
+            900,
+            "abcdef0123",
+            "400.0 MiB",
+            "300.01 MiB",
+        )
+        .await;
         // Any POST to /archiver.php (the paid archive request) must never happen.
         Mock::given(method("POST"))
             .and(path("/archiver.php"))
@@ -3599,9 +3621,100 @@ mod integration_tests {
             model
                 .error
                 .as_ref()
-                .is_some_and(|e| e.contains("exceeds configured 300 MiB limit")),
+                .is_some_and(|e| e.contains("selected EH archive size is too large")),
             "error should mention the configured limit, got: {:?}",
             model.error
+        );
+        assert_eq!(
+            eh_server
+                .received_requests()
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(
+                    |request| request.method.as_str() == "POST" && request.url.path() == "/api.php"
+                )
+                .count(),
+            0,
+            "selected archive-size checks must not request gallery metadata"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_download_size_limit_allows_small_selected_resample_without_metadata() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        setup_chat(&repo, -100, true).await;
+        let eh_server = MockServer::start().await;
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        // The selected 1280x archive is small even though the original archive
+        // estimate is above the configured limit. No gallery metadata route is
+        // mounted: a metadata request is a regression.
+        mock_eh_archiver_page_with_estimated_sizes(
+            &eh_server,
+            903,
+            "abcdef0123",
+            "301.0 MiB",
+            "2.33 MiB",
+        )
+        .await;
+        let download_url = format!("{}/archive/903/token/0", eh_server.uri());
+        mock_eh_archiver_post(&eh_server, &download_url).await;
+        let zip_temp = tempfile::tempdir().unwrap();
+        let zip_path = zip_temp.path().join("small_resample.zip");
+        create_test_zip(&zip_path, 2);
+        mock_eh_archive_download(
+            &eh_server,
+            "/archive/903/token/0",
+            std::fs::read(zip_path).unwrap(),
+        )
+        .await;
+
+        let mut cfg = make_config();
+        cfg.max_archive_size_mb = 300;
+        cfg.background_download_enabled = false;
+        let entry = insert_queue_entry(
+            &repo,
+            -100,
+            903,
+            "abcdef0123",
+            "Title",
+            false,
+            STATUS_PENDING,
+            None,
+            None,
+        )
+        .await;
+        let worker = EhDownloadWorker::new(
+            Arc::clone(&repo),
+            make_eh_client(&eh_server),
+            Arc::new(cfg),
+            temp_dir.path().to_path_buf(),
+        );
+
+        worker.tick().await.unwrap();
+
+        let model = eh_download_queue::Entity::find_by_id(entry.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(model.status, STATUS_DOWNLOADED);
+        let requests = eh_server.received_requests().await.unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.method.as_str() == "POST"
+                    && request.url.path() == "/archiver.php")
+                .count(),
+            1,
+            "the prepared selected archive should be posted"
+        );
+        assert!(
+            !requests.iter().any(
+                |request| request.method.as_str() == "POST" && request.url.path() == "/api.php"
+            ),
+            "selected archive-size checks must not request gallery metadata"
         );
     }
 
@@ -3612,10 +3725,15 @@ mod integration_tests {
         let eh_server = MockServer::start().await;
         let temp_dir = tempfile::tempdir().unwrap();
 
-        // filesize == limit must be allowed (strict `>` rejects, `<=` allows).
-        // Token must be hex (matches archiver_url regex in eh_client::parser).
-        mock_eh_metadata(&eh_server, 901, "abcdef0123", 300 * 1024 * 1024).await;
-        mock_eh_gallery_page(&eh_server, 901, "abcdef0123").await;
+        // A selected archive equal to the limit must be allowed (strict `>` rejects).
+        mock_eh_archiver_page_with_estimated_sizes(
+            &eh_server,
+            901,
+            "abcdef0123",
+            "400.0 MiB",
+            "300.0 MiB",
+        )
+        .await;
         let download_url = format!("{}/archive/901/token/0", eh_server.uri());
         mock_eh_archiver_post(&eh_server, &download_url).await;
 
@@ -3659,30 +3777,22 @@ mod integration_tests {
         assert!(model.file_size > 0);
     }
 
-    #[tokio::test]
-    async fn test_shared_size_limit_guard_rejects_oversized_metadata() {
-        // `ensure_eh_archive_under_size_limit()` is the shared guard used by both
-        // `EhDownloadWorker::process` and `EhBackgroundDownloadWorker::process`
-        // before any archive request. This covers the background path's guard
-        // without needing a full background worker harness.
-        let eh_server = MockServer::start().await;
-        mock_eh_metadata(&eh_server, 902, "abcdef0123", 301 * 1024 * 1024).await;
+    #[test]
+    fn test_shared_size_limit_guard_uses_selected_archive_estimate() {
         let mut cfg = make_config();
         cfg.max_archive_size_mb = 300;
 
-        let err = ensure_eh_archive_under_size_limit(
-            make_eh_client(&eh_server).as_ref(),
-            &cfg,
-            902,
-            "abcdef0123",
-        )
-        .await
-        .unwrap_err();
+        let err =
+            ensure_eh_archive_under_size_limit(&cfg, Some(300 * 1024 * 1024 + 1)).unwrap_err();
 
         assert!(
-            err.to_string().contains("exceeds configured 300 MiB limit"),
+            err.to_string()
+                .contains("selected EH archive size is too large"),
             "error should mention the configured limit, got: {err}"
         );
+        assert!(ensure_eh_archive_under_size_limit(&cfg, Some(300 * 1024 * 1024)).is_ok());
+        assert!(ensure_eh_archive_under_size_limit(&cfg, Some(0)).is_ok());
+        assert!(ensure_eh_archive_under_size_limit(&cfg, None).is_ok());
     }
 
     // === Upload Worker Tests ===
@@ -4554,7 +4664,6 @@ mod integration_tests {
         // the parser picks the resample form -> DownloadCost::Gp(218).
         mock_eh_archiver_page_with_cost(&eh_server, 2284788, "7841d194d4", "8,800 GP", "218 GP")
             .await;
-        mock_eh_metadata(&eh_server, 2284788, "7841d194d4", 10 * 1024 * 1024).await;
 
         // The POST to archiver.php must NEVER happen - if it did, it would
         // spend GP. We mount a matcher with expect(0) so any POST fails the test.
@@ -4616,7 +4725,6 @@ mod integration_tests {
         // archiver page reports Free! for both forms. Default config uses
         // subscription_resolution = "1280x" (resample) -> DownloadCost::Free.
         mock_eh_archiver_page_with_cost(&eh_server, 4053260, "53ad37062b", "Free!", "Free!").await;
-        mock_eh_metadata(&eh_server, 4053260, "53ad37062b", 10 * 1024 * 1024).await;
 
         let download_url = format!("{}/archive/4053260/token/0", eh_server.uri());
         mock_eh_archiver_post(&eh_server, &download_url).await;
@@ -4673,7 +4781,6 @@ mod integration_tests {
         // resample costs 218 GP; we set max_archive_gp_cost = 500 so 218 is allowed.
         mock_eh_archiver_page_with_cost(&eh_server, 2284788, "7841d194d4", "8,800 GP", "218 GP")
             .await;
-        mock_eh_metadata(&eh_server, 2284788, "7841d194d4", 10 * 1024 * 1024).await;
 
         let download_url = format!("{}/archive/2284788/token/0", eh_server.uri());
         mock_eh_archiver_post(&eh_server, &download_url).await;
@@ -4728,7 +4835,6 @@ mod integration_tests {
         .await;
         mock_eh_archiver_page_with_cost(&eh_server, 2284788, "7841d194d4", "8,800 GP", "218 GP")
             .await;
-        mock_eh_metadata(&eh_server, 2284788, "7841d194d4", 10 * 1024 * 1024).await;
         Mock::given(method("POST"))
             .and(path("/archiver.php"))
             .respond_with(ResponseTemplate::new(200).set_body_string("<html>no redirect</html>"))
@@ -4791,7 +4897,6 @@ mod integration_tests {
         .await;
         mock_eh_archiver_page_with_cost(&eh_server, 2284788, "7841d194d4", "8,800 GP", "218 GP")
             .await;
-        mock_eh_metadata(&eh_server, 2284788, "7841d194d4", 10 * 1024 * 1024).await;
         repo.db()
             .execute(Statement::from_string(
                 DbBackend::Sqlite,
@@ -4871,7 +4976,6 @@ mod integration_tests {
         // spent, the new download would push total to 1218 > 1000, so it must defer.
         mock_eh_archiver_page_with_cost(&eh_server, 2284788, "7841d194d4", "8,800 GP", "218 GP")
             .await;
-        mock_eh_metadata(&eh_server, 2284788, "7841d194d4", 10 * 1024 * 1024).await;
 
         Mock::given(method("POST"))
             .and(path("/archiver.php"))
@@ -5240,7 +5344,6 @@ mod integration_tests {
 
         mock_eh_archiver_page_with_cost(&eh_server, 2284788, "7841d194d4", "8,800 GP", "218 GP")
             .await;
-        mock_eh_metadata(&eh_server, 2284788, "7841d194d4", 10 * 1024 * 1024).await;
 
         // POST to archiver.php must never happen.
         Mock::given(method("POST"))
@@ -5291,6 +5394,81 @@ mod integration_tests {
     }
 
     #[tokio::test]
+    async fn test_background_worker_selected_size_limit_runs_after_prepare_without_metadata() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        let eh_server = MockServer::start().await;
+        let temp = tempfile::tempdir().unwrap();
+        let entry = insert_queue_entry(
+            &repo,
+            -100,
+            2284789,
+            "7841d194d4",
+            "Oversized background archive",
+            false,
+            STATUS_PENDING,
+            None,
+            None,
+        )
+        .await;
+        repo.schedule_eh_background_download_from(entry.id, STATUS_PENDING, "test setup")
+            .await
+            .unwrap();
+        mock_eh_archiver_page_with_estimated_sizes(
+            &eh_server,
+            2284789,
+            "7841d194d4",
+            "400.0 MiB",
+            "300.01 MiB",
+        )
+        .await;
+        Mock::given(method("POST"))
+            .and(path("/archiver.php"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("should not be called"))
+            .expect(0)
+            .mount(&eh_server)
+            .await;
+
+        let mut config = make_config();
+        config.background_download_enabled = true;
+        config.background_download_concurrency = 1;
+        config.max_archive_size_mb = 300;
+        let worker = EhBackgroundDownloadWorker::new(
+            Arc::clone(&repo),
+            make_eh_client(&eh_server),
+            Arc::new(config),
+            temp.path().to_path_buf(),
+        );
+
+        worker.tick().await.unwrap();
+
+        let updated = eh_download_queue::Entity::find_by_id(entry.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.status, STATUS_PENDING);
+        assert_eq!(
+            updated.background_download_status.as_deref(),
+            Some(BACKGROUND_STATUS_PENDING)
+        );
+        assert_eq!(updated.background_download_attempt_count, 1);
+
+        let requests = eh_server.received_requests().await.unwrap();
+        assert!(requests.iter().any(|request| {
+            request.method.as_str() == "GET" && request.url.path() == "/g/2284789/7841d194d4/"
+        }));
+        assert!(requests.iter().any(|request| {
+            request.method.as_str() == "GET" && request.url.path() == "/archiver.php"
+        }));
+        assert!(
+            !requests.iter().any(
+                |request| request.method.as_str() == "POST" && request.url.path() == "/api.php"
+            ),
+            "background selected archive-size checks must not request gallery metadata"
+        );
+    }
+
+    #[tokio::test]
     async fn test_background_worker_gp_attempt_survives_malformed_archive_redirect() {
         let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
         let eh_server = MockServer::start().await;
@@ -5312,7 +5490,6 @@ mod integration_tests {
             .unwrap();
         mock_eh_archiver_page_with_cost(&eh_server, 2284788, "7841d194d4", "8,800 GP", "218 GP")
             .await;
-        mock_eh_metadata(&eh_server, 2284788, "7841d194d4", 10 * 1024 * 1024).await;
         Mock::given(method("POST"))
             .and(path("/archiver.php"))
             .respond_with(ResponseTemplate::new(200).set_body_string("<html>no redirect</html>"))
@@ -5638,7 +5815,6 @@ mod integration_tests {
             .respond_with(ResponseTemplate::new(200).set_body_string(archiver_page_html))
             .mount(&eh_server)
             .await;
-        mock_eh_metadata(&eh_server, 123456, "abcdef0123", 10 * 1024 * 1024).await;
 
         // POST must never happen.
         Mock::given(method("POST"))
@@ -5695,7 +5871,6 @@ mod integration_tests {
 
         mock_eh_archiver_page_with_cost(&eh_server, 2284788, "7841d194d4", "8,800 GP", "218 GP")
             .await;
-        mock_eh_metadata(&eh_server, 2284788, "7841d194d4", 10 * 1024 * 1024).await;
 
         Mock::given(method("POST"))
             .and(path("/archiver.php"))
