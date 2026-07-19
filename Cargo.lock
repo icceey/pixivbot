@@ -1060,6 +1060,7 @@ version = "0.3.0"
 dependencies = [
  "async-trait",
  "chrono",
+ "flate2",
  "futures-util",
  "quick-xml",
  "regex",
