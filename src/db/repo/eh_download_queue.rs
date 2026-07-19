@@ -684,20 +684,12 @@ impl Repo {
     }
 
     /// Get total GP spent on archive downloads in the last `hours` window.
-    /// Uses the same `completed_at` semantics as `get_eh_downloaded_bytes_in_window`
+    /// Uses `completed_at` as the spend-window fact regardless of queue status,
     /// so free / unlocked downloads (gp_cost = 0) do not inflate the sum.
     pub async fn get_eh_gp_cost_in_window(&self, hours: u64) -> Result<i64> {
         let cutoff = Local::now().naive_local() - chrono::Duration::hours(hours as i64);
 
         let result = eh_download_queue::Entity::find()
-            .filter(eh_download_queue::Column::Status.is_in([
-                STATUS_DOWNLOADED,
-                STATUS_UPLOADING,
-                STATUS_UPLOADED,
-                STATUS_PUBLISHING,
-                STATUS_DONE,
-                STATUS_FAILED,
-            ]))
             .filter(eh_download_queue::Column::CompletedAt.gte(cutoff))
             .all(&self.db)
             .await

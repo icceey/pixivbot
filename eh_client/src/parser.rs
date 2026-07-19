@@ -8,6 +8,14 @@ pub struct ArchiverForm {
     pub fields: Vec<(String, String)>,
 }
 
+fn resolution_dltype(resolution: &str) -> &'static str {
+    if resolution.is_empty() || resolution == "original" {
+        "org"
+    } else {
+        "res"
+    }
+}
+
 fn search_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
@@ -131,8 +139,10 @@ pub fn parse_archiver_key(html: &str) -> Option<String> {
     Some(format!("{}--{}", numeric, hex))
 }
 
-/// Extract the archiver download form from an archiver.php page.
-pub fn parse_archiver_form(html: &str) -> Option<ArchiverForm> {
+/// Extract the archiver download form matching the requested resolution.
+pub fn parse_archiver_form(html: &str, resolution: &str) -> Option<ArchiverForm> {
+    let target_dltype = resolution_dltype(resolution);
+
     for cap in archiver_form_re().captures_iter(html) {
         let attrs = cap.get(1)?.as_str();
         let body = cap.get(2)?.as_str();
@@ -156,7 +166,7 @@ pub fn parse_archiver_form(html: &str) -> Option<ArchiverForm> {
 
         if fields
             .iter()
-            .any(|(name, _)| matches!(name.as_str(), "dlcheck" | "dltype" | "hathdl_xres"))
+            .any(|(name, value)| name == "dltype" && value == target_dltype)
         {
             return Some(ArchiverForm { action, fields });
         }
@@ -288,11 +298,11 @@ fn parse_cost_text(text: &str) -> DownloadCost {
 /// conservatively reject in that case to avoid accidental GP charges when EH
 /// changes the page structure.
 pub fn parse_archive_download_cost(html: &str, resolution: &str) -> DownloadCost {
-    let want_original = resolution == "original" || resolution.is_empty();
+    let target_dltype = resolution_dltype(resolution);
 
     // 1. Resample-unlocked marker: if the user has unlocked a resample download
     //    and we are requesting a resample, the POST is free.
-    if !want_original && unlocked_resample_re().is_match(html) {
+    if target_dltype == "res" && unlocked_resample_re().is_match(html) {
         return DownloadCost::Unlocked;
     }
 
@@ -304,8 +314,7 @@ pub fn parse_archive_download_cost(html: &str, resolution: &str) -> DownloadCost
 
     // Pair each cost with the next dltype form that follows it. The page layout
     // is: cost-div -> form(with dltype) -> size-p -> next-cost-div -> form(with dltype).
-    // We pick the pair whose dltype matches `want_original`.
-    let target_dltype = if want_original { "org" } else { "res" };
+    // We pick the pair whose dltype matches the requested resolution.
 
     for cost_cap in &cost_caps {
         let cost_end = cost_cap.get(0).unwrap().end();
@@ -487,28 +496,68 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_archiver_form() {
+    fn test_parse_archiver_form_selects_requested_dltype() {
         let html = r#"
-        <form id="hathdl_form" method="post" action="https://exhentai.org/archiver.php?gid=4034806&amp;token=abc123def0">
-          <input type="hidden" name="dltype" value="org" />
-          <input type="submit" name="dlcheck" value="Download Original Archive" />
+        <form id="original" method="post" action="https://exhentai.org/archiver.php?gid=4034806&amp;token=org123def0">
+           <input type="hidden" name="dltype" value="org" />
+           <input type="hidden" name="org_sentinel" value="original-only" />
+           <input type="submit" name="dlcheck" value="Download Original Archive" />
+        </form>
+        <form id="resample" method="post" action="https://exhentai.org/archiver.php?gid=4034806&amp;token=res123def0">
+           <input type="hidden" name="dltype" value="res" />
+           <input type="hidden" name="res_sentinel" value="resample-only" />
+           <input type="submit" name="dlcheck" value="Download Resample Archive" />
         </form>
         "#;
-        let form = parse_archiver_form(html).expect("should parse archiver form");
+
+        let form = parse_archiver_form(html, "original").expect("should parse original form");
         assert_eq!(
             form.action,
-            "https://exhentai.org/archiver.php?gid=4034806&token=abc123def0"
+            "https://exhentai.org/archiver.php?gid=4034806&token=org123def0"
         );
         assert_eq!(
             form.fields,
             vec![
                 ("dltype".to_string(), "org".to_string()),
+                ("org_sentinel".to_string(), "original-only".to_string()),
                 (
                     "dlcheck".to_string(),
                     "Download Original Archive".to_string()
                 ),
             ]
         );
+
+        let form =
+            parse_archiver_form(html, "").expect("should parse original form for empty resolution");
+        assert_eq!(
+            form.action,
+            "https://exhentai.org/archiver.php?gid=4034806&token=org123def0"
+        );
+        assert!(form
+            .fields
+            .contains(&("org_sentinel".to_string(), "original-only".to_string())));
+
+        let form = parse_archiver_form(html, "1280x").expect("should parse resample form");
+        assert_eq!(
+            form.action,
+            "https://exhentai.org/archiver.php?gid=4034806&token=res123def0"
+        );
+        assert!(form
+            .fields
+            .contains(&("res_sentinel".to_string(), "resample-only".to_string())));
+        assert!(!form.fields.iter().any(|(name, _)| name == "org_sentinel"));
+    }
+
+    #[test]
+    fn test_parse_archiver_form_missing_requested_dltype_returns_none() {
+        let html = r#"
+        <form method="post" action="https://exhentai.org/archiver.php?gid=4034806&amp;token=org123def0">
+           <input type="hidden" name="dltype" value="org" />
+           <input type="hidden" name="org_sentinel" value="original-only" />
+        </form>
+        "#;
+
+        assert!(parse_archiver_form(html, "1280x").is_none());
     }
 
     #[test]

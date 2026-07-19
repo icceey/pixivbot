@@ -425,7 +425,7 @@ impl EhClient {
             return Ok(request);
         }
 
-        let form = parser::parse_archiver_form(&archiver_html).ok_or_else(|| {
+        let form = parser::parse_archiver_form(&archiver_html, resolution).ok_or_else(|| {
             Error::Parse("archiver download form not found in archiver.php response".into())
         })?;
         Ok(ArchiveDownloadRequest::from_archiver_form(

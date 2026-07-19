@@ -49,6 +49,15 @@ impl wiremock::Match for BodyContains {
 }
 
 #[derive(Debug)]
+struct BodyNotContains(&'static str);
+
+impl wiremock::Match for BodyNotContains {
+    fn matches(&self, request: &wiremock::Request) -> bool {
+        !String::from_utf8_lossy(&request.body).contains(self.0)
+    }
+}
+
+#[derive(Debug)]
 struct HeaderAbsent(&'static str);
 
 impl wiremock::Match for HeaderAbsent {
@@ -706,6 +715,92 @@ async fn test_download_archive_returns_plain_error_when_no_progress() {
         "should contain Content-Range error message, got: {}",
         err
     );
+}
+
+#[tokio::test]
+async fn test_prepare_archive_download_1280x_uses_resample_form_and_cost() {
+    let server = MockServer::start().await;
+    let gallery_page_html = r#"
+<html><body>
+<a onclick="return popUp('/archiver.php?gid=4034806&amp;token=fedcba9876',480,320)">Archive Download</a>
+</body></html>
+"#;
+    let archiver_form_html = format!(
+        r#"
+<html><body>
+<div>Download Cost: &nbsp; <strong>8,800 GP</strong></div>
+<form method="post" action="{}/org-archiver.php?form=org">
+  <input type="hidden" name="dltype" value="org" />
+  <input type="hidden" name="hathdl_xres" value="org" />
+  <input type="hidden" name="org_sentinel" value="org-only" />
+  <input type="submit" name="dlcheck" value="Download Original Archive" />
+</form>
+<div>Download Cost: &nbsp; <strong>218 GP</strong></div>
+<form method="post" action="{}/res-archiver.php?form=res">
+  <input type="hidden" name="dltype" value="res" />
+  <input type="hidden" name="hathdl_xres" value="res" />
+  <input type="hidden" name="res_sentinel" value="res-only" />
+  <input type="submit" name="dlcheck" value="Download Resample Archive" />
+</form>
+</body></html>
+"#,
+        server.uri(),
+        server.uri()
+    );
+    let redirect_html = format!(
+        r#"<script>document.location = "{}/archive/4034806/fedcba9876/archive/0?autostart=1";</script>"#,
+        server.uri()
+    );
+    let zip_bytes = test_zip_bytes("image.jpg", b"resample_form_zip");
+
+    Mock::given(method("GET"))
+        .and(path("/g/4034806/e13b7d119b/"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(gallery_page_html))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/archiver.php"))
+        .and(query_param("gid", "4034806"))
+        .and(query_param("token", "fedcba9876"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(archiver_form_html))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/res-archiver.php"))
+        .and(query_param("form", "res"))
+        .and(BodyContains("dltype=res"))
+        .and(BodyContains("res_sentinel=res-only"))
+        .and(BodyContains("hathdl_xres=1280"))
+        .and(BodyNotContains("org_sentinel"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(redirect_html))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/archive/4034806/fedcba9876/archive/0"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(zip_bytes.clone()))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = client_at(&server);
+    let request = client
+        .prepare_archive_download(4034806, "e13b7d119b", "1280x")
+        .await
+        .expect("should prepare resample form-driven archive request");
+    assert_eq!(request.cost(), &eh_client::parser::DownloadCost::Gp(218));
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let dest = temp_dir.path().join("archive.zip");
+    let bytes = client
+        .download_archive_with_request(&request, &dest)
+        .await
+        .expect("resample form-driven download should succeed");
+
+    assert_eq!(bytes as usize, zip_bytes.len());
+    assert_eq!(std::fs::read(dest).unwrap(), zip_bytes);
 }
 
 #[tokio::test]
