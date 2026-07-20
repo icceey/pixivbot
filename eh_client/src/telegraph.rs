@@ -801,6 +801,387 @@ pub struct IpfS3Uploader {
     http: reqwest::Client,
 }
 
+const ZIP_CENTRAL_HEADER_SIGNATURE: [u8; 4] = [0x50, 0x4b, 0x01, 0x02];
+const ZIP_CENTRAL_FIXED_HEADER_LEN: usize = 46;
+const ZIP_CENTRAL_FLAGS_OFFSET: usize = 8;
+const ZIP_CENTRAL_METHOD_OFFSET: usize = 10;
+#[cfg(test)]
+const ZIP_CENTRAL_CRC32_OFFSET: usize = 16;
+const ZIP_CENTRAL_NAME_LEN_OFFSET: usize = 28;
+const ZIP_CENTRAL_EXTRA_LEN_OFFSET: usize = 30;
+const ZIP_CENTRAL_COMMENT_LEN_OFFSET: usize = 32;
+const ZIP_LOCAL_HEADER_SIGNATURE: [u8; 4] = [0x50, 0x4b, 0x03, 0x04];
+const ZIP_LOCAL_FIXED_HEADER_LEN: usize = 30;
+const ZIP_LOCAL_FLAGS_OFFSET: usize = 6;
+const ZIP_LOCAL_METHOD_OFFSET: usize = 8;
+const ZIP_LOCAL_CRC32_OFFSET: usize = 14;
+const ZIP_LOCAL_COMPRESSED_SIZE_OFFSET: usize = 18;
+const ZIP_LOCAL_UNCOMPRESSED_SIZE_OFFSET: usize = 22;
+const ZIP_LOCAL_NAME_LEN_OFFSET: usize = 26;
+const ZIP_LOCAL_EXTRA_LEN_OFFSET: usize = 28;
+const ZIP_DATA_DESCRIPTOR_SIGNATURE: [u8; 4] = [0x50, 0x4b, 0x07, 0x08];
+const ZIP_FLAG_ENCRYPTED: u16 = 1;
+const ZIP_FLAG_DATA_DESCRIPTOR: u16 = 1 << 3;
+const ZIP_FLAG_UTF8: u16 = 1 << 11;
+const ZIP_STREAM_RELEVANT_FLAGS: u16 =
+    ZIP_FLAG_ENCRYPTED | ZIP_FLAG_DATA_DESCRIPTOR | ZIP_FLAG_UTF8;
+
+struct IpfS3ZipCentralDirectoryEntry {
+    flags: u16,
+    method: u16,
+    raw_name: Vec<u8>,
+    header_start: u64,
+}
+
+struct IpfS3ZipArchiveEntry {
+    central: IpfS3ZipCentralDirectoryEntry,
+    crc32: u32,
+    compressed_size: u64,
+    uncompressed_size: u64,
+}
+
+struct IpfS3ZipLocalHeader<'a> {
+    flags: u16,
+    method: u16,
+    crc32: u32,
+    compressed_size: u32,
+    uncompressed_size: u32,
+    raw_name: &'a [u8],
+    extra: &'a [u8],
+    data_start: usize,
+}
+
+fn ipfs3_zip_u16_at(bytes: &[u8], offset: usize) -> Option<u16> {
+    let end = offset.checked_add(2)?;
+    let value: [u8; 2] = bytes.get(offset..end)?.try_into().ok()?;
+    Some(u16::from_le_bytes(value))
+}
+
+fn ipfs3_zip_u32_at(bytes: &[u8], offset: usize) -> Option<u32> {
+    let end = offset.checked_add(4)?;
+    let value: [u8; 4] = bytes.get(offset..end)?.try_into().ok()?;
+    Some(u32::from_le_bytes(value))
+}
+
+fn ipfs3_zip_path_is_safe(value: &str, allow_empty: bool) -> bool {
+    if value.is_empty() {
+        return allow_empty;
+    }
+    let bytes = value.as_bytes();
+    let has_windows_drive = bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
+    if value.contains('\\') || value.starts_with('/') || has_windows_drive {
+        return false;
+    }
+    if value
+        .split('/')
+        .any(|segment| segment == "." || segment == "..")
+    {
+        return false;
+    }
+    !value.trim_matches('/').is_empty()
+}
+
+fn ipfs3_zip_central_directory_entries(
+    archive_bytes: &[u8],
+    central_directory_start: u64,
+    archive_len: usize,
+) -> Option<Vec<IpfS3ZipCentralDirectoryEntry>> {
+    let Ok(mut offset) = usize::try_from(central_directory_start) else {
+        return None;
+    };
+    let mut entries = Vec::new();
+    let mut raw_names = std::collections::HashSet::new();
+
+    loop {
+        let signature_end = offset.checked_add(ZIP_CENTRAL_HEADER_SIGNATURE.len())?;
+        let signature = archive_bytes.get(offset..signature_end)?;
+        if signature != ZIP_CENTRAL_HEADER_SIGNATURE {
+            break;
+        }
+        let fixed_end = offset.checked_add(ZIP_CENTRAL_FIXED_HEADER_LEN)?;
+        let header = archive_bytes.get(offset..fixed_end)?;
+
+        let name_len = ipfs3_zip_u16_at(header, ZIP_CENTRAL_NAME_LEN_OFFSET)?;
+        let extra_len = ipfs3_zip_u16_at(header, ZIP_CENTRAL_EXTRA_LEN_OFFSET)?;
+        let comment_len = ipfs3_zip_u16_at(header, ZIP_CENTRAL_COMMENT_LEN_OFFSET)?;
+        let name_len = usize::from(name_len);
+        let name_end = fixed_end.checked_add(name_len)?;
+        let variable_len = name_len
+            .checked_add(usize::from(extra_len))
+            .and_then(|len| len.checked_add(usize::from(comment_len)))?;
+        let record_end = fixed_end.checked_add(variable_len)?;
+        archive_bytes.get(offset..record_end)?;
+        let raw_name = archive_bytes.get(fixed_end..name_end)?;
+        let raw_name = raw_name.to_vec();
+        if !raw_names.insert(raw_name.clone()) {
+            return None;
+        }
+        entries.push(IpfS3ZipCentralDirectoryEntry {
+            flags: ipfs3_zip_u16_at(header, ZIP_CENTRAL_FLAGS_OFFSET)?,
+            method: ipfs3_zip_u16_at(header, ZIP_CENTRAL_METHOD_OFFSET)?,
+            raw_name,
+            header_start: u64::from(ipfs3_zip_u32_at(header, 42)?),
+        });
+        offset = record_end;
+    }
+
+    (entries.len() == archive_len).then_some(entries)
+}
+
+#[cfg(test)]
+fn ipfs3_zip_central_directory_is_complete_and_unique(
+    archive_bytes: &[u8],
+    central_directory_start: u64,
+    archive_len: usize,
+) -> bool {
+    ipfs3_zip_central_directory_entries(archive_bytes, central_directory_start, archive_len)
+        .is_some()
+}
+
+fn ipfs3_zip_local_header(bytes: &[u8], header_start: u64) -> Option<IpfS3ZipLocalHeader<'_>> {
+    let start = usize::try_from(header_start).ok()?;
+    let fixed_end = start.checked_add(ZIP_LOCAL_FIXED_HEADER_LEN)?;
+    let header = bytes.get(start..fixed_end)?;
+    if header[..ZIP_LOCAL_HEADER_SIGNATURE.len()] != ZIP_LOCAL_HEADER_SIGNATURE {
+        return None;
+    }
+    let flags = ipfs3_zip_u16_at(header, ZIP_LOCAL_FLAGS_OFFSET)?;
+    let method = ipfs3_zip_u16_at(header, ZIP_LOCAL_METHOD_OFFSET)?;
+    let crc32 = ipfs3_zip_u32_at(header, ZIP_LOCAL_CRC32_OFFSET)?;
+    let compressed_size = ipfs3_zip_u32_at(header, ZIP_LOCAL_COMPRESSED_SIZE_OFFSET)?;
+    let uncompressed_size = ipfs3_zip_u32_at(header, ZIP_LOCAL_UNCOMPRESSED_SIZE_OFFSET)?;
+    let name_len = usize::from(ipfs3_zip_u16_at(header, ZIP_LOCAL_NAME_LEN_OFFSET)?);
+    let extra_len = usize::from(ipfs3_zip_u16_at(header, ZIP_LOCAL_EXTRA_LEN_OFFSET)?);
+    let name_end = fixed_end.checked_add(name_len)?;
+    let data_start = name_end.checked_add(extra_len)?;
+    Some(IpfS3ZipLocalHeader {
+        flags,
+        method,
+        crc32,
+        compressed_size,
+        uncompressed_size,
+        raw_name: bytes.get(fixed_end..name_end)?,
+        extra: bytes.get(name_end..data_start)?,
+        data_start,
+    })
+}
+
+fn ipfs3_zip_data_descriptor_record_end(
+    bytes: &[u8],
+    descriptor_start: usize,
+    entry: &IpfS3ZipArchiveEntry,
+) -> Option<usize> {
+    let signature_end = descriptor_start.checked_add(ZIP_DATA_DESCRIPTOR_SIGNATURE.len())?;
+    let payload_start = match bytes.get(descriptor_start..signature_end) {
+        Some(signature) if signature == ZIP_DATA_DESCRIPTOR_SIGNATURE => signature_end,
+        _ => descriptor_start,
+    };
+    let payload_end = payload_start.checked_add(12)?;
+    let payload = bytes.get(payload_start..payload_end)?;
+    if ipfs3_zip_u32_at(payload, 0)? != entry.crc32
+        || u64::from(ipfs3_zip_u32_at(payload, 4)?) != entry.compressed_size
+        || u64::from(ipfs3_zip_u32_at(payload, 8)?) != entry.uncompressed_size
+    {
+        return None;
+    }
+    Some(payload_end)
+}
+
+fn ipfs3_zip_deflate_stream_is_compatible(compressed_data: &[u8]) -> bool {
+    use flate2::{Decompress, FlushDecompress, Status};
+
+    let Ok(expected_total_in) = u64::try_from(compressed_data.len()) else {
+        return false;
+    };
+    let mut decompressor = Decompress::new(false);
+    let mut output = [0; 8 * 1024];
+
+    loop {
+        let total_in_before = decompressor.total_in();
+        let total_out_before = decompressor.total_out();
+        let Ok(input_start) = usize::try_from(total_in_before) else {
+            return false;
+        };
+        let Some(input) = compressed_data.get(input_start..) else {
+            return false;
+        };
+        let Ok(status) = decompressor.decompress(input, &mut output, FlushDecompress::None) else {
+            return false;
+        };
+
+        if status == Status::StreamEnd {
+            return decompressor.total_in() == expected_total_in;
+        }
+        if decompressor.total_in() == total_in_before
+            && decompressor.total_out() == total_out_before
+        {
+            return false;
+        }
+    }
+}
+
+fn ipfs3_zip_local_extra_is_compatible(extra: &[u8]) -> bool {
+    let mut offset = 0usize;
+    while offset < extra.len() {
+        let Some(header_end) = offset.checked_add(4) else {
+            return false;
+        };
+        let Some(header) = extra.get(offset..header_end) else {
+            return false;
+        };
+        let Some(field_id) = ipfs3_zip_u16_at(header, 0) else {
+            return false;
+        };
+        let Some(field_len) = ipfs3_zip_u16_at(header, 2) else {
+            return false;
+        };
+        let Some(field_end) = header_end.checked_add(usize::from(field_len)) else {
+            return false;
+        };
+        let Some(field_data) = extra.get(header_end..field_end) else {
+            return false;
+        };
+        if field_id == 0x7075
+            || (field_id == 0x6375
+                && (field_data.is_empty() || (field_data[0] == 1 && field_data.len() < 5)))
+        {
+            return false;
+        }
+        offset = field_end;
+    }
+    true
+}
+
+fn ipfs3_zip_archive_is_compatible(
+    archive_bytes: &[u8],
+    requested_entry_names: &[String],
+    extraction_prefix: &str,
+) -> bool {
+    let mut requested = std::collections::HashSet::new();
+    if requested_entry_names
+        .iter()
+        .any(|name| !requested.insert(name.as_str()))
+    {
+        return false;
+    }
+    if !ipfs3_zip_path_is_safe(extraction_prefix, true) {
+        return false;
+    }
+
+    let cursor = std::io::Cursor::new(archive_bytes);
+    let Ok(mut archive) = zip::ZipArchive::new(cursor) else {
+        return false;
+    };
+    let Some(central_entries) = ipfs3_zip_central_directory_entries(
+        archive_bytes,
+        archive.central_directory_start(),
+        archive.len(),
+    ) else {
+        return false;
+    };
+    let mut entries = Vec::with_capacity(archive.len());
+    for (index, central) in central_entries.into_iter().enumerate() {
+        let Ok(file) = archive.by_index_raw(index) else {
+            return false;
+        };
+        if file.name_raw() != central.raw_name {
+            return false;
+        }
+        entries.push(IpfS3ZipArchiveEntry {
+            central,
+            crc32: file.crc32(),
+            compressed_size: file.compressed_size(),
+            uncompressed_size: file.size(),
+        });
+    }
+    entries.sort_unstable_by_key(|entry| entry.central.header_start);
+
+    let Ok(central_directory_start) = usize::try_from(archive.central_directory_start()) else {
+        return false;
+    };
+    if entries
+        .first()
+        .is_none_or(|entry| entry.central.header_start != 0)
+    {
+        return false;
+    }
+    for (index, entry) in entries.iter().enumerate() {
+        let Ok(raw_name) = std::str::from_utf8(&entry.central.raw_name) else {
+            return false;
+        };
+        if !ipfs3_zip_path_is_safe(raw_name, false) || entry.central.flags & ZIP_FLAG_ENCRYPTED != 0
+        {
+            return false;
+        }
+
+        if entry.central.method != 0 && entry.central.method != 8 {
+            return false;
+        }
+        let Some(local) = ipfs3_zip_local_header(archive_bytes, entry.central.header_start) else {
+            return false;
+        };
+        let Ok(local_name) = std::str::from_utf8(local.raw_name) else {
+            return false;
+        };
+        let non_ascii_local_name = local.raw_name.iter().any(|byte| !byte.is_ascii());
+        let local_uses_descriptor = local.flags & ZIP_FLAG_DATA_DESCRIPTOR != 0;
+        if !ipfs3_zip_path_is_safe(local_name, false)
+            || local.raw_name != entry.central.raw_name
+            || local.flags & ZIP_FLAG_ENCRYPTED != 0
+            || local.flags & ZIP_STREAM_RELEVANT_FLAGS
+                != entry.central.flags & ZIP_STREAM_RELEVANT_FLAGS
+            || local.method != entry.central.method
+            || !ipfs3_zip_local_extra_is_compatible(local.extra)
+            || (non_ascii_local_name && local.flags & ZIP_FLAG_UTF8 == 0)
+            || (local_uses_descriptor && local.method != 8)
+        {
+            return false;
+        }
+
+        let Ok(compressed_size) = usize::try_from(entry.compressed_size) else {
+            return false;
+        };
+        let Some(data_end) = local.data_start.checked_add(compressed_size) else {
+            return false;
+        };
+        if entry.central.method == 8 {
+            let Some(compressed_data) = archive_bytes.get(local.data_start..data_end) else {
+                return false;
+            };
+            if !ipfs3_zip_deflate_stream_is_compatible(compressed_data) {
+                return false;
+            }
+        }
+        let local_record_end = if local_uses_descriptor {
+            let Some(record_end) =
+                ipfs3_zip_data_descriptor_record_end(archive_bytes, data_end, entry)
+            else {
+                return false;
+            };
+            record_end
+        } else {
+            if local.crc32 != entry.crc32
+                || u64::from(local.compressed_size) != entry.compressed_size
+                || u64::from(local.uncompressed_size) != entry.uncompressed_size
+            {
+                return false;
+            }
+            data_end
+        };
+        let expected_next_start = match entries.get(index + 1) {
+            Some(next) => match usize::try_from(next.central.header_start) {
+                Ok(start) => start,
+                Err(_) => return false,
+            },
+            None => central_directory_start,
+        };
+        if local_record_end != expected_next_start {
+            return false;
+        }
+    }
+    true
+}
+
 impl IpfS3Uploader {
     pub fn from_config(config: &IpfS3UploaderConfig) -> Result<Self> {
         let config = config.required()?;
@@ -943,6 +1324,10 @@ impl IpfS3Uploader {
             Error::Other(format!("ipfS3 ZIP object key {key} does not end in .zip"))
         })?;
         let extraction_prefix = format!("{archive_stem}/");
+        if !ipfs3_zip_archive_is_compatible(archive.bytes, archive.entry_names, &extraction_prefix)
+        {
+            return Ok(None);
+        }
         let mut upload_bucket = self.bucket.clone();
         upload_bucket.add_query("decompress-zip", &extraction_prefix);
 
@@ -977,7 +1362,11 @@ impl IpfS3Uploader {
                 "ipfS3 ZIP put_object for key {key} returned {error}"
             ))
         })?;
-        let cids = ipfs3_zip_entry_cids(&extraction_prefix, archive.entry_names, extract_result)?;
+        let Some(cids) =
+            ipfs3_zip_entry_cids(&extraction_prefix, archive.entry_names, extract_result)?
+        else {
+            return Ok(None);
+        };
         let pairs = cids
             .into_iter()
             .map(|cid| {
@@ -1066,9 +1455,9 @@ struct IpfS3ZipExtractFailure {
     #[serde(rename = "EntryName")]
     entry_name: String,
     #[serde(rename = "Code")]
-    code: String,
+    _code: String,
     #[serde(rename = "Message")]
-    message: String,
+    _message: String,
 }
 
 fn validate_ipfs3_zip_extract_result_xml(body: &[u8]) -> Result<()> {
@@ -1170,7 +1559,7 @@ fn ipfs3_zip_entry_cids(
     extraction_prefix: &str,
     entry_names: &[String],
     result: IpfS3ZipExtractResult,
-) -> Result<Vec<String>> {
+) -> Result<Option<Vec<String>>> {
     if result.extracted_count != result.entries.entries.len() {
         return Err(Error::Other(format!(
             "ipfS3 ZIP extraction ExtractedCount {} does not match {} entries",
@@ -1185,43 +1574,54 @@ fn ipfs3_zip_entry_cids(
             result.failures.failures.len()
         )));
     }
-    if let Some(failure) = result.failures.failures.first() {
-        return Err(Error::Other(format!(
-            "ipfS3 ZIP extraction reported {} failed entries; first failure: {}: {} ({})",
-            result.failed_count, failure.entry_name, failure.message, failure.code
-        )));
+    let requested_names = entry_names
+        .iter()
+        .map(String::as_str)
+        .collect::<std::collections::HashSet<_>>();
+    if requested_names.len() != entry_names.len() {
+        return Ok(None);
     }
 
     let mut entry_cids = std::collections::HashMap::new();
     for entry in result.entries.entries {
-        entry_cids.insert(entry.key, entry.etag);
+        let cid = entry.etag.trim().trim_matches('"').trim();
+        if cid.is_empty() {
+            let key_kind = if entry
+                .key
+                .strip_prefix(extraction_prefix)
+                .is_some_and(|name| requested_names.contains(name))
+            {
+                "requested extraction key"
+            } else {
+                "extraction key"
+            };
+            return Err(Error::Other(format!(
+                "ipfS3 ZIP extraction {key_kind} {} returned an empty CID",
+                entry.key,
+            )));
+        }
+        entry_cids.insert(entry.key, cid.to_string());
     }
-    let mut requested_names = std::collections::HashSet::new();
     let mut cids = Vec::with_capacity(entry_names.len());
 
     for entry_name in entry_names {
-        if !requested_names.insert(entry_name) {
-            return Err(Error::Other(format!(
-                "ipfS3 ZIP extraction has duplicate requested entry name {entry_name}"
-            )));
-        }
-
         let key = format!("{extraction_prefix}{entry_name}");
-        let cid = entry_cids.get(&key).ok_or_else(|| {
-            Error::Other(format!(
-                "ipfS3 ZIP extraction missing requested extraction key {key}"
-            ))
-        })?;
-        let cid = cid.trim().trim_matches('"').trim();
-        if cid.is_empty() {
-            return Err(Error::Other(format!(
-                "ipfS3 ZIP extraction requested extraction key {key} returned an empty CID"
-            )));
-        }
-        cids.push(cid.to_string());
+        let Some(cid) = entry_cids.get(&key) else {
+            return Ok(None);
+        };
+        cids.push(cid.clone());
     }
 
-    Ok(cids)
+    if result
+        .failures
+        .failures
+        .iter()
+        .any(|failure| requested_names.contains(failure.entry_name.as_str()))
+    {
+        return Ok(None);
+    }
+
+    Ok(Some(cids))
 }
 
 fn extension_for_content_type(content_type: &str) -> &'static str {
@@ -2456,6 +2856,873 @@ mod tests {
         assert!(!config.zip_extract_enabled);
     }
 
+    const ZIP_FIXTURE_DATA: &[u8] = b"hello";
+    const ZIP_FIXTURE_DEFLATED_DATA: &[u8] = &[0xcb, 0x48, 0xcd, 0xc9, 0xc9, 0x07, 0x00];
+
+    #[derive(Clone, Copy)]
+    struct ZipEntryFixture<'a> {
+        local_name: &'a [u8],
+        central_name: &'a [u8],
+        local_extra: &'a [u8],
+        central_extra: &'a [u8],
+        data: &'a [u8],
+        local_method: u16,
+        central_method: u16,
+        local_flags: u16,
+        central_flags: u16,
+        data_descriptor_has_signature: bool,
+    }
+
+    impl<'a> ZipEntryFixture<'a> {
+        fn stored(name: &'a [u8]) -> Self {
+            Self {
+                local_name: name,
+                central_name: name,
+                local_extra: &[],
+                central_extra: &[],
+                data: ZIP_FIXTURE_DATA,
+                local_method: 0,
+                central_method: 0,
+                local_flags: 0,
+                central_flags: 0,
+                data_descriptor_has_signature: true,
+            }
+        }
+
+        fn deflated(name: &'a [u8]) -> Self {
+            Self {
+                local_name: name,
+                central_name: name,
+                local_extra: &[],
+                central_extra: &[],
+                data: ZIP_FIXTURE_DATA,
+                local_method: 8,
+                central_method: 8,
+                local_flags: 0,
+                central_flags: 0,
+                data_descriptor_has_signature: true,
+            }
+        }
+    }
+
+    fn push_zip_u16(output: &mut Vec<u8>, value: u16) {
+        output.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn push_zip_u32(output: &mut Vec<u8>, value: u32) {
+        output.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn zip_fixture_crc32(bytes: &[u8]) -> u32 {
+        let mut crc = !0u32;
+        for &byte in bytes {
+            crc ^= u32::from(byte);
+            for _ in 0..8 {
+                crc = (crc >> 1) ^ (0xedb8_8320 & (0u32.wrapping_sub(crc & 1)));
+            }
+        }
+        !crc
+    }
+
+    fn zip_fixture_encoded_data<'a>(entry: ZipEntryFixture<'a>) -> &'a [u8] {
+        if entry.local_method == 8 && entry.data == ZIP_FIXTURE_DATA {
+            ZIP_FIXTURE_DEFLATED_DATA
+        } else {
+            entry.data
+        }
+    }
+
+    fn zip_fixture(entries: &[ZipEntryFixture<'_>]) -> Vec<u8> {
+        let mut output = Vec::new();
+        let mut local_offsets = Vec::with_capacity(entries.len());
+
+        for entry in entries {
+            let encoded = zip_fixture_encoded_data(*entry);
+            let crc = zip_fixture_crc32(entry.data);
+            let uses_descriptor = entry.local_flags & (1 << 3) != 0;
+            local_offsets.push(output.len() as u32);
+
+            push_zip_u32(&mut output, 0x0403_4b50);
+            push_zip_u16(&mut output, 20);
+            push_zip_u16(&mut output, entry.local_flags);
+            push_zip_u16(&mut output, entry.local_method);
+            push_zip_u16(&mut output, 0);
+            push_zip_u16(&mut output, 0);
+            push_zip_u32(&mut output, if uses_descriptor { 0 } else { crc });
+            push_zip_u32(
+                &mut output,
+                if uses_descriptor {
+                    0
+                } else {
+                    encoded.len() as u32
+                },
+            );
+            push_zip_u32(
+                &mut output,
+                if uses_descriptor {
+                    0
+                } else {
+                    entry.data.len() as u32
+                },
+            );
+            push_zip_u16(&mut output, entry.local_name.len() as u16);
+            push_zip_u16(&mut output, entry.local_extra.len() as u16);
+            output.extend_from_slice(entry.local_name);
+            output.extend_from_slice(entry.local_extra);
+            output.extend_from_slice(encoded);
+
+            if uses_descriptor {
+                if entry.data_descriptor_has_signature {
+                    push_zip_u32(&mut output, 0x0807_4b50);
+                }
+                push_zip_u32(&mut output, crc);
+                push_zip_u32(&mut output, encoded.len() as u32);
+                push_zip_u32(&mut output, entry.data.len() as u32);
+            }
+        }
+
+        let central_offset = output.len() as u32;
+        for (entry, local_offset) in entries.iter().zip(local_offsets) {
+            let encoded = zip_fixture_encoded_data(*entry);
+            push_zip_u32(&mut output, 0x0201_4b50);
+            push_zip_u16(&mut output, 20);
+            push_zip_u16(&mut output, 20);
+            push_zip_u16(&mut output, entry.central_flags);
+            push_zip_u16(&mut output, entry.central_method);
+            push_zip_u16(&mut output, 0);
+            push_zip_u16(&mut output, 0);
+            push_zip_u32(&mut output, zip_fixture_crc32(entry.data));
+            push_zip_u32(&mut output, encoded.len() as u32);
+            push_zip_u32(&mut output, entry.data.len() as u32);
+            push_zip_u16(&mut output, entry.central_name.len() as u16);
+            push_zip_u16(&mut output, entry.central_extra.len() as u16);
+            push_zip_u16(&mut output, 0);
+            push_zip_u16(&mut output, 0);
+            push_zip_u16(&mut output, 0);
+            push_zip_u32(&mut output, 0);
+            push_zip_u32(&mut output, local_offset);
+            output.extend_from_slice(entry.central_name);
+            output.extend_from_slice(entry.central_extra);
+        }
+
+        let central_size = output.len() as u32 - central_offset;
+        push_zip_u32(&mut output, 0x0605_4b50);
+        push_zip_u16(&mut output, 0);
+        push_zip_u16(&mut output, 0);
+        push_zip_u16(&mut output, entries.len() as u16);
+        push_zip_u16(&mut output, entries.len() as u16);
+        push_zip_u32(&mut output, central_size);
+        push_zip_u32(&mut output, central_offset);
+        push_zip_u16(&mut output, 0);
+        output
+    }
+
+    fn zip_fixture_central_start(bytes: &[u8]) -> usize {
+        let eocd_start = bytes.len() - 22;
+        usize::try_from(u32::from_le_bytes(
+            bytes[eocd_start + 16..eocd_start + 20].try_into().unwrap(),
+        ))
+        .unwrap()
+    }
+
+    fn zip_fixture_first_local_data_start(bytes: &[u8]) -> usize {
+        let name_len = usize::from(u16::from_le_bytes(bytes[26..28].try_into().unwrap()));
+        let extra_len = usize::from(u16::from_le_bytes(bytes[28..30].try_into().unwrap()));
+        ZIP_LOCAL_FIXED_HEADER_LEN + name_len + extra_len
+    }
+
+    fn zip_fixture_write_u32(bytes: &mut [u8], offset: usize, value: u32) {
+        bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn zip_fixture_insert_bytes(bytes: &mut Vec<u8>, offset: usize, inserted: &[u8]) {
+        let central_start = zip_fixture_central_start(bytes);
+        assert!(offset <= central_start);
+        let eocd_start = bytes.len() - 22;
+        let mut central_offset = central_start;
+        while bytes[central_offset..central_offset + 4] == ZIP_CENTRAL_HEADER_SIGNATURE {
+            let name_len = usize::from(u16::from_le_bytes(
+                bytes[central_offset + ZIP_CENTRAL_NAME_LEN_OFFSET
+                    ..central_offset + ZIP_CENTRAL_NAME_LEN_OFFSET + 2]
+                    .try_into()
+                    .unwrap(),
+            ));
+            let extra_len = usize::from(u16::from_le_bytes(
+                bytes[central_offset + ZIP_CENTRAL_EXTRA_LEN_OFFSET
+                    ..central_offset + ZIP_CENTRAL_EXTRA_LEN_OFFSET + 2]
+                    .try_into()
+                    .unwrap(),
+            ));
+            let comment_len = usize::from(u16::from_le_bytes(
+                bytes[central_offset + ZIP_CENTRAL_COMMENT_LEN_OFFSET
+                    ..central_offset + ZIP_CENTRAL_COMMENT_LEN_OFFSET + 2]
+                    .try_into()
+                    .unwrap(),
+            ));
+            let local_offset = usize::try_from(u32::from_le_bytes(
+                bytes[central_offset + 42..central_offset + 46]
+                    .try_into()
+                    .unwrap(),
+            ))
+            .unwrap();
+            if local_offset >= offset {
+                let adjusted = u32::try_from(local_offset + inserted.len()).unwrap();
+                bytes[central_offset + 42..central_offset + 46]
+                    .copy_from_slice(&adjusted.to_le_bytes());
+            }
+            central_offset += ZIP_CENTRAL_FIXED_HEADER_LEN + name_len + extra_len + comment_len;
+        }
+        assert_eq!(central_offset, eocd_start);
+        let adjusted_central_start = u32::try_from(central_start + inserted.len()).unwrap();
+        bytes[eocd_start + 16..eocd_start + 20]
+            .copy_from_slice(&adjusted_central_start.to_le_bytes());
+        bytes.splice(offset..offset, inserted.iter().copied());
+    }
+
+    fn zip_fixture_append_deflate_junk(bytes: &mut Vec<u8>, junk: &[u8]) {
+        let data_start = zip_fixture_first_local_data_start(bytes);
+        let central_start = zip_fixture_central_start(bytes);
+        let compressed_size = usize::try_from(u32::from_le_bytes(
+            bytes[central_start + 20..central_start + 24]
+                .try_into()
+                .unwrap(),
+        ))
+        .unwrap();
+        let data_end = data_start + compressed_size;
+        let uses_descriptor =
+            u16::from_le_bytes(bytes[6..8].try_into().unwrap()) & ZIP_FLAG_DATA_DESCRIPTOR != 0;
+
+        zip_fixture_insert_bytes(bytes, data_end, junk);
+
+        let compressed_size = u32::try_from(compressed_size + junk.len()).unwrap();
+        let central_start = zip_fixture_central_start(bytes);
+        zip_fixture_write_u32(bytes, central_start + 20, compressed_size);
+        if uses_descriptor {
+            let descriptor_start = data_end + junk.len();
+            let payload_start =
+                if bytes[descriptor_start..descriptor_start + 4] == ZIP_DATA_DESCRIPTOR_SIGNATURE {
+                    descriptor_start + 4
+                } else {
+                    descriptor_start
+                };
+            zip_fixture_write_u32(bytes, payload_start + 4, compressed_size);
+        } else {
+            zip_fixture_write_u32(bytes, ZIP_LOCAL_COMPRESSED_SIZE_OFFSET, compressed_size);
+        }
+    }
+
+    fn zip_fixture_local_record(entry: ZipEntryFixture<'_>) -> Vec<u8> {
+        let bytes = zip_fixture(&[entry]);
+        bytes[..zip_fixture_central_start(&bytes)].to_vec()
+    }
+
+    fn duplicate_physical_name_zip_fixture() -> Vec<u8> {
+        zip_fixture(&[
+            ZipEntryFixture {
+                local_name: b"../page.jpg",
+                central_name: b"page.jpg",
+                ..ZipEntryFixture::stored(b"page.jpg")
+            },
+            ZipEntryFixture::stored(b"page.jpg"),
+        ])
+    }
+
+    #[test]
+    fn ipfs3_zip_preflight_accepts_stored_deflate_and_safe_prefixes() {
+        let bytes = zip_fixture(&[
+            ZipEntryFixture::stored(b"page001.jpg"),
+            ZipEntryFixture::deflated(b"dir/page002.png"),
+            ZipEntryFixture::stored(b"metadata/"),
+        ]);
+        let requested = vec!["page001.jpg".to_string(), "dir/page002.png".to_string()];
+
+        assert!(ipfs3_zip_archive_is_compatible(
+            &bytes,
+            &requested,
+            "eh/archive/"
+        ));
+    }
+
+    #[test]
+    fn ipfs3_zip_preflight_accepts_deflate_with_data_descriptor() {
+        let signed_descriptor = zip_fixture(&[ZipEntryFixture {
+            local_flags: 1 << 3,
+            central_flags: 1 << 3,
+            ..ZipEntryFixture::deflated(b"page.jpg")
+        }]);
+        let unsigned_descriptor = zip_fixture(&[ZipEntryFixture {
+            local_flags: 1 << 3,
+            central_flags: 1 << 3,
+            data_descriptor_has_signature: false,
+            ..ZipEntryFixture::deflated(b"page.jpg")
+        }]);
+
+        for bytes in [signed_descriptor, unsigned_descriptor] {
+            assert!(ipfs3_zip_archive_is_compatible(
+                &bytes,
+                &["page.jpg".to_string()],
+                "eh/archive/"
+            ));
+        }
+    }
+
+    #[test]
+    fn ipfs3_zip_preflight_rejects_trailing_junk_after_deflate_stream() {
+        let requested = ["page.jpg".to_string()];
+        let entries = [
+            ("no descriptor", ZipEntryFixture::deflated(b"page.jpg")),
+            (
+                "signed descriptor",
+                ZipEntryFixture {
+                    local_flags: ZIP_FLAG_DATA_DESCRIPTOR,
+                    central_flags: ZIP_FLAG_DATA_DESCRIPTOR,
+                    ..ZipEntryFixture::deflated(b"page.jpg")
+                },
+            ),
+            (
+                "unsigned descriptor",
+                ZipEntryFixture {
+                    local_flags: ZIP_FLAG_DATA_DESCRIPTOR,
+                    central_flags: ZIP_FLAG_DATA_DESCRIPTOR,
+                    data_descriptor_has_signature: false,
+                    ..ZipEntryFixture::deflated(b"page.jpg")
+                },
+            ),
+        ];
+
+        for (case, entry) in entries {
+            let mut bytes = zip_fixture(&[entry]);
+            zip_fixture_append_deflate_junk(&mut bytes, b"junk");
+
+            assert!(
+                !ipfs3_zip_archive_is_compatible(&bytes, &requested, "eh/archive/"),
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn ipfs3_zip_preflight_preserves_unsigned_descriptor_signature_ambiguity() {
+        let mut bytes = zip_fixture(&[ZipEntryFixture {
+            local_flags: ZIP_FLAG_DATA_DESCRIPTOR,
+            central_flags: ZIP_FLAG_DATA_DESCRIPTOR,
+            data_descriptor_has_signature: false,
+            ..ZipEntryFixture::deflated(b"page.jpg")
+        }]);
+        let ambiguous_crc32 = u32::from_le_bytes(ZIP_DATA_DESCRIPTOR_SIGNATURE);
+        let descriptor_start =
+            zip_fixture_first_local_data_start(&bytes) + ZIP_FIXTURE_DEFLATED_DATA.len();
+        let central_crc32_offset = zip_fixture_central_start(&bytes) + ZIP_CENTRAL_CRC32_OFFSET;
+        zip_fixture_write_u32(&mut bytes, central_crc32_offset, ambiguous_crc32);
+        zip_fixture_write_u32(&mut bytes, descriptor_start, ambiguous_crc32);
+
+        assert!(!ipfs3_zip_archive_is_compatible(
+            &bytes,
+            &["page.jpg".to_string()],
+            "eh/archive/"
+        ));
+    }
+
+    #[test]
+    fn ipfs3_zip_preflight_rejects_local_stream_metadata_mismatches() {
+        let requested = ["page.jpg".to_string()];
+
+        let mut local_compressed_size = zip_fixture(&[ZipEntryFixture::stored(b"page.jpg")]);
+        zip_fixture_write_u32(&mut local_compressed_size, 18, 4);
+
+        let mut local_crc32 = zip_fixture(&[ZipEntryFixture::stored(b"page.jpg")]);
+        zip_fixture_write_u32(&mut local_crc32, 14, 0);
+
+        let mut local_uncompressed_size = zip_fixture(&[ZipEntryFixture::stored(b"page.jpg")]);
+        zip_fixture_write_u32(&mut local_uncompressed_size, 22, 4);
+
+        let mut descriptor_crc32 = zip_fixture(&[ZipEntryFixture {
+            local_flags: ZIP_FLAG_DATA_DESCRIPTOR,
+            central_flags: ZIP_FLAG_DATA_DESCRIPTOR,
+            ..ZipEntryFixture::deflated(b"page.jpg")
+        }]);
+        let descriptor_start =
+            zip_fixture_first_local_data_start(&descriptor_crc32) + ZIP_FIXTURE_DEFLATED_DATA.len();
+        zip_fixture_write_u32(&mut descriptor_crc32, descriptor_start + 4, 0);
+
+        let mut descriptor_compressed_size = zip_fixture(&[ZipEntryFixture {
+            local_flags: ZIP_FLAG_DATA_DESCRIPTOR,
+            central_flags: ZIP_FLAG_DATA_DESCRIPTOR,
+            ..ZipEntryFixture::deflated(b"page.jpg")
+        }]);
+        let descriptor_start = zip_fixture_first_local_data_start(&descriptor_compressed_size)
+            + ZIP_FIXTURE_DEFLATED_DATA.len();
+        zip_fixture_write_u32(&mut descriptor_compressed_size, descriptor_start + 8, 0);
+
+        for (case, bytes) in [
+            ("local compressed size", local_compressed_size),
+            ("local CRC32", local_crc32),
+            ("local uncompressed size", local_uncompressed_size),
+            ("descriptor CRC32", descriptor_crc32),
+            ("descriptor compressed size", descriptor_compressed_size),
+        ] {
+            assert!(
+                !ipfs3_zip_archive_is_compatible(&bytes, &requested, "eh/archive/"),
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn ipfs3_zip_preflight_rejects_incompatible_entries_and_prefixes() {
+        let unsafe_names: &[&[u8]] = &[
+            b"",
+            b"/",
+            b"/absolute.jpg",
+            b"C:/drive.jpg",
+            b"dir\\page.jpg",
+            b"a/./page.jpg",
+            b"a/../page.jpg",
+            b"\xff.jpg",
+        ];
+        for name in unsafe_names {
+            let bytes = zip_fixture(&[ZipEntryFixture::stored(name)]);
+            assert!(!ipfs3_zip_archive_is_compatible(
+                &bytes,
+                &["page.jpg".to_string()],
+                "eh/archive/"
+            ));
+        }
+
+        let requested = vec!["page.jpg".to_string()];
+        let encrypted = zip_fixture(&[ZipEntryFixture {
+            central_flags: 1,
+            ..ZipEntryFixture::stored(b"page.jpg")
+        }]);
+        let unsupported = zip_fixture(&[ZipEntryFixture {
+            local_method: 12,
+            central_method: 12,
+            ..ZipEntryFixture::stored(b"page.jpg")
+        }]);
+        let mismatched = zip_fixture(&[ZipEntryFixture {
+            local_method: 8,
+            central_method: 0,
+            ..ZipEntryFixture::stored(b"page.jpg")
+        }]);
+        let stored_descriptor = zip_fixture(&[ZipEntryFixture {
+            local_flags: 1 << 3,
+            central_flags: 1 << 3,
+            ..ZipEntryFixture::stored(b"page.jpg")
+        }]);
+        let descriptor_flag_mismatch = zip_fixture(&[ZipEntryFixture {
+            local_flags: 1 << 3,
+            ..ZipEntryFixture::deflated(b"page.jpg")
+        }]);
+        let unsafe_unrequested = zip_fixture(&[
+            ZipEntryFixture::stored(b"page.jpg"),
+            ZipEntryFixture::stored(b"../notes.txt"),
+        ]);
+
+        for bytes in [
+            encrypted,
+            unsupported,
+            mismatched,
+            stored_descriptor,
+            descriptor_flag_mismatch,
+            unsafe_unrequested,
+        ] {
+            assert!(!ipfs3_zip_archive_is_compatible(
+                &bytes,
+                &requested,
+                "eh/archive/"
+            ));
+        }
+
+        let valid = zip_fixture(&[ZipEntryFixture::stored(b"page.jpg")]);
+        for prefix in [
+            "/absolute/",
+            "C:/drive/",
+            "dir\\prefix/",
+            "a/./",
+            "a/../",
+            "/",
+        ] {
+            assert!(!ipfs3_zip_archive_is_compatible(&valid, &requested, prefix));
+        }
+        assert!(!ipfs3_zip_archive_is_compatible(
+            &valid,
+            &["page.jpg".to_string(), "page.jpg".to_string()],
+            "eh/archive/"
+        ));
+    }
+
+    #[test]
+    fn ipfs3_zip_preflight_rejects_incompatible_local_names_and_flags() {
+        let requested = vec!["page.jpg".to_string()];
+        let entries = [
+            ZipEntryFixture {
+                local_name: b"\xff.jpg",
+                ..ZipEntryFixture::stored(b"page.jpg")
+            },
+            ZipEntryFixture {
+                local_name: b"../page.jpg",
+                ..ZipEntryFixture::stored(b"page.jpg")
+            },
+            ZipEntryFixture {
+                local_name: b"dir\\page.jpg",
+                ..ZipEntryFixture::stored(b"page.jpg")
+            },
+            ZipEntryFixture {
+                local_name: b"other.jpg",
+                ..ZipEntryFixture::stored(b"page.jpg")
+            },
+            ZipEntryFixture {
+                local_flags: 1,
+                ..ZipEntryFixture::stored(b"page.jpg")
+            },
+        ];
+
+        for entry in entries {
+            let bytes = zip_fixture(&[entry]);
+            assert!(!ipfs3_zip_archive_is_compatible(
+                &bytes,
+                &requested,
+                "eh/archive/"
+            ));
+        }
+    }
+
+    #[test]
+    fn ipfs3_zip_preflight_rejects_non_utf8_flagged_names_and_unicode_path_extra() {
+        let requested = vec!["page.jpg".to_string()];
+        let non_ascii_without_utf8_flag =
+            zip_fixture(&[ZipEntryFixture::stored(b"\xe2\x98\x83.jpg")]);
+        let unicode_path_extra = zip_fixture(&[ZipEntryFixture {
+            local_extra: b"\x75\x70\x10\x00\x01\x00\x00\x00\x00../page.jpg",
+            ..ZipEntryFixture::stored(b"page.jpg")
+        }]);
+        let malformed_extra = zip_fixture(&[ZipEntryFixture {
+            local_extra: b"\x01\x00\x02",
+            ..ZipEntryFixture::stored(b"page.jpg")
+        }]);
+
+        for (case, bytes) in [
+            (
+                "non-ASCII name without UTF-8 flag",
+                non_ascii_without_utf8_flag,
+            ),
+            ("Unicode Path extra", unicode_path_extra),
+            ("malformed local extra", malformed_extra),
+        ] {
+            assert!(
+                !ipfs3_zip_archive_is_compatible(&bytes, &requested, "eh/archive/"),
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn ipfs3_zip_preflight_validates_unicode_comment_local_extra() {
+        let requested = vec!["page.jpg".to_string()];
+
+        for (case, local_extra) in [
+            (
+                "empty Unicode Comment extra",
+                b"\x75\x63\x00\x00".as_slice(),
+            ),
+            (
+                "truncated V1 Unicode Comment extra",
+                b"\x75\x63\x01\x00\x01".as_slice(),
+            ),
+        ] {
+            let bytes = zip_fixture(&[ZipEntryFixture {
+                local_extra,
+                ..ZipEntryFixture::stored(b"page.jpg")
+            }]);
+            assert!(
+                !ipfs3_zip_archive_is_compatible(&bytes, &requested, "eh/archive/"),
+                "{case}"
+            );
+        }
+
+        for (case, local_extra) in [
+            (
+                "unknown Unicode Comment version",
+                b"\x75\x63\x01\x00\x02".as_slice(),
+            ),
+            (
+                "complete V1 Unicode Comment extra",
+                b"\x75\x63\x05\x00\x01\x00\x00\x00\x00".as_slice(),
+            ),
+        ] {
+            let bytes = zip_fixture(&[ZipEntryFixture {
+                local_extra,
+                ..ZipEntryFixture::stored(b"page.jpg")
+            }]);
+            assert!(
+                ipfs3_zip_archive_is_compatible(&bytes, &requested, "eh/archive/"),
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn ipfs3_zip_preflight_rejects_central_unicode_path_name_override() {
+        let mut unicode_path_extra = b"\x75\x70\x10\x00\x01".to_vec();
+        unicode_path_extra.extend_from_slice(&zip_fixture_crc32(b"page.jpg").to_le_bytes());
+        unicode_path_extra.extend_from_slice(b"renamed.jpg");
+        let bytes = zip_fixture(&[ZipEntryFixture {
+            central_extra: &unicode_path_extra,
+            ..ZipEntryFixture::stored(b"page.jpg")
+        }]);
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes.as_slice())).unwrap();
+        let central_directory_start = archive.central_directory_start();
+        let archive_len = archive.len();
+        let file = archive.by_index_raw(0).unwrap();
+
+        assert_eq!(file.name_raw(), b"renamed.jpg");
+        assert_eq!(file.name(), "renamed.jpg");
+        let central_entries =
+            ipfs3_zip_central_directory_entries(&bytes, central_directory_start, archive_len)
+                .unwrap();
+        assert_eq!(central_entries[0].raw_name, b"page.jpg");
+        assert!(!ipfs3_zip_archive_is_compatible(
+            &bytes,
+            &["page.jpg".to_string()],
+            "eh/archive/"
+        ));
+    }
+
+    #[test]
+    fn ipfs3_zip_preflight_rejects_non_contiguous_or_aliased_local_records() {
+        let requested = vec!["one.jpg".to_string()];
+
+        let mut prefixed = zip_fixture(&[ZipEntryFixture::stored(b"one.jpg")]);
+        zip_fixture_insert_bytes(&mut prefixed, 0, b"prefix");
+
+        let mut gapped = zip_fixture(&[
+            ZipEntryFixture::stored(b"one.jpg"),
+            ZipEntryFixture::stored(b"two.jpg"),
+        ]);
+        let first_record_end =
+            ZIP_LOCAL_FIXED_HEADER_LEN + b"one.jpg".len() + ZIP_FIXTURE_DATA.len();
+        zip_fixture_insert_bytes(&mut gapped, first_record_end, b"gap");
+
+        let mut orphaned = zip_fixture(&[ZipEntryFixture::stored(b"one.jpg")]);
+        let orphan_start = zip_fixture_central_start(&orphaned);
+        let orphan = zip_fixture_local_record(ZipEntryFixture::stored(b"orphan.jpg"));
+        zip_fixture_insert_bytes(&mut orphaned, orphan_start, &orphan);
+
+        let mut aliased = zip_fixture(&[
+            ZipEntryFixture::stored(b"one.jpg"),
+            ZipEntryFixture::stored(b"two.jpg"),
+        ]);
+        let second_central =
+            zip_fixture_central_start(&aliased) + ZIP_CENTRAL_FIXED_HEADER_LEN + b"one.jpg".len();
+        aliased[second_central + 42..second_central + 46].copy_from_slice(&0u32.to_le_bytes());
+
+        for (case, bytes) in [
+            ("prefix", prefixed),
+            ("gap", gapped),
+            ("orphan", orphaned),
+            ("aliased", aliased),
+        ] {
+            assert!(
+                !ipfs3_zip_archive_is_compatible(&bytes, &requested, "eh/archive/"),
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn ipfs3_zip_preflight_rejects_duplicate_physical_central_names() {
+        let bytes = duplicate_physical_name_zip_fixture();
+
+        assert!(!ipfs3_zip_archive_is_compatible(
+            &bytes,
+            &["page.jpg".to_string()],
+            "eh/archive/"
+        ));
+    }
+
+    #[test]
+    fn ipfs3_zip_central_scan_rejects_early_stop_before_archive_len() {
+        let mut bytes = zip_fixture(&[
+            ZipEntryFixture::stored(b"one.jpg"),
+            ZipEntryFixture::stored(b"two.jpg"),
+        ]);
+        let archive = zip::ZipArchive::new(std::io::Cursor::new(bytes.as_slice())).unwrap();
+        let central_start = archive.central_directory_start();
+        let archive_len = archive.len();
+        drop(archive);
+        let second_record_start = usize::try_from(central_start).unwrap()
+            + ZIP_CENTRAL_FIXED_HEADER_LEN
+            + b"one.jpg".len();
+        bytes[second_record_start..second_record_start + 4].copy_from_slice(b"STOP");
+
+        assert!(!ipfs3_zip_central_directory_is_complete_and_unique(
+            &bytes,
+            central_start,
+            archive_len,
+        ));
+    }
+
+    #[tokio::test]
+    async fn ipfs3_zip_archive_upload_preflight_fallback_sends_no_put() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let mut config = complete_ipfs3_config(&server.uri(), "https://public.example/ipfs/");
+        config.zip_extract_enabled = true;
+        let uploader = IpfS3Uploader::from_config(&config).unwrap();
+        let zip_bytes = zip_fixture(&[ZipEntryFixture::stored(b"dir\\page.jpg")]);
+        let entries = vec!["dir\\page.jpg".to_string()];
+
+        let result = uploader
+            .upload_zip_archive_with_url_pairs(ZipArchiveUploadInput {
+                filename: "gallery.zip",
+                bytes: &zip_bytes,
+                entry_names: &entries,
+            })
+            .await
+            .unwrap();
+
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn ipfs3_zip_archive_upload_truncated_unicode_comment_sends_no_put() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let mut config = complete_ipfs3_config(&server.uri(), "https://public.example/ipfs/");
+        config.zip_extract_enabled = true;
+        let uploader = IpfS3Uploader::from_config(&config).unwrap();
+        let zip_bytes = zip_fixture(&[ZipEntryFixture {
+            local_extra: b"\x75\x63\x01\x00\x01",
+            ..ZipEntryFixture::stored(b"page.jpg")
+        }]);
+        let entries = vec!["page.jpg".to_string()];
+
+        let result = uploader
+            .upload_zip_archive_with_url_pairs(ZipArchiveUploadInput {
+                filename: "gallery.zip",
+                bytes: &zip_bytes,
+                entry_names: &entries,
+            })
+            .await
+            .unwrap();
+
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn ipfs3_zip_archive_upload_duplicate_physical_name_sends_no_put() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let mut config = complete_ipfs3_config(&server.uri(), "https://public.example/ipfs/");
+        config.zip_extract_enabled = true;
+        let uploader = IpfS3Uploader::from_config(&config).unwrap();
+        let zip_bytes = duplicate_physical_name_zip_fixture();
+        let entries = vec!["page.jpg".to_string()];
+
+        let result = uploader
+            .upload_zip_archive_with_url_pairs(ZipArchiveUploadInput {
+                filename: "gallery.zip",
+                bytes: &zip_bytes,
+                entry_names: &entries,
+            })
+            .await
+            .unwrap();
+
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn ipfs3_zip_archive_upload_orphan_local_record_sends_no_put() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let mut config = complete_ipfs3_config(&server.uri(), "https://public.example/ipfs/");
+        config.zip_extract_enabled = true;
+        let uploader = IpfS3Uploader::from_config(&config).unwrap();
+        let mut zip_bytes = zip_fixture(&[ZipEntryFixture::stored(b"page.jpg")]);
+        let orphan_start = zip_fixture_central_start(&zip_bytes);
+        let orphan = zip_fixture_local_record(ZipEntryFixture::stored(b"orphan.jpg"));
+        zip_fixture_insert_bytes(&mut zip_bytes, orphan_start, &orphan);
+        let entries = vec!["page.jpg".to_string()];
+
+        let result = uploader
+            .upload_zip_archive_with_url_pairs(ZipArchiveUploadInput {
+                filename: "gallery.zip",
+                bytes: &zip_bytes,
+                entry_names: &entries,
+            })
+            .await
+            .unwrap();
+
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn ipfs3_zip_archive_upload_deflate_trailing_junk_sends_no_put() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let mut config = complete_ipfs3_config(&server.uri(), "https://public.example/ipfs/");
+        config.zip_extract_enabled = true;
+        let uploader = IpfS3Uploader::from_config(&config).unwrap();
+        let mut zip_bytes = zip_fixture(&[ZipEntryFixture {
+            local_flags: ZIP_FLAG_DATA_DESCRIPTOR,
+            central_flags: ZIP_FLAG_DATA_DESCRIPTOR,
+            ..ZipEntryFixture::deflated(b"page.jpg")
+        }]);
+        zip_fixture_append_deflate_junk(&mut zip_bytes, b"junk");
+        let entries = vec!["page.jpg".to_string()];
+
+        let result = uploader
+            .upload_zip_archive_with_url_pairs(ZipArchiveUploadInput {
+                filename: "gallery.zip",
+                bytes: &zip_bytes,
+                entry_names: &entries,
+            })
+            .await
+            .unwrap();
+
+        assert!(result.is_none());
+    }
+
     fn ipfs3_zip_extract_result_xml(
         entries: &[(&str, &str)],
         failures: &[(&str, &str, &str)],
@@ -2537,6 +3804,7 @@ mod tests {
             &["page-002.jpg".to_string(), "page-001.jpg".to_string()],
             result,
         )
+        .unwrap()
         .unwrap();
 
         assert_eq!(cids, ["cid-two", "cid-last"]);
@@ -2614,25 +3882,51 @@ mod tests {
     }
 
     #[test]
-    fn ipfs3_zip_extract_result_rejects_reported_failures() {
+    fn ipfs3_zip_extract_result_falls_back_when_requested_entry_failed() {
         let result = parse_ipfs3_zip_extract_result(&ipfs3_zip_extract_result_xml(
-            &[("extract/page.jpg", "cid-page")],
-            &[("page.jpg", "ExtractFailed", "bad archive")],
+            &[("extract/page-002.jpg", "cid-page-two")],
+            &[("page-001.jpg", "ExtractFailed", "bad archive")],
             1,
             1,
         ))
         .unwrap();
 
-        let err = ipfs3_zip_entry_cids("extract/", &["page.jpg".to_string()], result).unwrap_err();
-        let message = err.to_string();
-        assert!(message.contains("1 failed"));
-        assert!(message.contains("page.jpg"));
-        assert!(message.contains("bad archive"));
-        assert!(message.contains("ExtractFailed"));
+        let cids = ipfs3_zip_entry_cids(
+            "extract/",
+            &["page-001.jpg".to_string(), "page-002.jpg".to_string()],
+            result,
+        )
+        .unwrap();
+
+        assert!(cids.is_none());
     }
 
     #[test]
-    fn ipfs3_zip_extract_result_rejects_missing_requested_key() {
+    fn ipfs3_zip_extract_result_ignores_unrequested_failure_when_requested_entries_succeed() {
+        let result = parse_ipfs3_zip_extract_result(&ipfs3_zip_extract_result_xml(
+            &[
+                ("extract/page-001.jpg", "cid-page-one"),
+                ("extract/page-002.jpg", "cid-page-two"),
+            ],
+            &[("unrequested.jpg", "ExtractFailed", "bad archive")],
+            2,
+            1,
+        ))
+        .unwrap();
+
+        let cids = ipfs3_zip_entry_cids(
+            "extract/",
+            &["page-001.jpg".to_string(), "page-002.jpg".to_string()],
+            result,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(cids, ["cid-page-one", "cid-page-two"]);
+    }
+
+    #[test]
+    fn ipfs3_zip_extract_result_falls_back_when_requested_key_is_missing() {
         let result = parse_ipfs3_zip_extract_result(&ipfs3_zip_extract_result_xml(
             &[("extract/page.jpg", "cid-page")],
             &[],
@@ -2641,15 +3935,13 @@ mod tests {
         ))
         .unwrap();
 
-        let err =
-            ipfs3_zip_entry_cids("extract/", &["missing.jpg".to_string()], result).unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("missing requested extraction key extract/missing.jpg"));
+        let cids = ipfs3_zip_entry_cids("extract/", &["missing.jpg".to_string()], result).unwrap();
+
+        assert!(cids.is_none());
     }
 
     #[test]
-    fn ipfs3_zip_extract_result_rejects_duplicate_requested_names() {
+    fn ipfs3_zip_extract_result_falls_back_when_requested_names_are_duplicate() {
         let result = parse_ipfs3_zip_extract_result(&ipfs3_zip_extract_result_xml(
             &[("extract/page.jpg", "cid-page")],
             &[],
@@ -2658,15 +3950,14 @@ mod tests {
         ))
         .unwrap();
 
-        let err = ipfs3_zip_entry_cids(
+        let cids = ipfs3_zip_entry_cids(
             "extract/",
             &["page.jpg".to_string(), "page.jpg".to_string()],
             result,
         )
-        .unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("duplicate requested entry name page.jpg"));
+        .unwrap();
+
+        assert!(cids.is_none());
     }
 
     #[test]
@@ -2685,6 +3976,25 @@ mod tests {
             .contains("requested extraction key extract/page.jpg returned an empty CID"));
     }
 
+    #[test]
+    fn ipfs3_zip_extract_result_rejects_empty_unrequested_entry_cid() {
+        let result = parse_ipfs3_zip_extract_result(&ipfs3_zip_extract_result_xml(
+            &[
+                ("extract/page.jpg", "cid-page"),
+                ("extract/notes.txt", " \"\" "),
+            ],
+            &[],
+            2,
+            0,
+        ))
+        .unwrap();
+
+        let err = ipfs3_zip_entry_cids("extract/", &["page.jpg".to_string()], result).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("extraction key extract/notes.txt returned an empty CID"));
+    }
+
     struct DefaultZipCapabilityUploader;
 
     #[async_trait::async_trait]
@@ -2698,10 +4008,11 @@ mod tests {
     async fn default_zip_archive_upload_capability_returns_none() {
         let uploader = DefaultZipCapabilityUploader;
         let entries = vec!["page001.jpg".to_string()];
+        let zip_bytes = zip_fixture(&[ZipEntryFixture::stored(b"page001.jpg")]);
         let result = uploader
             .upload_zip_archive_with_url_pairs(ZipArchiveUploadInput {
                 filename: "gallery.zip",
-                bytes: b"zip bytes",
+                bytes: &zip_bytes,
                 entry_names: &entries,
             })
             .await
@@ -2735,11 +4046,12 @@ mod tests {
         })
         .unwrap();
         let entries = vec!["page001.jpg".to_string()];
+        let zip_bytes = zip_fixture(&[ZipEntryFixture::stored(b"page001.jpg")]);
 
         let result = uploader
             .upload_zip_archive_with_url_pairs(ZipArchiveUploadInput {
                 filename: "gallery.zip",
-                bytes: b"zip bytes",
+                bytes: &zip_bytes,
                 entry_names: &entries,
             })
             .await
@@ -2754,9 +4066,14 @@ mod tests {
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let server = MockServer::start().await;
+        let zip_bytes = zip_fixture(&[
+            ZipEntryFixture::stored(b"page001.jpg"),
+            ZipEntryFixture::deflated(b"dir/page002.png"),
+            ZipEntryFixture::stored(b"notes.txt"),
+        ]);
         Mock::given(method("PUT"))
             .and(path_regex(r"^/bucket/eh/\d{14}-archive-[0-9a-f]{8}\.zip$"))
-            .and(body_bytes(b"zip bytes".to_vec()))
+            .and(body_bytes(zip_bytes.clone()))
             .respond_with(IpfS3ZipExtractResponder)
             .expect(1)
             .mount(&server)
@@ -2777,7 +4094,7 @@ mod tests {
         let pairs = uploader
             .upload_zip_archive_with_url_pairs(ZipArchiveUploadInput {
                 filename: "gallery.zip",
-                bytes: b"zip bytes",
+                bytes: &zip_bytes,
                 entry_names: &entries,
             })
             .await
@@ -2877,6 +4194,7 @@ mod tests {
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let server = MockServer::start().await;
+        let zip_bytes = zip_fixture(&[ZipEntryFixture::stored(b"page001.jpg")]);
         Mock::given(method("PUT"))
             .and(path_regex(r"^/bucket/eh/\d{14}-archive-[0-9a-f]{8}\.zip$"))
             .respond_with(
@@ -2896,7 +4214,7 @@ mod tests {
         let err = uploader
             .upload_zip_archive_with_url_pairs(ZipArchiveUploadInput {
                 filename: "gallery.zip",
-                bytes: b"zip bytes",
+                bytes: &zip_bytes,
                 entry_names: &entries,
             })
             .await
@@ -2911,6 +4229,7 @@ mod tests {
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let server = MockServer::start().await;
+        let zip_bytes = zip_fixture(&[ZipEntryFixture::stored(b"page001.jpg")]);
         Mock::given(method("PUT"))
             .and(path_regex(r"^/bucket/eh/\d{14}-archive-[0-9a-f]{8}\.zip$"))
             .respond_with(ResponseTemplate::new(503).set_body_string("unavailable"))
@@ -2926,7 +4245,7 @@ mod tests {
         let err = uploader
             .upload_zip_archive_with_url_pairs(ZipArchiveUploadInput {
                 filename: "gallery.zip",
-                bytes: b"zip bytes",
+                bytes: &zip_bytes,
                 entry_names: &entries,
             })
             .await

@@ -1224,21 +1224,17 @@ fn is_uploadable_zip_image_name(name: &str) -> bool {
 }
 
 /// Collect the entry names of uploadable image files inside a ZIP archive,
-/// preserving archive order.
+/// preserving their original `ZipFile::name()` spelling and archive order.
 ///
-/// Entry names are normalized to use forward slashes so they can be embedded
-/// into gateway URLs regardless of the platform that produced the archive.
-/// Non-image entries (directories, metadata, thumbnails) are skipped.
+/// Non-image entries (directories, metadata, thumbnails) are omitted from the
+/// returned names but remain in the archive for complete uploader preflight.
 fn collect_uploadable_zip_entry_names(zip_path: &std::path::Path) -> Result<Vec<String>> {
     let zip_file = std::fs::File::open(zip_path).context("Failed to open zip")?;
-    let mut archive = zip::ZipArchive::new(zip_file).context("Failed to read zip archive")?;
+    let archive = zip::ZipArchive::new(zip_file).context("Failed to read zip archive")?;
     let mut names = Vec::new();
-    for i in 0..archive.len() {
-        let file = archive.by_index(i).context("Failed to read zip entry")?;
-        let raw_name = file.name();
-        if !file.is_dir() && is_uploadable_zip_image_name(&raw_name.to_lowercase()) {
-            let name = raw_name.replace('\\', "/");
-            names.push(name);
+    for raw_name in archive.file_names() {
+        if !raw_name.ends_with('/') && is_uploadable_zip_image_name(&raw_name.to_lowercase()) {
+            names.push(raw_name.to_string());
         }
     }
     Ok(names)
@@ -1391,8 +1387,8 @@ impl EhUploadWorker {
         }
 
         // ZIP-first path: if the configured uploader can accept the whole
-        // archive, upload it once and build Telegraph URLs from the returned
-        // root CID instead of extracting and uploading each image separately.
+        // archive, upload it once and build Telegraph URLs from its per-entry
+        // extraction CIDs. A `None` response falls through to per-image upload.
         if self.image_uploader.supports_zip_archive_upload() {
             let zip_bytes = tokio::fs::read(zip_path)
                 .await
@@ -1431,12 +1427,17 @@ impl EhUploadWorker {
             let mut archive =
                 zip::ZipArchive::new(zip_file).context("Failed to read zip archive")?;
 
-            for i in 0..archive.len() {
+            let uploadable_image_indices = archive
+                .file_names()
+                .enumerate()
+                .filter_map(|(i, name)| {
+                    (!name.ends_with('/') && is_uploadable_zip_image_name(&name.to_lowercase()))
+                        .then_some(i)
+                })
+                .collect::<Vec<_>>();
+
+            for i in uploadable_image_indices {
                 let mut file = archive.by_index(i).context("Failed to read zip entry")?;
-                let name = file.name().to_lowercase();
-                if !is_uploadable_zip_image_name(&name) {
-                    continue;
-                }
 
                 let mut data = Vec::new();
                 std::io::Read::read_to_end(&mut file, &mut data)
@@ -2106,6 +2107,125 @@ mod integration_tests {
             zip.write_all(data.as_bytes()).unwrap();
         }
         zip.finish().unwrap();
+    }
+
+    fn create_test_zip_with_names(path: &std::path::Path, names: &[&str]) {
+        let file = std::fs::File::create(path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        for name in names {
+            zip.start_file(*name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(b"fake_image_data").unwrap();
+        }
+        zip.finish().unwrap();
+    }
+
+    fn create_unsupported_encrypted_metadata_zip(path: &std::path::Path) {
+        fn push_u16(bytes: &mut Vec<u8>, value: u16) {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+
+        fn push_u32(bytes: &mut Vec<u8>, value: u32) {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+
+        let name = b"folder/Photo.JPG";
+        let mut bytes = Vec::new();
+        push_u32(&mut bytes, 0x0403_4b50);
+        push_u16(&mut bytes, 20);
+        push_u16(&mut bytes, 1);
+        push_u16(&mut bytes, 12);
+        push_u16(&mut bytes, 0);
+        push_u16(&mut bytes, 0);
+        push_u32(&mut bytes, 0);
+        push_u32(&mut bytes, 0);
+        push_u32(&mut bytes, 0);
+        push_u16(&mut bytes, name.len() as u16);
+        push_u16(&mut bytes, 0);
+        bytes.extend_from_slice(name);
+
+        let central_start = bytes.len() as u32;
+        push_u32(&mut bytes, 0x0201_4b50);
+        push_u16(&mut bytes, 20);
+        push_u16(&mut bytes, 20);
+        push_u16(&mut bytes, 1);
+        push_u16(&mut bytes, 12);
+        push_u16(&mut bytes, 0);
+        push_u16(&mut bytes, 0);
+        push_u32(&mut bytes, 0);
+        push_u32(&mut bytes, 0);
+        push_u32(&mut bytes, 0);
+        push_u16(&mut bytes, name.len() as u16);
+        push_u16(&mut bytes, 0);
+        push_u16(&mut bytes, 0);
+        push_u16(&mut bytes, 0);
+        push_u16(&mut bytes, 0);
+        push_u32(&mut bytes, 0);
+        push_u32(&mut bytes, 0);
+        bytes.extend_from_slice(name);
+
+        let central_size = bytes.len() as u32 - central_start;
+        push_u32(&mut bytes, 0x0605_4b50);
+        push_u16(&mut bytes, 0);
+        push_u16(&mut bytes, 0);
+        push_u16(&mut bytes, 1);
+        push_u16(&mut bytes, 1);
+        push_u32(&mut bytes, central_size);
+        push_u32(&mut bytes, central_start);
+        push_u16(&mut bytes, 0);
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    fn create_test_zip_with_unsupported_encrypted_non_image(path: &std::path::Path) {
+        create_test_zip_with_names(path, &["page001.jpg", "notes.txt"]);
+
+        let mut bytes = std::fs::read(path).unwrap();
+        let mut modified_local = false;
+        let mut modified_central = false;
+        for offset in 0..=bytes.len() - 4 {
+            if &bytes[offset..offset + 4] == b"PK\x03\x04" {
+                let name_len = usize::from(u16::from_le_bytes(
+                    bytes[offset + 26..offset + 28].try_into().unwrap(),
+                ));
+                let extra_len = usize::from(u16::from_le_bytes(
+                    bytes[offset + 28..offset + 30].try_into().unwrap(),
+                ));
+                let name_start = offset + 30 + extra_len;
+                let name_end = name_start + name_len;
+                if &bytes[name_start..name_end] == b"notes.txt" {
+                    bytes[offset + 6..offset + 8].copy_from_slice(&1u16.to_le_bytes());
+                    bytes[offset + 8..offset + 10].copy_from_slice(&12u16.to_le_bytes());
+                    modified_local = true;
+                }
+            } else if &bytes[offset..offset + 4] == b"PK\x01\x02" {
+                let name_len = usize::from(u16::from_le_bytes(
+                    bytes[offset + 28..offset + 30].try_into().unwrap(),
+                ));
+                let extra_len = usize::from(u16::from_le_bytes(
+                    bytes[offset + 30..offset + 32].try_into().unwrap(),
+                ));
+                let name_start = offset + 46 + extra_len;
+                let name_end = name_start + name_len;
+                if &bytes[name_start..name_end] == b"notes.txt" {
+                    bytes[offset + 8..offset + 10].copy_from_slice(&1u16.to_le_bytes());
+                    bytes[offset + 10..offset + 12].copy_from_slice(&12u16.to_le_bytes());
+                    modified_central = true;
+                }
+            }
+        }
+        assert!(modified_local && modified_central);
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn collect_uploadable_zip_entry_names_reads_unsupported_encrypted_metadata() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let zip_path = temp_dir.path().join("metadata-only.zip");
+        create_unsupported_encrypted_metadata_zip(&zip_path);
+
+        let names = collect_uploadable_zip_entry_names(&zip_path).unwrap();
+
+        assert_eq!(names, ["folder/Photo.JPG"]);
     }
 
     fn create_test_zip_with_sizes(path: &std::path::Path, image_sizes: &[usize]) {
@@ -3964,6 +4084,7 @@ mod integration_tests {
         zip_calls: std::sync::atomic::AtomicUsize,
         image_calls: std::sync::atomic::AtomicUsize,
         seen_entries: std::sync::Mutex<Vec<String>>,
+        zip_fallback: bool,
     }
 
     #[async_trait::async_trait]
@@ -3974,11 +4095,14 @@ mod integration_tests {
 
         async fn upload_images(
             &self,
-            _images: &[ImageUploadInput<'_>],
+            images: &[ImageUploadInput<'_>],
         ) -> eh_client::Result<Vec<String>> {
             self.image_calls
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Ok(Vec::new())
+            Ok(images
+                .iter()
+                .map(|image| format!("https://images.example/{}", image.filename))
+                .collect())
         }
 
         async fn upload_zip_archive_with_url_pairs(
@@ -3988,6 +4112,9 @@ mod integration_tests {
             self.zip_calls
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             *self.seen_entries.lock().unwrap() = archive.entry_names.to_vec();
+            if self.zip_fallback {
+                return Ok(None);
+            }
             Ok(Some(
                 archive
                     .entry_names
@@ -4049,6 +4176,121 @@ mod integration_tests {
         assert_eq!(
             *uploader.seen_entries.lock().unwrap(),
             vec!["page000.jpg".to_string(), "page001.jpg".to_string()]
+        );
+        let model = eh_download_queue::Entity::find_by_id(entry.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(model.status, STATUS_UPLOADED);
+    }
+
+    #[tokio::test]
+    async fn test_upload_worker_falls_back_to_per_image_when_zip_uploader_returns_none() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        setup_chat(&repo, -100, true).await;
+        let tg_server = MockServer::start().await;
+        mock_telegraph_create_page(&tg_server).await;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let zip_path = temp_dir.path().join("zip_fallback.zip");
+        create_test_zip_with_names(&zip_path, &["dir\\page000.jpg", "page001.jpg"]);
+        let zip_path_str = zip_path.to_string_lossy().to_string();
+        let entry = insert_queue_entry(
+            &repo,
+            -100,
+            701,
+            "tok",
+            "Title",
+            true,
+            STATUS_DOWNLOADED,
+            Some(&zip_path_str),
+            None,
+        )
+        .await;
+        let uploader = Arc::new(ZipFirstMockUploader {
+            zip_fallback: true,
+            ..Default::default()
+        });
+        let worker = EhUploadWorker::new(
+            Arc::clone(&repo),
+            make_notifier(&tg_server),
+            make_telegraph_client(&tg_server),
+            uploader.clone(),
+            None,
+            Arc::new(make_config()),
+        );
+
+        worker.tick().await.unwrap();
+
+        assert_eq!(
+            uploader.zip_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            uploader
+                .image_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
+        assert_eq!(
+            *uploader.seen_entries.lock().unwrap(),
+            vec!["dir\\page000.jpg".to_string(), "page001.jpg".to_string()]
+        );
+        let model = eh_download_queue::Entity::find_by_id(entry.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(model.status, STATUS_UPLOADED);
+        assert!(model.telegraph_url.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_upload_worker_fallback_skips_unsupported_non_image_zip_entry() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        setup_chat(&repo, -100, true).await;
+        let tg_server = MockServer::start().await;
+        mock_telegraph_create_page(&tg_server).await;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let zip_path = temp_dir.path().join("zip_fallback_with_metadata.zip");
+        create_test_zip_with_unsupported_encrypted_non_image(&zip_path);
+        let zip_path_str = zip_path.to_string_lossy().to_string();
+        let entry = insert_queue_entry(
+            &repo,
+            -100,
+            702,
+            "tok",
+            "Title",
+            true,
+            STATUS_DOWNLOADED,
+            Some(&zip_path_str),
+            None,
+        )
+        .await;
+        let uploader = Arc::new(ZipFirstMockUploader {
+            zip_fallback: true,
+            ..Default::default()
+        });
+        let worker = EhUploadWorker::new(
+            Arc::clone(&repo),
+            make_notifier(&tg_server),
+            make_telegraph_client(&tg_server),
+            uploader.clone(),
+            None,
+            Arc::new(make_config()),
+        );
+
+        worker.tick().await.unwrap();
+
+        assert_eq!(
+            uploader.zip_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            uploader
+                .image_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
         );
         let model = eh_download_queue::Entity::find_by_id(entry.id)
             .one(repo.db())
