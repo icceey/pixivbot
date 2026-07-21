@@ -400,6 +400,14 @@ pub struct EhentaiConfig {
     pub gp_rate_window_hours: u64,
     #[serde(default = "default_eh_download_poll_interval_sec")]
     pub download_poll_interval_sec: u64,
+    /// Maximum active HTTP Range requests used by one authenticated EH archive.
+    /// This does not change queue-entry concurrency.
+    #[allow(dead_code)]
+    #[serde(
+        default = "default_eh_archive_download_concurrency",
+        deserialize_with = "deserialize_nonzero_usize"
+    )]
+    pub archive_download_concurrency: usize,
     #[serde(default = "default_eh_background_download_enabled")]
     pub background_download_enabled: bool,
     #[serde(default = "default_eh_background_download_concurrency")]
@@ -437,6 +445,7 @@ impl Default for EhentaiConfig {
             gp_rate_limit: default_eh_gp_rate_limit(),
             gp_rate_window_hours: default_eh_gp_rate_window_hours(),
             download_poll_interval_sec: default_eh_download_poll_interval_sec(),
+            archive_download_concurrency: default_eh_archive_download_concurrency(),
             background_download_enabled: default_eh_background_download_enabled(),
             background_download_concurrency: default_eh_background_download_concurrency(),
             background_download_max_attempts: default_eh_background_download_max_attempts(),
@@ -583,6 +592,21 @@ fn default_eh_download_poll_interval_sec() -> u64 {
     60
 }
 
+fn default_eh_archive_download_concurrency() -> usize {
+    1
+}
+
+fn deserialize_nonzero_usize<'de, D>(deserializer: D) -> std::result::Result<usize, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = usize::deserialize(deserializer)?;
+    if value == 0 {
+        return Err(serde::de::Error::custom("must be at least 1"));
+    }
+    Ok(value)
+}
+
 fn default_eh_background_download_enabled() -> bool {
     true
 }
@@ -706,5 +730,28 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(cfg.max_archive_size_bytes(), None);
+    }
+
+    #[test]
+    fn test_eh_archive_download_concurrency_defaults_to_one() {
+        let cfg: EhentaiConfig = serde_json::from_str("{}").unwrap();
+
+        assert_eq!(cfg.archive_download_concurrency, 1);
+    }
+
+    #[test]
+    fn test_eh_archive_download_concurrency_accepts_values_above_one() {
+        let cfg: EhentaiConfig =
+            serde_json::from_str(r#"{"archive_download_concurrency": 4}"#).unwrap();
+
+        assert_eq!(cfg.archive_download_concurrency, 4);
+    }
+
+    #[test]
+    fn test_eh_archive_download_concurrency_rejects_zero() {
+        let error = serde_json::from_str::<EhentaiConfig>(r#"{"archive_download_concurrency": 0}"#)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("must be at least 1"));
     }
 }

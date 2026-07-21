@@ -2,12 +2,13 @@ use super::Repo;
 use crate::db::entities::eh_download_queue;
 use anyhow::{Context, Result};
 use chrono::Local;
+use eh_client::ArchiveArtifacts;
 use sea_orm::prelude::DateTime;
 use sea_orm::sea_query::Expr;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, EntityTrait, Order, PaginatorTrait, QueryFilter, QueryOrder, Set,
 };
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::LazyLock;
 use tracing::warn;
 
@@ -3100,34 +3101,44 @@ impl Repo {
             return Ok(());
         }
 
-        let active_paths: std::collections::HashSet<String> = eh_download_queue::Entity::find()
-            .filter(eh_download_queue::Column::Status.is_in([
-                STATUS_PENDING,
-                STATUS_DOWNLOADING,
-                STATUS_DOWNLOADED,
-                STATUS_UPLOADING,
-                STATUS_UPLOADED,
-                STATUS_PUBLISHING,
-            ]))
-            .all(&self.db)
-            .await?
-            .into_iter()
-            .flat_map(|entry| expected_eh_cache_zip_paths(cache_dir, entry))
-            .collect();
+        let active_final_identities: HashSet<std::path::PathBuf> =
+            eh_download_queue::Entity::find()
+                .filter(eh_download_queue::Column::Status.is_in([
+                    STATUS_PENDING,
+                    STATUS_DOWNLOADING,
+                    STATUS_DOWNLOADED,
+                    STATUS_UPLOADING,
+                    STATUS_UPLOADED,
+                    STATUS_PUBLISHING,
+                ]))
+                .all(&self.db)
+                .await?
+                .into_iter()
+                .flat_map(|entry| expected_eh_cache_zip_paths(cache_dir, entry))
+                .collect();
 
+        let mut artifact_families: HashMap<std::path::PathBuf, ArchiveArtifacts> = HashMap::new();
         for entry in std::fs::read_dir(cache_dir).context("Failed to read eh_cache dir")? {
             let entry = entry?;
             let path = entry.path();
-            if !is_eh_cache_archive_artifact(&path) {
+            let Some(artifacts) = ArchiveArtifacts::from_member(&path) else {
                 continue;
-            }
+            };
+            artifact_families
+                .entry(artifacts.final_zip().to_path_buf())
+                .or_insert(artifacts);
+        }
 
-            let final_path = final_eh_cache_zip_path(&path);
-            let final_path_str = final_path.to_string_lossy().to_string();
-            if !active_paths.contains(&final_path_str) {
-                if let Err(e) = std::fs::remove_file(&path) {
-                    warn!("Failed to remove orphan zip {}: {}", path.display(), e);
-                }
+        for (final_zip, artifacts) in artifact_families {
+            let result = if !active_final_identities.contains(&final_zip) {
+                artifacts.remove_all().await
+            } else if final_zip.exists() {
+                artifacts.remove_multipart_state().await
+            } else {
+                continue;
+            };
+            if let Err(e) = result {
+                warn!("Failed to cleanup EH archive artifacts: {}", e);
             }
         }
 
@@ -3138,39 +3149,15 @@ impl Repo {
 fn expected_eh_cache_zip_paths(
     cache_dir: &std::path::Path,
     entry: eh_download_queue::Model,
-) -> Vec<String> {
+) -> Vec<std::path::PathBuf> {
     let mut paths = Vec::new();
     if let Some(zip_path) = entry.zip_path {
-        paths.push(zip_path);
+        paths.push(std::path::PathBuf::from(zip_path));
     }
     if matches!(entry.status.as_str(), STATUS_PENDING | STATUS_DOWNLOADING) {
-        paths.push(
-            cache_dir
-                .join(format!("{}_{}.zip", entry.gid, entry.token))
-                .to_string_lossy()
-                .to_string(),
-        );
+        paths.push(cache_dir.join(format!("{}_{}.zip", entry.gid, entry.token)));
     }
     paths
-}
-
-fn is_eh_cache_archive_artifact(path: &std::path::Path) -> bool {
-    path.extension().and_then(|e| e.to_str()) == Some("zip")
-        || path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.ends_with(".zip.part"))
-}
-
-fn final_eh_cache_zip_path(path: &std::path::Path) -> std::path::PathBuf {
-    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-        return path.to_path_buf();
-    };
-    if let Some(final_name) = name.strip_suffix(".zip.part") {
-        path.with_file_name(format!("{final_name}.zip"))
-    } else {
-        path.to_path_buf()
-    }
 }
 
 #[cfg(test)]
@@ -3891,13 +3878,22 @@ mod tests {
 
         let orphan_zip = cache_dir.join("orphan.zip");
         let orphan_part = cache_dir.join("orphan.zip.part");
+        let orphan_parts = cache_dir.join("orphan.zip.parts");
         let active_zip = cache_dir.join("active.zip");
         let active_part = cache_dir.join("active.zip.part");
-        let unrelated = cache_dir.join("note.txt");
+        let active_parts = cache_dir.join("active.zip.parts");
+        let unrelated = cache_dir.join("notes").join("keep.txt");
         std::fs::write(&orphan_zip, b"zip").unwrap();
         std::fs::write(&orphan_part, b"partial").unwrap();
+        std::fs::create_dir_all(orphan_parts.join("nested")).unwrap();
+        std::fs::write(orphan_parts.join("manifest.json"), b"manifest").unwrap();
+        std::fs::write(orphan_parts.join("nested").join("part-0001"), b"part").unwrap();
         std::fs::write(&active_zip, b"zip").unwrap();
         std::fs::write(&active_part, b"partial").unwrap();
+        std::fs::create_dir_all(active_parts.join("nested")).unwrap();
+        std::fs::write(active_parts.join("manifest.json"), b"manifest").unwrap();
+        std::fs::write(active_parts.join("nested").join("part-0001"), b"part").unwrap();
+        std::fs::create_dir_all(unrelated.parent().unwrap()).unwrap();
         std::fs::write(&unrelated, b"keep").unwrap();
 
         let model = repo
@@ -3917,9 +3913,23 @@ mod tests {
             !orphan_part.exists(),
             "orphan partial ZIP should be removed"
         );
+        assert!(
+            !orphan_parts.exists(),
+            "orphan multipart state should be removed recursively"
+        );
         assert!(active_zip.exists(), "active final ZIP should be kept");
-        assert!(active_part.exists(), "active partial ZIP should be kept");
-        assert!(unrelated.exists(), "unrelated files should be ignored");
+        assert!(
+            !active_part.exists(),
+            "active final ZIP should discard stale assembly scratch"
+        );
+        assert!(
+            !active_parts.exists(),
+            "active final ZIP should discard stale multipart state"
+        );
+        assert!(
+            unrelated.exists(),
+            "unrelated directories should be ignored"
+        );
     }
 
     #[tokio::test]
@@ -3936,7 +3946,11 @@ mod tests {
         assert_eq!(claimed.id, model.id);
 
         let part = cache_dir.join("88_tok.zip.part");
+        let parts_dir = cache_dir.join("88_tok.zip.parts");
         std::fs::write(&part, b"partial").unwrap();
+        std::fs::create_dir_all(parts_dir.join("nested")).unwrap();
+        std::fs::write(parts_dir.join("manifest.json"), b"manifest").unwrap();
+        std::fs::write(parts_dir.join("nested").join("part-0001"), b"part").unwrap();
 
         let reset = repo.reset_stale_eh_downloads().await.unwrap();
         assert_eq!(reset, 1);
@@ -3945,6 +3959,10 @@ mod tests {
         assert!(
             part.exists(),
             "pending retry partial should be kept for resumable download"
+        );
+        assert!(
+            parts_dir.exists(),
+            "pending retry multipart state should be kept for resumable download"
         );
 
         Entity::update_many()
@@ -3958,6 +3976,10 @@ mod tests {
         assert!(
             !part.exists(),
             "canceled queue partial should be removed as orphan"
+        );
+        assert!(
+            !parts_dir.exists(),
+            "canceled queue multipart state should be removed recursively"
         );
     }
 
