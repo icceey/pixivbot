@@ -171,6 +171,10 @@ download_original_threshold = 1
 # # telegraph_access_token = "your_telegraph_token"
 # # Max galleries to push per tick (default: 3)
 # max_push_per_tick = 3
+# # Maximum HTTP Range connections used by one authenticated archive.
+# # Default: 1. Values above 1 enable dynamic multipart transfer; 0 is invalid.
+# # This is independent of background_download_concurrency below.
+# archive_download_concurrency = 1
 # # Run repeated slow archive downloads in background so the main queue can continue.
 # background_download_enabled = true
 # background_download_concurrency = 2

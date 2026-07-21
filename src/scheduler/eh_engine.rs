@@ -9,9 +9,9 @@ use crate::scheduler::helpers::{eh_tag_subscription_state, get_chat_if_should_no
 use anyhow::{Context, Result};
 use chrono::Local;
 use eh_client::{
-    parser::DownloadCost, rewrite_ipfs_gateway_nodes, EhClient, EhGallery, ImageUploadInput,
-    ImageUploader, IpfS3PreviewRewriteConfig, TelegraphClient, TelegraphImageUrlPair,
-    TelegraphRewriteData, ZipArchiveUploadInput,
+    parser::DownloadCost, rewrite_ipfs_gateway_nodes, ArchiveArtifacts, ArchiveDownloadOptions,
+    EhClient, EhGallery, ImageUploadInput, ImageUploader, IpfS3PreviewRewriteConfig,
+    TelegraphClient, TelegraphImageUrlPair, TelegraphRewriteData, ZipArchiveUploadInput,
 };
 use rand::RngExt;
 use std::sync::{Arc, LazyLock};
@@ -36,6 +36,27 @@ const EH_UPLOAD_IMAGE_CHANNEL_CAPACITY: usize = 1;
 const SLOW_DOWNLOAD_BYTES_PER_SEC: u64 = 1024 * 1024;
 
 static EH_GP_BUDGET_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+fn archive_artifacts_for_entry(
+    cache_dir: &std::path::Path,
+    entry: &eh_download_queue::Model,
+) -> ArchiveArtifacts {
+    ArchiveArtifacts::new(
+        cache_dir
+            .join("eh_cache")
+            .join(format!("{}_{}.zip", entry.gid, entry.token)),
+    )
+}
+
+async fn cleanup_archive_artifacts(cache_dir: &std::path::Path, entry: &eh_download_queue::Model) {
+    let artifacts = archive_artifacts_for_entry(cache_dir, entry);
+    if let Err(e) = artifacts.remove_all().await {
+        warn!(
+            "Failed to delete EH archive artifacts for gid={}: {}",
+            entry.gid, e
+        );
+    }
+}
 
 fn gp_rate_defer_delay_secs(window_hours: u64) -> i64 {
     i64::try_from(window_hours)
@@ -300,6 +321,7 @@ impl EhBackgroundDownloadWorker {
                         "Permanent background EH download failure for gid={}: {}",
                         entry.gid, e
                     );
+                    cleanup_archive_artifacts(&self.cache_dir, &entry).await;
                 }
             }
         }
@@ -314,7 +336,8 @@ impl EhBackgroundDownloadWorker {
         let token = &entry.token;
         let eh_cache = self.cache_dir.join("eh_cache");
         tokio::fs::create_dir_all(&eh_cache).await?;
-        let zip_path = eh_cache.join(format!("{}_{}.zip", gid, token));
+        let artifacts = archive_artifacts_for_entry(&self.cache_dir, entry);
+        let zip_path = artifacts.final_zip().to_path_buf();
 
         let (file_size, gp_cost) = if self.client.is_logged_in() {
             let resolution = if entry.source == "direct" {
@@ -363,7 +386,13 @@ impl EhBackgroundDownloadWorker {
 
             let downloaded_file_size = self
                 .client
-                .download_archive_with_request(&archive_request, &zip_path)
+                .download_archive_with_request_and_options(
+                    &archive_request,
+                    &zip_path,
+                    ArchiveDownloadOptions {
+                        max_concurrency: self.config.archive_download_concurrency,
+                    },
+                )
                 .await
                 .context("Failed to download archive")?;
             let gp_cost = archive_request.cost().gp_amount().unwrap_or(0) as i64;
@@ -1101,7 +1130,8 @@ impl EhDownloadWorker {
         // Ensure cache dir exists
         let eh_cache = self.cache_dir.join("eh_cache");
         tokio::fs::create_dir_all(&eh_cache).await?;
-        let zip_path = eh_cache.join(format!("{}_{}.zip", gid, token));
+        let artifacts = archive_artifacts_for_entry(&self.cache_dir, entry);
+        let zip_path = artifacts.final_zip().to_path_buf();
         let zip_path_str = zip_path.to_string_lossy().to_string();
 
         // Download
@@ -1148,7 +1178,13 @@ impl EhDownloadWorker {
 
             let downloaded_file_size = self
                 .client
-                .download_archive_with_request(&archive_request, &zip_path)
+                .download_archive_with_request_and_options(
+                    &archive_request,
+                    &zip_path,
+                    ArchiveDownloadOptions {
+                        max_concurrency: self.config.archive_download_concurrency,
+                    },
+                )
                 .await
                 .context("Failed to download archive")?;
             let gp_cost = archive_request.cost().gp_amount().unwrap_or(0) as i64;
@@ -1177,23 +1213,9 @@ impl EhDownloadWorker {
         Ok(())
     }
 
-    /// Delete the ZIP/partial ZIP files for an entry if they exist (used on permanent failure).
-    async fn cleanup_zip(&self, _entry: &eh_download_queue::Model) {
-        // Download worker's ZIP path is constructed from gid+token, not stored yet on failure.
-        // The ZIP or resumable .part may exist at the expected path if download started but failed mid-stream.
-        let gid = _entry.gid as u64;
-        let token = &_entry.token;
-        let zip_path = self
-            .cache_dir
-            .join("eh_cache")
-            .join(format!("{}_{}.zip", gid, token));
-        for path in [&zip_path, &zip_path.with_extension("zip.part")] {
-            if path.exists() {
-                if let Err(e) = tokio::fs::remove_file(path).await {
-                    warn!("Failed to delete partial zip {}: {}", path.display(), e);
-                }
-            }
-        }
+    /// Delete the archive artifact family for an entry on permanent failure.
+    async fn cleanup_zip(&self, entry: &eh_download_queue::Model) {
+        cleanup_archive_artifacts(&self.cache_dir, entry).await;
     }
 }
 
@@ -2040,7 +2062,7 @@ mod integration_tests {
     use std::io::Write;
     use teloxide::requests::RequesterExt;
     use teloxide::Bot;
-    use wiremock::matchers::{method, path, query_param};
+    use wiremock::matchers::{header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn make_notifier(tg_server: &MockServer) -> Notifier {
@@ -3300,6 +3322,66 @@ mod integration_tests {
     }
 
     #[tokio::test]
+    async fn test_download_worker_threads_archive_download_concurrency() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        let eh_server = MockServer::start().await;
+        let temp = tempfile::tempdir().unwrap();
+
+        setup_chat(&repo, -100, true).await;
+        let entry = insert_queue_entry(
+            &repo,
+            -100,
+            123456,
+            "abcdef0123",
+            "Concurrent archive",
+            false,
+            STATUS_PENDING,
+            None,
+            None,
+        )
+        .await;
+
+        mock_eh_gallery_page(&eh_server, 123456, "abcdef0123").await;
+        let download_url = format!("{}/archive/123456/token/0", eh_server.uri());
+        mock_eh_archiver_post(&eh_server, &download_url).await;
+        let zip_temp = tempfile::tempdir().unwrap();
+        let zip_path = zip_temp.path().join("concurrent.zip");
+        create_test_zip(&zip_path, 1);
+        let zip_bytes = std::fs::read(&zip_path).unwrap();
+        let content_range = format!("bytes 0-{}/{}", zip_bytes.len() - 1, zip_bytes.len());
+        Mock::given(method("GET"))
+            .and(path("/archive/123456/token/0"))
+            .and(header("range", "bytes=0-"))
+            .respond_with(
+                ResponseTemplate::new(206)
+                    .insert_header("Content-Range", content_range)
+                    .set_body_bytes(zip_bytes),
+            )
+            .expect(1)
+            .mount(&eh_server)
+            .await;
+
+        let mut config = make_config();
+        config.background_download_enabled = false;
+        config.archive_download_concurrency = 2;
+        let worker = EhDownloadWorker::new(
+            Arc::clone(&repo),
+            make_eh_client(&eh_server),
+            Arc::new(config),
+            temp.path().to_path_buf(),
+        );
+
+        worker.tick().await.unwrap();
+
+        let updated = eh_download_queue::Entity::find_by_id(entry.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.status, STATUS_DOWNLOADED);
+    }
+
+    #[tokio::test]
     async fn test_download_worker_rate_limit_skips() {
         let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
         let eh_server = MockServer::start().await;
@@ -3502,8 +3584,12 @@ mod integration_tests {
         std::fs::create_dir_all(&eh_cache).unwrap();
         let zip_path = eh_cache.join("123456_abcdef0123.zip");
         let part_path = zip_path.with_extension("zip.part");
+        let parts_dir = zip_path.with_extension("zip.parts");
         std::fs::write(&zip_path, b"PK\x03\x04stale").unwrap();
         std::fs::write(&part_path, b"PK\x03\x04partial").unwrap();
+        std::fs::create_dir_all(parts_dir.join("nested")).unwrap();
+        std::fs::write(parts_dir.join("manifest.json"), b"manifest").unwrap();
+        std::fs::write(parts_dir.join("nested").join("part-0001"), b"part").unwrap();
 
         mock_eh_gallery_page(&eh_server, 123456, "abcdef0123").await;
         Mock::given(method("POST"))
@@ -3528,6 +3614,10 @@ mod integration_tests {
         assert_eq!(updated.status, STATUS_FAILED);
         assert!(!zip_path.exists(), "final ZIP should be cleaned");
         assert!(!part_path.exists(), "partial ZIP should be cleaned");
+        assert!(
+            !parts_dir.exists(),
+            "multipart parts directory should be removed recursively"
+        );
     }
 
     #[tokio::test]
@@ -5632,6 +5722,135 @@ mod integration_tests {
         assert!(
             updated.background_download_next_retry_at.is_some(),
             "bg defer must schedule a future retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_background_download_worker_threads_archive_download_concurrency() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        let eh_server = MockServer::start().await;
+        let temp = tempfile::tempdir().unwrap();
+
+        let entry = insert_queue_entry(
+            &repo,
+            -100,
+            123456,
+            "abcdef0123",
+            "Concurrent background archive",
+            false,
+            STATUS_PENDING,
+            None,
+            None,
+        )
+        .await;
+        repo.schedule_eh_background_download_from(entry.id, STATUS_PENDING, "test setup")
+            .await
+            .unwrap();
+
+        mock_eh_gallery_page(&eh_server, 123456, "abcdef0123").await;
+        let download_url = format!("{}/archive/123456/token/0", eh_server.uri());
+        mock_eh_archiver_post(&eh_server, &download_url).await;
+        let zip_temp = tempfile::tempdir().unwrap();
+        let zip_path = zip_temp.path().join("concurrent-background.zip");
+        create_test_zip(&zip_path, 1);
+        let zip_bytes = std::fs::read(&zip_path).unwrap();
+        let content_range = format!("bytes 0-{}/{}", zip_bytes.len() - 1, zip_bytes.len());
+        Mock::given(method("GET"))
+            .and(path("/archive/123456/token/0"))
+            .and(header("range", "bytes=0-"))
+            .respond_with(
+                ResponseTemplate::new(206)
+                    .insert_header("Content-Range", content_range)
+                    .set_body_bytes(zip_bytes),
+            )
+            .expect(1)
+            .mount(&eh_server)
+            .await;
+
+        let mut config = make_config();
+        config.archive_download_concurrency = 2;
+        let worker = EhBackgroundDownloadWorker::new(
+            Arc::clone(&repo),
+            make_eh_client(&eh_server),
+            Arc::new(config),
+            temp.path().to_path_buf(),
+        );
+
+        worker.tick().await.unwrap();
+
+        let updated = eh_download_queue::Entity::find_by_id(entry.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.status, STATUS_DOWNLOADED);
+        assert_eq!(updated.background_download_status, None);
+    }
+
+    #[tokio::test]
+    async fn test_background_worker_permanent_failure_cleans_archive_artifact_family() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        let eh_server = MockServer::start().await;
+        let temp = tempfile::tempdir().unwrap();
+
+        let entry = insert_queue_entry(
+            &repo,
+            -100,
+            123456,
+            "abcdef0123",
+            "Background permanent failure",
+            false,
+            STATUS_PENDING,
+            None,
+            None,
+        )
+        .await;
+        repo.schedule_eh_background_download_from(entry.id, STATUS_PENDING, "test setup")
+            .await
+            .unwrap();
+
+        let eh_cache = temp.path().join("eh_cache");
+        std::fs::create_dir_all(&eh_cache).unwrap();
+        let zip_path = eh_cache.join("123456_abcdef0123.zip");
+        let part_path = zip_path.with_extension("zip.part");
+        let parts_dir = zip_path.with_extension("zip.parts");
+        std::fs::write(&zip_path, b"PK\x03\x04stale").unwrap();
+        std::fs::write(&part_path, b"PK\x03\x04partial").unwrap();
+        std::fs::create_dir_all(parts_dir.join("nested")).unwrap();
+        std::fs::write(parts_dir.join("manifest.json"), b"manifest").unwrap();
+        std::fs::write(parts_dir.join("nested").join("part-0001"), b"part").unwrap();
+
+        mock_eh_gallery_page(&eh_server, 123456, "abcdef0123").await;
+        Mock::given(method("POST"))
+            .and(path("/archiver.php"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(1)
+            .mount(&eh_server)
+            .await;
+
+        let mut config = make_config();
+        config.background_download_max_attempts = 1;
+        let worker = EhBackgroundDownloadWorker::new(
+            Arc::clone(&repo),
+            make_eh_client(&eh_server),
+            Arc::new(config),
+            temp.path().to_path_buf(),
+        );
+
+        worker.tick().await.unwrap();
+
+        let updated = eh_download_queue::Entity::find_by_id(entry.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.status, STATUS_FAILED);
+        assert_eq!(updated.background_download_status, None);
+        assert!(!zip_path.exists(), "final ZIP should be cleaned");
+        assert!(!part_path.exists(), "partial ZIP should be cleaned");
+        assert!(
+            !parts_dir.exists(),
+            "multipart parts directory should be removed recursively"
         );
     }
 
