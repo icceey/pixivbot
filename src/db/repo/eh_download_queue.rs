@@ -1,10 +1,10 @@
 use super::Repo;
 use crate::db::entities::eh_download_queue;
 use anyhow::{Context, Result};
-use chrono::Local;
+use chrono::{Local, Timelike};
 use eh_client::ArchiveArtifacts;
 use sea_orm::prelude::DateTime;
-use sea_orm::sea_query::Expr;
+use sea_orm::sea_query::{Expr, SimpleExpr};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, EntityTrait, Order, PaginatorTrait, QueryFilter, QueryOrder, Set,
 };
@@ -50,6 +50,41 @@ pub const BACKGROUND_STATUS_RUNNING: &str = "running";
 pub const TELEGRAPH_REWRITE_STATUS_PENDING: &str = "pending";
 pub const TELEGRAPH_REWRITE_STATUS_REWRITING: &str = "rewriting";
 pub const TELEGRAPH_REWRITE_STATUS_FAILED: &str = "failed";
+const MAIN_DOWNLOAD_RECENT_WINDOW_HOURS: i64 = 2;
+
+enum ArchivePolicyClaim {
+    Main { started_at: DateTime },
+    Background { started_at: DateTime },
+}
+
+/// `started_at` is a row-level claim generation after the first claim. Keeping
+/// it monotonic at whole-second precision prevents same-tick ABA without a
+/// schema migration, including on databases that truncate timestamp fractions.
+fn next_claim_generation(now: DateTime, previous: Option<DateTime>) -> Result<DateTime> {
+    let now_second = now
+        .with_nanosecond(0)
+        .context("Cannot normalize EH claim generation timestamp")?;
+    let Some(previous) = previous else {
+        return Ok(now_second);
+    };
+    let previous_second = previous
+        .with_nanosecond(0)
+        .context("Cannot normalize previous EH claim generation timestamp")?;
+    let following_generation = previous_second
+        .checked_add_signed(chrono::Duration::seconds(1))
+        .context("EH claim generation timestamp overflow")?;
+
+    Ok(now_second.max(following_generation))
+}
+
+fn claim_generation_filter(previous: Option<DateTime>) -> sea_orm::Condition {
+    match previous {
+        Some(generation) => {
+            sea_orm::Condition::all().add(eh_download_queue::Column::StartedAt.eq(generation))
+        }
+        None => sea_orm::Condition::all().add(eh_download_queue::Column::StartedAt.is_null()),
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EhQueueStatusItem {
@@ -395,10 +430,6 @@ impl Repo {
                     )
                     .col_expr(eh_download_queue::Column::RetryCount, Expr::value(0))
                     .col_expr(
-                        eh_download_queue::Column::StartedAt,
-                        Expr::value(None::<DateTime>),
-                    )
-                    .col_expr(
                         eh_download_queue::Column::CompletedAt,
                         Expr::value(None::<DateTime>),
                     )
@@ -597,14 +628,34 @@ impl Repo {
 
         if let Some(model) = entry {
             let now = Local::now().naive_local();
-            let mut active: eh_download_queue::ActiveModel = model.into();
-            active.status = Set(STATUS_DOWNLOADING.to_string());
-            active.started_at = Set(Some(now));
-            let updated = active
-                .update(&self.db)
+            let generation = next_claim_generation(now, model.started_at)?;
+            let result = eh_download_queue::Entity::update_many()
+                .col_expr(
+                    eh_download_queue::Column::Status,
+                    Expr::value(STATUS_DOWNLOADING),
+                )
+                .col_expr(
+                    eh_download_queue::Column::StartedAt,
+                    Expr::value(generation),
+                )
+                .filter(eh_download_queue::Column::Id.eq(model.id))
+                .filter(eh_download_queue::Column::Status.eq(STATUS_PENDING))
+                .filter(claim_generation_filter(model.started_at))
+                .exec(&self.db)
                 .await
                 .context("Failed to mark eh download as downloading")?;
-            Ok(Some(updated))
+            if result.rows_affected == 0 {
+                return Ok(None);
+            }
+
+            let updated = eh_download_queue::Entity::find()
+                .filter(eh_download_queue::Column::Id.eq(model.id))
+                .filter(eh_download_queue::Column::Status.eq(STATUS_DOWNLOADING))
+                .filter(eh_download_queue::Column::StartedAt.eq(generation))
+                .one(&self.db)
+                .await
+                .context("Failed to re-fetch legacy EH download claim")?;
+            Ok(updated)
         } else {
             Ok(None)
         }
@@ -684,6 +735,126 @@ impl Repo {
             .update(&self.db)
             .await
             .context("Failed to mark eh download as failed")
+    }
+
+    /// Permanently fail a main download after its archive cost violates the
+    /// configured policy. The original claim generation prevents a stale worker
+    /// from overwriting a newer re-enqueued claim.
+    pub async fn fail_eh_download_for_archive_policy(
+        &self,
+        entry: &eh_download_queue::Model,
+        error: &str,
+    ) -> Result<eh_download_queue::Model> {
+        let started_at = entry
+            .started_at
+            .context("Cannot fail EH download for archive policy: missing main claim started_at")?;
+        self.fail_eh_download_for_archive_policy_claim(
+            entry.id,
+            error,
+            ArchivePolicyClaim::Main { started_at },
+        )
+        .await
+    }
+
+    /// Permanently fail a claimed background download after its archive cost
+    /// violates the configured policy. The original row claim generation preserves
+    /// newer cancellation or re-enqueue decisions.
+    pub async fn fail_eh_background_download_for_archive_policy(
+        &self,
+        entry: &eh_download_queue::Model,
+        error: &str,
+    ) -> Result<eh_download_queue::Model> {
+        let started_at = entry.started_at.context(
+            "Cannot fail EH download for archive policy: missing background claim started_at",
+        )?;
+        self.fail_eh_download_for_archive_policy_claim(
+            entry.id,
+            error,
+            ArchivePolicyClaim::Background { started_at },
+        )
+        .await
+    }
+
+    async fn fail_eh_download_for_archive_policy_claim(
+        &self,
+        id: i32,
+        error: &str,
+        claim: ArchivePolicyClaim,
+    ) -> Result<eh_download_queue::Model> {
+        let (expected_claim, claim_name): (SimpleExpr, &str) = match claim {
+            ArchivePolicyClaim::Main { started_at } => (
+                sea_orm::Condition::all()
+                    .add(eh_download_queue::Column::Status.eq(STATUS_DOWNLOADING))
+                    .add(eh_download_queue::Column::StartedAt.eq(started_at))
+                    .into(),
+                "main downloading claim",
+            ),
+            ArchivePolicyClaim::Background { started_at } => (
+                sea_orm::Condition::all()
+                    .add(eh_download_queue::Column::Status.eq(STATUS_PENDING))
+                    .add(
+                        eh_download_queue::Column::BackgroundDownloadStatus
+                            .eq(BACKGROUND_STATUS_RUNNING),
+                    )
+                    .add(eh_download_queue::Column::StartedAt.eq(started_at))
+                    .into(),
+                "background running claim",
+            ),
+        };
+        let now = Local::now().naive_local();
+        let result = eh_download_queue::Entity::update_many()
+            .col_expr(
+                eh_download_queue::Column::Status,
+                Expr::value(STATUS_FAILED),
+            )
+            .col_expr(
+                eh_download_queue::Column::Error,
+                Expr::value(Some(error.to_string())),
+            )
+            .col_expr(eh_download_queue::Column::CompletedAt, Expr::value(now))
+            .col_expr(
+                eh_download_queue::Column::NextRetryAt,
+                Expr::value(None::<DateTime>),
+            )
+            .col_expr(
+                eh_download_queue::Column::BackgroundDownloadStatus,
+                Expr::value(None::<String>),
+            )
+            .col_expr(
+                eh_download_queue::Column::BackgroundDownloadStartedAt,
+                Expr::value(None::<DateTime>),
+            )
+            .col_expr(
+                eh_download_queue::Column::BackgroundDownloadNextRetryAt,
+                Expr::value(None::<DateTime>),
+            )
+            .col_expr(
+                eh_download_queue::Column::BackgroundDownloadAttemptCount,
+                Expr::value(0),
+            )
+            .col_expr(
+                eh_download_queue::Column::BackgroundDownloadError,
+                Expr::value(None::<String>),
+            )
+            .filter(eh_download_queue::Column::Id.eq(id))
+            .filter(expected_claim)
+            .exec(&self.db)
+            .await
+            .context("Failed to fail EH download for archive policy")?;
+
+        if result.rows_affected != 1 {
+            anyhow::bail!(
+                "Cannot fail EH download {} for archive policy: expected {} claim, but it was changed by another worker",
+                id,
+                claim_name
+            );
+        }
+
+        eh_download_queue::Entity::find_by_id(id)
+            .one(&self.db)
+            .await
+            .context("Failed to fetch EH download after archive policy failure")?
+            .context("Entry disappeared after archive policy failure")
     }
 
     /// Get total bytes downloaded in the last `hours` window.
@@ -1268,7 +1439,6 @@ impl Repo {
         for entry in stale_downloading {
             let mut active: eh_download_queue::ActiveModel = entry.into();
             active.status = Set(STATUS_PENDING.to_string());
-            active.started_at = Set(None);
             active
                 .update(&self.db)
                 .await
@@ -1285,7 +1455,6 @@ impl Repo {
         for entry in stale_uploading {
             let mut active: eh_download_queue::ActiveModel = entry.into();
             active.status = Set(STATUS_DOWNLOADED.to_string());
-            active.started_at = Set(None);
             active
                 .update(&self.db)
                 .await
@@ -1307,7 +1476,6 @@ impl Repo {
             };
             let mut active: eh_download_queue::ActiveModel = entry.into();
             active.status = Set(target.to_string());
-            active.started_at = Set(None);
             active
                 .update(&self.db)
                 .await
@@ -1361,7 +1529,6 @@ impl Repo {
         for entry in failed {
             let mut active: eh_download_queue::ActiveModel = entry.into();
             active.status = Set(STATUS_PENDING.to_string());
-            active.started_at = Set(None);
             active.completed_at = Set(None);
             active
                 .update(&self.db)
@@ -1410,10 +1577,6 @@ impl Repo {
                 Expr::value(Some(zip_path.to_string())),
             )
             .col_expr(eh_download_queue::Column::CompletedAt, Expr::value(now))
-            .col_expr(
-                eh_download_queue::Column::StartedAt,
-                Expr::value(None::<DateTime>),
-            )
             .col_expr(
                 eh_download_queue::Column::Error,
                 Expr::value(None::<String>),
@@ -1832,6 +1995,33 @@ impl Repo {
     /// Uses a conditional UPDATE to atomically claim the entry.
     pub async fn get_next_for_download(&self) -> Result<Option<eh_download_queue::Model>> {
         let now = Local::now().naive_local();
+        self.get_next_for_download_at(now).await
+    }
+
+    async fn get_next_for_download_at(
+        &self,
+        now: DateTime,
+    ) -> Result<Option<eh_download_queue::Model>> {
+        let cutoff = now - chrono::Duration::hours(MAIN_DOWNLOAD_RECENT_WINDOW_HOURS);
+        let is_recent = Expr::col(eh_download_queue::Column::CreatedAt).gt(cutoff);
+        let recent_priority: SimpleExpr = Expr::case(is_recent.clone(), 0).finally(1).into();
+        let recent_created_at: SimpleExpr = Expr::case(
+            is_recent.clone(),
+            Expr::col(eh_download_queue::Column::CreatedAt),
+        )
+        .finally(Expr::value(None::<DateTime>))
+        .into();
+        let recent_id: SimpleExpr =
+            Expr::case(is_recent.clone(), Expr::col(eh_download_queue::Column::Id))
+                .finally(Expr::value(None::<i32>))
+                .into();
+        let old_created_at: SimpleExpr =
+            Expr::case(is_recent.clone(), Expr::value(None::<DateTime>))
+                .finally(Expr::col(eh_download_queue::Column::CreatedAt))
+                .into();
+        let old_id: SimpleExpr = Expr::case(is_recent, Expr::value(None::<i32>))
+            .finally(Expr::col(eh_download_queue::Column::Id))
+            .into();
         let entry = eh_download_queue::Entity::find()
             .filter(eh_download_queue::Column::Status.eq(STATUS_PENDING))
             .filter(eh_download_queue::Column::BackgroundDownloadStatus.is_null())
@@ -1840,7 +2030,11 @@ impl Repo {
                     .is_null()
                     .or(eh_download_queue::Column::NextRetryAt.lte(now)),
             )
-            .order_by(eh_download_queue::Column::CreatedAt, Order::Asc)
+            .order_by(recent_priority, Order::Asc)
+            .order_by(recent_created_at, Order::Asc)
+            .order_by(recent_id, Order::Asc)
+            .order_by(old_created_at, Order::Desc)
+            .order_by(old_id, Order::Desc)
             .one(&self.db)
             .await
             .context("Failed to fetch next for download")?;
@@ -1849,14 +2043,26 @@ impl Repo {
             return Ok(None);
         };
 
+        self.claim_main_download_from_snapshot_at(&model, now).await
+    }
+
+    async fn claim_main_download_from_snapshot_at(
+        &self,
+        model: &eh_download_queue::Model,
+        now: DateTime,
+    ) -> Result<Option<eh_download_queue::Model>> {
+        let generation = next_claim_generation(now, model.started_at)?;
         // Atomic claim: only flip if still pending with valid next_retry_at
-        // (guards against concurrent workers and defers)
+        // and the selected previous generation (guards stale selectors too).
         let result = eh_download_queue::Entity::update_many()
             .col_expr(
                 eh_download_queue::Column::Status,
                 Expr::value(STATUS_DOWNLOADING),
             )
-            .col_expr(eh_download_queue::Column::StartedAt, Expr::value(now))
+            .col_expr(
+                eh_download_queue::Column::StartedAt,
+                Expr::value(generation),
+            )
             .col_expr(
                 eh_download_queue::Column::NextRetryAt,
                 Expr::value(None::<DateTime>),
@@ -1864,6 +2070,7 @@ impl Repo {
             .filter(eh_download_queue::Column::Id.eq(model.id))
             .filter(eh_download_queue::Column::Status.eq(STATUS_PENDING))
             .filter(eh_download_queue::Column::BackgroundDownloadStatus.is_null())
+            .filter(claim_generation_filter(model.started_at))
             .filter(
                 sea_orm::Condition::any()
                     .add(eh_download_queue::Column::NextRetryAt.is_null())
@@ -1877,12 +2084,15 @@ impl Repo {
             return Ok(None); // someone else claimed it
         }
 
-        // Re-fetch the updated model
-        let updated = eh_download_queue::Entity::find_by_id(model.id)
+        // Confirm this worker's status and generation survived until readback.
+        let updated = eh_download_queue::Entity::find()
+            .filter(eh_download_queue::Column::Id.eq(model.id))
+            .filter(eh_download_queue::Column::Status.eq(STATUS_DOWNLOADING))
+            .filter(eh_download_queue::Column::BackgroundDownloadStatus.is_null())
+            .filter(eh_download_queue::Column::StartedAt.eq(generation))
             .one(&self.db)
-            .await?
-            .context("Entry disappeared after claim")?;
-        Ok(Some(updated))
+            .await?;
+        Ok(updated)
     }
 
     /// Get next entry for the upload stage: status=downloaded, telegraph=true, next_retry_at ok.
@@ -1906,13 +2116,17 @@ impl Repo {
             return Ok(None);
         };
 
+        let generation = next_claim_generation(now, model.started_at)?;
         // Atomic claim: only flip if still downloaded+telegraph with valid next_retry_at
         let result = eh_download_queue::Entity::update_many()
             .col_expr(
                 eh_download_queue::Column::Status,
                 Expr::value(STATUS_UPLOADING),
             )
-            .col_expr(eh_download_queue::Column::StartedAt, Expr::value(now))
+            .col_expr(
+                eh_download_queue::Column::StartedAt,
+                Expr::value(generation),
+            )
             .col_expr(
                 eh_download_queue::Column::NextRetryAt,
                 Expr::value(None::<DateTime>),
@@ -1920,6 +2134,7 @@ impl Repo {
             .filter(eh_download_queue::Column::Id.eq(model.id))
             .filter(eh_download_queue::Column::Status.eq(STATUS_DOWNLOADED))
             .filter(eh_download_queue::Column::Telegraph.eq(true))
+            .filter(claim_generation_filter(model.started_at))
             .filter(
                 sea_orm::Condition::any()
                     .add(eh_download_queue::Column::NextRetryAt.is_null())
@@ -1933,11 +2148,13 @@ impl Repo {
             return Ok(None);
         }
 
-        let updated = eh_download_queue::Entity::find_by_id(model.id)
+        let updated = eh_download_queue::Entity::find()
+            .filter(eh_download_queue::Column::Id.eq(model.id))
+            .filter(eh_download_queue::Column::Status.eq(STATUS_UPLOADING))
+            .filter(eh_download_queue::Column::StartedAt.eq(generation))
             .one(&self.db)
-            .await?
-            .context("Entry disappeared after claim")?;
-        Ok(Some(updated))
+            .await?;
+        Ok(updated)
     }
 
     /// Get next entry for the publish stage: either (downloaded, telegraph=false) or (uploaded).
@@ -1968,6 +2185,7 @@ impl Repo {
             return Ok(None);
         };
 
+        let generation = next_claim_generation(now, model.started_at)?;
         // Atomically claim: only flip if status is still the original AND next_retry_at is valid.
         // Also guard against row changes between select and update (telegraph toggle, re-enqueue).
         let original_status = model.status.clone();
@@ -1989,13 +2207,17 @@ impl Repo {
                 eh_download_queue::Column::Status,
                 Expr::value(STATUS_PUBLISHING),
             )
-            .col_expr(eh_download_queue::Column::StartedAt, Expr::value(now))
+            .col_expr(
+                eh_download_queue::Column::StartedAt,
+                Expr::value(generation),
+            )
             .col_expr(
                 eh_download_queue::Column::NextRetryAt,
                 Expr::value(None::<DateTime>),
             )
             .filter(eh_download_queue::Column::Id.eq(model.id))
             .filter(status_filter)
+            .filter(claim_generation_filter(model.started_at))
             .filter(retry_filter)
             .exec(&self.db)
             .await
@@ -2005,11 +2227,13 @@ impl Repo {
             return Ok(None);
         }
 
-        let updated = eh_download_queue::Entity::find_by_id(model.id)
+        let updated = eh_download_queue::Entity::find()
+            .filter(eh_download_queue::Column::Id.eq(model.id))
+            .filter(eh_download_queue::Column::Status.eq(STATUS_PUBLISHING))
+            .filter(eh_download_queue::Column::StartedAt.eq(generation))
             .one(&self.db)
-            .await?
-            .context("Entry disappeared after claim")?;
-        Ok(Some(updated))
+            .await?;
+        Ok(updated)
     }
 
     /// Mark the archive ZIP as sent (publish stage progress marker).
@@ -2613,10 +2837,6 @@ impl Repo {
                 Expr::value(now + chrono::Duration::seconds(delay)),
             )
             .col_expr(
-                eh_download_queue::Column::StartedAt,
-                Expr::value(None::<DateTime>),
-            )
-            .col_expr(
                 eh_download_queue::Column::Error,
                 Expr::value(Some(error.to_string())),
             )
@@ -2656,10 +2876,6 @@ impl Repo {
             .col_expr(
                 eh_download_queue::Column::Status,
                 Expr::value(STATUS_PENDING),
-            )
-            .col_expr(
-                eh_download_queue::Column::StartedAt,
-                Expr::value(None::<DateTime>),
             )
             .col_expr(
                 eh_download_queue::Column::NextRetryAt,
@@ -2874,6 +3090,13 @@ impl Repo {
         &self,
     ) -> Result<Option<eh_download_queue::Model>> {
         let now = Local::now().naive_local();
+        self.get_next_for_background_download_at(now).await
+    }
+
+    async fn get_next_for_background_download_at(
+        &self,
+        now: DateTime,
+    ) -> Result<Option<eh_download_queue::Model>> {
         let entry = eh_download_queue::Entity::find()
             .filter(eh_download_queue::Column::Status.eq(STATUS_PENDING))
             .filter(
@@ -2893,6 +3116,8 @@ impl Repo {
             return Ok(None);
         };
 
+        let generation = next_claim_generation(now, model.started_at)?;
+        let lease_started_at = next_claim_generation(now, None)?;
         let result = eh_download_queue::Entity::update_many()
             .col_expr(
                 eh_download_queue::Column::BackgroundDownloadStatus,
@@ -2900,13 +3125,18 @@ impl Repo {
             )
             .col_expr(
                 eh_download_queue::Column::BackgroundDownloadStartedAt,
-                Expr::value(Some(now)),
+                Expr::value(Some(lease_started_at)),
+            )
+            .col_expr(
+                eh_download_queue::Column::StartedAt,
+                Expr::value(generation),
             )
             .filter(eh_download_queue::Column::Id.eq(model.id))
             .filter(eh_download_queue::Column::Status.eq(STATUS_PENDING))
             .filter(
                 eh_download_queue::Column::BackgroundDownloadStatus.eq(BACKGROUND_STATUS_PENDING),
             )
+            .filter(claim_generation_filter(model.started_at))
             .filter(
                 sea_orm::Condition::any()
                     .add(eh_download_queue::Column::BackgroundDownloadNextRetryAt.is_null())
@@ -2920,11 +3150,17 @@ impl Repo {
             return Ok(None);
         }
 
-        let updated = eh_download_queue::Entity::find_by_id(model.id)
+        let updated = eh_download_queue::Entity::find()
+            .filter(eh_download_queue::Column::Id.eq(model.id))
+            .filter(eh_download_queue::Column::Status.eq(STATUS_PENDING))
+            .filter(
+                eh_download_queue::Column::BackgroundDownloadStatus.eq(BACKGROUND_STATUS_RUNNING),
+            )
+            .filter(eh_download_queue::Column::StartedAt.eq(generation))
+            .filter(eh_download_queue::Column::BackgroundDownloadStartedAt.eq(lease_started_at))
             .one(&self.db)
-            .await?
-            .context("Entry disappeared after background claim")?;
-        Ok(Some(updated))
+            .await?;
+        Ok(updated)
     }
 
     pub async fn mark_eh_background_download_downloaded(
@@ -2947,10 +3183,6 @@ impl Repo {
                 Expr::value(Some(zip_path.to_string())),
             )
             .col_expr(eh_download_queue::Column::CompletedAt, Expr::value(now))
-            .col_expr(
-                eh_download_queue::Column::StartedAt,
-                Expr::value(None::<DateTime>),
-            )
             .col_expr(
                 eh_download_queue::Column::Error,
                 Expr::value(None::<String>),
@@ -3165,8 +3397,53 @@ mod tests {
     use super::*;
     use crate::db::entities::eh_download_queue::{Column, Entity};
     use crate::db::repo::tests_helpers;
-    use chrono::Utc;
-    use sea_orm::sea_query::Expr;
+    use chrono::{Duration, NaiveDate, Utc};
+    use sea_orm::{sea_query::Expr, ConnectionTrait, DbBackend, Statement};
+
+    async fn set_download_claim_fields(
+        repo: &Repo,
+        id: i32,
+        created_at: DateTime,
+        next_retry_at: Option<DateTime>,
+        background_download_status: Option<&str>,
+    ) {
+        Entity::update_many()
+            .col_expr(Column::CreatedAt, Expr::value(created_at))
+            .col_expr(Column::NextRetryAt, Expr::value(next_retry_at))
+            .col_expr(
+                Column::BackgroundDownloadStatus,
+                Expr::value(background_download_status.map(str::to_owned)),
+            )
+            .filter(Column::Id.eq(id))
+            .exec(&repo.db)
+            .await
+            .unwrap();
+    }
+
+    #[test]
+    fn test_next_claim_generation_is_monotonic_at_second_precision() {
+        let second = NaiveDate::from_ymd_opt(2026, 7, 22)
+            .unwrap()
+            .and_hms_opt(12, 0, 0)
+            .unwrap();
+        let fractional_now = second + Duration::milliseconds(900);
+        let fractional_previous = second + Duration::milliseconds(100);
+
+        assert_eq!(next_claim_generation(fractional_now, None).unwrap(), second);
+        assert_eq!(
+            next_claim_generation(fractional_now, Some(fractional_previous)).unwrap(),
+            second + Duration::seconds(1)
+        );
+        assert_eq!(
+            next_claim_generation(second, Some(second + Duration::seconds(8))).unwrap(),
+            second + Duration::seconds(9)
+        );
+        assert_eq!(
+            next_claim_generation(second + Duration::seconds(8), Some(second)).unwrap(),
+            second + Duration::seconds(8)
+        );
+        assert!(next_claim_generation(DateTime::MAX, Some(DateTime::MAX)).is_err());
+    }
 
     #[tokio::test]
     async fn test_subscription_enqueue_records_origin_subscription() {
@@ -4140,6 +4417,156 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_main_download_claim_prioritizes_recent_fifo_then_old_lifo() {
+        let repo = tests_helpers::setup_test_db().await.unwrap();
+        let anchor = NaiveDate::from_ymd_opt(2026, 7, 22)
+            .unwrap()
+            .and_hms_opt(12, 0, 0)
+            .unwrap();
+
+        let recent_first = repo
+            .enqueue_eh_download(-100, 100, "tok", "Recent first", false, SOURCE_DIRECT)
+            .await
+            .unwrap();
+        let recent_second = repo
+            .enqueue_eh_download(-100, 101, "tok", "Recent second", false, SOURCE_DIRECT)
+            .await
+            .unwrap();
+        let recent_newer = repo
+            .enqueue_eh_download(-100, 102, "tok", "Recent newer", false, SOURCE_DIRECT)
+            .await
+            .unwrap();
+        let cutoff_first = repo
+            .enqueue_eh_download(-100, 200, "tok", "Cutoff first", false, SOURCE_DIRECT)
+            .await
+            .unwrap();
+        let cutoff_second = repo
+            .enqueue_eh_download(-100, 201, "tok", "Cutoff second", false, SOURCE_DIRECT)
+            .await
+            .unwrap();
+        let old = repo
+            .enqueue_eh_download(-100, 300, "tok", "Old", false, SOURCE_DIRECT)
+            .await
+            .unwrap();
+        let future_retry = repo
+            .enqueue_eh_download(-100, 400, "tok", "Future retry", false, SOURCE_DIRECT)
+            .await
+            .unwrap();
+        let background_old = repo
+            .enqueue_eh_download(-100, 500, "tok", "Background old", false, SOURCE_DIRECT)
+            .await
+            .unwrap();
+        let background_recent = repo
+            .enqueue_eh_download(-100, 501, "tok", "Background recent", false, SOURCE_DIRECT)
+            .await
+            .unwrap();
+
+        set_download_claim_fields(
+            &repo,
+            recent_first.id,
+            anchor - Duration::minutes(90),
+            None,
+            None,
+        )
+        .await;
+        set_download_claim_fields(
+            &repo,
+            recent_second.id,
+            anchor - Duration::minutes(90),
+            None,
+            None,
+        )
+        .await;
+        set_download_claim_fields(
+            &repo,
+            recent_newer.id,
+            anchor - Duration::minutes(30),
+            None,
+            None,
+        )
+        .await;
+        set_download_claim_fields(
+            &repo,
+            cutoff_first.id,
+            anchor - Duration::hours(2),
+            None,
+            None,
+        )
+        .await;
+        set_download_claim_fields(
+            &repo,
+            cutoff_second.id,
+            anchor - Duration::hours(2),
+            None,
+            None,
+        )
+        .await;
+        set_download_claim_fields(&repo, old.id, anchor - Duration::hours(3), None, None).await;
+        set_download_claim_fields(
+            &repo,
+            future_retry.id,
+            anchor - Duration::hours(4),
+            Some(anchor + Duration::minutes(1)),
+            None,
+        )
+        .await;
+        set_download_claim_fields(
+            &repo,
+            background_old.id,
+            anchor - Duration::hours(3),
+            None,
+            Some(BACKGROUND_STATUS_PENDING),
+        )
+        .await;
+        set_download_claim_fields(
+            &repo,
+            background_recent.id,
+            anchor - Duration::hours(1),
+            None,
+            Some(BACKGROUND_STATUS_PENDING),
+        )
+        .await;
+
+        assert!(recent_first.id < recent_second.id);
+        assert!(cutoff_first.id < cutoff_second.id);
+        for expected_gid in [100, 101, 102, 201, 200, 300] {
+            let claimed = repo
+                .get_next_for_download_at(anchor)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(claimed.gid, expected_gid);
+            assert_eq!(claimed.status, STATUS_DOWNLOADING);
+        }
+
+        assert!(repo
+            .get_next_for_download_at(anchor)
+            .await
+            .unwrap()
+            .is_none());
+        let deferred = Entity::find_by_id(future_retry.id)
+            .one(&repo.db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(deferred.status, STATUS_PENDING);
+        assert_eq!(deferred.next_retry_at, Some(anchor + Duration::minutes(1)));
+
+        let first_background = repo
+            .get_next_for_background_download()
+            .await
+            .unwrap()
+            .unwrap();
+        let second_background = repo
+            .get_next_for_background_download()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first_background.gid, background_old.gid);
+        assert_eq!(second_background.gid, background_recent.gid);
+    }
+
+    #[tokio::test]
     async fn test_background_download_lifecycle_success_retry_and_stale_reset() {
         let repo = tests_helpers::setup_test_db().await.unwrap();
         let model = repo
@@ -4149,9 +4576,12 @@ mod tests {
 
         let claimed = repo.get_next_for_download().await.unwrap().unwrap();
         assert_eq!(claimed.id, model.id);
-        repo.schedule_eh_background_download_from(claimed.id, STATUS_DOWNLOADING, "slow")
+        let main_generation = claimed.started_at;
+        let handed_off = repo
+            .schedule_eh_background_download_from(claimed.id, STATUS_DOWNLOADING, "slow")
             .await
             .unwrap();
+        assert_eq!(handed_off.started_at, main_generation);
 
         let bg_claim = repo
             .get_next_for_background_download()
@@ -4163,6 +4593,8 @@ mod tests {
             bg_claim.background_download_status.as_deref(),
             Some(BACKGROUND_STATUS_RUNNING)
         );
+        assert!(bg_claim.started_at > main_generation);
+        let background_generation = bg_claim.started_at;
 
         let (retry, permanent) = repo
             .schedule_eh_background_download_retry(bg_claim.id, "still slow", 6)
@@ -4176,6 +4608,7 @@ mod tests {
             Some(BACKGROUND_STATUS_PENDING)
         );
         assert!(retry.background_download_next_retry_at.is_some());
+        assert_eq!(retry.started_at, background_generation);
 
         Entity::update_many()
             .col_expr(
@@ -4204,6 +4637,7 @@ mod tests {
             Some(BACKGROUND_STATUS_PENDING)
         );
         assert!(reset_row.background_download_started_at.is_none());
+        assert_eq!(reset_row.started_at, background_generation);
 
         Entity::update_many()
             .col_expr(
@@ -4222,6 +4656,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        assert!(bg_claim.started_at > background_generation);
         let done = repo
             .mark_eh_background_download_downloaded(bg_claim.id, 1234, "/tmp/bg.zip", 0)
             .await
@@ -4231,6 +4666,7 @@ mod tests {
         assert_eq!(done.zip_path.as_deref(), Some("/tmp/bg.zip"));
         assert!(done.background_download_status.is_none());
         assert!(done.background_download_error.is_none());
+        assert_eq!(done.started_at, bg_claim.started_at);
     }
 
     #[tokio::test]
@@ -4293,12 +4729,17 @@ mod tests {
     #[tokio::test]
     async fn test_reenqueue_terminal_row_clears_background_state() {
         let repo = tests_helpers::setup_test_db().await.unwrap();
+        let generation = NaiveDate::from_ymd_opt(2026, 7, 22)
+            .unwrap()
+            .and_hms_opt(12, 0, 0)
+            .unwrap();
         let model = repo
             .enqueue_eh_download(-100, 48, "tok", "Title", false, SOURCE_DIRECT)
             .await
             .unwrap();
         Entity::update_many()
             .col_expr(Column::Status, Expr::value(STATUS_FAILED))
+            .col_expr(Column::StartedAt, Expr::value(Some(generation)))
             .col_expr(
                 Column::BackgroundDownloadStatus,
                 Expr::value(Some(BACKGROUND_STATUS_PENDING.to_string())),
@@ -4314,6 +4755,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(reenqueued.status, STATUS_PENDING);
+        assert_eq!(reenqueued.started_at, Some(generation));
         assert!(reenqueued.background_download_status.is_none());
         assert_eq!(reenqueued.background_download_attempt_count, 0);
     }
@@ -4524,16 +4966,107 @@ mod tests {
             .enqueue_eh_download(-100, 1, "tok", "T", false, SOURCE_DIRECT)
             .await
             .unwrap();
-        repo.get_next_pending_eh_download().await.unwrap(); // marks as downloading
+        let first_claim = repo.get_next_pending_eh_download().await.unwrap().unwrap(); // marks as downloading
 
         // Simulate crash: entry is stuck in "downloading"
         let reset_count = repo.reset_stale_eh_downloads().await.unwrap();
         assert_eq!(reset_count, 1);
+        let reset = Entity::find_by_id(m.id)
+            .one(&repo.db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reset.status, STATUS_PENDING);
+        assert_eq!(reset.started_at, first_claim.started_at);
 
         // Should be pending again
         let next = repo.get_next_pending_eh_download().await.unwrap().unwrap();
         assert_eq!(next.id, m.id);
         assert_eq!(next.status, STATUS_DOWNLOADING); // got_next marks it downloading again
+        assert!(next.started_at > first_claim.started_at);
+    }
+
+    #[tokio::test]
+    async fn test_main_claim_generation_survives_retry_handoff_and_completion() {
+        let repo = tests_helpers::setup_test_db().await.unwrap();
+        let claim_now = NaiveDate::from_ymd_opt(2026, 7, 22)
+            .unwrap()
+            .and_hms_opt(12, 0, 0)
+            .unwrap();
+        let entry = repo
+            .enqueue_eh_download(-100, 69, "tok", "Title", false, SOURCE_DIRECT)
+            .await
+            .unwrap();
+
+        let first_claim = repo
+            .get_next_for_download_at(claim_now)
+            .await
+            .unwrap()
+            .unwrap();
+        let (retry, permanent) = repo
+            .schedule_eh_retry_from(entry.id, STATUS_DOWNLOADING, STATUS_PENDING, "temporary", 5)
+            .await
+            .unwrap();
+        assert!(!permanent);
+        assert_eq!(retry.started_at, first_claim.started_at);
+
+        Entity::update_many()
+            .col_expr(Column::NextRetryAt, Expr::value(None::<DateTime>))
+            .filter(Column::Id.eq(entry.id))
+            .exec(&repo.db)
+            .await
+            .unwrap();
+        let second_claim = repo
+            .get_next_for_download_at(claim_now)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            second_claim.started_at,
+            first_claim
+                .started_at
+                .map(|generation| generation + Duration::seconds(1))
+        );
+
+        let handed_off = repo
+            .schedule_eh_background_download_from(entry.id, STATUS_DOWNLOADING, "slow")
+            .await
+            .unwrap();
+        assert_eq!(handed_off.started_at, second_claim.started_at);
+        assert_eq!(
+            repo.release_background_downloads_to_main_queue()
+                .await
+                .unwrap(),
+            1
+        );
+        let released = Entity::find_by_id(entry.id)
+            .one(&repo.db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(released.started_at, second_claim.started_at);
+
+        let third_claim = repo
+            .get_next_for_download_at(claim_now)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            third_claim.started_at,
+            second_claim
+                .started_at
+                .map(|generation| generation + Duration::seconds(1))
+        );
+        let downloaded = repo
+            .mark_eh_download_downloaded(entry.id, 1024, "/tmp/69.zip", 0)
+            .await
+            .unwrap();
+        assert_eq!(downloaded.started_at, third_claim.started_at);
+
+        let publishing = repo.get_next_for_publish().await.unwrap().unwrap();
+        assert!(publishing.started_at > downloaded.started_at);
+        let done = repo.mark_eh_download_done(entry.id, 1024).await.unwrap();
+        assert_eq!(done.started_at, publishing.started_at);
     }
 
     #[tokio::test]
@@ -4605,6 +5138,367 @@ mod tests {
             .unwrap();
         assert_eq!(row.status, STATUS_PENDING);
         assert_ne!(row.status, STATUS_FAILED);
+    }
+
+    /// A policy decision made by a main worker must not overwrite a row that
+    /// was re-enqueued after that worker claimed it.
+    #[tokio::test]
+    async fn test_main_archive_policy_failure_does_not_fail_reenqueued_row() {
+        let repo = tests_helpers::setup_test_db().await.unwrap();
+        let model = repo
+            .enqueue_eh_download(-100, 62, "tok", "Title", false, SOURCE_SUBSCRIPTION)
+            .await
+            .unwrap();
+
+        let claimed = repo.get_next_for_download().await.unwrap().unwrap();
+        assert_eq!(claimed.id, model.id);
+        assert_eq!(claimed.status, STATUS_DOWNLOADING);
+
+        let reenqueued = repo
+            .enqueue_eh_download(-100, 62, "new", "New", false, SOURCE_DIRECT)
+            .await
+            .unwrap();
+        assert_eq!(reenqueued.id, model.id);
+        assert_eq!(reenqueued.status, STATUS_PENDING);
+
+        let err = repo
+            .fail_eh_download_for_archive_policy(&claimed, "policy reject")
+            .await
+            .expect_err("stale policy decision must not fail a re-enqueued row");
+        assert!(err.to_string().contains("archive policy"));
+
+        let row = Entity::find_by_id(model.id)
+            .one(&repo.db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, STATUS_PENDING);
+        assert_ne!(row.status, STATUS_FAILED);
+    }
+
+    /// A policy decision made by a background worker must not overwrite a row
+    /// canceled after its running claim.
+    #[tokio::test]
+    async fn test_background_archive_policy_failure_does_not_fail_canceled_row() {
+        let repo = tests_helpers::setup_test_db().await.unwrap();
+        let model = repo
+            .enqueue_eh_subscription_download(-100, 123, 63, "tok", "Title", false)
+            .await
+            .unwrap();
+
+        let claimed = repo.get_next_for_download().await.unwrap().unwrap();
+        repo.schedule_eh_background_download_from(claimed.id, STATUS_DOWNLOADING, "slow")
+            .await
+            .unwrap();
+        let background_claim = repo
+            .get_next_for_background_download()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            background_claim.background_download_status.as_deref(),
+            Some(BACKGROUND_STATUS_RUNNING)
+        );
+
+        repo.cancel_eh_subscription_queue_entries(123)
+            .await
+            .unwrap();
+
+        let err = repo
+            .fail_eh_background_download_for_archive_policy(&background_claim, "policy reject")
+            .await
+            .expect_err("stale policy decision must not fail a canceled row");
+        assert!(err.to_string().contains("archive policy"));
+
+        let row = Entity::find_by_id(model.id)
+            .one(&repo.db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, STATUS_CANCELED);
+        assert_ne!(row.status, STATUS_FAILED);
+    }
+
+    #[tokio::test]
+    async fn test_archive_policy_failure_rejects_missing_claim_timestamp() {
+        let repo = tests_helpers::setup_test_db().await.unwrap();
+        let entry = repo
+            .enqueue_eh_download(-100, 66, "tok", "Title", false, SOURCE_DIRECT)
+            .await
+            .unwrap();
+
+        let main_err = repo
+            .fail_eh_download_for_archive_policy(&entry, "policy reject")
+            .await
+            .expect_err("main policy failure requires a claim timestamp");
+        assert!(main_err
+            .to_string()
+            .contains("missing main claim started_at"));
+
+        let background_err = repo
+            .fail_eh_background_download_for_archive_policy(&entry, "policy reject")
+            .await
+            .expect_err("background policy failure requires a claim timestamp");
+        assert!(background_err
+            .to_string()
+            .contains("missing background claim started_at"));
+    }
+
+    /// A main policy transition must be bound to the original worker claim, not
+    /// merely to a status that a newer worker can claim again.
+    #[tokio::test]
+    async fn test_main_archive_policy_aba_does_not_fail_reclaimed_row() {
+        let repo = tests_helpers::setup_test_db().await.unwrap();
+        let claim_now = NaiveDate::from_ymd_opt(2026, 7, 22)
+            .unwrap()
+            .and_hms_opt(12, 0, 0)
+            .unwrap();
+        let model = repo
+            .enqueue_eh_download(-100, 64, "tok", "Title", false, SOURCE_SUBSCRIPTION)
+            .await
+            .unwrap();
+
+        let first_claim = repo
+            .get_next_for_download_at(claim_now)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first_claim.status, STATUS_DOWNLOADING);
+        assert!(first_claim.started_at.is_some());
+
+        let reenqueued = repo
+            .enqueue_eh_download(-100, 64, "new", "New", false, SOURCE_DIRECT)
+            .await
+            .unwrap();
+        assert_eq!(reenqueued.status, STATUS_PENDING);
+        assert_eq!(reenqueued.started_at, first_claim.started_at);
+        let second_claim = repo
+            .get_next_for_download_at(claim_now)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(second_claim.status, STATUS_DOWNLOADING);
+        assert_eq!(
+            second_claim.started_at,
+            first_claim
+                .started_at
+                .map(|generation| generation + Duration::seconds(1))
+        );
+
+        let err = repo
+            .fail_eh_download_for_archive_policy(&first_claim, "policy reject")
+            .await
+            .expect_err("stale main claim must not fail the newer claim");
+        assert!(err.to_string().contains("archive policy"));
+
+        let row = Entity::find_by_id(model.id)
+            .one(&repo.db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, STATUS_DOWNLOADING);
+        assert_eq!(row.started_at, second_claim.started_at);
+        assert_ne!(row.status, STATUS_FAILED);
+    }
+
+    /// A background policy transition must be bound to the original running
+    /// claim, even after cancellation and a second background handoff/claim.
+    #[tokio::test]
+    async fn test_background_archive_policy_aba_does_not_fail_reclaimed_row() {
+        let repo = tests_helpers::setup_test_db().await.unwrap();
+        let claim_now = NaiveDate::from_ymd_opt(2026, 7, 22)
+            .unwrap()
+            .and_hms_opt(12, 0, 0)
+            .unwrap();
+        let model = repo
+            .enqueue_eh_subscription_download(-100, 124, 65, "tok", "Title", false)
+            .await
+            .unwrap();
+
+        let first_main_claim = repo
+            .get_next_for_download_at(claim_now)
+            .await
+            .unwrap()
+            .unwrap();
+        repo.schedule_eh_background_download_from(first_main_claim.id, STATUS_DOWNLOADING, "slow")
+            .await
+            .unwrap();
+        let first_background_claim = repo
+            .get_next_for_background_download_at(claim_now)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            first_background_claim.background_download_status.as_deref(),
+            Some(BACKGROUND_STATUS_RUNNING)
+        );
+        assert!(first_background_claim
+            .background_download_started_at
+            .is_some());
+        assert!(first_background_claim.started_at.is_some());
+
+        repo.cancel_eh_subscription_queue_entries(124)
+            .await
+            .unwrap();
+        let reenqueued = repo
+            .enqueue_eh_download(-100, 65, "new", "New", false, SOURCE_DIRECT)
+            .await
+            .unwrap();
+        assert_eq!(reenqueued.status, STATUS_PENDING);
+        assert_eq!(reenqueued.started_at, first_background_claim.started_at);
+        let second_main_claim = repo
+            .get_next_for_download_at(claim_now)
+            .await
+            .unwrap()
+            .unwrap();
+        repo.schedule_eh_background_download_from(second_main_claim.id, STATUS_DOWNLOADING, "slow")
+            .await
+            .unwrap();
+        let second_background_claim = repo
+            .get_next_for_background_download_at(claim_now)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            second_background_claim
+                .background_download_status
+                .as_deref(),
+            Some(BACKGROUND_STATUS_RUNNING)
+        );
+        assert_eq!(
+            first_background_claim.background_download_started_at,
+            second_background_claim.background_download_started_at
+        );
+        assert_eq!(
+            second_background_claim.started_at,
+            first_background_claim
+                .started_at
+                .map(|generation| generation + Duration::seconds(2))
+        );
+
+        let err = repo
+            .fail_eh_background_download_for_archive_policy(
+                &first_background_claim,
+                "policy reject",
+            )
+            .await
+            .expect_err("stale background claim must not fail the newer claim");
+        assert!(err.to_string().contains("archive policy"));
+
+        let row = Entity::find_by_id(model.id)
+            .one(&repo.db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, STATUS_PENDING);
+        assert_eq!(
+            row.background_download_status.as_deref(),
+            Some(BACKGROUND_STATUS_RUNNING)
+        );
+        assert_eq!(
+            row.background_download_started_at,
+            second_background_claim.background_download_started_at
+        );
+        assert_eq!(row.started_at, second_background_claim.started_at);
+        assert_ne!(row.status, STATUS_FAILED);
+    }
+
+    #[tokio::test]
+    async fn test_main_download_claim_rejects_stale_previous_generation() {
+        let repo = tests_helpers::setup_test_db().await.unwrap();
+        let claim_now = NaiveDate::from_ymd_opt(2026, 7, 22)
+            .unwrap()
+            .and_hms_opt(12, 0, 0)
+            .unwrap();
+        let entry = repo
+            .enqueue_eh_download(-100, 67, "tok", "Title", false, SOURCE_SUBSCRIPTION)
+            .await
+            .unwrap();
+        let stale_snapshot = Entity::find_by_id(entry.id)
+            .one(&repo.db)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let first_claim = repo
+            .get_next_for_download_at(claim_now)
+            .await
+            .unwrap()
+            .unwrap();
+        repo.enqueue_eh_download(-100, 67, "new", "New", false, SOURCE_DIRECT)
+            .await
+            .unwrap();
+        let second_claim = repo
+            .get_next_for_download_at(claim_now)
+            .await
+            .unwrap()
+            .unwrap();
+        Entity::update_many()
+            .col_expr(Column::Status, Expr::value(STATUS_PENDING))
+            .filter(Column::Id.eq(entry.id))
+            .filter(Column::Status.eq(STATUS_DOWNLOADING))
+            .exec(&repo.db)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            repo.claim_main_download_from_snapshot_at(&stale_snapshot, claim_now)
+                .await
+                .unwrap(),
+            None,
+            "the stale selector must not claim after a later generation is released"
+        );
+        let row = Entity::find_by_id(entry.id)
+            .one(&repo.db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, STATUS_PENDING);
+        assert_eq!(
+            second_claim.started_at,
+            first_claim
+                .started_at
+                .map(|generation| generation + Duration::seconds(1))
+        );
+        assert_eq!(row.started_at, second_claim.started_at);
+    }
+
+    #[tokio::test]
+    async fn test_main_download_claim_refetch_detects_lost_claim() {
+        let repo = tests_helpers::setup_test_db().await.unwrap();
+        let claim_now = NaiveDate::from_ymd_opt(2026, 7, 22)
+            .unwrap()
+            .and_hms_opt(12, 0, 0)
+            .unwrap();
+        let entry = repo
+            .enqueue_eh_download(-100, 68, "tok", "Title", false, SOURCE_DIRECT)
+            .await
+            .unwrap();
+        repo.db
+            .execute(Statement::from_string(
+                DbBackend::Sqlite,
+                "CREATE TRIGGER release_eh_main_claim AFTER UPDATE OF status ON eh_download_queue \
+                 WHEN NEW.status = 'downloading' BEGIN \
+                     UPDATE eh_download_queue SET status = 'pending' WHERE id = NEW.id; \
+                 END;",
+            ))
+            .await
+            .unwrap();
+
+        assert!(
+            repo.get_next_for_download_at(claim_now)
+                .await
+                .unwrap()
+                .is_none(),
+            "a claim lost before refetch must not be returned to its original worker"
+        );
+        let row = Entity::find_by_id(entry.id)
+            .one(&repo.db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, STATUS_PENDING);
+        assert_eq!(row.started_at, Some(claim_now));
     }
 
     #[tokio::test]

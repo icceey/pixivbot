@@ -154,7 +154,10 @@ pub fn parse_archiver_key(html: &str) -> Option<String> {
     Some(format!("{}--{}", numeric, hex))
 }
 
-/// Extract the archiver download form matching the requested resolution.
+/// Extract the direct archiver download form for a validated resolution.
+///
+/// `original` selects `dltype=org`; supported resamples (`780x`, `980x`, and
+/// `1280x`) select `dltype=res`. The separate H@H Downloader form is ignored.
 pub fn parse_archiver_form(html: &str, resolution: &str) -> Option<ArchiverForm> {
     let target_dltype = resolution_dltype(resolution);
 
@@ -202,8 +205,8 @@ pub fn parse_archive_redirect(html: &str) -> Option<String> {
 
 /// Cost classification for an archiver.php download form.
 ///
-/// Returned by `parse_archive_download_cost`. The caller decides whether to
-/// POST based on this cost and the configured GP guard threshold.
+/// Returned by `parse_archive_download_cost`. Callers may POST only permitted
+/// costs; `Insufficient`, `Unavailable`, and `Unknown` temporarily defer without POST.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DownloadCost {
     /// `Free!` - no GP will be charged.
@@ -214,11 +217,12 @@ pub enum DownloadCost {
     /// `{n} GP` - POST will charge `n` GP (auto-converts credits if GP insufficient).
     Gp(u64),
     /// `Insufficient Funds` - account lacks GP and credits to auto-convert.
-    /// POST would still be attempted by EH and likely fail; we reject early.
+    /// Callers temporarily defer without POST.
     Insufficient,
-    /// `N/A` - resolution not available (donor-only or too large).
+    /// `N/A` - the selected resolution is unavailable.
+    /// Callers temporarily defer without POST.
     Unavailable,
-    /// Could not parse the cost text. Callers should conservatively reject.
+    /// Could not parse the cost text. Callers temporarily defer without POST.
     Unknown,
 }
 
@@ -386,17 +390,19 @@ fn parse_form_download_cost(html: &str, target_dltype: &str) -> DownloadCost {
 
 /// Parse the GP/cost status of an archiver.php page for the given resolution.
 ///
-/// `resolution` follows the config convention:
-/// - `"original"` or `""` -> the original-archive form (`dltype=org`)
-/// - any non-original resolution -> the direct resample form (`dltype=res`)
+/// `resolution` is expected to have passed client validation:
+/// - `"original"` -> the original-archive form (`dltype=org`)
+/// - `"780x"`, `"980x"`, or `"1280x"` -> the direct resample form (`dltype=res`)
+///
+/// The separate H@H Downloader form and table are ignored.
 ///
 /// Resolution selection matches the form that `prepare_archive_download` will
 /// actually POST, so the returned cost reflects what the server will charge.
 ///
 /// Returns `DownloadCost::Unknown` if the page structure cannot be recognized
-/// (e.g. neither `dltype=org` nor `dltype=res` form is present). Callers should
-/// conservatively reject in that case to avoid accidental GP charges when EH
-/// changes the page structure.
+/// (e.g. neither `dltype=org` nor `dltype=res` form is present). Callers
+/// temporarily defer without POST rather than treating that state as a permanent
+/// archive-policy failure.
 pub fn parse_archive_download_cost(html: &str, resolution: &str) -> DownloadCost {
     let target_dltype = resolution_dltype(resolution);
 
@@ -410,8 +416,9 @@ pub fn parse_archive_download_cost(html: &str, resolution: &str) -> DownloadCost
 /// Parse the selected archive's estimated size in bytes from an archiver.php page.
 ///
 /// Selection follows `parse_archiver_form` and `parse_archive_download_cost`:
-/// original downloads use `dltype=org`; every non-original resolution uses the
-/// direct `dltype=res` form. The separate H@H Downloader table is ignored.
+/// `original` uses `dltype=org`; validated resamples (`780x`, `980x`, and
+/// `1280x`) use the direct `dltype=res` form. The separate H@H Downloader table
+/// is ignored.
 /// Returned byte counts round the displayed decimal MiB value up.
 pub fn parse_archive_download_estimated_size(html: &str, resolution: &str) -> Option<u64> {
     parse_form_estimated_size(html, resolution_dltype(resolution))
@@ -609,17 +616,7 @@ mod tests {
             ]
         );
 
-        let form =
-            parse_archiver_form(html, "").expect("should parse original form for empty resolution");
-        assert_eq!(
-            form.action,
-            "https://exhentai.org/archiver.php?gid=4034806&token=org123def0"
-        );
-        assert!(form
-            .fields
-            .contains(&("org_sentinel".to_string(), "original-only".to_string())));
-
-        for resolution in ["1280x", "1600x"] {
+        for resolution in ["780x", "980x", "1280x"] {
             let form = parse_archiver_form(html, resolution).expect("should parse resample form");
             assert_eq!(
                 form.action,
@@ -636,7 +633,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_archiver_form_uses_resample_for_all_non_original_resolutions() {
+    fn test_parse_archiver_form_uses_resample_for_supported_resolutions() {
         let html = r#"
         <div>Download Cost: &nbsp; <strong>218 GP</strong></div>
         <form method="post" action="https://exhentai.org/archiver.php?gid=4034806&amp;token=res123def0">
@@ -646,19 +643,17 @@ mod tests {
         </form>
         "#;
 
-        let form = parse_archiver_form(html, "1280x").expect("should parse generic resample form");
-        assert!(form
-            .fields
-            .contains(&("res_sentinel".to_string(), "resample-only".to_string())));
-        let donor_form = parse_archiver_form(html, "1600x")
-            .expect("should still prepare generic resample form without H@H");
-        assert!(donor_form
-            .fields
-            .contains(&("res_sentinel".to_string(), "resample-only".to_string())));
-        assert_eq!(
-            parse_archive_download_cost(html, "1600x"),
-            DownloadCost::Gp(218)
-        );
+        for resolution in ["780x", "980x", "1280x"] {
+            let form =
+                parse_archiver_form(html, resolution).expect("should parse generic resample form");
+            assert!(form
+                .fields
+                .contains(&("res_sentinel".to_string(), "resample-only".to_string())));
+            assert_eq!(
+                parse_archive_download_cost(html, resolution),
+                DownloadCost::Gp(218)
+            );
+        }
     }
 
     #[test]
@@ -696,7 +691,7 @@ mod tests {
                 DownloadCost::Gp(218)
             );
             assert_eq!(
-                parse_archive_download_cost(&html, "1600x"),
+                parse_archive_download_cost(&html, "980x"),
                 DownloadCost::Gp(218)
             );
         }
@@ -968,12 +963,6 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_archive_download_cost_empty_resolution_uses_original() {
-        let cost = parse_archive_download_cost(ARCHIVER_FREE_DEFAULT, "");
-        assert_eq!(cost, DownloadCost::Free);
-    }
-
-    #[test]
     fn test_parse_archive_download_cost_unlocked_resample() {
         let html = format!(
             r#"{ARCHIVER_FREE_RESAMPLE_UNLOCKED}
@@ -1015,7 +1004,7 @@ mod tests {
         let html = format!(
             r#"<table><tr><td><p>1920x</p><p>irrelevant</p><p>Free</p></td></tr></table>{ARCHIVER_GP_REQUIRED_WITH_HATHDL}"#
         );
-        for resolution in ["780x", "980x", "1280x", "1600x", "2400x"] {
+        for resolution in ["780x", "980x", "1280x"] {
             assert_eq!(
                 parse_archive_download_cost(&html, resolution),
                 DownloadCost::Gp(218),
@@ -1133,7 +1122,7 @@ mod tests {
             Some(2_443_183),
         );
         assert_eq!(
-            parse_archive_download_estimated_size(html, "1600x"),
+            parse_archive_download_estimated_size(html, "1280x"),
             Some(2_443_183),
         );
     }

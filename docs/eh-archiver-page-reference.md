@@ -68,7 +68,7 @@ Observed across the 4 captured samples:
 |---|---|---|
 | `Free!` | No GP cost for this resolution | All samples at some resolution |
 | `{n} GP` | Costs N GP (thousand separators with commas) | `8,800 GP`, `218 GP`, `747,708 GP` |
-| `N/A` | Resolution not available (donor-only or too-large) | `2560x` when donor-only |
+| `N/A` | Resolution not available | Observed in the ignored H@H table |
 | `Insufficient Funds` | Account lacks GP (variant from external sources) | Not in captured samples but seen in EhViewer test fixtures |
 
 Note: EH uses `Free!` with the `!` in the original/resample cost forms. The H@H
@@ -88,7 +88,8 @@ table cells use `Free` without `!`.
 
 - Both Download Cost `<strong>` show `Free!`
 - No unlocked paragraph
-- H@H table present, all cells `Free` (one cell `N/A` for donor-only 2560x)
+- H@H table present, all cells `Free` except one unavailable cell; the direct
+  workflow ignores this table
 - Safe to POST either form; no GP will be charged
 
 ### Case 3: e-hentai.org (gp-free gallery, shows funds)
@@ -104,31 +105,43 @@ table cells use `Free` without `!`.
 - Original Download Cost: `8,800 GP`
 - Resample Download Cost: `218 GP`
 - H@H table cells per resolution: `8800 GP`, `114 GP`, `218 GP`, `376 GP`, `546 GP`
-- POSTing either form WILL charge GP (auto-converts credits if GP insufficient)
+  (observed only; ignored by the direct workflow)
+- POSTing either generic form WILL charge GP (auto-converts credits if GP insufficient)
 - This is the case that needs the GP guard
 
 ## Resolution -> Form, Cost, and Estimated-Size Mapping
 
-The generic forms have `dltype=org` (left) and `dltype=res` (right). The
-separate `form#hathdl_form` carries `hathdl_xres` and is followed by the H@H
-per-resolution table.
+### Form-based prepared path
 
-| Config `resolution` | Which form POSTs | H@H cell used |
-|---|---|---|
-| `original` / `""` | left (`dltype=org`) | Original column |
-| `780x` | `form#hathdl_form` (`hathdl_xres=780`) | 800x column (closest match) |
-| `980x` | `form#hathdl_form` (`hathdl_xres=980`) | 1280x column (higher tier, conservatively) |
-| `1280x` | `form#hathdl_form` (`hathdl_xres=1280`) | 1280x column |
-| `1600x` | `form#hathdl_form` (`hathdl_xres=1600`) | 1920x column (donor-only) |
-| `2400x` | `form#hathdl_form` (`hathdl_xres=2400`) | 2560x column (donor-only) |
+When `prepare_archive_download()` constructs a request from an HTML form, it
+uses the generic forms: `dltype=org` (left) and `dltype=res` (right).
 
-Current code posts the `dltype=org` form for original downloads. For known
-resamples, it prefers `form#hathdl_form` when its action is `archiver.php` and
-it contains `hathdl_xres`; otherwise it retains the generic `dltype=res` form
-fallback. It reads known-resample costs from the mapped H@H table cell when the
-table is present. The selected archive-size estimate uses that exact same
-selection: generic original/resample forms use their own nearby `Estimated Size`
-paragraph; valid H@H selections use the mapped cell's size paragraph. The
+| Config `resolution` | Form posted on the generic-form path |
+|---|---|
+| `original` | left (`dltype=org`) |
+| `780x` | right (`dltype=res`) |
+| `980x` | right (`dltype=res`) |
+| `1280x` | right (`dltype=res`) |
+
+`1600x`, `2400x`, empty, and unknown values are rejected before the direct
+workflow makes a GET or POST. Donor resolutions require the separate H@H
+Downloader and are not direct archive resolutions.
+
+### Archiver-key compatibility path
+
+When a fetched archiver page exposes an archiver key,
+`prepare_archive_download()` constructs a legacy compatibility request with
+`dlcheck` plus `hathdl_xres` from that key instead of selecting an HTML form.
+`download_archive_with_options()` always constructs that same compatibility
+request from its supplied key. Both paths accept only the four validated
+resolutions. The legacy field name does not submit the separate live-page
+`form#hathdl_form`; that form and its per-resolution H@H table remain ignored,
+and the H@H Downloader workflow is out of scope.
+
+`prepare_archive_download()` always fetches and parses the selected generic
+form's Download Cost and Estimated Size for guards, even when the resulting
+request uses an archiver key. In contrast, `download_archive_with_options()`
+with a supplied key does not fetch or parse the archiver page itself. The
 displayed decimal MiB value is converted to bytes by rounding up, so the size
 guard cannot underestimate an archive.
 
@@ -137,45 +150,42 @@ guard cannot underestimate an archive.
 `parse_archive_download_cost(html, resolution) -> DownloadCost`:
 
 1. Scan for `You unlocked a resample download of this archive on <strong>{date}</strong>`.
-   If found AND resolution is a resample (`780x`/`980x`/`1280x`/...), return
+   If found AND resolution is a supported resample (`780x`/`980x`/`1280x`), return
    `DownloadCost::Unlocked`. (Original downloads are not free just because
    resample was unlocked.)
-2. For `original` / `""`, read the `dltype=org` form's Download Cost. For a known
-   resample, read the mapped cell from the first table after `#hathdl_form`.
-   The table must contain `Original` and at least one recognized resolution
-   label, so an unrelated following table cannot provide a cost.
-   If that table is absent, only `780x`/`980x`/`1280x` may use the generic
-   `dltype=res` form cost; higher or unknown resolutions are `Unknown`.
-3. Match the form or H@H cell cost text:
+2. For `original`, read the `dltype=org` form's Download Cost. For `780x`,
+   `980x`, or `1280x`, read the generic `dltype=res` form's Download Cost. The
+   H@H form and table are ignored.
+3. Match the selected generic form cost text:
    - `Free!` -> `DownloadCost::Free`
    - `{n} GP` (strip commas) -> `DownloadCost::Gp(n)`
    - `Insufficient Funds` -> `DownloadCost::Insufficient`
    - `N/A` -> `DownloadCost::Unavailable`
    - anything else -> `DownloadCost::Unknown`
-4. If `Unknown`, callers should conservatively reject (do not POST).
+4. `Insufficient`, `Unavailable`, and `Unknown` are temporary defer states:
+   callers do not POST and do not treat them as permanent archive-policy failures.
 
 `parse_archive_download_estimated_size(html, resolution) -> Option<u64>` uses
-the same form/cell selection. It returns `None` for missing, malformed, or
-untrusted estimates: invalid H@H forms and unrelated tables are not allowed to
-bind a size to a request. With no H@H form, only `780x`/`980x`/`1280x` use the
-generic resample estimate fallback; donor resolutions require a trusted mapped
-H@H cell. `None` (and a parsed zero) does not block a download.
+the same generic-form selection. It returns `None` for missing or malformed
+estimates; the H@H form and table cannot bind a size to a direct request. `None`
+(and a parsed zero) does not block a download.
 
 ## When POST Charges GP
 
-Only `download_archive_with_request()` (the POST to `archiver.php?...` with
-`dltype`/`dlcheck`/`hathdl_xres`) charges GP. The prior GETs (gallery page +
-archiver page) do not charge GP.
+After a resolution passes client validation, the archive POST in
+`download_archive_with_request()` or the direct archive-key download APIs can
+charge GP. The prior GETs (gallery page + archiver page) do not charge GP.
 
 This means:
-- `prepare_archive_download()` (GETs + parse) is always safe.
+- `prepare_archive_download()` rejects unsupported resolutions before HTTP; its
+  GETs + parse are otherwise safe.
 - Logged-in workers first call `prepare_archive_download()` and then check the
   selected archive estimate against `max_archive_size_mb`. An estimate strictly
   greater than the limit rejects; an equal, missing, or zero estimate passes.
 - The GP cost guard and any GP ledger reservation run after the selected-size
   check and before `download_archive_with_request()`.
-- `download_archive_with_request()` (POST) is the GP-spending step. The
-  unauthenticated direct-image path does not use the archive-size gate.
+- `download_archive_with_request()` (POST) is the prepared-request GP-spending
+  step. The unauthenticated direct-image path does not use the archive-size gate.
 
 ## Account GP Balance (when shown)
 
