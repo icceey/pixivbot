@@ -735,7 +735,6 @@ async fn test_prepare_archive_download_1280x_uses_resample_form_and_cost() {
 <div>Download Cost: &nbsp; <strong>8,800 GP</strong></div>
 <form method="post" action="{}/org-archiver.php?form=org">
   <input type="hidden" name="dltype" value="org" />
-  <input type="hidden" name="hathdl_xres" value="org" />
   <input type="hidden" name="org_sentinel" value="org-only" />
   <input type="submit" name="dlcheck" value="Download Original Archive" />
 </form>
@@ -743,13 +742,24 @@ async fn test_prepare_archive_download_1280x_uses_resample_form_and_cost() {
 <div>Download Cost: &nbsp; <strong>218 GP</strong></div>
 <form method="post" action="{}/res-archiver.php?form=res">
   <input type="hidden" name="dltype" value="res" />
-  <input type="hidden" name="hathdl_xres" value="res" />
   <input type="hidden" name="res_sentinel" value="res-only" />
   <input type="submit" name="dlcheck" value="Download Resample Archive" />
 </form>
 <p>Estimated Size: <strong>5.01 MiB</strong></p>
+<p>H@H Downloader</p>
+<form id="hathdl_form" method="post" action="{}/archiver.php?form=hathdl">
+  <input type="hidden" id="hathdl_xres" name="hathdl_xres" value="" />
+</form>
+<table><tr>
+  <td><p>Original</p><p>400.0 MiB</p><p>8,800 GP</p></td>
+  <td><p>800x</p><p>8.0 MiB</p><p>114 GP</p></td>
+  <td><p>1280x</p><p>12.5 MiB</p><p>999 GP</p></td>
+  <td><p>1920x</p><p>19.25 MiB</p><p>1,999 GP</p></td>
+  <td><p>2560x</p><p>25.0 MiB</p><p>2,999 GP</p></td>
+</tr></table>
 </body></html>
 "#,
+        server.uri(),
         server.uri(),
         server.uri()
     );
@@ -777,8 +787,9 @@ async fn test_prepare_archive_download_1280x_uses_resample_form_and_cost() {
         .and(path("/res-archiver.php"))
         .and(query_param("form", "res"))
         .and(BodyContains("dltype=res"))
+        .and(BodyContains("dlcheck=Download+Resample+Archive"))
         .and(BodyContains("res_sentinel=res-only"))
-        .and(BodyContains("hathdl_xres=1280"))
+        .and(BodyNotContains("hathdl_xres"))
         .and(BodyNotContains("org_sentinel"))
         .respond_with(ResponseTemplate::new(200).set_body_string(redirect_html))
         .expect(1)
@@ -811,7 +822,7 @@ async fn test_prepare_archive_download_1280x_uses_resample_form_and_cost() {
 }
 
 #[tokio::test]
-async fn test_prepare_archive_download_1600x_uses_hathdl_cost_and_request_resolution() {
+async fn test_prepare_archive_download_1600x_uses_direct_resample_form() {
     let server = MockServer::start().await;
     let gallery_page_html = r#"
 <html><body>
@@ -833,6 +844,7 @@ async fn test_prepare_archive_download_1600x_uses_hathdl_cost_and_request_resolu
   <input type="hidden" name="res_sentinel" value="res-only" />
   <input type="submit" name="dlcheck" value="Download Resample Archive" />
 </form>
+<p>Estimated Size: <strong>5.01 MiB</strong></p>
 <form id="hathdl_form" method="post" action="{}/archiver.php?form=hathdl">
   <input type="hidden" id="hathdl_xres" name="hathdl_xres" value="" />
   <input type="hidden" name="hathdl_sentinel" value="hathdl-only" />
@@ -854,7 +866,7 @@ async fn test_prepare_archive_download_1600x_uses_hathdl_cost_and_request_resolu
         r#"<script>document.location = "{}/archive/4034806/fedcba9876/archive/0?autostart=1";</script>"#,
         server.uri()
     );
-    let zip_bytes = test_zip_bytes("image.jpg", b"hathdl_cost_zip");
+    let zip_bytes = test_zip_bytes("image.jpg", b"direct_resample_zip");
 
     Mock::given(method("GET"))
         .and(path("/g/4034806/e13b7d119b/"))
@@ -871,14 +883,14 @@ async fn test_prepare_archive_download_1600x_uses_hathdl_cost_and_request_resolu
         .mount(&server)
         .await;
     Mock::given(method("POST"))
-        .and(path("/archiver.php"))
-        .and(query_param("form", "hathdl"))
-        .and(BodyContains("hathdl_xres=1600"))
-        .and(BodyContains("hathdl_sentinel=hathdl-only"))
+        .and(path("/res-archiver.php"))
+        .and(query_param("form", "res"))
+        .and(BodyContains("dltype=res"))
+        .and(BodyContains("dlcheck=Download+Resample+Archive"))
+        .and(BodyContains("res_sentinel=res-only"))
+        .and(BodyNotContains("hathdl_xres"))
+        .and(BodyNotContains("hathdl_sentinel"))
         .and(BodyNotContains("org_sentinel"))
-        .and(BodyNotContains("res_sentinel"))
-        .and(BodyNotContains("dltype=res"))
-        .and(BodyNotContains("dlcheck"))
         .respond_with(ResponseTemplate::new(200).set_body_string(redirect_html))
         .expect(1)
         .mount(&server)
@@ -894,16 +906,16 @@ async fn test_prepare_archive_download_1600x_uses_hathdl_cost_and_request_resolu
     let request = client
         .prepare_archive_download(4034806, "e13b7d119b", "1600x")
         .await
-        .expect("should prepare H@H-priced resample archive request");
-    assert_eq!(request.cost(), &eh_client::parser::DownloadCost::Gp(376));
-    assert_eq!(request.estimated_size_bytes(), Some(20_185_088));
+        .expect("should prepare direct resample archive request");
+    assert_eq!(request.cost(), &eh_client::parser::DownloadCost::Gp(218));
+    assert_eq!(request.estimated_size_bytes(), Some(5_253_366));
 
     let temp_dir = tempfile::tempdir().unwrap();
     let dest = temp_dir.path().join("archive.zip");
     let bytes = client
         .download_archive_with_request(&request, &dest)
         .await
-        .expect("H@H-priced resample form download should succeed");
+        .expect("direct resample form download should succeed");
 
     assert_eq!(bytes as usize, zip_bytes.len());
     assert_eq!(std::fs::read(dest).unwrap(), zip_bytes);
