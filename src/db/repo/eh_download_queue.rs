@@ -50,6 +50,31 @@ pub const TELEGRAPH_REWRITE_STATUS_PENDING: &str = "pending";
 pub const TELEGRAPH_REWRITE_STATUS_REWRITING: &str = "rewriting";
 pub const TELEGRAPH_REWRITE_STATUS_FAILED: &str = "failed";
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EhQueueStatusItem {
+    pub gid: i64,
+    pub title: String,
+    pub status: String,
+    pub background_download_status: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EhQueueSnapshot {
+    pub active: Vec<EhQueueStatusItem>,
+    pub recent_terminal: Option<EhQueueStatusItem>,
+}
+
+impl From<eh_download_queue::Model> for EhQueueStatusItem {
+    fn from(model: eh_download_queue::Model) -> Self {
+        Self {
+            gid: model.gid,
+            title: model.title,
+            status: model.status,
+            background_download_status: model.background_download_status,
+        }
+    }
+}
+
 /// Source constants for eh_download_queue.
 pub const SOURCE_SUBSCRIPTION: &str = "subscription";
 pub const SOURCE_DIRECT: &str = "direct";
@@ -681,6 +706,45 @@ impl Repo {
             .context("Failed to fetch eh downloads in window")?;
 
         Ok(result.iter().map(|e| e.file_size).sum())
+    }
+
+    /// Get the current queue status for one chat.
+    pub async fn get_eh_queue_snapshot(&self, chat_id: i64) -> Result<EhQueueSnapshot> {
+        let active = eh_download_queue::Entity::find()
+            .filter(eh_download_queue::Column::ChatId.eq(chat_id))
+            .filter(eh_download_queue::Column::Status.is_in([
+                STATUS_PENDING,
+                STATUS_DOWNLOADING,
+                STATUS_DOWNLOADED,
+                STATUS_UPLOADING,
+                STATUS_UPLOADED,
+                STATUS_PUBLISHING,
+            ]))
+            .order_by(eh_download_queue::Column::CreatedAt, Order::Asc)
+            .all(&self.db)
+            .await
+            .context("Failed to fetch active EH queue entries")?
+            .into_iter()
+            .map(EhQueueStatusItem::from)
+            .collect();
+
+        let recent_terminal = eh_download_queue::Entity::find()
+            .filter(eh_download_queue::Column::ChatId.eq(chat_id))
+            .filter(eh_download_queue::Column::Status.is_in([
+                STATUS_DONE,
+                STATUS_FAILED,
+                STATUS_CANCELED,
+            ]))
+            .order_by(eh_download_queue::Column::CreatedAt, Order::Desc)
+            .one(&self.db)
+            .await
+            .context("Failed to fetch recent terminal EH queue entry")?
+            .map(EhQueueStatusItem::from);
+
+        Ok(EhQueueSnapshot {
+            active,
+            recent_terminal,
+        })
     }
 
     /// Count pending downloads in the queue.

@@ -3,6 +3,137 @@
 
 use crate::db::repo::tests_helpers;
 use crate::db::types::{EhFilter, EhTagState, EhTaskKey, SubscriptionState, TagFilter, TaskType};
+use crate::db::{entities::eh_download_queue, repo::eh_download_queue::*};
+use chrono::{Duration, NaiveDate};
+use sea_orm::{ActiveModelTrait, Set};
+
+#[tokio::test]
+async fn test_eh_queue_status_snapshot_scopes_orders_and_selects_recent_terminal() {
+    const CURRENT_CHAT_ID: i64 = -100;
+    const FOREIGN_CHAT_ID: i64 = -200;
+
+    let repo = tests_helpers::setup_test_db().await.unwrap();
+    let base = NaiveDate::from_ymd_opt(2026, 7, 21)
+        .unwrap()
+        .and_hms_opt(0, 0, 0)
+        .unwrap();
+
+    for (gid, status, background_download_status, created_at_seconds) in [
+        (101, STATUS_PENDING, None, 1),
+        (102, STATUS_DOWNLOADING, None, 2),
+        (103, STATUS_DOWNLOADED, None, 3),
+        (104, STATUS_UPLOADING, None, 4),
+        (105, STATUS_UPLOADED, None, 5),
+        (106, STATUS_PUBLISHING, None, 6),
+        (107, STATUS_PENDING, Some(BACKGROUND_STATUS_PENDING), 7),
+        (108, STATUS_PENDING, Some(BACKGROUND_STATUS_RUNNING), 8),
+    ] {
+        let title = format!("Gallery {gid}");
+        let model = repo
+            .enqueue_eh_download(CURRENT_CHAT_ID, gid, "token", &title, false, SOURCE_DIRECT)
+            .await
+            .unwrap();
+        let mut active: eh_download_queue::ActiveModel = model.into();
+        active.status = Set(status.to_string());
+        active.created_at = Set(base + Duration::seconds(created_at_seconds));
+        active.background_download_status = Set(background_download_status.map(str::to_owned));
+        active.update(repo.db()).await.unwrap();
+    }
+
+    for (gid, status, created_at_seconds, completed_at_seconds, error) in [
+        (201, STATUS_DONE, 20, 90, None),
+        (202, STATUS_CANCELED, 25, 80, None),
+        (203, STATUS_FAILED, 30, 10, Some("internal database secret")),
+    ] {
+        let title = format!("Gallery {gid}");
+        let model = repo
+            .enqueue_eh_download(CURRENT_CHAT_ID, gid, "token", &title, false, SOURCE_DIRECT)
+            .await
+            .unwrap();
+        let mut active: eh_download_queue::ActiveModel = model.into();
+        active.status = Set(status.to_string());
+        active.created_at = Set(base + Duration::seconds(created_at_seconds));
+        active.completed_at = Set(Some(base + Duration::seconds(completed_at_seconds)));
+        active.error = Set(error.map(str::to_owned));
+        active.update(repo.db()).await.unwrap();
+    }
+
+    let foreign_active = repo
+        .enqueue_eh_download(
+            FOREIGN_CHAT_ID,
+            301,
+            "token",
+            "Foreign active",
+            false,
+            SOURCE_DIRECT,
+        )
+        .await
+        .unwrap();
+    let mut foreign_active: eh_download_queue::ActiveModel = foreign_active.into();
+    foreign_active.created_at = Set(base);
+    foreign_active.update(repo.db()).await.unwrap();
+
+    let foreign_terminal = repo
+        .enqueue_eh_download(
+            FOREIGN_CHAT_ID,
+            302,
+            "token",
+            "Foreign terminal",
+            false,
+            SOURCE_DIRECT,
+        )
+        .await
+        .unwrap();
+    let mut foreign_terminal: eh_download_queue::ActiveModel = foreign_terminal.into();
+    foreign_terminal.status = Set(STATUS_DONE.to_string());
+    foreign_terminal.created_at = Set(base + Duration::seconds(100));
+    foreign_terminal.update(repo.db()).await.unwrap();
+
+    let snapshot = repo.get_eh_queue_snapshot(CURRENT_CHAT_ID).await.unwrap();
+
+    assert_eq!(
+        snapshot
+            .active
+            .iter()
+            .map(|item| item.gid)
+            .collect::<Vec<_>>(),
+        vec![101, 102, 103, 104, 105, 106, 107, 108]
+    );
+    assert_eq!(snapshot.active[0].title, "Gallery 101");
+    assert_eq!(
+        snapshot
+            .active
+            .iter()
+            .map(|item| item.status.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            STATUS_PENDING,
+            STATUS_DOWNLOADING,
+            STATUS_DOWNLOADED,
+            STATUS_UPLOADING,
+            STATUS_UPLOADED,
+            STATUS_PUBLISHING,
+            STATUS_PENDING,
+            STATUS_PENDING,
+        ]
+    );
+    assert_eq!(
+        snapshot.active[6].background_download_status.as_deref(),
+        Some(BACKGROUND_STATUS_PENDING)
+    );
+    assert_eq!(
+        snapshot.active[7].background_download_status.as_deref(),
+        Some(BACKGROUND_STATUS_RUNNING)
+    );
+
+    let recent_terminal = snapshot.recent_terminal.as_ref().unwrap();
+    assert_eq!(recent_terminal.gid, 203);
+    assert_eq!(recent_terminal.title, "Gallery 203");
+    assert_eq!(recent_terminal.status, STATUS_FAILED);
+    assert!(!snapshot.active.iter().any(|item| item.gid == 301));
+    assert_ne!(recent_terminal.gid, 302);
+    assert!(!format!("{snapshot:?}").contains("internal database secret"));
+}
 
 #[tokio::test]
 async fn test_upsert_eh_subscription_insert() {

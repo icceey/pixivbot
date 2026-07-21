@@ -1,6 +1,10 @@
 use crate::bot::notifier::ThrottledBot;
 use crate::bot::BotHandler;
-use crate::db::repo::eh_download_queue::SOURCE_DIRECT;
+use crate::db::repo::eh_download_queue::{
+    EhQueueSnapshot, EhQueueStatusItem, BACKGROUND_STATUS_PENDING, BACKGROUND_STATUS_RUNNING,
+    SOURCE_DIRECT, STATUS_CANCELED, STATUS_DONE, STATUS_DOWNLOADED, STATUS_DOWNLOADING,
+    STATUS_FAILED, STATUS_PENDING, STATUS_PUBLISHING, STATUS_UPLOADED, STATUS_UPLOADING,
+};
 use crate::db::types::{EhFilter, EhTaskKey, TagFilter, TaskType};
 use crate::utils::args;
 use eh_client::EhCategory;
@@ -8,6 +12,20 @@ use teloxide::prelude::*;
 use teloxide::types::{ChatId, ParseMode, UserId};
 use teloxide::utils::markdown;
 use tracing::{error, warn};
+
+const EH_QUEUE_MAX_VISIBLE_ACTIVE_ITEMS: usize = 20;
+const EH_QUEUE_MAX_TITLE_CHARS: usize = 80;
+const TELEGRAM_MAX_MESSAGE_UTF16_UNITS: usize = 4096;
+const EH_QUEUE_ACTIVE_STAGE_ORDER: [&str; 8] = [
+    "后台下载中",
+    "后台排队",
+    "排队中",
+    "下载中",
+    "等待上传或发送",
+    "上传中",
+    "等待发送",
+    "发送中",
+];
 
 impl BotHandler {
     pub async fn handle_esub(
@@ -258,6 +276,33 @@ impl BotHandler {
                     .await;
             }
         }
+
+        Ok(())
+    }
+
+    pub async fn handle_estatus(&self, bot: ThrottledBot, chat_id: ChatId) -> ResponseResult<()> {
+        if self.eh_client.is_none() {
+            let _ = bot.send_message(chat_id, "E-Hentai 功能未启用").await;
+            return Ok(());
+        }
+
+        let snapshot = match self.repo.get_eh_queue_snapshot(chat_id.0).await {
+            Ok(snapshot) => snapshot,
+            Err(e) => {
+                error!(
+                    "Failed to get EH queue status for chat {}: {:#}",
+                    chat_id, e
+                );
+                let _ = bot
+                    .send_message(chat_id, "❌ 获取 EH 下载队列状态失败，请稍后重试")
+                    .await;
+                return Ok(());
+            }
+        };
+
+        bot.send_message(chat_id, format_eh_queue_status(&snapshot))
+            .parse_mode(ParseMode::MarkdownV2)
+            .await?;
 
         Ok(())
     }
@@ -699,9 +744,258 @@ fn extract_gallery_url_from_text(text: &str) -> Option<String> {
     None
 }
 
+fn eh_queue_stage(status: &str, background_status: Option<&str>) -> &'static str {
+    match status {
+        STATUS_PENDING => match background_status {
+            Some(BACKGROUND_STATUS_RUNNING) => "后台下载中",
+            Some(BACKGROUND_STATUS_PENDING) => "后台排队",
+            _ => "排队中",
+        },
+        STATUS_DOWNLOADING => "下载中",
+        STATUS_DOWNLOADED => "等待上传或发送",
+        STATUS_UPLOADING => "上传中",
+        STATUS_UPLOADED => "等待发送",
+        STATUS_PUBLISHING => "发送中",
+        STATUS_DONE => "已完成",
+        STATUS_FAILED => "失败",
+        STATUS_CANCELED => "已取消",
+        _ => "未知状态",
+    }
+}
+
+fn format_eh_queue_status_item(item: &EhQueueStatusItem) -> String {
+    let title = item
+        .title
+        .chars()
+        .take(EH_QUEUE_MAX_TITLE_CHARS)
+        .collect::<String>();
+    let stage = eh_queue_stage(&item.status, item.background_download_status.as_deref());
+
+    format!(
+        "GID `{}` · {} · {stage}",
+        item.gid,
+        markdown::escape(&title)
+    )
+}
+
+fn format_eh_queue_status(snapshot: &EhQueueSnapshot) -> String {
+    for visible_active_count in
+        (0..=snapshot.active.len().min(EH_QUEUE_MAX_VISIBLE_ACTIVE_ITEMS)).rev()
+    {
+        let message =
+            format_eh_queue_status_with_visible_active_count(snapshot, visible_active_count);
+        if message.encode_utf16().count() <= TELEGRAM_MAX_MESSAGE_UTF16_UNITS {
+            return message;
+        }
+    }
+
+    unreachable!("a queue status without active details always fits Telegram's message limit")
+}
+
+fn format_eh_queue_status_with_visible_active_count(
+    snapshot: &EhQueueSnapshot,
+    visible_active_count: usize,
+) -> String {
+    let mut message = "📥 *EH 下载队列*".to_string();
+
+    if snapshot.active.is_empty() {
+        message.push_str("\n\n当前聊天没有活动中的 EH 下载任务");
+    } else {
+        message.push_str(&format!("\n\n活动任务：`{}`", snapshot.active.len()));
+
+        let stage_summary = EH_QUEUE_ACTIVE_STAGE_ORDER
+            .iter()
+            .filter_map(|stage| {
+                let count = snapshot
+                    .active
+                    .iter()
+                    .filter(|item| {
+                        eh_queue_stage(&item.status, item.background_download_status.as_deref())
+                            == *stage
+                    })
+                    .count();
+                (count > 0).then(|| format!("{stage} `{count}`"))
+            })
+            .collect::<Vec<_>>()
+            .join(" · ");
+        message.push_str(&format!("\n阶段：{stage_summary}\n\n*任务*"));
+
+        for item in snapshot.active.iter().take(visible_active_count) {
+            message.push_str("\n• ");
+            message.push_str(&format_eh_queue_status_item(item));
+        }
+
+        let hidden_count = snapshot.active.len() - visible_active_count;
+        if hidden_count > 0 {
+            message.push_str(&format!("\n另有 `{hidden_count}` 项未显示"));
+        }
+    }
+
+    if let Some(item) = &snapshot.recent_terminal {
+        message.push_str("\n\n*最近记录*\n• ");
+        message.push_str(&format_eh_queue_status_item(item));
+    }
+
+    message
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn queue_item(
+        gid: i64,
+        title: &str,
+        status: &str,
+        background_download_status: Option<&str>,
+    ) -> EhQueueStatusItem {
+        EhQueueStatusItem {
+            gid,
+            title: title.to_string(),
+            status: status.to_string(),
+            background_download_status: background_download_status.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn test_eh_queue_status_stage_labels() {
+        assert_eq!(
+            eh_queue_stage(STATUS_PENDING, Some(BACKGROUND_STATUS_RUNNING)),
+            "后台下载中"
+        );
+        assert_eq!(
+            eh_queue_stage(STATUS_PENDING, Some(BACKGROUND_STATUS_PENDING)),
+            "后台排队"
+        );
+        assert_eq!(eh_queue_stage(STATUS_PENDING, None), "排队中");
+        assert_eq!(
+            eh_queue_stage(STATUS_DOWNLOADING, Some(BACKGROUND_STATUS_RUNNING)),
+            "下载中"
+        );
+        assert_eq!(eh_queue_stage(STATUS_DOWNLOADED, None), "等待上传或发送");
+        assert_eq!(eh_queue_stage(STATUS_UPLOADING, None), "上传中");
+        assert_eq!(eh_queue_stage(STATUS_UPLOADED, None), "等待发送");
+        assert_eq!(eh_queue_stage(STATUS_PUBLISHING, None), "发送中");
+        assert_eq!(eh_queue_stage(STATUS_DONE, None), "已完成");
+        assert_eq!(eh_queue_stage(STATUS_FAILED, None), "失败");
+        assert_eq!(eh_queue_stage(STATUS_CANCELED, None), "已取消");
+        assert_eq!(eh_queue_stage("unknown", None), "未知状态");
+    }
+
+    #[test]
+    fn test_eh_queue_status_summarizes_all_active_stages() {
+        let snapshot = EhQueueSnapshot {
+            active: vec![
+                queue_item(
+                    1,
+                    "后台下载",
+                    STATUS_PENDING,
+                    Some(BACKGROUND_STATUS_RUNNING),
+                ),
+                queue_item(
+                    2,
+                    "后台排队",
+                    STATUS_PENDING,
+                    Some(BACKGROUND_STATUS_PENDING),
+                ),
+                queue_item(3, "排队", STATUS_PENDING, None),
+                queue_item(4, "下载", STATUS_DOWNLOADING, None),
+                queue_item(5, "下载完成", STATUS_DOWNLOADED, None),
+                queue_item(6, "上传", STATUS_UPLOADING, None),
+                queue_item(7, "上传完成", STATUS_UPLOADED, None),
+                queue_item(8, "发送", STATUS_PUBLISHING, None),
+            ],
+            recent_terminal: None,
+        };
+
+        assert_eq!(
+            format_eh_queue_status(&snapshot),
+            "📥 *EH 下载队列*\n\n活动任务：`8`\n阶段：后台下载中 `1` · 后台排队 `1` · 排队中 `1` · 下载中 `1` · 等待上传或发送 `1` · 上传中 `1` · 等待发送 `1` · 发送中 `1`\n\n*任务*\n• GID `1` · 后台下载 · 后台下载中\n• GID `2` · 后台排队 · 后台排队\n• GID `3` · 排队 · 排队中\n• GID `4` · 下载 · 下载中\n• GID `5` · 下载完成 · 等待上传或发送\n• GID `6` · 上传 · 上传中\n• GID `7` · 上传完成 · 等待发送\n• GID `8` · 发送 · 发送中"
+        );
+    }
+
+    #[test]
+    fn test_eh_queue_status_formats_empty_with_recent_terminal() {
+        let snapshot = EhQueueSnapshot {
+            active: Vec::new(),
+            recent_terminal: Some(queue_item(900, "completed title", STATUS_DONE, None)),
+        };
+
+        assert_eq!(
+            format_eh_queue_status(&snapshot),
+            "📥 *EH 下载队列*\n\n当前聊天没有活动中的 EH 下载任务\n\n*最近记录*\n• GID `900` · completed title · 已完成"
+        );
+    }
+
+    #[test]
+    fn test_eh_queue_status_limits_entries_truncates_and_escapes() {
+        let long_title = "界".repeat(81);
+        let mut active = vec![queue_item(1, &long_title, STATUS_PENDING, None)];
+        active.push(queue_item(2, "A_*[危险].!", STATUS_PENDING, None));
+        active.extend(
+            (3..=21).map(|gid| queue_item(gid, &format!("任务{gid}"), STATUS_PENDING, None)),
+        );
+        let snapshot = EhQueueSnapshot {
+            active,
+            recent_terminal: Some(queue_item(999, "最近失败", STATUS_FAILED, None)),
+        };
+
+        let formatted = format_eh_queue_status(&snapshot);
+
+        assert!(formatted.contains("活动任务：`21`"));
+        assert!(formatted.contains("阶段：排队中 `21`"));
+        assert_eq!(formatted.matches('界').count(), 80);
+        assert!(formatted.contains("A\\_\\*\\[危险\\]\\.\\!"));
+        assert!(!formatted.contains("A_*[危险].!"));
+        assert!(formatted.contains("GID `20`"));
+        assert!(!formatted.contains("GID `21`"));
+        assert!(formatted.contains("另有 `1` 项未显示"));
+        assert!(formatted.contains("• GID `999` · 最近失败 · 失败"));
+    }
+
+    #[test]
+    fn test_eh_queue_status_fits_telegram_limit_for_wide_titles() {
+        let wide_title = "😀".repeat(EH_QUEUE_MAX_TITLE_CHARS);
+        let snapshot = EhQueueSnapshot {
+            active: (0..EH_QUEUE_MAX_VISIBLE_ACTIVE_ITEMS)
+                .map(|offset| {
+                    queue_item(i64::MAX - offset as i64, &wide_title, STATUS_PENDING, None)
+                })
+                .collect(),
+            recent_terminal: Some(queue_item(i64::MIN, &wide_title, STATUS_FAILED, None)),
+        };
+
+        let output = format_eh_queue_status(&snapshot);
+        let utf16_units = output.encode_utf16().count();
+        assert!(
+            utf16_units <= TELEGRAM_MAX_MESSAGE_UTF16_UNITS,
+            "formatted output contains {utf16_units} UTF-16 units"
+        );
+
+        let active_section = output
+            .split_once("\n\n*最近记录*")
+            .map(|(active, _)| active)
+            .expect("recent terminal should be present");
+        let visible_active_count = active_section
+            .lines()
+            .filter(|line| line.starts_with("• GID "))
+            .count();
+        let hidden_active_count = active_section
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("另有 `")
+                    .and_then(|line| line.split_once("` 项未显示"))
+                    .and_then(|(count, _)| count.parse::<usize>().ok())
+            })
+            .unwrap_or(0);
+
+        assert_eq!(visible_active_count + hidden_active_count, 20);
+        assert!(hidden_active_count > 0);
+        assert!(output.contains(&format!(
+            "*最近记录*\n• GID `{}` · {wide_title} · 失败",
+            i64::MIN
+        )));
+    }
 
     #[test]
     fn test_parse_eh_filter_basic() {

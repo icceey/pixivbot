@@ -52,6 +52,8 @@ pub enum Command {
     EUnsub(String),
     #[command(description = "直接下载 E-Hentai 画廊\n  用法: /edl <url> [telegraph=on]")]
     EDl(String),
+    #[command(description = "查看当前聊天的 E-Hentai 下载队列", parse_with = "split")]
+    EStatus {},
     #[command(
         description = "下载 E-Hentai 画廊并上传 Telegraph\n  用法: /telegraph <url> 或回复消息"
     )]
@@ -106,6 +108,7 @@ impl Command {
                 BotCommand::new("esub", "订阅EH画廊 - /esub <搜索词> [过滤条件]"),
                 BotCommand::new("eunsub", "取消EH订阅 - /eunsub <搜索词>"),
                 BotCommand::new("edl", "下载EH画廊 - /edl <url> [telegraph=on]"),
+                BotCommand::new("estatus", "查看当前聊天的EH下载队列"),
                 BotCommand::new(
                     "telegraph",
                     "下载EH画廊上传Telegraph - /telegraph <url> 或回复消息",
@@ -143,6 +146,7 @@ impl Command {
 #[cfg(test)]
 mod tests {
     use super::Command;
+    use teloxide::utils::command::BotCommands;
 
     fn command_names(commands: Vec<teloxide::types::BotCommand>) -> Vec<String> {
         commands
@@ -195,7 +199,7 @@ mod tests {
     fn user_commands_include_ehentai_entries_when_configured() {
         let commands = command_names(Command::user_commands(false, true));
 
-        for name in ["esub", "eunsub", "edl"] {
+        for name in ["esub", "eunsub", "edl", "estatus"] {
             assert!(
                 commands.iter().any(|command| command == name),
                 "expected {name} to be visible when ehentai is configured"
@@ -207,7 +211,7 @@ mod tests {
     fn user_commands_omit_ehentai_entries_when_not_configured() {
         let commands = command_names(Command::user_commands(false, false));
 
-        for name in ["esub", "eunsub", "edl"] {
+        for name in ["esub", "eunsub", "edl", "estatus"] {
             assert!(
                 !commands.iter().any(|command| command == name),
                 "expected {name} to be hidden when ehentai is not configured"
@@ -224,6 +228,38 @@ mod tests {
         assert!(owner_commands.iter().any(|command| command == "setadmin"));
         assert!(!admin_commands.iter().any(|command| command == "bsub"));
         assert!(!owner_commands.iter().any(|command| command == "bunsub"));
+    }
+
+    #[test]
+    fn estatus_parses_as_no_argument_command() {
+        assert!(matches!(
+            Command::parse("/estatus", ""),
+            Ok(Command::EStatus {})
+        ));
+        assert!(Command::parse("/estatus unexpected", "").is_err());
+    }
+
+    #[test]
+    fn estatus_visibility_follows_eh_configuration_for_all_roles() {
+        for commands in [
+            Command::user_commands(false, false),
+            Command::admin_commands(false, false),
+            Command::owner_commands(false, false),
+        ] {
+            assert!(!command_names(commands)
+                .iter()
+                .any(|command| command == "estatus"));
+        }
+
+        for commands in [
+            Command::user_commands(false, true),
+            Command::admin_commands(false, true),
+            Command::owner_commands(false, true),
+        ] {
+            assert!(command_names(commands)
+                .iter()
+                .any(|command| command == "estatus"));
+        }
     }
 
     #[test]
