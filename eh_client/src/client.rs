@@ -1,28 +1,15 @@
+use crate::archive_download::{
+    archive_http_error, download_to_partial, ArchiveArtifacts, ArchiveDownloadOptions,
+};
 use crate::error::{Error, Result};
 use crate::models::{EhCookies, EhGallery, EhGalleryRef, RawApiResponse, RawGalleryMetaEntry};
 use crate::parser;
-use futures_util::StreamExt;
-use reqwest::header::{CONTENT_LENGTH, CONTENT_RANGE, COOKIE, RANGE};
+use reqwest::header::COOKIE;
 use std::path::Path;
-use std::time::{Duration, Instant};
-use tokio::io::AsyncWriteExt;
-use tokio::time::sleep;
-use tokio_util::io::StreamReader;
 
 const USER_AGENT_STR: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 const ARCHIVE_CONNECT_TIMEOUT_SECS: u64 = 30;
 const ARCHIVE_READ_TIMEOUT_SECS: u64 = 60;
-const ARCHIVE_DOWNLOAD_MAX_ATTEMPTS: usize = 4;
-
-/// Threshold for "made progress": strictly greater than 10 KiB/s.
-const PROGRESS_THRESHOLD_BYTES_PER_SEC: f64 = 10_240.0;
-
-/// Returns true if the attempt transferred data fast enough to count as real progress.
-/// - 10 KiB/s = 10240 bytes/s; strictly greater than (not equal to).
-/// - `elapsed_secs == 0.0` returns false (prevents division by zero).
-fn made_progress(new_bytes: u64, elapsed_secs: f64) -> bool {
-    elapsed_secs > 0.0 && (new_bytes as f64 / elapsed_secs) > PROGRESS_THRESHOLD_BYTES_PER_SEC
-}
 
 pub struct EhClient {
     http: reqwest::Client,
@@ -157,77 +144,6 @@ fn resolve_url(base_url: &str, url: &str) -> String {
     }
 }
 
-fn is_ehentai_host(url: &str) -> bool {
-    reqwest::Url::parse(url)
-        .ok()
-        .and_then(|url| url.host_str().map(str::to_owned))
-        .is_some_and(|host| matches!(host.as_str(), "e-hentai.org" | "exhentai.org"))
-}
-
-fn response_expected_total(
-    headers: &reqwest::header::HeaderMap,
-    existing_len: u64,
-    append: bool,
-) -> Option<u64> {
-    let content_len = headers
-        .get(CONTENT_LENGTH)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse::<u64>().ok())?;
-    Some(if append {
-        existing_len + content_len
-    } else {
-        content_len
-    })
-}
-
-fn parse_content_range_header(value: &str) -> Option<(u64, u64, Option<u64>)> {
-    let range = value.strip_prefix("bytes ")?;
-    let (bounds, total) = range.split_once('/')?;
-    let (start, end) = bounds.split_once('-')?;
-    let start = start.parse::<u64>().ok()?;
-    let end = end.parse::<u64>().ok()?;
-    if end < start {
-        return None;
-    }
-    let total = if total == "*" {
-        None
-    } else {
-        Some(total.parse::<u64>().ok()?)
-    };
-    Some((start, end, total))
-}
-
-fn validate_content_range(headers: &reqwest::header::HeaderMap, existing_len: u64) -> Result<u64> {
-    let value = headers
-        .get(CONTENT_RANGE)
-        .ok_or_else(|| Error::Other("archive resume response missing Content-Range".into()))?
-        .to_str()
-        .map_err(|_| Error::Other("archive resume response has invalid Content-Range".into()))?;
-    let (start, end, total) = parse_content_range_header(value)
-        .ok_or_else(|| Error::Other("archive resume response has invalid Content-Range".into()))?;
-    if start != existing_len {
-        return Err(Error::Other(format!(
-            "archive resume Content-Range starts at {start}, expected {existing_len}"
-        )));
-    }
-    if let Some(total) = total {
-        if end >= total {
-            return Err(Error::Other(format!(
-                "archive resume Content-Range end {end} exceeds total {total}"
-            )));
-        }
-        if end + 1 != total {
-            return Err(Error::Other(format!(
-                "archive resume Content-Range ended at {}, expected final byte {}",
-                end,
-                total.saturating_sub(1)
-            )));
-        }
-        return Ok(total);
-    }
-    Ok(end + 1)
-}
-
 impl EhClient {
     pub fn new(base_url: &str, api_url: &str, cookies: EhCookies) -> Result<Self> {
         let mut builder = reqwest::Client::builder()
@@ -275,7 +191,8 @@ impl EhClient {
             .get(&gallery_url)
             .header(COOKIE, self.cookies.to_header())
             .send()
-            .await?;
+            .await
+            .map_err(archive_http_error)?;
         let status = resp.status();
         if !status.is_success() {
             return Err(Error::Api {
@@ -283,7 +200,7 @@ impl EhClient {
                 status: status.as_u16(),
             });
         }
-        let gallery_html = resp.text().await?;
+        let gallery_html = resp.text().await.map_err(archive_http_error)?;
 
         let (archiver_gid, archiver_token) = parser::parse_archiver_url(&gallery_html)
             .ok_or_else(|| Error::Parse("archiver URL not found in gallery page".into()))?;
@@ -297,7 +214,8 @@ impl EhClient {
             .get(&archiver_page_url)
             .header(COOKIE, self.cookies.to_header())
             .send()
-            .await?;
+            .await
+            .map_err(archive_http_error)?;
         let status = resp.status();
         if !status.is_success() {
             return Err(Error::Api {
@@ -305,7 +223,7 @@ impl EhClient {
                 status: status.as_u16(),
             });
         }
-        let archiver_html = resp.text().await?;
+        let archiver_html = resp.text().await.map_err(archive_http_error)?;
 
         Ok((archiver_gid, archiver_token, archiver_html))
     }
@@ -459,8 +377,8 @@ impl EhClient {
     /// `resolution` controls quality: "780x"/"980x"/"1280x" (free resamples),
     /// "1600x"/"2400x" (donors), "original" (costs GP).
     ///
-    /// Streams to a temporary path, validates the ZIP, then atomically renames
-    /// to `dest`. The temp file is removed on any error after creation.
+    /// Streams to recoverable temporary state, validates the ZIP, then atomically
+    /// renames to `dest`.
     pub async fn download_archive(
         &self,
         gid: u64,
@@ -469,14 +387,15 @@ impl EhClient {
         resolution: &str,
         dest: &Path,
     ) -> Result<u64> {
-        let request = ArchiveDownloadRequest::from_archiver_key(
-            &self.base_url,
+        self.download_archive_with_options(
             gid,
             token,
             archiver_key,
             resolution,
-        );
-        self.download_archive_with_request(&request, dest).await
+            dest,
+            ArchiveDownloadOptions::default(),
+        )
+        .await
     }
 
     /// Download a gallery archive ZIP from a prepared archiver POST request.
@@ -485,6 +404,43 @@ impl EhClient {
         request: &ArchiveDownloadRequest,
         dest: &Path,
     ) -> Result<u64> {
+        self.download_archive_with_request_and_options(
+            request,
+            dest,
+            ArchiveDownloadOptions::default(),
+        )
+        .await
+    }
+
+    /// Download a gallery archive ZIP with explicit transfer options.
+    pub async fn download_archive_with_options(
+        &self,
+        gid: u64,
+        token: &str,
+        archiver_key: &str,
+        resolution: &str,
+        dest: &Path,
+        options: ArchiveDownloadOptions,
+    ) -> Result<u64> {
+        let request = ArchiveDownloadRequest::from_archiver_key(
+            &self.base_url,
+            gid,
+            token,
+            archiver_key,
+            resolution,
+        );
+        self.download_archive_with_request_and_options(&request, dest, options)
+            .await
+    }
+
+    /// Download from a prepared archiver request with explicit transfer options.
+    pub async fn download_archive_with_request_and_options(
+        &self,
+        request: &ArchiveDownloadRequest,
+        dest: &Path,
+        options: ArchiveDownloadOptions,
+    ) -> Result<u64> {
+        let options = options.validate()?;
         // Step 1: POST to archiver.php to initiate download
         let resp = self
             .http
@@ -492,7 +448,8 @@ impl EhClient {
             .header(COOKIE, self.cookies.to_header())
             .form(&request.form_data)
             .send()
-            .await?;
+            .await
+            .map_err(archive_http_error)?;
 
         let status = resp.status();
         if !status.is_success() {
@@ -502,209 +459,44 @@ impl EhClient {
             });
         }
 
-        let html = resp.text().await?;
+        let html = resp.text().await.map_err(archive_http_error)?;
 
         // Step 2: Parse the JS redirect URL
         let download_url = parser::parse_archive_redirect(&html)
             .ok_or_else(|| Error::Parse("archive redirect URL not found".into()))?;
 
         // Step 4: Stream to temp file, validate, then rename atomically
-        let temp_path = dest.with_extension("zip.part");
-        self.download_archive_response_resumable(&download_url, &temp_path)
-            .await?;
+        let artifacts = ArchiveArtifacts::new(dest);
+        download_to_partial(
+            &self.http,
+            &self.cookies,
+            &download_url,
+            &artifacts,
+            options,
+        )
+        .await?;
 
         // Step 5: Validate that we got a complete ZIP (not an error HTML page or corrupt resume)
-        if let Err(e) = validate_complete_zip(&temp_path).await {
-            let _ = tokio::fs::remove_file(&temp_path).await;
+        if let Err(e) = validate_complete_zip(artifacts.assembly_scratch()).await {
+            let _ = artifacts.remove_multipart_state().await;
             return Err(e);
         }
 
-        let total = tokio::fs::metadata(&temp_path).await?.len();
+        let total = tokio::fs::metadata(artifacts.assembly_scratch())
+            .await?
+            .len();
 
         // Step 6: Atomically rename temp to final dest
-        if let Err(e) = tokio::fs::rename(&temp_path, dest).await {
-            let _ = tokio::fs::remove_file(&temp_path).await;
+        if let Err(e) = tokio::fs::rename(artifacts.assembly_scratch(), dest).await {
+            let _ = tokio::fs::remove_file(artifacts.assembly_scratch()).await;
             return Err(e.into());
         }
 
+        if artifacts.remove_parts_dir().await.is_err() {
+            tracing::warn!("could not remove completed archive multipart state");
+        }
+
         Ok(total)
-    }
-
-    async fn download_archive_response_resumable(
-        &self,
-        download_url: &str,
-        temp_path: &Path,
-    ) -> Result<()> {
-        let initial_len = tokio::fs::metadata(temp_path)
-            .await
-            .map(|m| m.len())
-            .unwrap_or(0);
-        let total_start = Instant::now();
-        let mut attempts = 0usize;
-        let mut had_progress = false;
-        let mut last_error: Option<Error> = None;
-
-        for attempt in 1..=ARCHIVE_DOWNLOAD_MAX_ATTEMPTS {
-            attempts = attempt;
-            let before_len = tokio::fs::metadata(temp_path)
-                .await
-                .map(|m| m.len())
-                .unwrap_or(0);
-            let start = Instant::now();
-
-            match self
-                .download_archive_response_once(download_url, temp_path)
-                .await
-            {
-                Ok(()) => return Ok(()),
-                Err(e) => {
-                    let elapsed = start.elapsed().as_secs_f64();
-                    let after_len = tokio::fs::metadata(temp_path)
-                        .await
-                        .map(|m| m.len())
-                        .unwrap_or(before_len);
-                    let new_bytes = after_len.saturating_sub(before_len);
-                    let attempt_made_progress = made_progress(new_bytes, elapsed);
-                    if attempt_made_progress {
-                        had_progress = true;
-                    }
-                    tracing::warn!(
-                        attempt,
-                        max_attempts = ARCHIVE_DOWNLOAD_MAX_ATTEMPTS,
-                        new_bytes,
-                        elapsed_secs = elapsed,
-                        attempt_made_progress,
-                        had_progress,
-                        error = %e,
-                        "archive download attempt failed",
-                    );
-                    last_error = Some(e);
-                    // Sleep between attempts to avoid request burst on immediate failures.
-                    // Worst case: 4 immediate failures ≈ 3s extra, acceptable for a single worker tick.
-                    sleep(Duration::from_secs(1)).await;
-                }
-            }
-        }
-
-        match last_error {
-            Some(e) if had_progress => {
-                let final_len = tokio::fs::metadata(temp_path)
-                    .await
-                    .map(|m| m.len())
-                    .unwrap_or(initial_len);
-                Err(Error::DownloadInProgress {
-                    inner: Box::new(e),
-                    attempts,
-                    bytes_delta: final_len.saturating_sub(initial_len),
-                    elapsed: total_start.elapsed(),
-                })
-            }
-            Some(e) => Err(e),
-            None => Err(Error::Other("archive download failed".into())),
-        }
-    }
-
-    async fn download_archive_response_once(
-        &self,
-        download_url: &str,
-        temp_path: &Path,
-    ) -> Result<()> {
-        let existing_len = tokio::fs::metadata(temp_path)
-            .await
-            .map(|m| m.len())
-            .unwrap_or(0);
-
-        let mut request = self.http.get(download_url);
-        if existing_len > 0 {
-            request = request.header(RANGE, format!("bytes={existing_len}-"));
-        }
-        if is_ehentai_host(download_url) {
-            request = request.header(COOKIE, self.cookies.to_header());
-        }
-
-        let resp = request.send().await?;
-        let status = resp.status();
-        if existing_len > 0 && status.as_u16() == 416 {
-            let _ = tokio::fs::remove_file(temp_path).await;
-            return Err(Error::Api {
-                message: format!(
-                    "archive download returned {}; restarting without partial",
-                    status
-                ),
-                status: status.as_u16(),
-            });
-        }
-        let mut expected_total_from_range = None;
-        let append = if existing_len > 0 && status.as_u16() == 206 {
-            expected_total_from_range = Some(validate_content_range(resp.headers(), existing_len)?);
-            true
-        } else if status.is_success() {
-            if existing_len > 0 && status.as_u16() == 200 {
-                let _ = tokio::fs::remove_file(temp_path).await;
-            }
-            false
-        } else {
-            return Err(Error::Api {
-                message: format!("archive download returned {}", status),
-                status: status.as_u16(),
-            });
-        };
-
-        let expected_total = expected_total_from_range
-            .or_else(|| response_expected_total(resp.headers(), existing_len, append));
-        if append && expected_total == Some(existing_len) {
-            return Ok(());
-        }
-
-        let mut options = tokio::fs::OpenOptions::new();
-        options.create(true).write(true);
-        if append {
-            options.append(true);
-        } else {
-            options.truncate(true);
-        }
-
-        let file = options.open(temp_path).await?;
-        let mut writer = tokio::io::BufWriter::with_capacity(2 * 1024 * 1024, file);
-
-        // Convert the response byte stream into an AsyncRead, mapping reqwest
-        // errors to io::Error so StreamReader can surface them.
-        let stream = resp
-            .bytes_stream()
-            .map(|r| r.map_err(std::io::Error::other));
-        let mut reader = StreamReader::new(stream);
-
-        // copy_buf reads from the stream and writes to BufWriter. Writes are
-        // memcpy until the 2MB buffer fills, so the read loop runs almost
-        // continuously, keeping the TCP receive window open.
-        let copied = match tokio::io::copy_buf(&mut reader, &mut writer).await {
-            Ok(n) => {
-                // On success, flush must succeed so written reflects bytes on disk.
-                writer.flush().await?;
-                n
-            }
-            Err(e) => {
-                // On stream error, flush best-effort to persist buffered bytes
-                // so the .part file advances and resume Range/made_progress
-                // reflect real downloaded data.
-                let _ = writer.flush().await;
-                return Err(e.into());
-            }
-        };
-        let written = if append {
-            existing_len + copied
-        } else {
-            copied
-        };
-
-        if let Some(expected_total) = expected_total {
-            if written < expected_total {
-                return Err(Error::Other(format!(
-                    "archive download ended at {written} bytes, expected {expected_total}"
-                )));
-            }
-        }
-        Ok(())
     }
 
     /// Get the base URL.
@@ -1213,38 +1005,6 @@ mod tests {
             url,
             "https://e-hentai.org/archiver.php?gid=123456&token=abcdef0123&or=780x"
         );
-    }
-
-    #[test]
-    fn archive_download_cookie_host_check_only_matches_eh_domains() {
-        assert!(is_ehentai_host(
-            "https://e-hentai.org/archive/1/abc/file/0?start=1"
-        ));
-        assert!(is_ehentai_host(
-            "https://exhentai.org/archive/1/abc/file/0?start=1"
-        ));
-        assert!(!is_ehentai_host(
-            "http://127.0.0.1/archive/1/abc/file/0?start=1"
-        ));
-        assert!(!is_ehentai_host(
-            "https://example.com/archive/1/abc/file/0?start=1"
-        ));
-    }
-
-    #[test]
-    fn test_made_progress_threshold() {
-        // Exactly 10KB/s (10240 bytes in 1.0s) → NOT progress (strictly greater)
-        assert!(!made_progress(10240, 1.0));
-        // One byte above threshold → progress
-        assert!(made_progress(10241, 1.0));
-        // Zero bytes → never progress
-        assert!(!made_progress(0, 1.0));
-        // Zero elapsed → false (prevents division by zero)
-        assert!(!made_progress(99999, 0.0));
-        // Large transfer, small elapsed → progress
-        assert!(made_progress(20000, 0.5));
-        // Small transfer, large elapsed → no progress
-        assert!(!made_progress(100, 10.0));
     }
 
     #[test]
