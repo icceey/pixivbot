@@ -6,7 +6,8 @@ use eh_client::ArchiveArtifacts;
 use sea_orm::prelude::DateTime;
 use sea_orm::sea_query::{Expr, SimpleExpr};
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, EntityTrait, Order, PaginatorTrait, QueryFilter, QueryOrder, Set,
+    ActiveModelTrait, ColumnTrait, EntityTrait, Order, PaginatorTrait, QueryFilter, QueryOrder,
+    QueryTrait, Set,
 };
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::LazyLock;
@@ -2022,19 +2023,21 @@ impl Repo {
         let old_id: SimpleExpr = Expr::case(is_recent, Expr::value(None::<i32>))
             .finally(Expr::col(eh_download_queue::Column::Id))
             .into();
-        let entry = eh_download_queue::Entity::find()
+        let mut query = eh_download_queue::Entity::find()
             .filter(eh_download_queue::Column::Status.eq(STATUS_PENDING))
             .filter(eh_download_queue::Column::BackgroundDownloadStatus.is_null())
             .filter(
                 eh_download_queue::Column::NextRetryAt
                     .is_null()
                     .or(eh_download_queue::Column::NextRetryAt.lte(now)),
-            )
-            .order_by(recent_priority, Order::Asc)
-            .order_by(recent_created_at, Order::Asc)
-            .order_by(recent_id, Order::Asc)
-            .order_by(old_created_at, Order::Desc)
-            .order_by(old_id, Order::Desc)
+            );
+        QueryTrait::query(&mut query)
+            .order_by_expr(recent_priority, Order::Asc)
+            .order_by_expr(recent_created_at, Order::Asc)
+            .order_by_expr(recent_id, Order::Asc)
+            .order_by_expr(old_created_at, Order::Desc)
+            .order_by_expr(old_id, Order::Desc);
+        let entry = query
             .one(&self.db)
             .await
             .context("Failed to fetch next for download")?;
@@ -5306,10 +5309,7 @@ mod tests {
     #[tokio::test]
     async fn test_background_archive_policy_aba_does_not_fail_reclaimed_row() {
         let repo = tests_helpers::setup_test_db().await.unwrap();
-        let claim_now = NaiveDate::from_ymd_opt(2026, 7, 22)
-            .unwrap()
-            .and_hms_opt(12, 0, 0)
-            .unwrap();
+        let claim_now = Local::now().naive_local() + Duration::minutes(1);
         let model = repo
             .enqueue_eh_subscription_download(-100, 124, 65, "tok", "Title", false)
             .await
