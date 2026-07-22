@@ -11,6 +11,20 @@ const USER_AGENT_STR: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWeb
 const ARCHIVE_CONNECT_TIMEOUT_SECS: u64 = 30;
 const ARCHIVE_READ_TIMEOUT_SECS: u64 = 60;
 
+/// Direct archive resolutions accepted by EH archive download APIs.
+pub const SUPPORTED_ARCHIVE_RESOLUTIONS: [&str; 4] = ["780x", "980x", "1280x", "original"];
+
+/// Validate a direct EH archive resolution before issuing network requests.
+pub fn validate_archive_resolution(resolution: &str) -> Result<()> {
+    if SUPPORTED_ARCHIVE_RESOLUTIONS.contains(&resolution) {
+        Ok(())
+    } else {
+        Err(Error::Other(format!(
+            "unsupported EH archive resolution '{resolution}'; supported values: 780x, 980x, 1280x, original"
+        )))
+    }
+}
+
 pub struct EhClient {
     http: reqwest::Client,
     base_url: String,
@@ -321,12 +335,15 @@ impl EhClient {
     /// Also parses the archiver.php page for the download cost (Free / Unlocked
     /// / `N GP` / Insufficient / N/A / Unknown) and attaches it to the returned
     /// request so callers can decide whether to POST without spending GP.
+    /// `resolution` must be exactly `780x`, `980x`, `1280x`, or `original`.
+    /// Unsupported resolutions fail before any HTTP request.
     pub async fn prepare_archive_download(
         &self,
         gid: u64,
         token: &str,
         resolution: &str,
     ) -> Result<ArchiveDownloadRequest> {
+        validate_archive_resolution(resolution)?;
         let (archiver_gid, archiver_token, archiver_html) =
             self.fetch_archiver_page(gid, token).await?;
 
@@ -372,8 +389,8 @@ impl EhClient {
 
     /// Download a gallery archive ZIP to the specified path.
     /// `archiver_key` is obtained from `get_archiver_key`.
-    /// `resolution` controls quality: "780x"/"980x"/"1280x" (free resamples),
-    /// "1600x"/"2400x" (donors), "original" (costs GP).
+    /// `resolution` must be exactly `780x`, `980x`, `1280x`, or `original`.
+    /// Unsupported resolutions fail before any HTTP request.
     ///
     /// Streams to recoverable temporary state, validates the ZIP, then atomically
     /// renames to `dest`.
@@ -411,6 +428,8 @@ impl EhClient {
     }
 
     /// Download a gallery archive ZIP with explicit transfer options.
+    /// `resolution` must be exactly `780x`, `980x`, `1280x`, or `original`.
+    /// Unsupported resolutions fail before any HTTP request.
     pub async fn download_archive_with_options(
         &self,
         gid: u64,
@@ -420,6 +439,7 @@ impl EhClient {
         dest: &Path,
         options: ArchiveDownloadOptions,
     ) -> Result<u64> {
+        validate_archive_resolution(resolution)?;
         let request = ArchiveDownloadRequest::from_archiver_key(
             &self.base_url,
             gid,
@@ -1016,5 +1036,22 @@ mod tests {
         );
 
         assert_eq!(request.estimated_size_bytes(), None);
+    }
+
+    #[test]
+    fn test_archive_resolution_validation_accepts_supported_and_rejects_invalid_values() {
+        for resolution in SUPPORTED_ARCHIVE_RESOLUTIONS {
+            validate_archive_resolution(resolution)
+                .unwrap_or_else(|error| panic!("{resolution} should be accepted: {error}"));
+        }
+
+        for resolution in ["1600x", "2400x", "bogus", ""] {
+            let error = validate_archive_resolution(resolution)
+                .expect_err("unsupported archive resolution should be rejected");
+            assert!(matches!(error, Error::Other(_)));
+            assert!(error.to_string().contains(&format!(
+                "unsupported EH archive resolution '{resolution}'; supported values: 780x, 980x, 1280x, original"
+            )));
+        }
     }
 }

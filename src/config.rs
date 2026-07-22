@@ -346,12 +346,19 @@ pub struct EhentaiConfig {
     pub ipb_pass_hash: Option<String>,
     #[serde(default)]
     pub igneous: Option<String>,
-    /// Resolution for subscription downloads: "780x", "980x", "1280x" (free),
-    /// "1600x"/"2400x" (donors), "original" (costs GP). Default: "1280x" (free max).
-    #[serde(default = "default_eh_subscription_resolution")]
+    /// Resolution for subscription downloads: `780x`, `980x`, `1280x`, or `original`.
+    /// Donor resolutions require a separate H@H Downloader and are rejected. Default: `1280x`.
+    #[serde(
+        default = "default_eh_subscription_resolution",
+        deserialize_with = "deserialize_eh_archive_resolution"
+    )]
     pub subscription_resolution: String,
-    /// Resolution for /edl direct downloads. Default: "1280x".
-    #[serde(default = "default_eh_download_resolution")]
+    /// Resolution for /edl direct downloads: `780x`, `980x`, `1280x`, or `original`.
+    /// Donor resolutions require a separate H@H Downloader and are rejected. Default: `1280x`.
+    #[serde(
+        default = "default_eh_download_resolution",
+        deserialize_with = "deserialize_eh_archive_resolution"
+    )]
     pub download_resolution: String,
     /// Whether subscription updates send the archive ZIP (default: true).
     #[serde(default = "default_eh_send_archive")]
@@ -382,11 +389,10 @@ pub struct EhentaiConfig {
     /// `0` disables this per-gallery archive gate.
     #[serde(default = "default_eh_max_archive_size_mb")]
     pub max_archive_size_mb: u64,
-    /// Maximum GP cost allowed for a single archive download. `0` (default) means
-    /// only Free / Unlocked archives are downloaded; any gallery that would cost
-    /// GP is deferred. Set to a positive value to allow paid downloads up to that
-    /// amount. Insufficient Funds / N/A / Unknown always defer regardless of this
-    /// setting.
+    /// Maximum GP cost allowed for a single archive download. Numeric costs above
+    /// this threshold permanently fail the queue entry. `0` (default) permits only
+    /// `Gp(0)`, Free, and Unlocked. Insufficient Funds / N/A / Unknown, rolling GP
+    /// budget exhaustion, and byte-rate limits defer regardless of this setting.
     #[serde(default = "default_eh_max_archive_gp_cost")]
     pub max_archive_gp_cost: u64,
     /// Maximum total GP that can be spent on archive downloads within the rolling
@@ -496,23 +502,15 @@ impl EhentaiConfig {
     /// per-archive `max_archive_gp_cost` setting.
     ///
     /// - Free / Unlocked: always allowed (no GP spent).
-    /// - `Gp(n)` with `n > 0`: allowed iff `n <= max_archive_gp_cost`.
-    ///   When `max_archive_gp_cost == 0` (default), any non-zero GP cost is
-    ///   rejected, since 0 means "only free downloads".
-    /// - `Gp(0)`: treated as a non-free variant (the page said "0 GP" rather
-    ///   than "Free!"), so it is rejected when `max_archive_gp_cost == 0`.
-    /// - Insufficient / Unavailable / Unknown: never allowed (conservative reject).
+    /// - `Gp(n)`: allowed iff `n <= max_archive_gp_cost`, including `Gp(0)`
+    ///   when the configured limit is zero.
+    /// - Insufficient / Unavailable / Unknown: never allowed by the numeric
+    ///   policy; callers defer them as temporary states.
     pub fn allows_archive_gp_cost(&self, cost: &eh_client::parser::DownloadCost) -> bool {
         use eh_client::parser::DownloadCost;
         match cost {
             DownloadCost::Free | DownloadCost::Unlocked => true,
-            DownloadCost::Gp(n) => {
-                if self.max_archive_gp_cost == 0 {
-                    false
-                } else {
-                    *n <= self.max_archive_gp_cost
-                }
-            }
+            DownloadCost::Gp(n) => *n <= self.max_archive_gp_cost,
             DownloadCost::Insufficient | DownloadCost::Unavailable | DownloadCost::Unknown => false,
         }
     }
@@ -538,6 +536,18 @@ fn default_eh_subscription_resolution() -> String {
 
 fn default_eh_download_resolution() -> String {
     "1280x".to_string()
+}
+
+fn deserialize_eh_archive_resolution<'de, D>(
+    deserializer: D,
+) -> std::result::Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let resolution = String::deserialize(deserializer)?;
+    eh_client::client::validate_archive_resolution(&resolution)
+        .map_err(serde::de::Error::custom)?;
+    Ok(resolution)
 }
 
 fn default_eh_send_archive() -> bool {
@@ -717,6 +727,40 @@ mod tests {
     }
 
     #[test]
+    fn test_eh_archive_resolution_deserialization_accepts_supported_values() {
+        for field in ["subscription_resolution", "download_resolution"] {
+            for resolution in ["780x", "980x", "1280x", "original"] {
+                let config = serde_json::from_str::<EhentaiConfig>(&format!(
+                    r#"{{"{field}":"{resolution}"}}"#
+                ))
+                .unwrap_or_else(|error| panic!("{field}={resolution} should deserialize: {error}"));
+
+                let actual = match field {
+                    "subscription_resolution" => &config.subscription_resolution,
+                    "download_resolution" => &config.download_resolution,
+                    _ => unreachable!(),
+                };
+                assert_eq!(actual, resolution);
+            }
+        }
+    }
+
+    #[test]
+    fn test_eh_archive_resolution_deserialization_rejects_unsupported_values() {
+        for field in ["subscription_resolution", "download_resolution"] {
+            for resolution in ["1600x", "2400x", "bogus", ""] {
+                let error = serde_json::from_str::<EhentaiConfig>(&format!(
+                    r#"{{"{field}":"{resolution}"}}"#
+                ))
+                .expect_err("unsupported archive resolution should fail deserialization");
+                assert!(error.to_string().contains(&format!(
+                    "unsupported EH archive resolution '{resolution}'; supported values: 780x, 980x, 1280x, original"
+                )));
+            }
+        }
+    }
+
+    #[test]
     fn test_eh_max_archive_size_defaults_to_300_mib() {
         let cfg = EhentaiConfig::default();
         assert_eq!(cfg.max_archive_size_mb, 300);
@@ -730,6 +774,24 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(cfg.max_archive_size_bytes(), None);
+    }
+
+    #[test]
+    fn test_eh_max_archive_gp_cost_allows_zero_gp_at_zero_limit() {
+        use eh_client::parser::DownloadCost;
+
+        let mut cfg = EhentaiConfig::default();
+        assert!(cfg.allows_archive_gp_cost(&DownloadCost::Free));
+        assert!(cfg.allows_archive_gp_cost(&DownloadCost::Unlocked));
+        assert!(cfg.allows_archive_gp_cost(&DownloadCost::Gp(0)));
+        assert!(!cfg.allows_archive_gp_cost(&DownloadCost::Gp(1)));
+        assert!(!cfg.allows_archive_gp_cost(&DownloadCost::Insufficient));
+        assert!(!cfg.allows_archive_gp_cost(&DownloadCost::Unavailable));
+        assert!(!cfg.allows_archive_gp_cost(&DownloadCost::Unknown));
+
+        cfg.max_archive_gp_cost = 500;
+        assert!(cfg.allows_archive_gp_cost(&DownloadCost::Gp(500)));
+        assert!(!cfg.allows_archive_gp_cost(&DownloadCost::Gp(501)));
     }
 
     #[test]

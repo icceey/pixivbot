@@ -822,103 +822,64 @@ async fn test_prepare_archive_download_1280x_uses_resample_form_and_cost() {
 }
 
 #[tokio::test]
-async fn test_prepare_archive_download_1600x_uses_direct_resample_form() {
+async fn test_prepare_archive_download_rejects_unsupported_resolution_before_network() {
     let server = MockServer::start().await;
-    let gallery_page_html = r#"
-<html><body>
-<a onclick="return popUp('/archiver.php?gid=4034806&amp;token=fedcba9876',480,320)">Archive Download</a>
-</body></html>
-"#;
-    let archiver_form_html = format!(
-        r#"
-<html><body>
-<div>Download Cost: &nbsp; <strong>8,800 GP</strong></div>
-<form method="post" action="{}/org-archiver.php?form=org">
-  <input type="hidden" name="dltype" value="org" />
-  <input type="hidden" name="org_sentinel" value="org-only" />
-  <input type="submit" name="dlcheck" value="Download Original Archive" />
-</form>
-<div>Download Cost: &nbsp; <strong>218 GP</strong></div>
-<form method="post" action="{}/res-archiver.php?form=res">
-  <input type="hidden" name="dltype" value="res" />
-  <input type="hidden" name="res_sentinel" value="res-only" />
-  <input type="submit" name="dlcheck" value="Download Resample Archive" />
-</form>
-<p>Estimated Size: <strong>5.01 MiB</strong></p>
-<form id="hathdl_form" method="post" action="{}/archiver.php?form=hathdl">
-  <input type="hidden" id="hathdl_xres" name="hathdl_xres" value="" />
-  <input type="hidden" name="hathdl_sentinel" value="hathdl-only" />
-</form>
-<table><tr>
-  <td><p>Original</p><p>419.6 MiB</p><p>8,800 GP</p></td>
-  <td><p>800x</p><p>10.38 MiB</p><p>114 GP</p></td>
-  <td><p>1280x</p><p>12.5 MiB</p><p>218 GP</p></td>
-  <td><p>1920x</p><p>19.25 MiB</p><p>376 GP</p></td>
-  <td><p>2560x</p><p>25.0 MiB</p><p>546 GP</p></td>
-</tr></table>
-</body></html>
-"#,
-        server.uri(),
-        server.uri(),
-        server.uri()
-    );
-    let redirect_html = format!(
-        r#"<script>document.location = "{}/archive/4034806/fedcba9876/archive/0?autostart=1";</script>"#,
-        server.uri()
-    );
-    let zip_bytes = test_zip_bytes("image.jpg", b"direct_resample_zip");
-
-    Mock::given(method("GET"))
-        .and(path("/g/4034806/e13b7d119b/"))
-        .respond_with(ResponseTemplate::new(200).set_body_string(gallery_page_html))
-        .expect(1)
-        .mount(&server)
-        .await;
-    Mock::given(method("GET"))
-        .and(path("/archiver.php"))
-        .and(query_param("gid", "4034806"))
-        .and(query_param("token", "fedcba9876"))
-        .respond_with(ResponseTemplate::new(200).set_body_string(archiver_form_html))
-        .expect(1)
-        .mount(&server)
-        .await;
-    Mock::given(method("POST"))
-        .and(path("/res-archiver.php"))
-        .and(query_param("form", "res"))
-        .and(BodyContains("dltype=res"))
-        .and(BodyContains("dlcheck=Download+Resample+Archive"))
-        .and(BodyContains("res_sentinel=res-only"))
-        .and(BodyNotContains("hathdl_xres"))
-        .and(BodyNotContains("hathdl_sentinel"))
-        .and(BodyNotContains("org_sentinel"))
-        .respond_with(ResponseTemplate::new(200).set_body_string(redirect_html))
-        .expect(1)
-        .mount(&server)
-        .await;
-    Mock::given(method("GET"))
-        .and(path("/archive/4034806/fedcba9876/archive/0"))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(zip_bytes.clone()))
-        .expect(1)
-        .mount(&server)
-        .await;
-
     let client = client_at(&server);
-    let request = client
-        .prepare_archive_download(4034806, "e13b7d119b", "1600x")
-        .await
-        .expect("should prepare direct resample archive request");
-    assert_eq!(request.cost(), &eh_client::parser::DownloadCost::Gp(218));
-    assert_eq!(request.estimated_size_bytes(), Some(5_253_366));
+    for resolution in ["1600x", "2400x", "bogus", ""] {
+        let error = client
+            .prepare_archive_download(4034806, "e13b7d119b", resolution)
+            .await
+            .expect_err("unsupported archive resolution should be rejected");
+        assert!(matches!(error, eh_client::Error::Other(_)));
+        assert!(error.to_string().contains(&format!(
+            "unsupported EH archive resolution '{resolution}'; supported values: 780x, 980x, 1280x, original"
+        )));
+    }
 
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn test_archive_key_downloads_reject_unsupported_resolution_before_network() {
+    let server = MockServer::start().await;
+    let client = client_at(&server);
     let temp_dir = tempfile::tempdir().unwrap();
     let dest = temp_dir.path().join("archive.zip");
-    let bytes = client
-        .download_archive_with_request(&request, &dest)
-        .await
-        .expect("direct resample form download should succeed");
 
-    assert_eq!(bytes as usize, zip_bytes.len());
-    assert_eq!(std::fs::read(dest).unwrap(), zip_bytes);
+    for resolution in ["1600x", "2400x", "bogus", ""] {
+        let error = client
+            .download_archive(
+                123456,
+                "abcdef0123",
+                "123456--abc123def456",
+                resolution,
+                &dest,
+            )
+            .await
+            .expect_err("unsupported archive resolution should be rejected");
+        assert!(matches!(error, eh_client::Error::Other(_)));
+        assert!(error.to_string().contains(&format!(
+            "unsupported EH archive resolution '{resolution}'; supported values: 780x, 980x, 1280x, original"
+        )));
+
+        let error = client
+            .download_archive_with_options(
+                123456,
+                "abcdef0123",
+                "123456--abc123def456",
+                resolution,
+                &dest,
+                ArchiveDownloadOptions::default(),
+            )
+            .await
+            .expect_err("unsupported archive resolution should be rejected");
+        assert!(matches!(error, eh_client::Error::Other(_)));
+        assert!(error.to_string().contains(&format!(
+            "unsupported EH archive resolution '{resolution}'; supported values: 780x, 980x, 1280x, original"
+        )));
+    }
+
+    assert!(server.received_requests().await.unwrap().is_empty());
 }
 
 #[tokio::test]

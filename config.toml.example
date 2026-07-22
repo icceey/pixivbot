@@ -152,11 +152,13 @@ download_original_threshold = 1
 # # ipb_member_id = "12345"
 # # ipb_pass_hash = "abcdef0123456789abcdef0123456789"
 # # igneous = "abcdef"           # Required for exhentai only
-# # Image resolution for subscription archive downloads:
-# #   "780x", "980x", "1280x" (free resamples), "1600x"/"2400x" (donors),
-# #   "original" (logged-in, costs GP/credits)
+# # Image resolution for subscription archive downloads: "780x", "980x", "1280x",
+# # or "original" (logged-in, costs GP/credits). Donor resolutions require a
+# # separate H@H Downloader and are rejected by direct archive downloads.
 # subscription_resolution = "1280x"
-# # Image resolution for /edl direct downloads (default: "1280x")
+# # Image resolution for /edl direct downloads: "780x", "980x", "1280x", or
+# # "original" (default: "1280x"). Donor resolutions require a separate H@H
+# # Downloader and are rejected by direct archive downloads.
 # download_resolution = "1280x"
 # # Send archive ZIP to chat (default: true)
 # send_archive = true
@@ -192,10 +194,10 @@ download_original_threshold = 1
 # # Set to 0 to disable this selected archive limit.
 # max_archive_size_mb = 300
 # # Maximum GP cost allowed for a single archive download (default: 0).
-# # 0 = only Free / Unlocked archives are downloaded; any gallery that would
-# # cost GP is deferred until the cost changes (e.g. resample unlocked).
-# # Set to a positive value to allow paid downloads up to that amount.
-# # Insufficient Funds / N/A / Unknown always defer regardless of this setting.
+# # A numeric GP cost above this threshold permanently fails the queue entry.
+# # 0 permits only Gp(0), Free, and Unlocked archive costs.
+# # Insufficient Funds / N/A / Unknown, rolling GP budget, and byte-rate limits
+# # defer regardless of this setting.
 # max_archive_gp_cost = 0
 # # Maximum total GP that can be spent on archive downloads within the rolling
 # # window configured by `gp_rate_window_hours` (default: 0 = no daily GP budget
