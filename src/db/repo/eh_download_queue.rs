@@ -4151,7 +4151,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_cleanup_eh_cache_orphans_removes_partial_without_active_zip() {
+    async fn test_cleanup_eh_cache_orphans_preserves_active_upload_state_and_removes_orphan_upload_state(
+    ) {
         let repo = tests_helpers::setup_test_db().await.unwrap();
         let temp = tempfile::tempdir().unwrap();
         let cache_dir = temp.path();
@@ -4159,20 +4160,28 @@ mod tests {
         let orphan_zip = cache_dir.join("orphan.zip");
         let orphan_part = cache_dir.join("orphan.zip.part");
         let orphan_parts = cache_dir.join("orphan.zip.parts");
+        let orphan_uploads = cache_dir.join("orphan.zip.uploads");
         let active_zip = cache_dir.join("active.zip");
         let active_part = cache_dir.join("active.zip.part");
         let active_parts = cache_dir.join("active.zip.parts");
+        let active_uploads = cache_dir.join("active.zip.uploads");
         let unrelated = cache_dir.join("notes").join("keep.txt");
         std::fs::write(&orphan_zip, b"zip").unwrap();
         std::fs::write(&orphan_part, b"partial").unwrap();
         std::fs::create_dir_all(orphan_parts.join("nested")).unwrap();
         std::fs::write(orphan_parts.join("manifest.json"), b"manifest").unwrap();
         std::fs::write(orphan_parts.join("nested").join("part-0001"), b"part").unwrap();
+        std::fs::create_dir_all(orphan_uploads.join("nested")).unwrap();
+        std::fs::write(orphan_uploads.join("archive.json"), b"archive").unwrap();
+        std::fs::write(orphan_uploads.join("nested").join("image-0.json"), b"image").unwrap();
         std::fs::write(&active_zip, b"zip").unwrap();
         std::fs::write(&active_part, b"partial").unwrap();
         std::fs::create_dir_all(active_parts.join("nested")).unwrap();
         std::fs::write(active_parts.join("manifest.json"), b"manifest").unwrap();
         std::fs::write(active_parts.join("nested").join("part-0001"), b"part").unwrap();
+        std::fs::create_dir_all(active_uploads.join("nested")).unwrap();
+        std::fs::write(active_uploads.join("archive.json"), b"archive").unwrap();
+        std::fs::write(active_uploads.join("nested").join("image-0.json"), b"image").unwrap();
         std::fs::create_dir_all(unrelated.parent().unwrap()).unwrap();
         std::fs::write(&unrelated, b"keep").unwrap();
 
@@ -4197,6 +4206,10 @@ mod tests {
             !orphan_parts.exists(),
             "orphan multipart state should be removed recursively"
         );
+        assert!(
+            !orphan_uploads.exists(),
+            "orphan upload state should be removed recursively"
+        );
         assert!(active_zip.exists(), "active final ZIP should be kept");
         assert!(
             !active_part.exists(),
@@ -4205,6 +4218,11 @@ mod tests {
         assert!(
             !active_parts.exists(),
             "active final ZIP should discard stale multipart state"
+        );
+        assert!(
+            active_uploads.join("archive.json").exists()
+                && active_uploads.join("nested").join("image-0.json").exists(),
+            "active final ZIP should keep resumable upload state"
         );
         assert!(
             unrelated.exists(),
@@ -4227,10 +4245,14 @@ mod tests {
 
         let part = cache_dir.join("88_tok.zip.part");
         let parts_dir = cache_dir.join("88_tok.zip.parts");
+        let uploads_dir = cache_dir.join("88_tok.zip.uploads");
         std::fs::write(&part, b"partial").unwrap();
         std::fs::create_dir_all(parts_dir.join("nested")).unwrap();
         std::fs::write(parts_dir.join("manifest.json"), b"manifest").unwrap();
         std::fs::write(parts_dir.join("nested").join("part-0001"), b"part").unwrap();
+        std::fs::create_dir_all(uploads_dir.join("nested")).unwrap();
+        std::fs::write(uploads_dir.join("archive.json"), b"archive").unwrap();
+        std::fs::write(uploads_dir.join("nested").join("image-0.json"), b"image").unwrap();
 
         let reset = repo.reset_stale_eh_downloads().await.unwrap();
         assert_eq!(reset, 1);
@@ -4243,6 +4265,10 @@ mod tests {
         assert!(
             parts_dir.exists(),
             "pending retry multipart state should be kept for resumable download"
+        );
+        assert!(
+            uploads_dir.exists(),
+            "pending retry upload state should be kept for resumable upload"
         );
 
         Entity::update_many()
@@ -4260,6 +4286,10 @@ mod tests {
         assert!(
             !parts_dir.exists(),
             "canceled queue multipart state should be removed recursively"
+        );
+        assert!(
+            !uploads_dir.exists(),
+            "canceled queue upload state should be removed recursively"
         );
     }
 

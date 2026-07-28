@@ -7,6 +7,7 @@ pub struct ArchiveArtifacts {
     final_zip: PathBuf,
     assembly_scratch: PathBuf,
     parts_dir: PathBuf,
+    uploads_dir: PathBuf,
 }
 
 impl ArchiveArtifacts {
@@ -15,6 +16,7 @@ impl ArchiveArtifacts {
         Self {
             assembly_scratch: final_zip.with_extension("zip.part"),
             parts_dir: final_zip.with_extension("zip.parts"),
+            uploads_dir: final_zip.with_extension("zip.uploads"),
             final_zip,
         }
     }
@@ -22,6 +24,8 @@ impl ArchiveArtifacts {
     pub fn from_member(path: &Path) -> Option<Self> {
         let name = path.file_name()?.to_str()?;
         let final_name = if let Some(name) = name.strip_suffix(".zip.parts") {
+            format!("{name}.zip")
+        } else if let Some(name) = name.strip_suffix(".zip.uploads") {
             format!("{name}.zip")
         } else if let Some(name) = name.strip_suffix(".zip.part") {
             format!("{name}.zip")
@@ -45,12 +49,20 @@ impl ArchiveArtifacts {
         &self.parts_dir
     }
 
+    pub fn uploads_dir(&self) -> &Path {
+        &self.uploads_dir
+    }
+
     pub async fn remove_assembly_scratch(&self) -> Result<()> {
         remove_file_if_present(&self.assembly_scratch).await
     }
 
     pub async fn remove_parts_dir(&self) -> Result<()> {
         remove_dir_if_present(&self.parts_dir).await
+    }
+
+    pub async fn remove_upload_state(&self) -> Result<()> {
+        remove_dir_if_present(&self.uploads_dir).await
     }
 
     pub async fn remove_multipart_state(&self) -> Result<()> {
@@ -64,9 +76,11 @@ impl ArchiveArtifacts {
         let final_result = remove_file_if_present(&self.final_zip).await;
         let assembly_result = self.remove_assembly_scratch().await;
         let parts_result = self.remove_parts_dir().await;
+        let uploads_result = self.remove_upload_state().await;
         final_result?;
         assembly_result?;
-        parts_result
+        parts_result?;
+        uploads_result
     }
 }
 
@@ -104,11 +118,16 @@ mod tests {
             artifacts.parts_dir(),
             std::path::Path::new("cache/12_token.zip.parts")
         );
+        assert_eq!(
+            artifacts.uploads_dir(),
+            std::path::Path::new("cache/12_token.zip.uploads")
+        );
 
         for member in [
             "cache/12_token.zip",
             "cache/12_token.zip.part",
             "cache/12_token.zip.parts",
+            "cache/12_token.zip.uploads",
         ] {
             assert_eq!(
                 ArchiveArtifacts::from_member(std::path::Path::new(member)),
@@ -139,6 +158,12 @@ mod tests {
         tokio::fs::write(artifacts.parts_dir().join("part-0000000000000000"), b"part")
             .await
             .unwrap();
+        tokio::fs::create_dir_all(artifacts.uploads_dir().join("nested"))
+            .await
+            .unwrap();
+        tokio::fs::write(artifacts.uploads_dir().join("nested/state"), b"state")
+            .await
+            .unwrap();
 
         artifacts.remove_all().await.unwrap();
         artifacts.remove_all().await.unwrap();
@@ -146,5 +171,44 @@ mod tests {
         assert!(!artifacts.final_zip().exists());
         assert!(!artifacts.assembly_scratch().exists());
         assert!(!artifacts.parts_dir().exists());
+        assert!(!artifacts.uploads_dir().exists());
+    }
+
+    #[tokio::test]
+    async fn upload_state_has_an_independent_lifecycle() {
+        let temp = tempfile::tempdir().unwrap();
+        let artifacts = ArchiveArtifacts::new(temp.path().join("12_token.zip"));
+
+        tokio::fs::write(artifacts.final_zip(), b"zip")
+            .await
+            .unwrap();
+        tokio::fs::write(artifacts.assembly_scratch(), b"partial")
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(artifacts.parts_dir())
+            .await
+            .unwrap();
+        tokio::fs::write(artifacts.parts_dir().join("manifest.json"), b"manifest")
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(artifacts.uploads_dir())
+            .await
+            .unwrap();
+        tokio::fs::write(artifacts.uploads_dir().join("upload-state.json"), b"state")
+            .await
+            .unwrap();
+
+        artifacts.remove_multipart_state().await.unwrap();
+
+        assert!(artifacts.final_zip().exists());
+        assert!(artifacts.uploads_dir().exists());
+        assert!(!artifacts.assembly_scratch().exists());
+        assert!(!artifacts.parts_dir().exists());
+
+        artifacts.remove_upload_state().await.unwrap();
+        artifacts.remove_upload_state().await.unwrap();
+
+        assert!(artifacts.final_zip().exists());
+        assert!(!artifacts.uploads_dir().exists());
     }
 }
