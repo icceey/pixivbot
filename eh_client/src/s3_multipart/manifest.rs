@@ -65,6 +65,17 @@ pub(super) struct TerminalAbortManifest {
     pub(super) upload_id: String,
 }
 
+pub(super) fn is_terminal_abort_manifest_candidate(path: &Path) -> bool {
+    path.extension().and_then(|extension| extension.to_str()) == Some("json")
+        || is_temporary_manifest(path)
+}
+
+pub(super) fn is_temporary_manifest(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|file_name| file_name.to_str())
+        .is_some_and(|file_name| file_name.starts_with(MANIFEST_TEMP_PREFIX))
+}
+
 pub(super) async fn load_manifest(
     path: &Path,
     identity: &ManifestIdentity<'_>,

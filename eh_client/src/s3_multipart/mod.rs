@@ -483,18 +483,26 @@ pub(crate) async fn abort_upload_state(
             }
         }
         let path = entry.path();
-        if path.extension().and_then(|extension| extension.to_str()) == Some("json") {
-            manifest_paths.push(path);
+        if manifest::is_terminal_abort_manifest_candidate(&path) {
+            manifest_paths.push((manifest::is_temporary_manifest(&path), path));
         }
     }
-    manifest_paths.sort_unstable();
+    manifest_paths.sort_unstable_by(|(_, left), (_, right)| left.cmp(right));
 
-    for path in manifest_paths {
+    for (is_temporary, path) in manifest_paths {
         let manifest =
             match manifest::load_terminal_abort_manifest(&path, provider, uploader_identity_sha256)
                 .await
             {
                 Ok(Some(manifest)) => manifest,
+                Ok(None) if is_temporary => {
+                    if first_error.is_none() {
+                        first_error = Some(crate::Error::Other(
+                            "multipart temporary manifest could not be safely verified".to_owned(),
+                        ));
+                    }
+                    continue;
+                }
                 Ok(None) => continue,
                 Err(error) => {
                     if first_error.is_none() {
@@ -1919,6 +1927,134 @@ mod tests {
         .await
         .is_err());
         assert!(manifest_path.exists());
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn terminal_abort_recovers_matching_atomic_temp_manifest() {
+        let server = MockServer::start().await;
+        mount_abort_for(&server, UPLOAD_ID).await;
+        let temp = tempfile::tempdir().unwrap();
+        let uploads_dir = temp.path().join("gallery.zip.uploads");
+        tokio::fs::create_dir(&uploads_dir).await.unwrap();
+        let manifest_path = uploads_dir.join("manifest.json.tmp-crash");
+        write_valid_manifest(&manifest_path, &vec![7; PART_SIZE], UPLOADER_ID).await;
+
+        abort_upload_state(
+            test_bucket(&server).as_ref(),
+            ProviderKind::S3,
+            UPLOADER_ID,
+            &uploads_dir,
+        )
+        .await
+        .unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        assert_request_sequence(&requests, &["DELETE"]);
+        assert_eq!(requests[0].url.path(), format!("/{BUCKET}/{KEY}"));
+        assert_eq!(
+            query_value(&requests[0], "uploadId").as_deref(),
+            Some(UPLOAD_ID)
+        );
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn terminal_abort_rejects_unverifiable_atomic_temp_manifests_without_leaking_state() {
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let temp = tempfile::tempdir().unwrap();
+        let uploads_dir = temp.path().join("gallery.zip.uploads");
+        tokio::fs::create_dir(&uploads_dir).await.unwrap();
+        let malformed_sentinel = "atomic-temp-manifest-body-sentinel";
+        tokio::fs::write(
+            uploads_dir.join("manifest.json.tmp-malformed"),
+            malformed_sentinel,
+        )
+        .await
+        .unwrap();
+        write_valid_manifest(
+            &uploads_dir.join("manifest.json.tmp-other-uploader"),
+            &vec![7; PART_SIZE],
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        )
+        .await;
+
+        let error = abort_upload_state(
+            test_bucket(&server).as_ref(),
+            ProviderKind::S3,
+            UPLOADER_ID,
+            &uploads_dir,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, crate::Error::Other(_)));
+        assert_eq!(
+            error.to_string(),
+            "multipart temporary manifest could not be safely verified"
+        );
+        for forbidden in [
+            malformed_sentinel,
+            KEY,
+            UPLOAD_ID,
+            "AKIA_TEST_SENTINEL",
+            "secret-test-sentinel",
+        ] {
+            assert!(
+                !error.to_string().contains(forbidden),
+                "terminal Abort error leaked {forbidden}"
+            );
+        }
+        assert!(
+            uploads_dir.is_dir(),
+            "the durable gate must retain the family"
+        );
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn terminal_abort_continues_after_unverifiable_atomic_temp_manifest() {
+        let server = MockServer::start().await;
+        mount_abort_for(&server, UPLOAD_ID).await;
+        let temp = tempfile::tempdir().unwrap();
+        let uploads_dir = temp.path().join("gallery.zip.uploads");
+        tokio::fs::create_dir(&uploads_dir).await.unwrap();
+        tokio::fs::write(
+            uploads_dir.join("manifest.json.tmp-malformed"),
+            "atomic-temp-manifest-body-sentinel",
+        )
+        .await
+        .unwrap();
+        write_valid_manifest(
+            &uploads_dir.join("z-valid.json"),
+            &vec![7; PART_SIZE],
+            UPLOADER_ID,
+        )
+        .await;
+
+        let error = abort_upload_state(
+            test_bucket(&server).as_ref(),
+            ProviderKind::S3,
+            UPLOADER_ID,
+            &uploads_dir,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "multipart temporary manifest could not be safely verified"
+        );
+        let requests = server.received_requests().await.unwrap();
+        assert_request_sequence(&requests, &["DELETE"]);
+        assert_eq!(
+            query_value(&requests[0], "uploadId").as_deref(),
+            Some(UPLOAD_ID)
+        );
         server.verify().await;
     }
 

@@ -520,7 +520,7 @@ For ZIP mode, both stored prefix and requested-entry fingerprint must match; for
 
 - [ ] **Step 5: Implement atomic write and idempotent exact-file removal**
 
-`write_manifest_atomic(path, manifest)` must create only the parent directory, serialize pretty JSON, create a tempfile in that parent with prefix `manifest.json.tmp-`, write all bytes, flush, `sync_all`, and `persist(path)` inside `spawn_blocking`. `remove_manifest(path)` removes only that JSON file and ignores NotFound; it does not remove sibling image manifests or the `.zip.uploads` directory.
+`write_manifest_atomic(path, manifest)` must create only the parent directory, serialize pretty JSON, create a tempfile in that parent with prefix `manifest.json.tmp-`, write all bytes, flush, `sync_all`, and `persist(path)` inside `spawn_blocking`. A crash before `persist` can leave a complete or partial `manifest.json.tmp-*` file, so terminal cleanup must scan it alongside formal JSON manifests; it never changes normal resume loading. `remove_manifest(path)` removes only that JSON file and ignores NotFound; it does not remove sibling image manifests or the `.zip.uploads` directory.
 
 Expose a constructor that derives ZIP prefix from the chosen stable object key:
 
@@ -1364,7 +1364,7 @@ async fn remove_entry_archive_family(entry: &eh_download_queue::Model) {
 }
 ```
 
-Before every local upload-state or family deletion, call the shared gate. S3/ipfS3 implementations deterministically scan direct matching manifests and attempt every safely identified Abort through the base bucket; an error or missing Abort uploader preserves the family and its manifests, while malformed or identity-mismatched manifests rely on provider incomplete-multipart lifecycle cleanup. Publish calls the gate before `mark_eh_download_done`; after any send marker is written, a later cleanup retry observes that marker and never resends.
+Before every local upload-state or family deletion, call the shared gate. S3/ipfS3 implementations deterministically scan direct `*.json` manifests and `manifest.json.tmp-*` atomic-write remnants, then attempt every safely identified Abort through the base bucket; an error or missing Abort uploader preserves the family and its manifests. Formal JSON manifests that are malformed or identity-mismatched keep their existing skip behavior, while an unverifiable atomic temporary manifest returns a sanitized error and also preserves the complete family because it may hold the sole upload ID. Publish calls the gate before `mark_eh_download_done`; after any send marker is written, a later cleanup retry observes that marker and never resends.
 
 Apply them as follows:
 
