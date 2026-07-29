@@ -88,7 +88,8 @@ Write the manifest atomically immediately after CreateMultipartUpload succeeds. 
 Each S3-backed uploader keeps process-local capability states:
 
 - standard multipart: unknown, supported, or unsupported;
-- ipfS3 multipart ZIP extraction: unknown, supported, or unsupported.
+- ipfS3 multipart ZIP extraction (Create/Complete): unknown, supported, or unsupported;
+- ipfS3 single-Put ZIP extraction: unknown, supported, or unsupported.
 
 No separate probe object is created. For an eligible real object, CreateMultipartUpload creates the actual session. An immediate empty ListParts request verifies that the endpoint supports the server reconciliation required by this design. The same session then uploads data.
 
@@ -169,8 +170,8 @@ For Create, ListParts, UploadPart, and Complete, a strictly parsed S3 `NotImplem
 
 If an operation is explicitly unsupported:
 
-- attempt to abort an active multipart session;
-- remove the matching manifest;
+- for an active session with a persisted manifest, require a successful Abort (with `NoSuchUpload` treated as successful cleanup) before removing the matching manifest and returning the fallback signal; an Abort network, IAM, or 5xx failure returns an error and retains the manifest;
+- for an active session without a manifest, make the existing best-effort Abort because no resumable state exists;
 - cache only the affected capability as unsupported;
 - retry that object through the existing complete PutObject path.
 
@@ -222,7 +223,7 @@ All default tests remain offline with `wiremock`.
 - Part ETags are CID strings and are submitted unchanged except for XML escaping.
 - Archive CID is never used for image URLs; entry order and existing partial-result fallback remain unchanged.
 - A standard CompleteMultipartUpload result marks only multipart ZIP extraction unsupported and falls back to the existing single PutObject ZIP extension.
-- A default-enabled ZIP single PutObject that returns `200` plus an ETag but an empty/ASCII-whitespace body, canonical `501 NotImplemented`, non-5xx `UnsupportedOperation`, or `405 MethodNotAllowed` returns `Ok(None)`, caches ZIP extraction as unsupported, and reaches per-image fallback. HTTP 500 `NotImplemented`, raw/malformed 501, malformed `<Error>`, and malformed non-empty success XML still error.
+- A default-enabled ZIP single PutObject that returns `200` plus an ETag but an empty/ASCII-whitespace body, canonical `501 NotImplemented`, non-5xx `UnsupportedOperation`, or `405 MethodNotAllowed` returns `Ok(None)`, caches only single-Put ZIP extraction as unsupported, and reaches per-image fallback. Multipart ZIP and single-Put ZIP extraction caches remain independent: a multipart ZIP failure may still make one compatible single-Put attempt, while a cached single-Put unsupported result makes later ZIP calls return `Ok(None)` with no network request. HTTP 500 `NotImplemented`, raw/malformed 501, malformed `<Error>`, and malformed non-empty success XML still error.
 
 ### Lifecycle and regressions
 

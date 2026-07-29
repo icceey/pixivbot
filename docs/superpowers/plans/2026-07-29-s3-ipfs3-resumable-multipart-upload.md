@@ -17,10 +17,10 @@
 - The local manifest stores no credentials, signed URLs, object bytes, or locally asserted completed-part ETags; ListParts is authoritative.
 - Add only `sha2` to `eh_client`; do not add AWS SDK crates, a database migration, parallel part upload, task-level URL persistence, SSE, a general upload queue, or a server-side orphan sweeper.
 - Do not use HTTP OPTIONS for capability discovery.
-- For Create/ListParts/UploadPart/Complete, a strictly parsed S3 `NotImplemented` code in a non-5xx error response, including a Complete HTTP 200 `<Error>` response, may trigger multipart fallback; canonical HTTP 501 with that code is the allowed 5xx exception. Explicit `UnsupportedOperation` or operation-specific `MethodNotAllowed` remain fallback signals. HTTP 500 `NotImplemented` and every other 5xx, as well as raw or malformed 501, Head/Abort, authentication, generic 4xx, network, timeout, and malformed protocol, remain errors.
+- For Create/ListParts/UploadPart/Complete, a strictly parsed S3 `NotImplemented` code in a non-5xx error response, including a Complete HTTP 200 `<Error>` response, may trigger multipart fallback; canonical HTTP 501 with that code is the allowed 5xx exception. Explicit `UnsupportedOperation` or operation-specific `MethodNotAllowed` remain fallback signals. For an active persisted session, fallback requires confirmed Abort success (including `NoSuchUpload`) before its manifest can be removed; an Abort network, IAM, or 5xx error retains the manifest and is returned instead of falling back. HTTP 500 `NotImplemented` and every other 5xx, as well as raw or malformed 501, Head/Abort, authentication, generic 4xx, network, timeout, and malformed protocol, remain errors.
 - `decompress-zip` is added only to a dedicated CreateMultipartUpload bucket clone; UploadPart, ListParts, CompleteMultipartUpload, and AbortMultipartUpload always use the unmodified base bucket and carry no `decompress-*` query.
 - A standard CompleteMultipartUpload XML result disables only ipfS3 multipart ZIP extraction; it must not disable standard/image multipart.
-- For a ZIP single PutObject, only a 2xx empty/ASCII-whitespace response or a strictly parsed standalone S3 `<Error>` with non-5xx `NotImplemented`/`UnsupportedOperation`, canonical `501 NotImplemented`, or `405 MethodNotAllowed` is the extension-unsupported signal: mark ZIP extraction unsupported and return `Ok(None)` for existing per-image fallback. HTTP 500 `NotImplemented`, other 5xx, raw/malformed 501, malformed `<Error>`, non-empty malformed/unknown success bodies, and transport/authentication failures remain errors.
+- For a ZIP single PutObject, only a 2xx empty/ASCII-whitespace response or a strictly parsed standalone S3 `<Error>` with non-5xx `NotImplemented`/`UnsupportedOperation`, canonical `501 NotImplemented`, or `405 MethodNotAllowed` is the extension-unsupported signal: mark the independent single-Put ZIP extraction cache unsupported and return `Ok(None)` for existing per-image fallback. Multipart ZIP and single-Put ZIP caches stay separate: multipart unsupported still allows the first single-Put attempt, while cached single-Put unsupported returns `Ok(None)` for later ZIP uploads without a network request. HTTP 500 `NotImplemented`, other 5xx, raw/malformed 501, malformed `<Error>`, non-empty malformed/unknown success bodies, and transport/authentication failures remain errors.
 - Preserve existing ZIP preflight, strict `DecompressZipResult` parsing, requested archive order, per-entry CID semantics, preview/public gateway behavior, PutObject behavior, Telegraph splitting, and notification behavior.
 - Download cleanup continues to remove only `.zip.part` and `.zip.parts`; active/retryable startup cleanup preserves `.zip.uploads`. A durable cross-stage gate protects every local deletion that would remove `.zip.uploads`: only a configured S3/ipfS3 uploader that successfully Aborts may permit it; without that capability or on Abort failure the complete family is retained.
 - Never read, print, copy, or commit `config.toml`; use only `config.toml.example` as the public configuration reference.
@@ -944,7 +944,7 @@ Map `Unknown=0`, `Supported=1`, `Unsupported=2` in `MultipartCapability`; use Ac
 
 - [ ] **Step 6: Implement explicit unsupported cleanup and replacement rules**
 
-On an explicit unsupported operation: best-effort Abort an active session using the unmodified base bucket, remove the matching local manifest, and return `Unsupported`. Abort failure must not hide the primary explicit unsupported result.
+On an explicit unsupported operation with a persisted manifest: Abort the active session through the unmodified base bucket and require either success or `NoSuchUpload` before removing the matching local manifest and returning `Unsupported`. An Abort network, IAM, or 5xx failure returns its error, preserves the manifest, and blocks fallback. Without a manifest, retain best-effort Abort before returning `Unsupported` because no resumable state exists.
 
 Maintain `replacement_used: bool` for one `upload_multipart` call. Catch both `MultipartFailure::InvalidInventory` and `reconcile_parts` wrong-size failures as replaceable inventory corruption. For either inventory corruption or same-uploader stale identity, require Abort success or `NoSuchUpload` before clearing/replacing; a transient/auth Abort failure returns error and leaves the manifest for retry. `NoSuchUpload` itself needs no Abort. Once the budget is used, a second invalid-session/reconciliation result returns an error naming the operation but no signed URL/body.
 
@@ -1073,7 +1073,7 @@ Suggested orchestrator commit after authorization: `feat(eh_client): resume s3-b
 
 **Interfaces:**
 - Consumes: existing ZIP compatibility/parser/entry-mapping helpers, Task 8 standard Complete parser, and `CreateExtension::IpfS3DecompressZip`.
-- Produces: ipfS3 ZIP multipart-first flow, dedicated ZIP capability cache, exact Create-only extension behavior, single-Put ZIP compatibility fallback, and ordered entry URL pairs.
+- Produces: ipfS3 ZIP multipart-first flow, independent multipart ZIP and single-Put ZIP capability caches, exact Create-only extension behavior, single-Put ZIP compatibility fallback, and ordered entry URL pairs.
 
 - [ ] **Step 1: Write the complete multipart ZIP request-contract test**
 
@@ -1123,13 +1123,13 @@ Expected: current ZIP path sends one PutObject and the multipart request expecta
 
 - [ ] **Step 5: Add a ZIP-extraction capability cache without changing trait capability**
 
-Add `multipart_zip_extract: MultipartCapability` to `IpfS3Uploader`. `supports_zip_archive_upload()` continues to return the operator's `zip_extract_enabled`; a process-cached multipart ZIP `Unsupported` still uses the existing single-Put ZIP extension and therefore must not make the trait return false.
+Add `multipart_zip_extract: MultipartCapability` and `single_put_zip_extract: MultipartCapability` to `IpfS3Uploader`. The former records only multipart Create/Complete ZIP extraction capability; the latter records only single-Put extension responses. `supports_zip_archive_upload()` continues to return the operator's `zip_extract_enabled`; a process-cached multipart ZIP `Unsupported` still uses the existing single-Put ZIP extension and therefore must not make the trait return false.
 
 - [ ] **Step 6: Route compatible enabled ZIPs through multipart first**
 
-Keep current guards in order: explicit false -> `Ok(None)`, empty requested list -> empty success, deterministic ZIP preflight -> `Ok(None)`. Then:
+Keep current guards in order: explicit false -> `Ok(None)`, empty requested list -> empty success, cached single-Put ZIP unsupported -> `Ok(None)` with no request, deterministic ZIP preflight -> `Ok(None)`. Then:
 
-- if standard or ZIP-extraction multipart cache is unsupported, call the unchanged single-Put ZIP helper;
+- if single-Put ZIP extraction is already unsupported, return `Ok(None)` without a request; otherwise, if standard or ZIP-extraction multipart cache is unsupported, call the unchanged single-Put ZIP helper;
 - otherwise call the engine with `CreateExtension::IpfS3DecompressZip { requested_entries_sha256 }` and `HeadRecovery::Never`;
 - engine derives/persists the exact extraction prefix from the selected stable object key;
 - explicit unsupported on the extension-bearing Create marks only multipart ZIP extraction unsupported; explicit unsupported on query-free ListParts/UploadPart/Complete marks standard multipart unsupported; either case calls one single-Put ZIP fallback and does not alter the unrelated cache;

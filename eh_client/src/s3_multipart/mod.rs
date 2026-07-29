@@ -639,9 +639,11 @@ async fn finish_multipart_failure(
     failure: list_parts::MultipartFailure,
 ) -> crate::Result<MultipartOutcome> {
     if matches!(failure, list_parts::MultipartFailure::Unsupported { .. }) {
-        best_effort_abort(bucket, &active.object_key, &active.upload_id).await;
         if let Some(path) = manifest_path {
+            abort_for_replacement(bucket, &active.object_key, &active.upload_id).await?;
             manifest::remove_manifest(path).await?;
+        } else {
+            best_effort_abort(bucket, &active.object_key, &active.upload_id).await;
         }
     } else if manifest_path.is_none() {
         best_effort_abort(bucket, &active.object_key, &active.upload_id).await;
@@ -1755,6 +1757,48 @@ mod tests {
         .await;
         assert!(result.is_err());
         assert!(manifest_path.is_dir());
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn unsupported_manifest_abort_failure_blocks_fallback_and_preserves_manifest() {
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(query_param("uploadId", UPLOAD_ID))
+            .respond_with(ResponseTemplate::new(500).set_body_string(s3_error_xml("AccessDenied")))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let temp = tempfile::tempdir().unwrap();
+        let manifest_path = temp.path().join("archive.json");
+        let bytes = vec![4; PART_SIZE];
+        write_valid_manifest(&manifest_path, &bytes, UPLOADER_ID).await;
+        let active = ActiveSession {
+            object_key: KEY.to_owned(),
+            upload_id: UPLOAD_ID.to_owned(),
+            from_valid_manifest: true,
+        };
+
+        let result = finish_multipart_failure(
+            test_bucket(&server).as_ref(),
+            &active,
+            Some(&manifest_path),
+            list_parts::MultipartFailure::Unsupported {
+                operation: MultipartOperation::ListParts,
+                status: 405,
+                code: "NotImplemented".to_owned(),
+            },
+        )
+        .await;
+
+        match result {
+            Err(error) => assert!(error.to_string().contains("Abort")),
+            Ok(MultipartOutcome::Unsupported { .. }) => {
+                panic!("an unconfirmed Abort must block the Unsupported fallback outcome")
+            }
+            Ok(MultipartOutcome::Completed(_)) => unreachable!(),
+        }
+        assert!(manifest_path.is_file());
         server.verify().await;
     }
 
