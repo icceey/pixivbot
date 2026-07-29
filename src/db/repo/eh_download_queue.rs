@@ -2683,6 +2683,84 @@ impl Repo {
         Ok(())
     }
 
+    /// Recover an upload-stage Abort failure without spending a retry.
+    ///
+    /// This intentionally accepts only `STATUS_UPLOADING`: publish-stage rows
+    /// have different completion and retry semantics and must not be released
+    /// through the upload fallback path.
+    pub async fn defer_eh_upload_after_abort_failure(
+        &self,
+        id: i32,
+        delay_secs: i64,
+    ) -> Result<()> {
+        let result = eh_download_queue::Entity::update_many()
+            .col_expr(
+                eh_download_queue::Column::Status,
+                Expr::value(STATUS_DOWNLOADED),
+            )
+            .col_expr(
+                eh_download_queue::Column::NextRetryAt,
+                Expr::value(Local::now().naive_local() + chrono::Duration::seconds(delay_secs)),
+            )
+            .filter(eh_download_queue::Column::Id.eq(id))
+            .filter(eh_download_queue::Column::Status.eq(STATUS_UPLOADING))
+            .exec(&self.db)
+            .await
+            .context("Failed to defer EH upload after multipart Abort failure")?;
+
+        if result.rows_affected != 1 {
+            anyhow::bail!(
+                "Cannot defer EH upload {} after multipart Abort failure: expected status '{}'",
+                id,
+                STATUS_UPLOADING
+            );
+        }
+        Ok(())
+    }
+
+    /// Recover a publish-stage Abort-gate failure without spending a retry.
+    ///
+    /// Only a claimed publish row may use this path. The target is selected
+    /// from whether Telegraph upload succeeded, so sent markers remain intact
+    /// and the next publish claim only completes local cleanup.
+    pub async fn defer_eh_publish_after_abort_failure(
+        &self,
+        id: i32,
+        target_status: &str,
+        delay_secs: i64,
+    ) -> Result<()> {
+        if !matches!(target_status, STATUS_DOWNLOADED | STATUS_UPLOADED) {
+            anyhow::bail!(
+                "defer_eh_publish_after_abort_failure: invalid target status '{}' (expected downloaded or uploaded)",
+                target_status
+            );
+        }
+
+        let result = eh_download_queue::Entity::update_many()
+            .col_expr(
+                eh_download_queue::Column::Status,
+                Expr::value(target_status),
+            )
+            .col_expr(
+                eh_download_queue::Column::NextRetryAt,
+                Expr::value(Local::now().naive_local() + chrono::Duration::seconds(delay_secs)),
+            )
+            .filter(eh_download_queue::Column::Id.eq(id))
+            .filter(eh_download_queue::Column::Status.eq(STATUS_PUBLISHING))
+            .exec(&self.db)
+            .await
+            .context("Failed to defer EH publish after multipart Abort failure")?;
+
+        if result.rows_affected != 1 {
+            anyhow::bail!(
+                "Cannot defer EH publish {} after multipart Abort failure: expected status '{}'",
+                id,
+                STATUS_PUBLISHING
+            );
+        }
+        Ok(())
+    }
+
     /// Schedule a retry for an entry: set status back to target_status, increment retry_count,
     /// set next_retry_at to now + backoff. If retry_count exceeds max, set status=failed.
     /// Returns (model, is_permanent_failure).
@@ -3383,8 +3461,9 @@ impl Repo {
                         .is_err()
                     {
                         warn!(
-                            "Failed to abort EH orphan upload state; removing local terminal state"
+                            "Failed to abort EH orphan upload state; preserving local archive family"
                         );
+                        continue;
                     }
                 }
                 artifacts.remove_all().await
@@ -3427,6 +3506,7 @@ mod tests {
     #[derive(Default)]
     struct RecordingAbortUploader {
         aborts: std::sync::Mutex<Vec<(std::path::PathBuf, bool)>>,
+        fail_abort: bool,
     }
 
     #[async_trait::async_trait]
@@ -3445,6 +3525,11 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((uploads_dir.to_path_buf(), uploads_dir.exists()));
+            if self.fail_abort {
+                return Err(eh_client::Error::Other(
+                    "recording uploader abort failure".to_string(),
+                ));
+            }
             Ok(())
         }
     }
@@ -4149,6 +4234,137 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_defer_eh_upload_after_abort_failure_only_accepts_uploading() {
+        let repo = tests_helpers::setup_test_db().await.unwrap();
+        let uploading = repo
+            .enqueue_eh_download(-100, 56, "uploading", "Title", true, SOURCE_DIRECT)
+            .await
+            .unwrap();
+        Entity::update_many()
+            .col_expr(Column::Status, Expr::value(STATUS_UPLOADING))
+            .filter(Column::Id.eq(uploading.id))
+            .exec(repo.db())
+            .await
+            .unwrap();
+
+        repo.defer_eh_upload_after_abort_failure(uploading.id, 60)
+            .await
+            .expect("uploading row should be deferred after an Abort failure");
+        let uploading = Entity::find_by_id(uploading.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(uploading.status, STATUS_DOWNLOADED);
+        assert_eq!(uploading.retry_count, 0);
+        assert!(uploading.next_retry_at.is_some());
+
+        let publishing = repo
+            .enqueue_eh_download(-100, 57, "publishing", "Title", false, SOURCE_DIRECT)
+            .await
+            .unwrap();
+        Entity::update_many()
+            .col_expr(Column::Status, Expr::value(STATUS_PUBLISHING))
+            .filter(Column::Id.eq(publishing.id))
+            .exec(repo.db())
+            .await
+            .unwrap();
+
+        let error = repo
+            .defer_eh_upload_after_abort_failure(publishing.id, 60)
+            .await
+            .expect_err("publish rows must not use the upload-stage Abort recovery CAS");
+        assert!(error.to_string().contains("expected status 'uploading'"));
+        let publishing = Entity::find_by_id(publishing.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(publishing.status, STATUS_PUBLISHING);
+    }
+
+    #[tokio::test]
+    async fn test_defer_eh_publish_after_abort_failure_only_accepts_publishing_targets() {
+        let repo = tests_helpers::setup_test_db().await.unwrap();
+        let downloaded = repo
+            .enqueue_eh_download(-100, 58, "downloaded", "Title", false, SOURCE_DIRECT)
+            .await
+            .unwrap();
+        Entity::update_many()
+            .col_expr(Column::Status, Expr::value(STATUS_PUBLISHING))
+            .col_expr(Column::RetryCount, Expr::value(7))
+            .col_expr(Column::Error, Expr::value("existing publish error"))
+            .filter(Column::Id.eq(downloaded.id))
+            .exec(repo.db())
+            .await
+            .unwrap();
+        repo.mark_eh_archive_sent(downloaded.id).await.unwrap();
+
+        repo.defer_eh_publish_after_abort_failure(downloaded.id, STATUS_DOWNLOADED, 60)
+            .await
+            .expect("publishing row should defer to downloaded after an Abort failure");
+        let downloaded = Entity::find_by_id(downloaded.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(downloaded.status, STATUS_DOWNLOADED);
+        assert_eq!(downloaded.retry_count, 7);
+        assert_eq!(downloaded.error.as_deref(), Some("existing publish error"));
+        assert!(downloaded.archive_sent_at.is_some());
+        assert!(downloaded.next_retry_at.is_some());
+
+        let uploaded = repo
+            .enqueue_eh_download(-100, 59, "uploaded", "Title", true, SOURCE_DIRECT)
+            .await
+            .unwrap();
+        Entity::update_many()
+            .col_expr(Column::Status, Expr::value(STATUS_PUBLISHING))
+            .filter(Column::Id.eq(uploaded.id))
+            .exec(repo.db())
+            .await
+            .unwrap();
+        repo.defer_eh_publish_after_abort_failure(uploaded.id, STATUS_UPLOADED, 60)
+            .await
+            .expect("publishing row should defer to uploaded after an Abort failure");
+        let uploaded = Entity::find_by_id(uploaded.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(uploaded.status, STATUS_UPLOADED);
+        assert_eq!(uploaded.retry_count, 0);
+
+        let uploading = repo
+            .enqueue_eh_download(-100, 60, "uploading", "Title", false, SOURCE_DIRECT)
+            .await
+            .unwrap();
+        Entity::update_many()
+            .col_expr(Column::Status, Expr::value(STATUS_UPLOADING))
+            .filter(Column::Id.eq(uploading.id))
+            .exec(repo.db())
+            .await
+            .unwrap();
+        let error = repo
+            .defer_eh_publish_after_abort_failure(uploading.id, STATUS_DOWNLOADED, 60)
+            .await
+            .expect_err("uploading rows must not use the publish-stage Abort recovery CAS");
+        assert!(error.to_string().contains("expected status 'publishing'"));
+
+        let error = repo
+            .defer_eh_publish_after_abort_failure(uploading.id, STATUS_PENDING, 60)
+            .await
+            .expect_err("publish Abort recovery must reject invalid targets");
+        assert!(error.to_string().contains("invalid target status"));
+        let uploading = Entity::find_by_id(uploading.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(uploading.status, STATUS_UPLOADING);
+    }
+
+    #[tokio::test]
     async fn test_enqueue_merges_telegraph_and_direct_source() {
         let repo = tests_helpers::setup_test_db().await.unwrap();
         let first = repo
@@ -4394,6 +4610,51 @@ mod tests {
         assert!(
             !removable_zip.exists(),
             "an orphan without upload state must retain existing cleanup behavior"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_eh_cache_orphans_preserves_family_when_abort_fails() {
+        let repo = tests_helpers::setup_test_db().await.unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let cache_dir = temp.path();
+        let orphan_zip = cache_dir.join("abort-fails.zip");
+        let orphan_part = cache_dir.join("abort-fails.zip.part");
+        let orphan_uploads = cache_dir.join("abort-fails.zip.uploads");
+        let manifest = orphan_uploads.join("archive.json");
+        std::fs::write(&orphan_zip, b"zip").unwrap();
+        std::fs::write(&orphan_part, b"partial").unwrap();
+        std::fs::create_dir_all(&orphan_uploads).unwrap();
+        std::fs::write(&manifest, b"manifest").unwrap();
+        let uploader = RecordingAbortUploader {
+            fail_abort: true,
+            ..Default::default()
+        };
+
+        repo.cleanup_eh_cache_orphans(cache_dir, Some(&uploader))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            *uploader.aborts.lock().unwrap(),
+            vec![(orphan_uploads.clone(), true)],
+            "Abort must observe the manifest directory before cleanup considers deletion"
+        );
+        assert!(
+            orphan_zip.exists(),
+            "Abort failure must retain the final ZIP"
+        );
+        assert!(
+            orphan_part.exists(),
+            "Abort failure must retain family scratch"
+        );
+        assert!(
+            orphan_uploads.exists(),
+            "Abort failure must retain upload state"
+        );
+        assert!(
+            manifest.exists(),
+            "Abort failure must retain the upload manifest"
         );
     }
 

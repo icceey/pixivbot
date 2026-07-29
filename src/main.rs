@@ -385,11 +385,12 @@ async fn main() -> Result<()> {
         if let (Some(telegraph), Some(image_uploader)) =
             (telegraph_client.as_ref(), eh_image_uploader.as_ref())
         {
-            let worker = scheduler::EhUploadWorker::new(
+            let worker = scheduler::EhUploadWorker::new_with_abort_uploader(
                 repo.clone(),
                 notifier.clone(),
                 std::sync::Arc::clone(telegraph),
                 std::sync::Arc::clone(image_uploader),
+                eh_startup_abort_uploader.clone(),
                 eh_telegraph_rewrite_config.clone(),
                 std::sync::Arc::new(config.ehentai.clone()),
             );
@@ -404,7 +405,7 @@ async fn main() -> Result<()> {
     };
 
     let eh_publish_worker_handle = if let Some(ref eh_client) = eh_client {
-        let worker = scheduler::EhPublishWorker::new(
+        let worker = scheduler::EhPublishWorker::new_with_abort_uploader(
             repo.clone(),
             notifier.clone(),
             std::sync::Arc::clone(eh_client),
@@ -415,6 +416,7 @@ async fn main() -> Result<()> {
             } else {
                 None
             },
+            eh_startup_abort_uploader.clone(),
             std::sync::Arc::new(config.ehentai.clone()),
         );
         info!("✅ E-Hentai publish worker initialized");

@@ -22,7 +22,7 @@
 - A standard CompleteMultipartUpload XML result disables only ipfS3 multipart ZIP extraction; it must not disable standard/image multipart.
 - For a ZIP single PutObject, only a 2xx empty/ASCII-whitespace response or a strictly parsed standalone S3 `<Error>` with non-5xx `NotImplemented`/`UnsupportedOperation`, canonical `501 NotImplemented`, or `405 MethodNotAllowed` is the extension-unsupported signal: mark ZIP extraction unsupported and return `Ok(None)` for existing per-image fallback. HTTP 500 `NotImplemented`, other 5xx, raw/malformed 501, malformed `<Error>`, non-empty malformed/unknown success bodies, and transport/authentication failures remain errors.
 - Preserve existing ZIP preflight, strict `DecompressZipResult` parsing, requested archive order, per-entry CID semantics, preview/public gateway behavior, PutObject behavior, Telegraph splitting, and notification behavior.
-- Download cleanup continues to remove only `.zip.part` and `.zip.parts`; active/retryable startup cleanup preserves `.zip.uploads`. Genuine startup orphans with `.zip.uploads` are terminal-Aborted before deletion only when the configured S3/ipfS3 uploader is available; with no such uploader they are retained.
+- Download cleanup continues to remove only `.zip.part` and `.zip.parts`; active/retryable startup cleanup preserves `.zip.uploads`. A durable cross-stage gate protects every local deletion that would remove `.zip.uploads`: only a configured S3/ipfS3 uploader that successfully Aborts may permit it; without that capability or on Abort failure the complete family is retained.
 - Never read, print, copy, or commit `config.toml`; use only `config.toml.example` as the public configuration reference.
 - All default tests stay offline with wiremock.
 - Implementation subagents must not run `git add`, `git commit`, `git push`, `git tag`, or another git write. Suggested boundaries below are for the orchestrator to apply only after explicit user authorization.
@@ -52,9 +52,9 @@
 | `eh_client/src/archive_download/artifacts.rs` | Add `.zip.uploads`, family recognition, dedicated upload-state removal, and include it only in whole-family removal. |
 | `eh_client/Cargo.toml` | Add direct `sha2 = "0.10.9"`. |
 | `Cargo.lock` | Record `sha2` as a direct dependency of `eh_client` if Cargo changes the package dependency list. |
-| `src/scheduler/eh_engine.rs` | Derive stable ZIP/image contexts, preserve uploadable archive order, and perform success/cancel/permanent/final cleanup. |
-| `src/db/repo/eh_download_queue.rs` | Recognize `.zip.uploads`, preserve it for active/retryable rows, and terminal-Abort/remove genuine orphan state only when an uploader is available. |
-| `src/main.rs` | Build the EH image uploader once, share it with the upload worker, and pass only S3/ipfS3 instances to startup orphan cleanup. |
+| `src/scheduler/eh_engine.rs` | Derive stable ZIP/image contexts, preserve uploadable archive order, and apply the shared Abort gate before every upload/publish/download cleanup. |
+| `src/db/repo/eh_download_queue.rs` | Recognize `.zip.uploads`, preserve it for active/retryable rows, terminal-Abort/remove genuine orphan state only when an uploader is available, and provide an uploading-only fallback defer CAS. |
+| `src/main.rs` | Build the EH image uploader once, share only S3/ipfS3 Abort capability with upload/publish/startup cleanup, and pass `None` for other providers. |
 | `config.toml.example` | Document defaults, `0`, lazy detection, exact fallback boundary, permissions, and Create-only ipfS3 ZIP extension behavior. |
 
 No migration, entity, AWS SDK, Telegraph page model, notifier, or unrelated provider file is modified.
@@ -1259,7 +1259,7 @@ Pass references through `UploadResumeContext` for that awaited one-image call.
 
 - [ ] **Step 6: Remove upload state only after Telegraph result is durable**
 
-In `create_telegraph_page_for_entry`, keep `mark_eh_download_uploaded_with_rewrite` first. After it succeeds, derive `ArchiveArtifacts::new(zip_path)` from `entry.zip_path` and call `remove_upload_state()`. If removal fails after the DB transition, log a warning and return success so the completed page is not recreated; startup/final cleanup can remove the residue. Do not remove the final ZIP here because publish may still need it.
+In `create_telegraph_page_for_entry`, keep `mark_eh_download_uploaded_with_rewrite` first. After it succeeds, pass the shared Abort gate derived from `entry.zip_path` before calling `remove_upload_state()`. A missing uploader or Abort error preserves `.zip.uploads` and returns the safe gate error after the DB transition, so the completed page is not recreated; later publish/startup cleanup can retry. Do not remove the final ZIP here because publish may still need it.
 
 - [ ] **Step 7: Run GREEN and worker regressions**
 
@@ -1272,7 +1272,7 @@ cargo test -p pixivbot scheduler::eh_engine::tests::successful_telegraph_upload_
 cargo test -p pixivbot scheduler::eh_engine::tests::test_upload_worker_ -- --nocapture
 ```
 
-Expected: contexts are stable across attempts, successful Telegraph persistence removes `.zip.uploads` but preserves `.zip`, and ZIP-first/per-image fallback tests remain green.
+Expected: contexts are stable across attempts, successful Telegraph persistence removes `.zip.uploads` only after the durable Abort gate while preserving `.zip`, and ZIP-first/per-image fallback tests remain green.
 
 - [ ] **Step 8: Stop at the review boundary; do not commit**
 
@@ -1295,8 +1295,10 @@ Suggested orchestrator commit after authorization: `feat(scheduler): persist eh 
 - Produces: exact lifecycle matrix below, focused cleanup tests, full regression and `make ci` evidence.
 
 **Confirmed PR #120 review fixes:**
-- Extend `Repo::cleanup_eh_cache_orphans(cache_dir, abort_uploader: Option<&dyn ImageUploader>)`. For an inactive/canceled family with an existing `.zip.uploads`, await `abort_upload_state()` before `remove_all()` when an uploader is supplied; log any Abort failure and continue terminal local cleanup. With no uploader, warn and retain that family. Families without uploads retain removal behavior; active/retryable families are unchanged.
-- Add `startup_abort_uploader: Option<Arc<dyn ImageUploader>>` to `EhDownloadWorker` and pass it to startup cleanup. `main.rs` builds the image uploader once when EH and Telegraph are both enabled, shares that Arc with `EhUploadWorker`, and supplies a clone to the download worker only for `ImageUploadProvider::S3` or `IpfS3`; Pixi, Catbox, or no Telegraph pass `None` so the trait's default no-op cannot claim a remote Abort.
+- Extend `Repo::cleanup_eh_cache_orphans(cache_dir, abort_uploader: Option<&dyn ImageUploader>)`. For an inactive/canceled family with an existing `.zip.uploads`, await `abort_upload_state()` before `remove_all()` when an uploader is supplied; on Abort failure, warn and retain the entire family. With no uploader, warn and retain that family. Families without uploads retain removal behavior; active/retryable families are unchanged.
+- Add a private shared helper that derives `uploads_dir` from `entry.zip_path`. If it does not exist it succeeds; otherwise it requires `Option<&dyn ImageUploader>` and calls `abort_upload_state()`, returning a safe gid-only error for no uploader or failure without deleting local state. `EhUploadWorker` and `EhPublishWorker` each receive an independent `abort_uploader: Option<Arc<dyn ImageUploader>>`; their image/uploader work does not imply Abort capability. `main.rs` supplies the existing provider-specific S3/ipfS3 Arc to upload, publish, and startup cleanup only; Pixi, Catbox, or no Telegraph pass `None` so the trait default no-op cannot claim remote Abort.
+- Add `Repo::defer_eh_upload_after_abort_failure(id, delay)`, an uploading-only `uploading -> downloaded` CAS with no retry/error mutation. The fallback path propagates both Abort and CAS failure context rather than warning and continuing; it must never accept `publishing`.
+- Add `Repo::defer_eh_publish_after_abort_failure(id, target, delay)`, a publishing-only `publishing -> downloaded|uploaded` CAS with no retry/error/marker mutation. Publish handles an Abort-gate error before normal retry accounting, selects `uploaded` only when Telegraph exists, and returns the gate error after releasing the row; this preserves sent markers for cleanup-only retry and never consumes `max_retry_count`.
 - Add repository/scheduler tests proving Abort observes the still-existing directory before an orphan/canceled family is removed, active uploads are neither Aborted nor removed, no-uploader orphan uploads are retained, and no-upload orphans are still deleted.
 
 - [ ] **Step 1: Write failing artifact-lifecycle tests before changing cleanup paths**
@@ -1306,14 +1308,16 @@ Add/extend tests to prove this exact matrix:
 | Event | Final ZIP | `.zip.part` / `.zip.parts` | `.zip.uploads` |
 |---|---|---|---|
 | upload retry or chat deferral | preserve | preserve existing behavior | preserve |
-| Telegraph upload success | preserve until publish | unchanged | remove |
-| permanent Telegraph failure with archive fallback | preserve | unchanged | remove |
-| permanent upload failure without fallback | remove whole family | remove | remove |
-| cancellation observed by upload/publish worker | preserve immediate ZIP behavior | unchanged | remove |
-| final publish success or permanent publish failure | remove whole family | remove | remove |
+| Telegraph upload success | preserve until publish | unchanged | Abort, then remove |
+| permanent Telegraph failure with archive fallback | preserve | unchanged | Abort, then remove |
+| permanent upload failure without fallback | Abort, then remove whole family | Abort, then remove | Abort, then remove |
+| cancellation observed by upload/publish worker | preserve immediate ZIP behavior | unchanged | Abort, then remove |
+| final publish success or permanent publish failure | Abort, then remove whole family | Abort, then remove | Abort, then remove |
 | active/retryable startup row with final ZIP | preserve | remove stale download state | preserve |
 | genuine orphan/canceled startup family with S3/ipfS3 Abort uploader | remove whole family | remove | Abort, then remove |
 | genuine orphan/canceled startup family without Abort uploader | preserve whole family | preserve | preserve |
+
+The durable gate applies across owner changes, Telegraph disablement, upload, publish, archive-only, startup, and download/background paths. Any Abort failure or unavailable uploader preserves the local family. On upload fallback Abort failure, the dedicated uploading-only CAS defers the claimed row to `downloaded` without spending a retry; a CAS error returns alongside the Abort context. A publish cleanup-gate failure uses only its publishing-only, no-increment CAS to release the row to `uploaded` when Telegraph exists or `downloaded` otherwise, preserving sent markers without resending or consuming `max_retry_count`. Non-fallback permanent failure remains `failed`.
 
 Required test names:
 
@@ -1327,7 +1331,7 @@ test_cleanup_eh_cache_orphans_aborts_orphan_upload_state_before_removal_and_pres
 test_cleanup_eh_cache_orphans_retains_upload_state_without_abort_uploader
 ```
 
-Extend the existing `test_publish_skips_entry_canceled_after_claim` with a seeded `.zip.uploads/archive.json` and assert cancellation removes that directory while preserving its existing immediate-ZIP assertion.
+Extend the existing upload-worker cancellation test with a seeded `.zip.uploads/archive.json` and assert successful Abort removes that directory while preserving its existing immediate-ZIP assertion; an Abort failure retains it.
 
 - [ ] **Step 2: Run RED**
 
@@ -1360,17 +1364,16 @@ async fn remove_entry_archive_family(entry: &eh_download_queue::Model) {
 }
 ```
 
-Before cancellation or permanent upload-failure deletion, call `ImageUploader::abort_upload_state(uploads_dir)` best-effort. S3/ipfS3 implementations deterministically scan direct matching manifests and attempt every safely identified Abort through the base bucket; errors are warned and do not block local deletion, while malformed or identity-mismatched manifests rely on provider incomplete-multipart lifecycle cleanup. Do not call this terminal cleanup after successful Complete/Telegraph cleanup or in the publish stage.
+Before every local upload-state or family deletion, call the shared gate. S3/ipfS3 implementations deterministically scan direct matching manifests and attempt every safely identified Abort through the base bucket; an error or missing Abort uploader preserves the family and its manifests, while malformed or identity-mismatched manifests rely on provider incomplete-multipart lifecycle cleanup. Publish calls the gate before `mark_eh_download_done`; after any send marker is written, a later cleanup retry observes that marker and never resends.
 
 Apply them as follows:
 
-- before `fallback_eh_upload_to_archive`, remove upload state only;
-- on permanent upload/publish failure, remove whole family;
-- after upload/publish worker detects cancellation under `EH_PUBLISH_CANCEL_LOCK`, remove upload state only and perform no send/upload;
-- final publish cleanup uses whole-family removal;
-- existing download-worker `cleanup_archive_artifacts` already uses `remove_all()` and automatically gains upload-state removal.
+- before `fallback_eh_upload_to_archive`, remove upload state only after the gate succeeds; on Abort failure, use the dedicated still-`uploading` CAS to defer to `downloaded` and return the Abort/CAS error;
+- on permanent publish failure, gate whole-family cleanup; on non-fallback permanent upload failure, remove the whole family and notify only after the gate succeeds; upload/publish cancellation under `EH_PUBLISH_CANCEL_LOCK` removes upload state only after the gate succeeds and performs no send/upload;
+- before already-sent and normal publish completion, pass the gate before marking done, then remove the whole family; a gate failure leaves the row retryable and markers prevent duplicate sends;
+- download/background `cleanup_archive_artifacts` warns and retains a family when `.uploads` exists because those workers have no Abort capability; no-upload cleanup is unchanged.
 
-Cleanup failure remains logged and does not overwrite the queue transition's primary result.
+Non-gating local filesystem cleanup failures remain logged and do not overwrite the queue transition's primary result; terminal Abort failures are returned and block deletion.
 
 - [ ] **Step 4: Abort verified orphan upload state before startup cleanup**
 
@@ -1383,7 +1386,10 @@ if !active_final_identities.contains(&final_zip) {
             warn!("Preserving EH orphan upload state without an Abort uploader");
             continue;
         };
-        let _ = uploader.abort_upload_state(artifacts.uploads_dir()).await;
+        if uploader.abort_upload_state(artifacts.uploads_dir()).await.is_err() {
+            warn!("Preserving EH orphan upload state after Abort failure");
+            continue;
+        }
     }
     artifacts.remove_all().await
 } else if final_zip.exists() {
