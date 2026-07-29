@@ -211,6 +211,16 @@ pub(super) fn classify_embedded_s3_error(
         return Some(protocol_failure());
     }
 
+    if status == 501
+        && error.code == "NotImplemented"
+        && is_canonical_not_implemented_operation(operation)
+    {
+        return Some(MultipartFailure::Unsupported {
+            operation,
+            status,
+            code: error.code,
+        });
+    }
     if (500..600).contains(&status) {
         return Some(MultipartFailure::Service {
             operation,
@@ -411,6 +421,16 @@ fn is_explicit_unsupported_operation(operation: MultipartOperation, code: &str) 
                 | MultipartOperation::Complete,
             "NotImplemented" | "UnsupportedOperation" | "MethodNotAllowed"
         )
+    )
+}
+
+fn is_canonical_not_implemented_operation(operation: MultipartOperation) -> bool {
+    matches!(
+        operation,
+        MultipartOperation::Create
+            | MultipartOperation::ListParts
+            | MultipartOperation::UploadPart
+            | MultipartOperation::Complete
     )
 }
 
@@ -886,6 +906,74 @@ mod tests {
             MultipartFailure::NoSuchUpload {
                 operation: MultipartOperation::ListParts
             }
+        ));
+    }
+
+    #[test]
+    fn canonical_501_not_implemented_is_unsupported_only_for_transfer_operations() {
+        for operation in [
+            MultipartOperation::Create,
+            MultipartOperation::ListParts,
+            MultipartOperation::UploadPart,
+            MultipartOperation::Complete,
+        ] {
+            let error =
+                classify_response(operation, 501, s3_error_xml("NotImplemented").as_bytes())
+                    .unwrap_err();
+            assert!(matches!(
+                error,
+                MultipartFailure::Unsupported {
+                    operation: actual_operation,
+                    status: 501,
+                    code: actual_code,
+                } if actual_operation == operation && actual_code == "NotImplemented"
+            ));
+        }
+
+        for operation in [MultipartOperation::Head, MultipartOperation::Abort] {
+            let error =
+                classify_response(operation, 501, s3_error_xml("NotImplemented").as_bytes())
+                    .unwrap_err();
+            assert!(matches!(
+                error,
+                MultipartFailure::Service {
+                    operation: actual_operation,
+                    status: 501,
+                    code: Some(ref actual_code),
+                } if actual_operation == operation && actual_code == "NotImplemented"
+            ));
+        }
+
+        let bare = classify_response(MultipartOperation::ListParts, 501, b"not XML").unwrap_err();
+        assert!(matches!(
+            bare,
+            MultipartFailure::Service {
+                status: 501,
+                code: None,
+                ..
+            }
+        ));
+        let malformed = classify_response(
+            MultipartOperation::ListParts,
+            501,
+            b"<Error><Code>NotImplemented</Code>",
+        )
+        .unwrap_err();
+        assert!(matches!(malformed, MultipartFailure::Protocol(_)));
+
+        let server_error = classify_response(
+            MultipartOperation::ListParts,
+            500,
+            s3_error_xml("NotImplemented").as_bytes(),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            server_error,
+            MultipartFailure::Service {
+                status: 500,
+                code: Some(ref code),
+                ..
+            } if code == "NotImplemented"
         ));
     }
 

@@ -1397,6 +1397,19 @@ impl EhUploadWorker {
         }
     }
 
+    async fn abort_entry_upload_state(&self, entry: &eh_download_queue::Model) {
+        let Some(zip_path) = entry.zip_path.as_deref() else {
+            return;
+        };
+        let uploads_dir = ArchiveArtifacts::new(zip_path).uploads_dir().to_path_buf();
+        if let Err(error) = self.image_uploader.abort_upload_state(&uploads_dir).await {
+            warn!(
+                "Failed to abort incomplete EH multipart uploads for gid={}: {}",
+                entry.gid, error
+            );
+        }
+    }
+
     pub async fn run(self) {
         let poll = self.config.download_poll_interval_sec.max(10);
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(poll));
@@ -1436,6 +1449,7 @@ impl EhUploadWorker {
                     "Upload permanently failed for entry {}, falling back to archive delivery",
                     entry.id
                 );
+                self.abort_entry_upload_state(&entry).await;
                 remove_entry_upload_state(&entry).await;
                 let _ = self
                     .repo
@@ -1458,6 +1472,7 @@ impl EhUploadWorker {
                 )
                 .await?;
             if permanent {
+                self.abort_entry_upload_state(&entry).await;
                 remove_entry_archive_family(&entry).await;
                 let escaped_err = teloxide::utils::markdown::escape(&e.to_string());
                 let title = teloxide::utils::markdown::escape(&entry.title);
@@ -1483,6 +1498,7 @@ impl EhUploadWorker {
                 .await?
             {
                 info!("Skipping canceled EH upload entry {}", entry.id);
+                self.abort_entry_upload_state(entry).await;
                 remove_entry_upload_state(entry).await;
                 return Ok(());
             }
@@ -1507,6 +1523,7 @@ impl EhUploadWorker {
             .await?
         {
             info!("Skipping canceled EH upload entry {}", entry.id);
+            self.abort_entry_upload_state(entry).await;
             remove_entry_upload_state(entry).await;
             return Ok(());
         }
@@ -4516,6 +4533,41 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct TerminalCleanupMockUploader {
+        cleanup_calls: std::sync::Mutex<Vec<(std::path::PathBuf, bool)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ImageUploader for TerminalCleanupMockUploader {
+        async fn upload_images(
+            &self,
+            _images: &[ImageUploadInput<'_>],
+        ) -> eh_client::Result<Vec<String>> {
+            Err(eh_client::Error::Other(
+                "mock image upload failure".to_string(),
+            ))
+        }
+
+        async fn abort_upload_state(&self, uploads_dir: &std::path::Path) -> eh_client::Result<()> {
+            self.cleanup_calls
+                .lock()
+                .unwrap()
+                .push((uploads_dir.to_path_buf(), uploads_dir.exists()));
+            Ok(())
+        }
+    }
+
+    fn assert_terminal_cleanup_precedes_local_removal(
+        uploader: &TerminalCleanupMockUploader,
+        artifacts: &ArchiveArtifacts,
+    ) {
+        assert_eq!(
+            *uploader.cleanup_calls.lock().unwrap(),
+            vec![(artifacts.uploads_dir().to_path_buf(), true)]
+        );
+    }
+
     #[tokio::test]
     async fn upload_worker_passes_stable_zip_resume_context() {
         let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
@@ -5311,12 +5363,13 @@ mod tests {
             None,
         )
         .await;
+        let uploader = Arc::new(TerminalCleanupMockUploader::default());
 
         let worker = EhUploadWorker::new(
             Arc::clone(&repo),
             notifier,
             make_telegraph_client(&tg_server),
-            make_image_uploader(&tg_server),
+            uploader.clone(),
             None,
             config,
         );
@@ -5346,6 +5399,7 @@ mod tests {
             artifacts.parts_dir().exists(),
             "archive fallback should not change download parts semantics"
         );
+        assert_terminal_cleanup_precedes_local_removal(&uploader, &artifacts);
     }
 
     #[tokio::test]
@@ -5374,12 +5428,13 @@ mod tests {
             None,
         )
         .await;
+        let uploader = Arc::new(TerminalCleanupMockUploader::default());
 
         let worker = EhUploadWorker::new(
             Arc::clone(&repo),
             notifier,
             make_telegraph_client(&tg_server),
-            make_image_uploader(&tg_server),
+            uploader.clone(),
             None,
             config,
         );
@@ -5395,6 +5450,7 @@ mod tests {
         assert!(!artifacts.assembly_scratch().exists());
         assert!(!artifacts.parts_dir().exists());
         assert!(!artifacts.uploads_dir().exists());
+        assert_terminal_cleanup_precedes_local_removal(&uploader, &artifacts);
     }
 
     #[tokio::test]
@@ -5430,12 +5486,13 @@ mod tests {
         repo.cancel_eh_subscription_queue_entries(123)
             .await
             .unwrap();
+        let uploader = Arc::new(TerminalCleanupMockUploader::default());
 
         let worker = EhUploadWorker::new(
             Arc::clone(&repo),
             make_notifier(&tg_server),
             make_telegraph_client(&tg_server),
-            make_image_uploader(&tg_server),
+            uploader.clone(),
             None,
             Arc::new(make_config()),
         );
@@ -5453,6 +5510,7 @@ mod tests {
             tg_server.received_requests().await.unwrap().is_empty(),
             "canceled upload must not contact upload or Telegraph services"
         );
+        assert_terminal_cleanup_precedes_local_removal(&uploader, &artifacts);
     }
 
     #[tokio::test]

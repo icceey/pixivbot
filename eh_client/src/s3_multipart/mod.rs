@@ -440,6 +440,76 @@ pub(crate) async fn upload_multipart(
     }
 }
 
+/// Best-effort terminal cleanup for sessions whose local manifests identify the
+/// same provider and configured uploader. It never discovers unknown sessions.
+pub(crate) async fn abort_upload_state(
+    bucket: &s3::Bucket,
+    provider: ProviderKind,
+    uploader_identity_sha256: &str,
+    uploads_dir: &Path,
+) -> crate::Result<()> {
+    let mut directory = match tokio::fs::read_dir(uploads_dir).await {
+        Ok(directory) => directory,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut manifest_paths = Vec::new();
+    let mut first_error = None;
+    loop {
+        let entry = match directory.next_entry().await {
+            Ok(Some(entry)) => entry,
+            Ok(None) => break,
+            Err(error) => {
+                first_error = Some(crate::Error::Io(error));
+                break;
+            }
+        };
+        match entry.file_type().await {
+            Ok(file_type) if file_type.is_file() => {}
+            Ok(_) => continue,
+            Err(error) => {
+                if first_error.is_none() {
+                    first_error = Some(error.into());
+                }
+                continue;
+            }
+        }
+        let path = entry.path();
+        if path.extension().and_then(|extension| extension.to_str()) == Some("json") {
+            manifest_paths.push(path);
+        }
+    }
+    manifest_paths.sort_unstable();
+
+    for path in manifest_paths {
+        let manifest =
+            match manifest::load_terminal_abort_manifest(&path, provider, uploader_identity_sha256)
+                .await
+            {
+                Ok(Some(manifest)) => manifest,
+                Ok(None) => continue,
+                Err(error) => {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                    continue;
+                }
+            };
+        if let Err(error) =
+            abort_for_replacement(bucket, &manifest.object_key, &manifest.upload_id).await
+        {
+            if first_error.is_none() {
+                first_error = Some(error);
+            }
+        }
+    }
+
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
 async fn upload_part(
     bucket: &s3::Bucket,
     key: &str,

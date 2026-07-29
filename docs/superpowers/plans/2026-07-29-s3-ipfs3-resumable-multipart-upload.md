@@ -17,7 +17,7 @@
 - The local manifest stores no credentials, signed URLs, object bytes, or locally asserted completed-part ETags; ListParts is authoritative.
 - Add only `sha2` to `eh_client`; do not add AWS SDK crates, a database migration, parallel part upload, task-level URL persistence, SSE, a general upload queue, or a server-side orphan sweeper.
 - Do not use HTTP OPTIONS for capability discovery.
-- Only explicit S3 codes `NotImplemented`, `UnsupportedOperation`, or operation-specific `MethodNotAllowed` may trigger multipart fallback; authentication, generic 4xx, network, timeout, malformed protocol, and 5xx failures remain errors.
+- For Create/ListParts/UploadPart/Complete, a strictly parsed S3 `NotImplemented` code in a non-5xx error response, including a Complete HTTP 200 `<Error>` response, may trigger multipart fallback; canonical HTTP 501 with that code is the allowed 5xx exception. Explicit `UnsupportedOperation` or operation-specific `MethodNotAllowed` remain fallback signals. HTTP 500 `NotImplemented` and every other 5xx, as well as raw or malformed 501, Head/Abort, authentication, generic 4xx, network, timeout, and malformed protocol, remain errors.
 - `decompress-zip` is added only to a dedicated CreateMultipartUpload bucket clone; UploadPart, ListParts, CompleteMultipartUpload, and AbortMultipartUpload always use the unmodified base bucket and carry no `decompress-*` query.
 - A standard CompleteMultipartUpload XML result disables only ipfS3 multipart ZIP extraction; it must not disable standard/image multipart.
 - Preserve existing ZIP preflight, strict `DecompressZipResult` parsing, requested archive order, per-entry CID semantics, preview/public gateway behavior, PutObject behavior, Telegraph splitting, and notification behavior.
@@ -860,7 +860,7 @@ Reject duplicate (defense in depth), zero/out-of-range number, empty ETag, non-f
 
 - [ ] **Step 6: Preserve resumable state on retryable transfer failures**
 
-When a manifest path exists, network errors, timeouts, 5xx, authentication errors, malformed XML, and missing successful UploadPart ETags return an error without aborting or deleting the valid manifest. Without a context, best-effort Abort before returning because no next call can recover the session.
+When a manifest path exists, network errors, timeouts, HTTP 500 `NotImplemented`, every other 5xx, authentication errors, malformed XML, and missing successful UploadPart ETags return an error without aborting or deleting the valid manifest. For Create/ListParts/UploadPart/Complete, strictly parsed `NotImplemented` in a non-5xx S3 error response, including a Complete HTTP 200 `<Error>` response, and canonical HTTP 501 use the fallback path; raw or malformed 501 and Head/Abort do not. Without a context, best-effort Abort before returning because no next call can recover the session.
 
 - [ ] **Step 7: Run GREEN plus pagination integration**
 
@@ -1091,7 +1091,7 @@ Add tests proving:
 
 - reconstruction reuses exact object key/extraction prefix and requested-entry fingerprint;
 - changed requested entry name/order invalidates and replaces the session once;
-- malformed `DecompressZipResult`, transport/auth/5xx, and malformed protocol remain errors;
+- malformed `DecompressZipResult`, transport/auth failures, HTTP 500 `NotImplemented`, every other 5xx, and malformed protocol remain errors; for Create/ListParts/UploadPart/Complete, strictly parsed `NotImplemented` in a non-5xx S3 error response, including a Complete HTTP 200 `<Error>` response, and canonical HTTP 501 use the fallback path, while raw or malformed 501 and Head/Abort do not;
 - deterministic preflight incompatibility still returns `Ok(None)` before any multipart request;
 - valid extraction XML with missing/failed requested entries returns `Ok(None)` to existing per-image fallback after manifest cleanup.
 
@@ -1348,6 +1348,8 @@ async fn remove_entry_archive_family(entry: &eh_download_queue::Model) {
     }
 }
 ```
+
+Before cancellation or permanent upload-failure deletion, call `ImageUploader::abort_upload_state(uploads_dir)` best-effort. S3/ipfS3 implementations deterministically scan direct matching manifests and attempt every safely identified Abort through the base bucket; errors are warned and do not block local deletion, while malformed or identity-mismatched manifests rely on provider incomplete-multipart lifecycle cleanup. Do not call this terminal cleanup after successful Complete/Telegraph cleanup or in the publish stage.
 
 Apply them as follows:
 

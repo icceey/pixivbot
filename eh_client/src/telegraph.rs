@@ -1,8 +1,9 @@
 use crate::error::{Error, Result};
 use crate::s3_multipart::{
-    requested_entries_fingerprint, upload_multipart, uploader_identity_fingerprint,
-    CapabilityState, CompletionEvidence, CreateExtension, HeadRecovery, MultipartCapability,
-    MultipartOperation, MultipartOutcome, MultipartUploadRequest, ProviderKind,
+    abort_upload_state as abort_multipart_upload_state, requested_entries_fingerprint,
+    upload_multipart, uploader_identity_fingerprint, CapabilityState, CompletionEvidence,
+    CreateExtension, HeadRecovery, MultipartCapability, MultipartOperation, MultipartOutcome,
+    MultipartUploadRequest, ProviderKind,
 };
 use async_trait::async_trait;
 use s3::command::Command;
@@ -812,6 +813,10 @@ pub trait ImageUploader: Send + Sync {
         false
     }
 
+    async fn abort_upload_state(&self, _uploads_dir: &std::path::Path) -> Result<()> {
+        Ok(())
+    }
+
     async fn upload_images(&self, images: &[ImageUploadInput<'_>]) -> Result<Vec<String>>;
 
     async fn upload_images_with_url_pairs(
@@ -1134,6 +1139,16 @@ impl S3Uploader {
 
 #[async_trait]
 impl ImageUploader for S3Uploader {
+    async fn abort_upload_state(&self, uploads_dir: &std::path::Path) -> Result<()> {
+        abort_multipart_upload_state(
+            self.bucket.as_ref(),
+            ProviderKind::S3,
+            &self.uploader_identity_sha256,
+            uploads_dir,
+        )
+        .await
+    }
+
     async fn upload_images(&self, images: &[ImageUploadInput<'_>]) -> Result<Vec<String>> {
         let mut urls = Vec::with_capacity(images.len());
         for (index, image) in images.iter().enumerate() {
@@ -1970,6 +1985,16 @@ impl IpfS3Uploader {
 impl ImageUploader for IpfS3Uploader {
     fn supports_zip_archive_upload(&self) -> bool {
         self.config.zip_extract_enabled
+    }
+
+    async fn abort_upload_state(&self, uploads_dir: &std::path::Path) -> Result<()> {
+        abort_multipart_upload_state(
+            self.bucket.as_ref(),
+            ProviderKind::IpfS3,
+            &self.uploader_identity_sha256,
+            uploads_dir,
+        )
+        .await
     }
 
     async fn upload_images(&self, images: &[ImageUploadInput<'_>]) -> Result<Vec<String>> {
@@ -5162,6 +5187,32 @@ mod tests {
         vec![0x5a; 1024 * 1024]
     }
 
+    async fn write_terminal_manifest(
+        path: &std::path::Path,
+        provider: &str,
+        uploader_identity_sha256: &str,
+        object_key: &str,
+        upload_id: &str,
+    ) {
+        let manifest = serde_json::json!({
+            "version": 1,
+            "provider": provider,
+            "uploader_identity_sha256": uploader_identity_sha256,
+            "object_key": object_key,
+            "logical_object_id": "image-0",
+            "object_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "object_len": 123,
+            "content_type": "image/jpeg",
+            "part_size": PART_SIZE,
+            "upload_id": upload_id,
+            "zip_extraction_prefix": null,
+            "requested_entries_sha256": null,
+        });
+        tokio::fs::write(path, serde_json::to_vec(&manifest).unwrap())
+            .await
+            .unwrap();
+    }
+
     fn multipart_complete_parts(request: &wiremock::Request) -> Vec<(u32, String)> {
         #[derive(Deserialize)]
         #[serde(rename = "CompleteMultipartUpload")]
@@ -6208,6 +6259,196 @@ mod tests {
             assert_eq!(urls.len(), 1, "{operation}");
             server.verify().await;
         }
+    }
+
+    #[tokio::test]
+    async fn s3_canonical_501_not_implemented_falls_back_once_but_500_remains_an_error() {
+        use wiremock::{Mock, MockServer};
+
+        for (status, fallback_expected) in [(501, true), (500, false)] {
+            let server = MockServer::start().await;
+            let mut config = complete_s3_config(&server.uri(), "https://cdn.example/root/");
+            config.multipart_image_threshold_mb = 1;
+            Mock::given(ImageS3Request::Create)
+                .respond_with(ImageCompleteBody::Error {
+                    status,
+                    code: "NotImplemented".to_string(),
+                })
+                .expect(1)
+                .mount(&server)
+                .await;
+            mount_image_ordinary_put(&server, None, if fallback_expected { 1 } else { 0 }).await;
+            let bytes = one_mib_image();
+
+            let result = S3Uploader::from_config(&config)
+                .unwrap()
+                .upload_images(&[ImageUploadInput {
+                    filename: "image.bin",
+                    bytes: &bytes,
+                    resume_context: None,
+                }])
+                .await;
+            assert_eq!(result.is_ok(), fallback_expected, "HTTP {status}");
+            server.verify().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn s3_terminal_abort_attempts_matching_manifests_in_order_and_continues_after_failure() {
+        use wiremock::matchers::{method, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(query_param("uploadId", "archive-upload-id"))
+            .respond_with(ResponseTemplate::new(500).set_body_string(
+                "<Error><Code>InternalError</Code><Message>terminal-abort-response-body</Message></Error>",
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(query_param("uploadId", "image-upload-id"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let uploader = S3Uploader::from_config(&complete_s3_config(
+            &server.uri(),
+            "https://cdn.example/root/",
+        ))
+        .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let uploads_dir = temp.path().join("gallery.zip.uploads");
+        tokio::fs::create_dir(&uploads_dir).await.unwrap();
+        write_terminal_manifest(
+            &uploads_dir.join("image-0.json"),
+            "s3",
+            &uploader.uploader_identity_sha256,
+            "images/image.jpg",
+            "image-upload-id",
+        )
+        .await;
+        write_terminal_manifest(
+            &uploads_dir.join("archive.json"),
+            "s3",
+            &uploader.uploader_identity_sha256,
+            "archives/gallery.zip",
+            "archive-upload-id",
+        )
+        .await;
+
+        let error = uploader.abort_upload_state(&uploads_dir).await.unwrap_err();
+        assert!(error.to_string().contains("Abort"));
+        for forbidden in [
+            "terminal-abort-response-body",
+            "archives/gallery.zip",
+            "archive-upload-id",
+            "key",
+            "secret",
+        ] {
+            assert!(
+                !error.to_string().contains(forbidden),
+                "terminal Abort error leaked {forbidden}"
+            );
+        }
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| {
+                    request
+                        .url
+                        .query_pairs()
+                        .find(|(name, _)| name == "uploadId")
+                        .map(|(_, value)| value.into_owned())
+                        .unwrap()
+                })
+                .collect::<Vec<_>>(),
+            ["archive-upload-id", "image-upload-id"]
+        );
+        assert!(requests.iter().all(|request| {
+            request
+                .url
+                .query_pairs()
+                .all(|(name, _)| !name.to_ascii_lowercase().starts_with("decompress-"))
+        }));
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn s3_terminal_abort_skips_malformed_and_identity_mismatched_manifests() {
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(ImageS3Request::Abort)
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let uploader = S3Uploader::from_config(&complete_s3_config(
+            &server.uri(),
+            "https://cdn.example/root/",
+        ))
+        .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let uploads_dir = temp.path().join("gallery.zip.uploads");
+        tokio::fs::create_dir(&uploads_dir).await.unwrap();
+        tokio::fs::write(uploads_dir.join("archive.json"), b"not json")
+            .await
+            .unwrap();
+        write_terminal_manifest(
+            &uploads_dir.join("image-0.json"),
+            "s3",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "images/image.jpg",
+            "other-endpoint-upload-id",
+        )
+        .await;
+
+        uploader.abort_upload_state(&uploads_dir).await.unwrap();
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn ipfs3_terminal_abort_uses_the_base_bucket_without_decompress_queries() {
+        use wiremock::matchers::{method, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(query_param("uploadId", "archive-upload-id"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let uploader = IpfS3Uploader::from_config(&complete_ipfs3_config(
+            &server.uri(),
+            "https://public.example/ipfs",
+        ))
+        .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let uploads_dir = temp.path().join("gallery.zip.uploads");
+        tokio::fs::create_dir(&uploads_dir).await.unwrap();
+        write_terminal_manifest(
+            &uploads_dir.join("archive.json"),
+            "ipf_s3",
+            &uploader.uploader_identity_sha256,
+            "archives/gallery.zip",
+            "archive-upload-id",
+        )
+        .await;
+
+        uploader.abort_upload_state(&uploads_dir).await.unwrap();
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0]
+            .url
+            .query_pairs()
+            .all(|(name, _)| !name.to_ascii_lowercase().starts_with("decompress-")));
+        server.verify().await;
     }
 
     #[tokio::test]

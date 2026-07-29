@@ -87,14 +87,17 @@ download_original_threshold = 1
 # to use Catbox, or "ipfs3" to use an ipfS3 (S3-compatible IPFS gateway) store.
 # S3 and ipfS3 use multipart upload for images at or above
 # multipart_image_threshold_mb (the comparison is inclusive); smaller images use
-# PutObject. Set the threshold to 0 to disable multipart uploads.
+# PutObject. Set the threshold to 0 to disable image multipart uploads only. The
+# ipfS3 ZIP-first path is controlled by zip_extract_enabled; set it to false to
+# disable only that path, so ZIP multipart is not attempted.
 # Multipart capability is probed lazily on each real eligible object, never at
 # startup. The configured credentials need CreateMultipartUpload, UploadPart,
 # ListParts (AWS: s3:ListMultipartUploadParts), CompleteMultipartUpload, and
-# AbortMultipartUpload permissions. An ambiguous or lost CompleteMultipartUpload
-# response is verified with HEAD. The uploader falls back to PutObject only when
-# multipart is explicitly unsupported; permission, authentication, and transient
-# errors are reported instead of being downgraded.
+# AbortMultipartUpload permissions. HEAD requires s3:GetObject on AWS. An
+# ambiguous or lost CompleteMultipartUpload response is verified with HEAD. The
+# uploader falls back to PutObject only when multipart is explicitly unsupported;
+# permission, authentication, and transient errors are reported instead of being
+# downgraded.
 # ----------------------------------------------------------------------------
 # [image_upload]
 # provider = "pixi"

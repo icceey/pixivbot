@@ -30,7 +30,7 @@ The confirmed ipfS3 implementation at commit `cd88a1734c871d3c2506f71b416fddebba
 Add `multipart_image_threshold_mb: u64` to both `S3UploaderConfig` and `IpfS3UploaderConfig`.
 
 - Default: `8`.
-- `0`: disable multipart for images.
+- `0`: disable multipart for images only; enabled ipfS3 ZIP-first multipart remains controlled by `zip_extract_enabled`.
 - An image uses multipart when `bytes.len() >= threshold_mb * 1024 * 1024`.
 - Conversion uses saturating arithmetic.
 - The multipart part size is fixed at 8 MiB. Every non-final part therefore exceeds S3's 5 MiB minimum.
@@ -81,7 +81,7 @@ It never contains credentials, pre-signed URLs, object bytes, or locally asserte
 
 Write the manifest atomically immediately after CreateMultipartUpload succeeds. Use the existing tempfile, flush, `sync_all`, and persist pattern from the archive download manifest. If persistence fails, attempt AbortMultipartUpload before returning the error.
 
-`ArchiveArtifacts` gains a separate `.zip.uploads` directory and a dedicated `remove_upload_state()` operation. The existing download multipart cleanup must continue to remove only `.zip.part` and `.zip.parts`; in particular, startup orphan cleanup must preserve `.zip.uploads` while its final ZIP belongs to an active or retryable queue row. `remove_all()`, successful Telegraph upload, cancellation, permanent failure, and cleanup of a genuinely orphaned archive family remove `.zip.uploads`.
+`ArchiveArtifacts` gains a separate `.zip.uploads` directory and a dedicated `remove_upload_state()` operation. The existing download multipart cleanup must continue to remove only `.zip.part` and `.zip.parts`; in particular, startup orphan cleanup must preserve `.zip.uploads` while its final ZIP belongs to an active or retryable queue row. `remove_all()`, successful Telegraph upload, cancellation, permanent failure, and cleanup of a genuinely orphaned archive family remove `.zip.uploads`. Before upload-worker cancellation or permanent-failure paths remove local upload state, the configured S3-backed uploader best-effort Aborts every safely identifiable matching manifest session.
 
 ### Capability state
 
@@ -163,7 +163,7 @@ Parse the `DecompressZipResult` body and build URLs from each extracted entry CI
 
 ## Error handling and fallback
 
-Only an explicit S3 error code such as `NotImplemented`, `UnsupportedOperation`, or an operation-specific `MethodNotAllowed` response may mark an operation unsupported. A raw OPTIONS result, generic 4xx status, authentication error, network error, timeout, malformed response, or 5xx response must not silently trigger PutObject fallback.
+For Create, ListParts, UploadPart, and Complete, a strictly parsed S3 `NotImplemented` code in a non-5xx error response, including a Complete HTTP 200 `<Error>` response, may mark that operation unsupported. Canonical HTTP 501 with that code is the allowed 5xx exception. Explicit `UnsupportedOperation` or an operation-specific `MethodNotAllowed` response remain fallback signals. HTTP 500 with `NotImplemented` and every other 5xx response remain errors; raw or malformed 501, mismatched operations, Head or Abort, a raw OPTIONS result, generic 4xx status, authentication error, network error, timeout, or malformed response must not silently trigger PutObject fallback.
 
 If an operation is explicitly unsupported:
 
@@ -184,7 +184,7 @@ If Complete may have succeeded but its response was lost, a retry first HEADs th
 
 A forbidden or malformed HEAD response is returned as an error rather than guessed as absence or success. A confirmed missing object proceeds to the one allowed replacement session.
 
-Known active sessions are aborted when they are deliberately replaced. Remote sessions orphaned by a lost/corrupt manifest or cache deletion cannot be discovered without ListMultipartUploads and remain subject to the object store's incomplete-multipart lifecycle policy.
+Known active sessions are aborted when they are deliberately replaced. Before terminal local-state deletion caused by cancellation or permanent upload failure, cleanup deterministically scans direct `.zip.uploads/*.json` manifests and best-effort Aborts every session whose manifest version, stored values, provider, and uploader identity match the current uploader; `NoSuchUpload` is already clean, and one failure does not stop later Abort attempts. Malformed, unreadable, identity-mismatched, or otherwise unrecoverable manifests are never aborted against the current endpoint. Those remote sessions, and any terminal Abort failure, cannot be safely discovered or retried without ListMultipartUploads and remain subject to the object store's incomplete-multipart lifecycle policy.
 
 ## Testing
 
@@ -205,9 +205,9 @@ All default tests remain offline with `wiremock`.
 
 ### Capability and errors
 
-- Create or ListParts explicitly not implemented: Abort when possible and use exactly one PutObject.
-- Explicit unsupported UploadPart or Complete: clean up and fall back without disabling unrelated capabilities.
-- Authentication, network, 5xx, and malformed XML failures remain retryable errors and do not use PutObject fallback.
+- Strictly parsed `NotImplemented` for Create, ListParts, UploadPart, or Complete in a non-5xx S3 error response, including a Complete HTTP 200 `<Error>` response, or in canonical HTTP 501, aborts when possible and uses exactly one PutObject.
+- Explicit `UnsupportedOperation` or operation-specific `MethodNotAllowed` also cleans up and falls back without disabling unrelated capabilities.
+- HTTP 500 `NotImplemented`, every other 5xx, and malformed XML failures remain retryable errors and do not use PutObject fallback; raw or malformed 501 and Head or Abort `NotImplemented` do not downgrade.
 - HTTP OPTIONS is never sent.
 
 ### ipfS3 ZIP compatibility

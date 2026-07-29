@@ -59,6 +59,12 @@ pub(super) enum ManifestMismatch {
     InvalidStoredValue,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct TerminalAbortManifest {
+    pub(super) object_key: String,
+    pub(super) upload_id: String,
+}
+
 pub(super) async fn load_manifest(
     path: &Path,
     identity: &ManifestIdentity<'_>,
@@ -76,6 +82,38 @@ pub(super) async fn load_manifest(
         Ok(()) => Ok(ManifestLoad::Valid(manifest)),
         Err(reason) => Ok(ManifestLoad::Stale { manifest, reason }),
     }
+}
+
+/// Load only the identity needed to safely abort a terminal multipart session.
+///
+/// Terminal cleanup deliberately does not compare the current object bytes or
+/// fingerprint: after a task has reached a terminal state, it must be able to
+/// clean a matching persisted session even when the archive is being removed.
+pub(super) async fn load_terminal_abort_manifest(
+    path: &Path,
+    provider: ProviderKind,
+    uploader_identity_sha256: &str,
+) -> crate::Result<Option<TerminalAbortManifest>> {
+    let bytes = match tokio::fs::read(path).await {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let manifest: MultipartManifest = match serde_json::from_slice(&bytes) {
+        Ok(manifest) => manifest,
+        Err(_) => return Ok(None),
+    };
+    if manifest.version != MANIFEST_VERSION
+        || validate_stored_values(&manifest).is_err()
+        || manifest.provider != provider
+        || manifest.uploader_identity_sha256 != uploader_identity_sha256
+    {
+        return Ok(None);
+    }
+    Ok(Some(TerminalAbortManifest {
+        object_key: manifest.object_key,
+        upload_id: manifest.upload_id,
+    }))
 }
 
 pub(super) fn new_manifest(
