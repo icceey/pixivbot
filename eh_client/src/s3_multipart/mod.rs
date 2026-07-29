@@ -725,6 +725,20 @@ mod tests {
     const REPLACEMENT_UPLOAD_ID: &str = "replacement-upload-id";
     const UPLOADER_ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
+    #[derive(Clone)]
+    struct CreateManifestParentFile {
+        manifest_parent: std::path::PathBuf,
+    }
+
+    impl wiremock::Respond for CreateManifestParentFile {
+        fn respond(&self, _: &wiremock::Request) -> ResponseTemplate {
+            std::fs::write(&self.manifest_parent, b"file").unwrap();
+            ResponseTemplate::new(200).set_body_string(format!(
+                "<InitiateMultipartUploadResult><Bucket>{BUCKET}</Bucket><Key>{KEY}</Key><UploadId>{UPLOAD_ID}</UploadId></InitiateMultipartUploadResult>"
+            ))
+        }
+    }
+
     #[tokio::test]
     async fn multipart_rejects_more_than_ten_thousand_parts_before_create() {
         let server = MockServer::start().await;
@@ -901,7 +915,17 @@ mod tests {
     #[tokio::test]
     async fn manifest_persistence_failure_aborts_created_session_before_uploading_parts() {
         let server = MockServer::start().await;
-        mount_create(&server).await;
+        let temp = tempfile::tempdir().unwrap();
+        let manifest_parent = temp.path().join("not-a-directory");
+        let manifest_path = manifest_parent.join("manifest.json");
+        Mock::given(method("POST"))
+            .and(query_param("uploads", ""))
+            .respond_with(CreateManifestParentFile {
+                manifest_parent: manifest_parent.clone(),
+            })
+            .expect(1)
+            .mount(&server)
+            .await;
         Mock::given(method("DELETE"))
             .and(query_param("uploadId", UPLOAD_ID))
             .respond_with(ResponseTemplate::new(204))
@@ -909,10 +933,6 @@ mod tests {
             .mount(&server)
             .await;
 
-        let temp = tempfile::tempdir().unwrap();
-        let manifest_parent = temp.path().join("not-a-directory");
-        tokio::fs::write(&manifest_parent, b"file").await.unwrap();
-        let manifest_path = manifest_parent.join("manifest.json");
         let bytes = vec![5; PART_SIZE];
         let error = match upload_multipart(
             test_bucket(&server).as_ref(),
