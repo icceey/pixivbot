@@ -20,8 +20,9 @@
 - For Create/ListParts/UploadPart/Complete, a strictly parsed S3 `NotImplemented` code in a non-5xx error response, including a Complete HTTP 200 `<Error>` response, may trigger multipart fallback; canonical HTTP 501 with that code is the allowed 5xx exception. Explicit `UnsupportedOperation` or operation-specific `MethodNotAllowed` remain fallback signals. HTTP 500 `NotImplemented` and every other 5xx, as well as raw or malformed 501, Head/Abort, authentication, generic 4xx, network, timeout, and malformed protocol, remain errors.
 - `decompress-zip` is added only to a dedicated CreateMultipartUpload bucket clone; UploadPart, ListParts, CompleteMultipartUpload, and AbortMultipartUpload always use the unmodified base bucket and carry no `decompress-*` query.
 - A standard CompleteMultipartUpload XML result disables only ipfS3 multipart ZIP extraction; it must not disable standard/image multipart.
+- For a ZIP single PutObject, only a 2xx empty/ASCII-whitespace response or a strictly parsed standalone S3 `<Error>` with non-5xx `NotImplemented`/`UnsupportedOperation`, canonical `501 NotImplemented`, or `405 MethodNotAllowed` is the extension-unsupported signal: mark ZIP extraction unsupported and return `Ok(None)` for existing per-image fallback. HTTP 500 `NotImplemented`, other 5xx, raw/malformed 501, malformed `<Error>`, non-empty malformed/unknown success bodies, and transport/authentication failures remain errors.
 - Preserve existing ZIP preflight, strict `DecompressZipResult` parsing, requested archive order, per-entry CID semantics, preview/public gateway behavior, PutObject behavior, Telegraph splitting, and notification behavior.
-- Download cleanup continues to remove only `.zip.part` and `.zip.parts`; active/retryable startup cleanup preserves `.zip.uploads`.
+- Download cleanup continues to remove only `.zip.part` and `.zip.parts`; active/retryable startup cleanup preserves `.zip.uploads`. Genuine startup orphans with `.zip.uploads` are terminal-Aborted before deletion only when the configured S3/ipfS3 uploader is available; with no such uploader they are retained.
 - Never read, print, copy, or commit `config.toml`; use only `config.toml.example` as the public configuration reference.
 - All default tests stay offline with wiremock.
 - Implementation subagents must not run `git add`, `git commit`, `git push`, `git tag`, or another git write. Suggested boundaries below are for the orchestrator to apply only after explicit user authorization.
@@ -52,7 +53,8 @@
 | `eh_client/Cargo.toml` | Add direct `sha2 = "0.10.9"`. |
 | `Cargo.lock` | Record `sha2` as a direct dependency of `eh_client` if Cargo changes the package dependency list. |
 | `src/scheduler/eh_engine.rs` | Derive stable ZIP/image contexts, preserve uploadable archive order, and perform success/cancel/permanent/final cleanup. |
-| `src/db/repo/eh_download_queue.rs` | Recognize `.zip.uploads`, preserve it for active/retryable rows, and remove it for genuine orphan families. |
+| `src/db/repo/eh_download_queue.rs` | Recognize `.zip.uploads`, preserve it for active/retryable rows, and terminal-Abort/remove genuine orphan state only when an uploader is available. |
+| `src/main.rs` | Build the EH image uploader once, share it with the upload worker, and pass only S3/ipfS3 instances to startup orphan cleanup. |
 | `config.toml.example` | Document defaults, `0`, lazy detection, exact fallback boundary, permissions, and Create-only ipfS3 ZIP extension behavior. |
 
 No migration, entity, AWS SDK, Telegraph page model, notifier, or unrelated provider file is modified.
@@ -93,7 +95,7 @@ pub(crate) const MAX_PARTS: usize = 10_000;
 pub(crate) enum ProviderKind { S3, IpfS3 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum MultipartOperation { Create, ListParts, UploadPart, Complete, Abort, Head }
+pub(crate) enum MultipartOperation { Create, ListParts, UploadPart, Complete, ZipPut, Abort, Head }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CreateExtension {
@@ -1092,6 +1094,7 @@ Add tests proving:
 - reconstruction reuses exact object key/extraction prefix and requested-entry fingerprint;
 - changed requested entry name/order invalidates and replaces the session once;
 - malformed `DecompressZipResult`, transport/auth failures, HTTP 500 `NotImplemented`, every other 5xx, and malformed protocol remain errors; for Create/ListParts/UploadPart/Complete, strictly parsed `NotImplemented` in a non-5xx S3 error response, including a Complete HTTP 200 `<Error>` response, and canonical HTTP 501 use the fallback path, while raw or malformed 501 and Head/Abort do not;
+- ZIP single Put accepts only empty/ASCII-whitespace 2xx success, strictly parsed non-5xx `NotImplemented` or `UnsupportedOperation`, canonical `501 NotImplemented`, and strictly parsed `405 MethodNotAllowed` as per-image fallback signals; raw/malformed errors and every other failure remain errors.
 - deterministic preflight incompatibility still returns `Ok(None)` before any multipart request;
 - valid extraction XML with missing/failed requested entries returns `Ok(None)` to existing per-image fallback after manifest cleanup.
 
@@ -1282,6 +1285,7 @@ Suggested orchestrator commit after authorization: `feat(scheduler): persist eh 
 **Files:**
 - Modify/Test: `src/scheduler/eh_engine.rs:40-59,1393-1443,1450-1484,1652-1662,1719-1939,4862-5150`
 - Modify/Test: `src/db/repo/eh_download_queue.rs:3332-3381,4153-4264`
+- Modify: `src/main.rs:320-390`
 - Verify: `eh_client/src/archive_download/mod.rs`
 - Verify: `eh_client/src/client.rs`
 - Verify: `config.toml.example`
@@ -1289,6 +1293,11 @@ Suggested orchestrator commit after authorization: `feat(scheduler): persist eh 
 **Interfaces:**
 - Consumes: complete `ArchiveArtifacts` API, scheduler queue transitions, and repository active-status set.
 - Produces: exact lifecycle matrix below, focused cleanup tests, full regression and `make ci` evidence.
+
+**Confirmed PR #120 review fixes:**
+- Extend `Repo::cleanup_eh_cache_orphans(cache_dir, abort_uploader: Option<&dyn ImageUploader>)`. For an inactive/canceled family with an existing `.zip.uploads`, await `abort_upload_state()` before `remove_all()` when an uploader is supplied; log any Abort failure and continue terminal local cleanup. With no uploader, warn and retain that family. Families without uploads retain removal behavior; active/retryable families are unchanged.
+- Add `startup_abort_uploader: Option<Arc<dyn ImageUploader>>` to `EhDownloadWorker` and pass it to startup cleanup. `main.rs` builds the image uploader once when EH and Telegraph are both enabled, shares that Arc with `EhUploadWorker`, and supplies a clone to the download worker only for `ImageUploadProvider::S3` or `IpfS3`; Pixi, Catbox, or no Telegraph pass `None` so the trait's default no-op cannot claim a remote Abort.
+- Add repository/scheduler tests proving Abort observes the still-existing directory before an orphan/canceled family is removed, active uploads are neither Aborted nor removed, no-uploader orphan uploads are retained, and no-upload orphans are still deleted.
 
 - [ ] **Step 1: Write failing artifact-lifecycle tests before changing cleanup paths**
 
@@ -1303,7 +1312,8 @@ Add/extend tests to prove this exact matrix:
 | cancellation observed by upload/publish worker | preserve immediate ZIP behavior | unchanged | remove |
 | final publish success or permanent publish failure | remove whole family | remove | remove |
 | active/retryable startup row with final ZIP | preserve | remove stale download state | preserve |
-| genuine orphan/canceled terminal family at startup | remove whole family | remove | remove |
+| genuine orphan/canceled startup family with S3/ipfS3 Abort uploader | remove whole family | remove | Abort, then remove |
+| genuine orphan/canceled startup family without Abort uploader | preserve whole family | preserve | preserve |
 
 Required test names:
 
@@ -1313,7 +1323,8 @@ test_upload_permanent_failure_without_fallback_removes_whole_archive_family
 test_upload_canceled_after_claim_removes_upload_state_without_sending
 test_publish_success_removes_whole_archive_family
 test_publish_permanent_failure_removes_whole_archive_family
-test_cleanup_eh_cache_orphans_preserves_active_upload_state_and_removes_orphan_upload_state
+test_cleanup_eh_cache_orphans_aborts_orphan_upload_state_before_removal_and_preserves_active_state
+test_cleanup_eh_cache_orphans_retains_upload_state_without_abort_uploader
 ```
 
 Extend the existing `test_publish_skips_entry_canceled_after_claim` with a seeded `.zip.uploads/archive.json` and assert cancellation removes that directory while preserving its existing immediate-ZIP assertion.
@@ -1324,10 +1335,10 @@ Run:
 
 ```powershell
 cargo test -p pixivbot scheduler::eh_engine::tests::test_upload_permanent_failure_fallback_removes_upload_state_but_keeps_zip -- --exact
-cargo test -p pixivbot db::repo::eh_download_queue::tests::test_cleanup_eh_cache_orphans_preserves_active_upload_state_and_removes_orphan_upload_state -- --exact
+cargo test -p pixivbot db::repo::eh_download_queue::tests::test_cleanup_eh_cache_orphans_aborts_orphan_upload_state_before_removal_and_preserves_active_state -- --exact
 ```
 
-Expected: current worker cleanup only removes the ZIP file and repository family recognition does not include `.zip.uploads`.
+Expected: current startup cleanup removes `.zip.uploads` without a preceding Abort and has no no-uploader preservation branch.
 
 - [ ] **Step 3: Replace ad hoc ZIP deletion with explicit artifact operations**
 
@@ -1361,12 +1372,19 @@ Apply them as follows:
 
 Cleanup failure remains logged and does not overwrite the queue transition's primary result.
 
-- [ ] **Step 4: Preserve active upload state in startup orphan cleanup**
+- [ ] **Step 4: Abort verified orphan upload state before startup cleanup**
 
-Because Task 2 makes `ArchiveArtifacts::from_member()` recognize `.zip.uploads`, keep the existing active/retryable statuses and branch semantics:
+Because Task 2 makes `ArchiveArtifacts::from_member()` recognize `.zip.uploads`, pass an optional configured S3/ipfS3 uploader into cleanup and retain active/retryable semantics:
 
 ```rust
 if !active_final_identities.contains(&final_zip) {
+    if artifacts.uploads_dir().exists() {
+        let Some(uploader) = abort_uploader else {
+            warn!("Preserving EH orphan upload state without an Abort uploader");
+            continue;
+        };
+        let _ = uploader.abort_upload_state(artifacts.uploads_dir()).await;
+    }
     artifacts.remove_all().await
 } else if final_zip.exists() {
     artifacts.remove_multipart_state().await // deliberately preserves uploads_dir
@@ -1375,7 +1393,7 @@ if !active_final_identities.contains(&final_zip) {
 }
 ```
 
-Extend fixtures with nested `archive.json`/`image-0.json`. Assert active `.zip.uploads` survives while `.zip.parts` is independently removed; orphan and canceled families lose `.zip.uploads` recursively. Do not add DB fields or migration.
+Extend fixtures with nested `archive.json`/`image-0.json`. Assert Abort sees an orphan/canceled uploads directory before recursive removal, active and pending families are not Aborted, a no-uploader uploads family remains intact, and an orphan without uploads is still removed. Do not add DB fields or migration.
 
 - [ ] **Step 5: Run focused lifecycle and provider suites**
 

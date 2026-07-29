@@ -146,6 +146,8 @@ download_original_threshold = 1
 # # In multipart uploads, `decompress-zip` is signed only on CreateMultipartUpload;
 # # UploadPart, ListParts, CompleteMultipartUpload, AbortMultipartUpload, and HEAD
 # # never carry it. The compatible single-Put ZIP fallback still signs it on PutObject.
+# # A standard empty success or explicit unsupported S3 Error falls back per image;
+# # protocol, authentication, and transient failures are reported instead.
 # zip_extract_enabled = true
 #
 # [image_upload.catbox]

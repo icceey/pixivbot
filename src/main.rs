@@ -317,6 +317,20 @@ async fn main() -> Result<()> {
         }
     }
 
+    let eh_image_uploader = if eh_client.is_some() && telegraph_client.is_some() {
+        Some(config.image_upload.build_uploader().await?)
+    } else {
+        None
+    };
+    let eh_startup_abort_uploader = if matches!(
+        config.image_upload.provider,
+        eh_client::ImageUploadProvider::S3 | eh_client::ImageUploadProvider::IpfS3
+    ) {
+        eh_image_uploader.clone()
+    } else {
+        None
+    };
+
     let eh_engine_handle = if let Some(ref eh_client) = eh_client {
         let eh_engine = scheduler::EhEngine::new(
             repo.clone(),
@@ -341,6 +355,7 @@ async fn main() -> Result<()> {
             std::sync::Arc::clone(eh_client),
             std::sync::Arc::new(config.ehentai.clone()),
             eh_cache_dir.clone(),
+            eh_startup_abort_uploader.clone(),
         );
         info!("✅ E-Hentai download worker initialized");
         Some(tokio::spawn(async move { worker.run().await }))
@@ -367,13 +382,14 @@ async fn main() -> Result<()> {
     };
 
     let eh_upload_worker_handle = if eh_client.is_some() {
-        if let Some(ref telegraph) = telegraph_client {
-            let image_uploader = config.image_upload.build_uploader().await?;
+        if let (Some(telegraph), Some(image_uploader)) =
+            (telegraph_client.as_ref(), eh_image_uploader.as_ref())
+        {
             let worker = scheduler::EhUploadWorker::new(
                 repo.clone(),
                 notifier.clone(),
                 std::sync::Arc::clone(telegraph),
-                image_uploader,
+                std::sync::Arc::clone(image_uploader),
                 eh_telegraph_rewrite_config.clone(),
                 std::sync::Arc::new(config.ehentai.clone()),
             );

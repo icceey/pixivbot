@@ -56,8 +56,16 @@ pub(crate) enum MultipartOperation {
     ListParts,
     UploadPart,
     Complete,
+    ZipPut,
     Abort,
     Head,
+}
+
+pub(crate) fn zip_put_extension_is_explicitly_unsupported(status: u16, body: &[u8]) -> bool {
+    matches!(
+        list_parts::classify_response(MultipartOperation::ZipPut, status, body),
+        Err(list_parts::MultipartFailure::Unsupported { .. })
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2057,7 +2065,9 @@ mod tests {
                     .await;
                 mount_abort_for(&server, UPLOAD_ID).await;
             }
-            MultipartOperation::Abort | MultipartOperation::Head => unreachable!(),
+            MultipartOperation::ZipPut | MultipartOperation::Abort | MultipartOperation::Head => {
+                unreachable!()
+            }
         }
 
         let result = upload_multipart(
@@ -2148,9 +2158,10 @@ mod tests {
                     .mount(&server)
                     .await;
             }
-            MultipartOperation::Create | MultipartOperation::Abort | MultipartOperation::Head => {
-                unreachable!()
-            }
+            MultipartOperation::Create
+            | MultipartOperation::ZipPut
+            | MultipartOperation::Abort
+            | MultipartOperation::Head => unreachable!(),
         }
         Mock::given(method("DELETE"))
             .respond_with(ResponseTemplate::new(500))

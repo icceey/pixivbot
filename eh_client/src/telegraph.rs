@@ -1,9 +1,9 @@
 use crate::error::{Error, Result};
 use crate::s3_multipart::{
     abort_upload_state as abort_multipart_upload_state, requested_entries_fingerprint,
-    upload_multipart, uploader_identity_fingerprint, CapabilityState, CompletionEvidence,
-    CreateExtension, HeadRecovery, MultipartCapability, MultipartOperation, MultipartOutcome,
-    MultipartUploadRequest, ProviderKind,
+    upload_multipart, uploader_identity_fingerprint, zip_put_extension_is_explicitly_unsupported,
+    CapabilityState, CompletionEvidence, CreateExtension, HeadRecovery, MultipartCapability,
+    MultipartOperation, MultipartOutcome, MultipartUploadRequest, ProviderKind,
 };
 use async_trait::async_trait;
 use s3::command::Command;
@@ -1843,6 +1843,15 @@ impl IpfS3Uploader {
             ))
         })?;
         let status = response.status_code();
+        let body = response.bytes();
+        if (200..300).contains(&status) && body.iter().all(|byte| byte.is_ascii_whitespace()) {
+            self.multipart_zip_extract.mark_unsupported();
+            return Ok(None);
+        }
+        if zip_put_extension_is_explicitly_unsupported(status, body) {
+            self.multipart_zip_extract.mark_unsupported();
+            return Ok(None);
+        }
         if !(200..300).contains(&status) {
             return Err(Error::Api {
                 message: format!("ipfS3 ZIP put_object returned {status} for key {key}"),
@@ -1850,7 +1859,7 @@ impl IpfS3Uploader {
             });
         }
 
-        let extract_result = parse_ipfs3_zip_extract_result(response.bytes()).map_err(|error| {
+        let extract_result = parse_ipfs3_zip_extract_result(body).map_err(|error| {
             Error::Other(format!(
                 "ipfS3 ZIP put_object for key {key} returned {error}"
             ))
@@ -4270,7 +4279,16 @@ mod tests {
             .mount(&server)
             .await;
 
-        let config = complete_ipfs3_config(&server.uri(), "https://public.example/ipfs/");
+        let config = IpfS3UploaderConfig {
+            endpoint_url: Some(server.uri()),
+            bucket: Some("bucket".into()),
+            region: Some("auto".into()),
+            access_key_id: Some("key".into()),
+            secret_access_key: Some("secret".into()),
+            gateway_url: Some("https://public.example/ipfs/".into()),
+            key_prefix: "eh".into(),
+            ..Default::default()
+        };
         let uploader = IpfS3Uploader::from_config(&config).unwrap();
         let zip_bytes = zip_fixture(&[ZipEntryFixture::stored(b"dir\\page.jpg")]);
         let entries = vec!["dir\\page.jpg".to_string()];
@@ -4886,6 +4904,121 @@ mod tests {
             assert!(!url.contains("bafyHttpArchiveCidMustNotAppear"));
             assert!(!url.contains("page001.jpg"));
             assert!(!url.contains("dir/page002.png"));
+        }
+    }
+
+    #[tokio::test]
+    async fn ipfs3_zip_archive_single_put_empty_success_marks_extension_unsupported_and_returns_none(
+    ) {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let zip_bytes = zip_fixture(&[ZipEntryFixture::stored(b"page001.jpg")]);
+        Mock::given(method("PUT"))
+            .and(path_regex(r"^/bucket/eh/\d{14}-archive-[0-9a-f]{8}\.zip$"))
+            .respond_with(ResponseTemplate::new(200).insert_header("etag", "\"archive-cid\""))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let config = complete_ipfs3_config(&server.uri(), "https://public.example/ipfs/");
+        assert!(config.zip_extract_enabled);
+        let uploader = IpfS3Uploader::from_config(&config).unwrap();
+        uploader.standard_multipart.mark_unsupported();
+        let entries = vec!["page001.jpg".to_string()];
+
+        let result = uploader
+            .upload_zip_archive_with_url_pairs(ZipArchiveUploadInput {
+                filename: "gallery.zip",
+                bytes: &zip_bytes,
+                entry_names: &entries,
+                resume_context: None,
+            })
+            .await
+            .unwrap();
+
+        assert!(result.is_none());
+        assert_eq!(
+            uploader.multipart_zip_extract.state(),
+            CapabilityState::Unsupported
+        );
+    }
+
+    #[tokio::test]
+    async fn ipfs3_zip_archive_single_put_classifies_only_explicit_extension_unsupported_errors() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let not_implemented =
+            "<Error><Code>NotImplemented</Code><Message>not implemented</Message></Error>";
+        let unsupported_operation =
+            "<Error><Code>UnsupportedOperation</Code><Message>unsupported</Message></Error>";
+        let method_not_allowed =
+            "<Error><Code>MethodNotAllowed</Code><Message>method not allowed</Message></Error>";
+        let access_denied =
+            "<Error><Code>AccessDenied</Code><Message>access denied</Message></Error>";
+        let malformed_not_implemented =
+            "<Error><Code>NotImplemented</Code><Message>not implemented</Message>";
+        for (name, status, body, falls_back) in [
+            ("http_200_not_implemented", 200, not_implemented, true),
+            ("canonical_501_not_implemented", 501, not_implemented, true),
+            (
+                "non_5xx_unsupported_operation",
+                400,
+                unsupported_operation,
+                true,
+            ),
+            ("http_405_method_not_allowed", 405, method_not_allowed, true),
+            ("non_405_method_not_allowed", 400, method_not_allowed, false),
+            ("access_denied", 403, access_denied, false),
+            ("http_500_not_implemented", 500, not_implemented, false),
+            ("raw_501", 501, "not implemented", false),
+            ("malformed_501", 501, malformed_not_implemented, false),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("PUT"))
+                .and(path_regex(r"^/bucket/eh/\d{14}-archive-[0-9a-f]{8}\.zip$"))
+                .respond_with(ResponseTemplate::new(status).set_body_string(body))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let uploader = IpfS3Uploader::from_config(&complete_ipfs3_config(
+                &server.uri(),
+                "https://public.example/ipfs/",
+            ))
+            .unwrap();
+            uploader.standard_multipart.mark_unsupported();
+            let entries = vec!["page001.jpg".to_string()];
+            let zip_bytes = zip_fixture(&[ZipEntryFixture::stored(b"page001.jpg")]);
+            let result = uploader
+                .upload_zip_archive_with_url_pairs(ZipArchiveUploadInput {
+                    filename: "gallery.zip",
+                    bytes: &zip_bytes,
+                    entry_names: &entries,
+                    resume_context: None,
+                })
+                .await;
+
+            if falls_back {
+                assert!(
+                    result.unwrap().is_none(),
+                    "{name} should use the per-image fallback"
+                );
+                assert_eq!(
+                    uploader.multipart_zip_extract.state(),
+                    CapabilityState::Unsupported,
+                    "{name} should cache ZIP extraction as unsupported"
+                );
+            } else {
+                assert!(result.is_err(), "{name} must remain an error");
+                assert_eq!(
+                    uploader.multipart_zip_extract.state(),
+                    CapabilityState::Unknown,
+                    "{name} must not cache ZIP extraction as unsupported"
+                );
+            }
         }
     }
 

@@ -163,6 +163,8 @@ Parse the `DecompressZipResult` body and build URLs from each extracted entry CI
 
 ## Error handling and fallback
 
+For an enabled ipfS3 ZIP single PutObject request, a 2xx response whose body is empty or wholly ASCII whitespace is a compatibility signal: a standard S3 endpoint accepted the archive but does not implement `decompress-zip`. The only other downgrade signals are a strictly parsed, standalone S3 `<Error>` containing `NotImplemented` on a non-5xx status or canonical HTTP 501, `UnsupportedOperation` on a non-5xx status, or `MethodNotAllowed` on HTTP 405. Each marks only the process-local ZIP-extraction capability unsupported and returns `Ok(None)` so the scheduler uses its existing ordered per-image fallback. HTTP 500 `NotImplemented`, other 5xx, raw or malformed 501, malformed `<Error>`, authentication failures, non-empty unknown/malformed success bodies, and transport failures remain errors; none may be silently downgraded.
+
 For Create, ListParts, UploadPart, and Complete, a strictly parsed S3 `NotImplemented` code in a non-5xx error response, including a Complete HTTP 200 `<Error>` response, may mark that operation unsupported. Canonical HTTP 501 with that code is the allowed 5xx exception. Explicit `UnsupportedOperation` or an operation-specific `MethodNotAllowed` response remain fallback signals. HTTP 500 with `NotImplemented` and every other 5xx response remain errors; raw or malformed 501, mismatched operations, Head or Abort, a raw OPTIONS result, generic 4xx status, authentication error, network error, timeout, or malformed response must not silently trigger PutObject fallback.
 
 If an operation is explicitly unsupported:
@@ -185,6 +187,8 @@ If Complete may have succeeded but its response was lost, a retry first HEADs th
 A forbidden or malformed HEAD response is returned as an error rather than guessed as absence or success. A confirmed missing object proceeds to the one allowed replacement session.
 
 Known active sessions are aborted when they are deliberately replaced. Before terminal local-state deletion caused by cancellation or permanent upload failure, cleanup deterministically scans direct `.zip.uploads/*.json` manifests and best-effort Aborts every session whose manifest version, stored values, provider, and uploader identity match the current uploader; `NoSuchUpload` is already clean, and one failure does not stop later Abort attempts. Malformed, unreadable, identity-mismatched, or otherwise unrecoverable manifests are never aborted against the current endpoint. Those remote sessions, and any terminal Abort failure, cannot be safely discovered or retried without ListMultipartUploads and remain subject to the object store's incomplete-multipart lifecycle policy.
+
+Startup orphan cleanup follows the same terminal rule only when it receives the configured S3 or ipfS3 uploader: before removing a genuine orphan or canceled archive family with a `.zip.uploads` directory, it best-effort calls `abort_upload_state()` while that directory still exists, then removes the local family even if Abort fails. Without an Abort-capable configured uploader, it logs a warning and preserves the entire family containing `.zip.uploads` so its sole remote upload IDs are not discarded. Families without upload state retain the existing cleanup behavior; active and retryable families continue to preserve upload state.
 
 ## Testing
 
@@ -218,10 +222,11 @@ All default tests remain offline with `wiremock`.
 - Part ETags are CID strings and are submitted unchanged except for XML escaping.
 - Archive CID is never used for image URLs; entry order and existing partial-result fallback remain unchanged.
 - A standard CompleteMultipartUpload result marks only multipart ZIP extraction unsupported and falls back to the existing single PutObject ZIP extension.
+- A default-enabled ZIP single PutObject that returns `200` plus an ETag but an empty/ASCII-whitespace body, canonical `501 NotImplemented`, non-5xx `UnsupportedOperation`, or `405 MethodNotAllowed` returns `Ok(None)`, caches ZIP extraction as unsupported, and reaches per-image fallback. HTTP 500 `NotImplemented`, raw/malformed 501, malformed `<Error>`, and malformed non-empty success XML still error.
 
 ### Lifecycle and regressions
 
-- Successful upload, cancellation, permanent failure, and genuine orphan cleanup remove `.zip.uploads`; startup cleanup preserves it for active/retryable rows and may independently remove stale download `.zip.parts` state.
+- Successful upload, cancellation, permanent failure, and genuine orphan cleanup remove `.zip.uploads` after any available S3/ipfS3 terminal Abort; startup cleanup preserves it for active/retryable rows and may independently remove stale download `.zip.parts` state. Startup cleanup without an S3/ipfS3 Abort uploader preserves an orphan `.zip.uploads` family instead of deleting its only remote-session identities.
 - Existing S3/ipfS3 PutObject, ZIP preflight, Telegraph creation, preview rewrite, Pixi, and Catbox tests remain green.
 
 Run focused `eh_client` telegraph/multipart tests and EH scheduler/repository cleanup tests, then run `make ci`.
@@ -239,3 +244,4 @@ Run focused `eh_client` telegraph/multipart tests and EH scheduler/repository cl
 - Internal consistency: ListParts is server-authoritative, while the local manifest stores only the session identity needed to call it; active-row startup cleanup preserves that manifest.
 - Scope: resume is one object at a time; task-level successful-image persistence and unrelated upload features are excluded.
 - Ambiguity: ZIP extension queries, image threshold boundary, unsupported-error fallback, stale-session replacement, and completion-result handling are explicit.
+- Confirmed review fixes: empty successful single-Put ZIP responses have the sole new downgrade path, and startup orphan cleanup's uploader availability and local-deletion order are explicit.

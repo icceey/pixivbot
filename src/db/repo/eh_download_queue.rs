@@ -2,7 +2,7 @@ use super::Repo;
 use crate::db::entities::eh_download_queue;
 use anyhow::{Context, Result};
 use chrono::{Local, Timelike};
-use eh_client::ArchiveArtifacts;
+use eh_client::{ArchiveArtifacts, ImageUploader};
 use sea_orm::prelude::DateTime;
 use sea_orm::sea_query::{Expr, SimpleExpr};
 use sea_orm::{
@@ -3331,7 +3331,11 @@ impl Repo {
 
     /// Delete ZIP/partial ZIP files in the cache dir that have no corresponding
     /// active or retryable queue entry.
-    pub async fn cleanup_eh_cache_orphans(&self, cache_dir: &std::path::Path) -> Result<()> {
+    pub async fn cleanup_eh_cache_orphans(
+        &self,
+        cache_dir: &std::path::Path,
+        abort_uploader: Option<&dyn ImageUploader>,
+    ) -> Result<()> {
         if !cache_dir.exists() {
             return Ok(());
         }
@@ -3366,6 +3370,23 @@ impl Repo {
 
         for (final_zip, artifacts) in artifact_families {
             let result = if !active_final_identities.contains(&final_zip) {
+                if artifacts.uploads_dir().exists() {
+                    let Some(uploader) = abort_uploader else {
+                        warn!(
+                            "Preserving EH orphan upload state because no S3/ipfS3 abort uploader is configured"
+                        );
+                        continue;
+                    };
+                    if uploader
+                        .abort_upload_state(artifacts.uploads_dir())
+                        .await
+                        .is_err()
+                    {
+                        warn!(
+                            "Failed to abort EH orphan upload state; removing local terminal state"
+                        );
+                    }
+                }
                 artifacts.remove_all().await
             } else if final_zip.exists() {
                 artifacts.remove_multipart_state().await
@@ -3402,6 +3423,31 @@ mod tests {
     use crate::db::repo::tests_helpers;
     use chrono::{Duration, NaiveDate, Utc};
     use sea_orm::{sea_query::Expr, ConnectionTrait, DbBackend, Statement};
+
+    #[derive(Default)]
+    struct RecordingAbortUploader {
+        aborts: std::sync::Mutex<Vec<(std::path::PathBuf, bool)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ImageUploader for RecordingAbortUploader {
+        async fn upload_images(
+            &self,
+            _images: &[eh_client::ImageUploadInput<'_>],
+        ) -> eh_client::Result<Vec<String>> {
+            Err(eh_client::Error::Other(
+                "recording uploader upload_images must not be called".to_string(),
+            ))
+        }
+
+        async fn abort_upload_state(&self, uploads_dir: &std::path::Path) -> eh_client::Result<()> {
+            self.aborts
+                .lock()
+                .unwrap()
+                .push((uploads_dir.to_path_buf(), uploads_dir.exists()));
+            Ok(())
+        }
+    }
 
     async fn set_download_claim_fields(
         repo: &Repo,
@@ -4151,7 +4197,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_cleanup_eh_cache_orphans_preserves_active_upload_state_and_removes_orphan_upload_state(
+    async fn test_cleanup_eh_cache_orphans_aborts_orphan_upload_state_before_removal_and_preserves_active_state(
     ) {
         let repo = tests_helpers::setup_test_db().await.unwrap();
         let temp = tempfile::tempdir().unwrap();
@@ -4195,7 +4241,16 @@ mod tests {
             .await
             .unwrap();
 
-        repo.cleanup_eh_cache_orphans(cache_dir).await.unwrap();
+        let uploader = RecordingAbortUploader::default();
+        repo.cleanup_eh_cache_orphans(cache_dir, Some(&uploader))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            *uploader.aborts.lock().unwrap(),
+            vec![(orphan_uploads.clone(), true)],
+            "only the orphan upload state should be aborted before removal"
+        );
 
         assert!(!orphan_zip.exists(), "orphan final ZIP should be removed");
         assert!(
@@ -4256,7 +4311,14 @@ mod tests {
 
         let reset = repo.reset_stale_eh_downloads().await.unwrap();
         assert_eq!(reset, 1);
-        repo.cleanup_eh_cache_orphans(cache_dir).await.unwrap();
+        let uploader = RecordingAbortUploader::default();
+        repo.cleanup_eh_cache_orphans(cache_dir, Some(&uploader))
+            .await
+            .unwrap();
+        assert!(
+            uploader.aborts.lock().unwrap().is_empty(),
+            "pending resume state must not be aborted"
+        );
 
         assert!(
             part.exists(),
@@ -4278,7 +4340,14 @@ mod tests {
             .await
             .unwrap();
 
-        repo.cleanup_eh_cache_orphans(cache_dir).await.unwrap();
+        repo.cleanup_eh_cache_orphans(cache_dir, Some(&uploader))
+            .await
+            .unwrap();
+        assert_eq!(
+            *uploader.aborts.lock().unwrap(),
+            vec![(uploads_dir.clone(), true)],
+            "canceled state must be aborted before terminal deletion"
+        );
         assert!(
             !part.exists(),
             "canceled queue partial should be removed as orphan"
@@ -4290,6 +4359,41 @@ mod tests {
         assert!(
             !uploads_dir.exists(),
             "canceled queue upload state should be removed recursively"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_eh_cache_orphans_retains_upload_state_without_abort_uploader() {
+        let repo = tests_helpers::setup_test_db().await.unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let cache_dir = temp.path();
+
+        let retained_zip = cache_dir.join("retained.zip");
+        let retained_part = cache_dir.join("retained.zip.part");
+        let retained_uploads = cache_dir.join("retained.zip.uploads");
+        let removable_zip = cache_dir.join("removable.zip");
+        std::fs::write(&retained_zip, b"zip").unwrap();
+        std::fs::write(&retained_part, b"partial").unwrap();
+        std::fs::create_dir_all(&retained_uploads).unwrap();
+        std::fs::write(retained_uploads.join("archive.json"), b"manifest").unwrap();
+        std::fs::write(&removable_zip, b"zip").unwrap();
+
+        repo.cleanup_eh_cache_orphans(cache_dir, None)
+            .await
+            .unwrap();
+
+        assert!(
+            retained_zip.exists(),
+            "upload-state family must be retained"
+        );
+        assert!(retained_part.exists(), "family scratch must be retained");
+        assert!(
+            retained_uploads.exists(),
+            "the only remote upload IDs must not be discarded"
+        );
+        assert!(
+            !removable_zip.exists(),
+            "an orphan without upload state must retain existing cleanup behavior"
         );
     }
 

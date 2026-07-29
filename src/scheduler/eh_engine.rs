@@ -1052,6 +1052,7 @@ pub struct EhDownloadWorker {
     client: Arc<EhClient>,
     config: Arc<EhentaiConfig>,
     cache_dir: std::path::PathBuf,
+    startup_abort_uploader: Option<Arc<dyn ImageUploader>>,
 }
 
 impl EhDownloadWorker {
@@ -1060,19 +1061,25 @@ impl EhDownloadWorker {
         client: Arc<EhClient>,
         config: Arc<EhentaiConfig>,
         cache_dir: std::path::PathBuf,
+        startup_abort_uploader: Option<Arc<dyn ImageUploader>>,
     ) -> Self {
         Self {
             repo,
             client,
             config,
             cache_dir,
+            startup_abort_uploader,
         }
     }
 
     pub async fn run(self) {
         // Clean orphan cache files on startup (stale entry reset is done in main.rs)
         let eh_cache = self.cache_dir.join("eh_cache");
-        if let Err(e) = self.repo.cleanup_eh_cache_orphans(&eh_cache).await {
+        if let Err(e) = self
+            .repo
+            .cleanup_eh_cache_orphans(&eh_cache, self.startup_abort_uploader.as_deref())
+            .await
+        {
             warn!("Failed to cleanup eh cache orphans: {:#}", e);
         }
 
@@ -3520,6 +3527,7 @@ mod tests {
             make_eh_client(&eh_server),
             Arc::new(config),
             temp.path().to_path_buf(),
+            None,
         );
 
         worker.tick().await.unwrap();
@@ -3583,6 +3591,7 @@ mod tests {
             make_eh_client(&eh_server),
             Arc::new(config),
             temp.path().to_path_buf(),
+            None,
         );
 
         worker.tick().await.unwrap();
@@ -3646,6 +3655,7 @@ mod tests {
             make_eh_client(&eh_server),
             Arc::new(config),
             temp.path().to_path_buf(),
+            None,
         );
         worker.tick().await.unwrap();
 
@@ -3687,6 +3697,7 @@ mod tests {
             make_eh_client(&eh_server),
             Arc::new(config),
             temp.path().to_path_buf(),
+            None,
         );
         worker.tick().await.unwrap();
 
@@ -3745,6 +3756,7 @@ mod tests {
             make_eh_client(&eh_server),
             Arc::new(config),
             temp.path().to_path_buf(),
+            None,
         );
         worker.tick().await.unwrap();
 
@@ -3817,6 +3829,7 @@ mod tests {
             make_eh_client(&eh_server),
             Arc::new(make_config()),
             temp.path().to_path_buf(),
+            None,
         );
         worker.tick().await.unwrap();
 
@@ -3891,6 +3904,7 @@ mod tests {
             make_eh_client(&eh_server),
             Arc::new(config),
             temp.path().to_path_buf(),
+            None,
         );
         worker.tick().await.unwrap();
 
@@ -3970,6 +3984,7 @@ mod tests {
             make_eh_client(&eh_server),
             Arc::new(make_config()),
             temp.path().to_path_buf(),
+            None,
         );
         worker.tick().await.unwrap();
 
@@ -4031,6 +4046,7 @@ mod tests {
             make_eh_client(&eh_server),
             Arc::new(cfg),
             temp_dir.path().to_path_buf(),
+            None,
         );
 
         worker.tick().await.unwrap();
@@ -4108,6 +4124,7 @@ mod tests {
             make_eh_client(&eh_server),
             Arc::new(cfg),
             temp_dir.path().to_path_buf(),
+            None,
         );
 
         worker.tick().await.unwrap();
@@ -4179,6 +4196,7 @@ mod tests {
             make_eh_client(&eh_server),
             Arc::new(cfg),
             temp_dir.path().to_path_buf(),
+            None,
         );
 
         worker.tick().await.unwrap();
@@ -4252,6 +4270,7 @@ mod tests {
             make_eh_client(&eh_server),
             Arc::new(cfg),
             temp_dir.path().to_path_buf(),
+            None,
         );
 
         worker.tick().await.unwrap();
@@ -5711,6 +5730,7 @@ mod tests {
             make_eh_client(&eh_server),
             Arc::new(config),
             temp.path().to_path_buf(),
+            None,
         );
 
         worker.tick().await.unwrap();
@@ -5780,6 +5800,7 @@ mod tests {
             make_eh_client(&eh_server),
             Arc::new(config),
             temp.path().to_path_buf(),
+            None,
         );
 
         worker.tick().await.unwrap();
@@ -5836,6 +5857,7 @@ mod tests {
             make_eh_client(&eh_server),
             Arc::new(config),
             temp.path().to_path_buf(),
+            None,
         );
 
         worker.tick().await.unwrap();
@@ -5888,6 +5910,7 @@ mod tests {
             make_eh_client(&eh_server),
             Arc::new(config),
             temp.path().to_path_buf(),
+            None,
         );
 
         worker.tick().await.unwrap();
@@ -5957,6 +5980,7 @@ mod tests {
             make_eh_client(&eh_server),
             Arc::new(config),
             temp.path().to_path_buf(),
+            None,
         );
 
         worker.tick().await.unwrap();
@@ -6031,6 +6055,7 @@ mod tests {
             make_eh_client(&eh_server),
             Arc::new(config),
             temp.path().to_path_buf(),
+            None,
         );
 
         worker.tick().await.unwrap();
@@ -6986,6 +7011,7 @@ mod tests {
             Arc::clone(&client),
             Arc::clone(&config),
             temp.path().to_path_buf(),
+            None,
         );
         let background_worker = EhBackgroundDownloadWorker::new(
             Arc::clone(&repo),
@@ -7105,6 +7131,7 @@ mod tests {
             make_eh_client(&eh_server),
             Arc::new(config),
             temp.path().to_path_buf(),
+            None,
         );
 
         worker.tick().await.unwrap();
@@ -7162,6 +7189,7 @@ mod tests {
             make_eh_client(&eh_server),
             Arc::new(config),
             temp.path().to_path_buf(),
+            None,
         );
 
         worker.tick().await.unwrap();

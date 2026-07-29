@@ -231,7 +231,7 @@ pub(super) fn classify_embedded_s3_error(
     if error.code == "NoSuchUpload" {
         return Some(MultipartFailure::NoSuchUpload { operation });
     }
-    if is_explicit_unsupported_operation(operation, &error.code) {
+    if is_explicit_unsupported_operation(operation, status, &error.code) {
         return Some(MultipartFailure::Unsupported {
             operation,
             status,
@@ -411,17 +411,27 @@ fn has_only_root(body: &[u8], expected: &[u8]) -> bool {
     }
 }
 
-fn is_explicit_unsupported_operation(operation: MultipartOperation, code: &str) -> bool {
-    matches!(
-        (operation, code),
-        (
-            MultipartOperation::Create
-                | MultipartOperation::ListParts
-                | MultipartOperation::UploadPart
-                | MultipartOperation::Complete,
-            "NotImplemented" | "UnsupportedOperation" | "MethodNotAllowed"
-        )
-    )
+fn is_explicit_unsupported_operation(
+    operation: MultipartOperation,
+    status: u16,
+    code: &str,
+) -> bool {
+    match operation {
+        MultipartOperation::ZipPut => {
+            matches!(code, "NotImplemented" | "UnsupportedOperation")
+                || (status == 405 && code == "MethodNotAllowed")
+        }
+        MultipartOperation::Create
+        | MultipartOperation::ListParts
+        | MultipartOperation::UploadPart
+        | MultipartOperation::Complete => {
+            matches!(
+                code,
+                "NotImplemented" | "UnsupportedOperation" | "MethodNotAllowed"
+            )
+        }
+        MultipartOperation::Abort | MultipartOperation::Head => false,
+    }
 }
 
 fn is_canonical_not_implemented_operation(operation: MultipartOperation) -> bool {
@@ -431,6 +441,7 @@ fn is_canonical_not_implemented_operation(operation: MultipartOperation) -> bool
             | MultipartOperation::ListParts
             | MultipartOperation::UploadPart
             | MultipartOperation::Complete
+            | MultipartOperation::ZipPut
     )
 }
 
@@ -812,6 +823,7 @@ mod tests {
             MultipartOperation::ListParts,
             MultipartOperation::UploadPart,
             MultipartOperation::Complete,
+            MultipartOperation::ZipPut,
         ] {
             for code in ["NotImplemented", "UnsupportedOperation", "MethodNotAllowed"] {
                 let error =
@@ -916,6 +928,7 @@ mod tests {
             MultipartOperation::ListParts,
             MultipartOperation::UploadPart,
             MultipartOperation::Complete,
+            MultipartOperation::ZipPut,
         ] {
             let error =
                 classify_response(operation, 501, s3_error_xml("NotImplemented").as_bytes())
