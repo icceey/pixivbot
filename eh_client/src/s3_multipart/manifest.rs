@@ -65,6 +65,14 @@ pub(super) struct TerminalAbortManifest {
     pub(super) upload_id: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum TerminalAbortManifestLoad {
+    Verified(TerminalAbortManifest),
+    Missing,
+    MalformedJson,
+    Unverifiable,
+}
+
 pub(super) fn is_terminal_abort_manifest_candidate(path: &Path) -> bool {
     path.extension().and_then(|extension| extension.to_str()) == Some("json")
         || is_temporary_manifest(path)
@@ -104,24 +112,26 @@ pub(super) async fn load_terminal_abort_manifest(
     path: &Path,
     provider: ProviderKind,
     uploader_identity_sha256: &str,
-) -> crate::Result<Option<TerminalAbortManifest>> {
+) -> crate::Result<TerminalAbortManifestLoad> {
     let bytes = match tokio::fs::read(path).await {
         Ok(bytes) => bytes,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            return Ok(TerminalAbortManifestLoad::Missing);
+        }
         Err(error) => return Err(error.into()),
     };
     let manifest: MultipartManifest = match serde_json::from_slice(&bytes) {
         Ok(manifest) => manifest,
-        Err(_) => return Ok(None),
+        Err(_) => return Ok(TerminalAbortManifestLoad::MalformedJson),
     };
     if manifest.version != MANIFEST_VERSION
         || validate_stored_values(&manifest).is_err()
         || manifest.provider != provider
         || manifest.uploader_identity_sha256 != uploader_identity_sha256
     {
-        return Ok(None);
+        return Ok(TerminalAbortManifestLoad::Unverifiable);
     }
-    Ok(Some(TerminalAbortManifest {
+    Ok(TerminalAbortManifestLoad::Verified(TerminalAbortManifest {
         object_key: manifest.object_key,
         upload_id: manifest.upload_id,
     }))
@@ -570,6 +580,83 @@ mod tests {
         tokio::fs::create_dir(&io_path).await.unwrap();
         let error = load_manifest(&io_path, &identity).await.unwrap_err();
         assert!(matches!(error, Error::Io(error) if error.kind() != ErrorKind::NotFound));
+    }
+
+    #[tokio::test]
+    async fn terminal_abort_load_classifies_verifiable_and_unverifiable_manifests() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("archive.json");
+        let identity = standard_identity();
+        assert_eq!(
+            load_terminal_abort_manifest(
+                &path,
+                identity.provider,
+                identity.uploader_identity_sha256
+            )
+            .await
+            .unwrap(),
+            TerminalAbortManifestLoad::Missing
+        );
+
+        tokio::fs::write(&path, b"not json").await.unwrap();
+        assert_eq!(
+            load_terminal_abort_manifest(
+                &path,
+                identity.provider,
+                identity.uploader_identity_sha256
+            )
+            .await
+            .unwrap(),
+            TerminalAbortManifestLoad::MalformedJson
+        );
+
+        let valid = new_manifest(
+            &identity,
+            "objects/archive.bin".to_owned(),
+            "upload-1".to_owned(),
+        )
+        .unwrap();
+        let mut unsupported_version = valid.clone();
+        unsupported_version.version = MANIFEST_VERSION + 1;
+        let mut invalid_stored_value = valid.clone();
+        invalid_stored_value.object_key = String::new();
+        let mut wrong_provider = valid.clone();
+        wrong_provider.provider = ProviderKind::IpfS3;
+        let mut wrong_uploader = valid.clone();
+        wrong_uploader.uploader_identity_sha256 = HASH_B.to_owned();
+        for manifest in [
+            unsupported_version,
+            invalid_stored_value,
+            wrong_provider,
+            wrong_uploader,
+        ] {
+            write_manifest_atomic(&path, &manifest).await.unwrap();
+            assert_eq!(
+                load_terminal_abort_manifest(
+                    &path,
+                    identity.provider,
+                    identity.uploader_identity_sha256
+                )
+                .await
+                .unwrap(),
+                TerminalAbortManifestLoad::Unverifiable
+            );
+        }
+
+        write_manifest_atomic(&path, &valid).await.unwrap();
+        assert!(matches!(
+            load_terminal_abort_manifest(
+                &path,
+                identity.provider,
+                identity.uploader_identity_sha256
+            )
+            .await
+            .unwrap(),
+            TerminalAbortManifestLoad::Verified(TerminalAbortManifest {
+                object_key,
+                upload_id,
+            }) if object_key == "objects/archive.bin" && upload_id == "upload-1"
+        ));
     }
 
     #[tokio::test]

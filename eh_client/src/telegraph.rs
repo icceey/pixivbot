@@ -6655,7 +6655,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn s3_terminal_abort_skips_malformed_and_identity_mismatched_manifests() {
+    async fn s3_terminal_abort_skips_malformed_manifests() {
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let server = MockServer::start().await;
@@ -6675,15 +6675,6 @@ mod tests {
         tokio::fs::write(uploads_dir.join("archive.json"), b"not json")
             .await
             .unwrap();
-        write_terminal_manifest(
-            &uploads_dir.join("image-0.json"),
-            "s3",
-            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-            "images/image.jpg",
-            "other-endpoint-upload-id",
-        )
-        .await;
-
         uploader.abort_upload_state(&uploads_dir).await.unwrap();
         server.verify().await;
     }

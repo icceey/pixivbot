@@ -6,6 +6,10 @@ use std::sync::atomic::{AtomicU8, Ordering};
 
 pub(crate) const PART_SIZE: usize = 8 * 1024 * 1024;
 pub(crate) const MAX_PARTS: usize = 10_000;
+const TERMINAL_MANIFEST_VERIFICATION_ERROR: &str =
+    "multipart terminal manifest could not be safely verified";
+const TEMPORARY_MANIFEST_VERIFICATION_ERROR: &str =
+    "multipart temporary manifest could not be safely verified";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -494,16 +498,23 @@ pub(crate) async fn abort_upload_state(
             match manifest::load_terminal_abort_manifest(&path, provider, uploader_identity_sha256)
                 .await
             {
-                Ok(Some(manifest)) => manifest,
-                Ok(None) if is_temporary => {
+                Ok(manifest::TerminalAbortManifestLoad::Verified(manifest)) => manifest,
+                Ok(manifest::TerminalAbortManifestLoad::Unverifiable) if !is_temporary => {
                     if first_error.is_none() {
                         first_error = Some(crate::Error::Other(
-                            "multipart temporary manifest could not be safely verified".to_owned(),
+                            TERMINAL_MANIFEST_VERIFICATION_ERROR.to_owned(),
                         ));
                     }
                     continue;
                 }
-                Ok(None) => continue,
+                Ok(_) => {
+                    if is_temporary && first_error.is_none() {
+                        first_error = Some(crate::Error::Other(
+                            TEMPORARY_MANIFEST_VERIFICATION_ERROR.to_owned(),
+                        ));
+                    }
+                    continue;
+                }
                 Err(error) => {
                     if first_error.is_none() {
                         first_error = Some(error);
@@ -2049,6 +2060,116 @@ mod tests {
             error.to_string(),
             "multipart temporary manifest could not be safely verified"
         );
+        let requests = server.received_requests().await.unwrap();
+        assert_request_sequence(&requests, &["DELETE"]);
+        assert_eq!(
+            query_value(&requests[0], "uploadId").as_deref(),
+            Some(UPLOAD_ID)
+        );
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn terminal_abort_rejects_unverifiable_formal_manifest_and_continues_with_verified_manifest(
+    ) {
+        let server = MockServer::start().await;
+        mount_abort_for(&server, UPLOAD_ID).await;
+        let temp = tempfile::tempdir().unwrap();
+        let uploads_dir = temp.path().join("gallery.zip.uploads");
+        tokio::fs::create_dir(&uploads_dir).await.unwrap();
+        let bytes = vec![7; PART_SIZE];
+        let old_uploader_identity =
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let old_object_key = "old-object-key-sentinel";
+        let old_upload_id = "old-upload-id-sentinel";
+        let object_sha256 = sha256_hex(&bytes);
+        let old_identity = manifest::ManifestIdentity {
+            provider: ProviderKind::S3,
+            uploader_identity_sha256: old_uploader_identity,
+            logical_object_id: "gallery-123",
+            object_sha256: &object_sha256,
+            object_len: bytes.len() as u64,
+            content_type: "application/octet-stream",
+            requested_entries_sha256: None,
+        };
+        let old_manifest = manifest::new_manifest(
+            &old_identity,
+            old_object_key.to_owned(),
+            old_upload_id.to_owned(),
+        )
+        .unwrap();
+        let mismatched_path = uploads_dir.join("archive.json");
+        manifest::write_manifest_atomic(&mismatched_path, &old_manifest)
+            .await
+            .unwrap();
+        write_valid_manifest(&uploads_dir.join("z-matching.json"), &bytes, UPLOADER_ID).await;
+
+        let error = abort_upload_state(
+            test_bucket(&server).as_ref(),
+            ProviderKind::S3,
+            UPLOADER_ID,
+            &uploads_dir,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "multipart terminal manifest could not be safely verified"
+        );
+        for forbidden in [
+            mismatched_path.to_string_lossy().as_ref(),
+            old_object_key,
+            old_upload_id,
+            UPLOADER_ID,
+            old_uploader_identity,
+            "AKIA_TEST_SENTINEL",
+            "secret-test-sentinel",
+        ] {
+            assert!(
+                !error.to_string().contains(forbidden),
+                "terminal Abort error leaked {forbidden}"
+            );
+        }
+        let requests = server.received_requests().await.unwrap();
+        assert_request_sequence(&requests, &["DELETE"]);
+        assert_eq!(
+            query_value(&requests[0], "uploadId").as_deref(),
+            Some(UPLOAD_ID)
+        );
+        assert!(
+            uploads_dir.is_dir(),
+            "the durable gate must retain the family"
+        );
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn terminal_abort_skips_malformed_formal_manifest_and_aborts_verified_manifest() {
+        let server = MockServer::start().await;
+        mount_abort_for(&server, UPLOAD_ID).await;
+        let temp = tempfile::tempdir().unwrap();
+        let uploads_dir = temp.path().join("gallery.zip.uploads");
+        tokio::fs::create_dir(&uploads_dir).await.unwrap();
+        tokio::fs::write(uploads_dir.join("archive.json"), b"not json")
+            .await
+            .unwrap();
+        write_valid_manifest(
+            &uploads_dir.join("z-matching.json"),
+            &vec![7; PART_SIZE],
+            UPLOADER_ID,
+        )
+        .await;
+
+        abort_upload_state(
+            test_bucket(&server).as_ref(),
+            ProviderKind::S3,
+            UPLOADER_ID,
+            &uploads_dir,
+        )
+        .await
+        .unwrap();
+
         let requests = server.received_requests().await.unwrap();
         assert_request_sequence(&requests, &["DELETE"]);
         assert_eq!(
