@@ -845,7 +845,7 @@ Expected: current engine always starts fresh or uploads every part, so request-c
 
 Build `ManifestIdentity` from request provider/uploader/logical ID/content SHA-256/length/content type/fixed part size/ZIP entry fingerprint. For `ManifestLoad::Valid`, use stored object key/upload ID and never use the candidate key. For `Missing` or `MalformedJson`, create a fresh session; remove malformed JSON before Create.
 
-For `Stale` with the same uploader identity and a readable key/upload ID, Task 7 decides safe abort/replacement. For an uploader-identity mismatch, remove the local manifest without sending Abort to the current endpoint.
+For `Stale` with the same uploader identity and a readable key/upload ID, Task 7 decides safe abort/replacement. For `Provider` or `UploaderIdentity` mismatch, retain the local manifest and return a fixed sanitized resume-identity error before any network request. The uploader fingerprint includes provider, endpoint, region, bucket, and path-style mode, so operators must restore matching configuration or rely on provider lifecycle/manual resolution; do not discard the sole object key and upload ID.
 
 - [ ] **Step 5: Treat ListParts as the sole completed-part authority**
 
@@ -917,7 +917,7 @@ Add tests for:
 - `InvalidInventory` duplicate/out-of-range/empty-ETag parts and engine-detected wrong-size parts -> Abort old, clear manifest, one replacement;
 - malformed local JSON -> remove local file and create one session without attempting an unknown remote Abort;
 - stale same-uploader manifest after content change -> Abort old key/upload ID before one replacement;
-- stale uploader-identity manifest -> no Abort to the new endpoint, remove local file, one fresh Create.
+- stale provider or uploader-identity manifest -> no request to the current endpoint, retain the local file, and return the fixed sanitized resume-identity error without a fresh Create.
 
 - [ ] **Step 3: Write lost-Complete HEAD tests for all recovery modes**
 
@@ -946,7 +946,7 @@ Map `Unknown=0`, `Supported=1`, `Unsupported=2` in `MultipartCapability`; use Ac
 
 On an explicit unsupported operation with a persisted manifest: Abort the active session through the unmodified base bucket and require either success or `NoSuchUpload` before removing the matching local manifest and returning `Unsupported`. An Abort network, IAM, or 5xx failure returns its error, preserves the manifest, and blocks fallback. Without a manifest, retain best-effort Abort before returning `Unsupported` because no resumable state exists.
 
-Maintain `replacement_used: bool` for one `upload_multipart` call. Catch both `MultipartFailure::InvalidInventory` and `reconcile_parts` wrong-size failures as replaceable inventory corruption. For either inventory corruption or same-uploader stale identity, require Abort success or `NoSuchUpload` before clearing/replacing; a transient/auth Abort failure returns error and leaves the manifest for retry. `NoSuchUpload` itself needs no Abort. Once the budget is used, a second invalid-session/reconciliation result returns an error naming the operation but no signed URL/body.
+Maintain `replacement_used: bool` for one `upload_multipart` call. Catch both `MultipartFailure::InvalidInventory` and `reconcile_parts` wrong-size failures as replaceable inventory corruption. For either inventory corruption or same-uploader stale identity, require Abort success or `NoSuchUpload` before clearing/replacing; a transient/auth Abort failure returns error and leaves the manifest for retry. Provider or uploader-identity mismatch is non-replaceable in normal resume: retain the manifest and return the fixed sanitized error without contacting the current endpoint. `NoSuchUpload` itself needs no Abort. Once the budget is used, a second invalid-session/reconciliation result returns an error naming the operation but no signed URL/body.
 
 - [ ] **Step 7: Implement HEAD decision after NoSuchUpload**
 
@@ -1363,7 +1363,7 @@ async fn remove_entry_archive_family(entry: &eh_download_queue::Model) {
 }
 ```
 
-Before every local upload-state or family deletion, call the shared gate. S3/ipfS3 implementations deterministically scan direct `*.json` manifests and `manifest.json.tmp-*` atomic-write remnants, then attempt every safely identified Abort through the base bucket; an error or missing Abort uploader preserves the family and its manifests. Formal malformed JSON keeps its existing skip behavior. A formal manifest that parses but has an unsupported version, invalid stored value, provider mismatch, or uploader-identity mismatch is not aborted against the current endpoint; it returns a fixed sanitized terminal-cleanup error, preserves the complete family, and does not stop later verified Abort attempts. An unverifiable atomic temporary manifest continues to return its sanitized temporary-manifest error and also preserves the complete family because it may hold the sole upload ID. These rules apply only to terminal cleanup and do not change normal resume's uploader-identity mismatch strategy. Publish calls the gate before `mark_eh_download_done`; after any send marker is written, a later cleanup retry observes that marker and never resends.
+Before every local upload-state or family deletion, call the shared gate. S3/ipfS3 implementations deterministically scan direct `*.json` manifests and `manifest.json.tmp-*` atomic-write remnants, then attempt every safely identified Abort through the base bucket; an error or missing Abort uploader preserves the family and its manifests. Formal malformed JSON keeps its existing skip behavior. A formal manifest that parses but has an unsupported version, invalid stored value, provider mismatch, or uploader-identity mismatch is not aborted against the current endpoint; it returns a fixed sanitized terminal-cleanup error, preserves the complete family, and does not stop later verified Abort attempts. An unverifiable atomic temporary manifest continues to return its sanitized temporary-manifest error and also preserves the complete family because it may hold the sole upload ID. These terminal rules do not replace the separately specified normal-resume provider/uploader identity mismatch rule above. Publish calls the gate before `mark_eh_download_done`; after any send marker is written, a later cleanup retry observes that marker and never resends.
 
 Apply them as follows:
 

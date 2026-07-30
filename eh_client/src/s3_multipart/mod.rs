@@ -10,6 +10,8 @@ const TERMINAL_MANIFEST_VERIFICATION_ERROR: &str =
     "multipart terminal manifest could not be safely verified";
 const TEMPORARY_MANIFEST_VERIFICATION_ERROR: &str =
     "multipart temporary manifest could not be safely verified";
+const RESUME_UPLOADER_IDENTITY_MISMATCH_ERROR: &str =
+    "multipart resume manifest belongs to a different uploader identity";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -258,11 +260,14 @@ pub(crate) async fn upload_multipart(
                 manifest::remove_manifest(path).await?;
                 None
             }
-            manifest::ManifestLoad::Stale { manifest, .. }
-                if manifest.uploader_identity_sha256 != request.uploader_identity_sha256 =>
-            {
-                manifest::remove_manifest(path).await?;
-                None
+            manifest::ManifestLoad::Stale {
+                reason:
+                    manifest::ManifestMismatch::Provider | manifest::ManifestMismatch::UploaderIdentity,
+                ..
+            } => {
+                return Err(crate::Error::Other(
+                    RESUME_UPLOADER_IDENTITY_MISMATCH_ERROR.to_owned(),
+                ));
             }
             manifest::ManifestLoad::Stale { manifest, .. } => {
                 if !is_safe_session_value(&manifest.object_key)
@@ -1656,8 +1661,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn malformed_and_stale_manifests_replace_without_cross_endpoint_abort() {
-        let cases = ["malformed", "same-uploader-stale", "uploader-mismatch"];
+    async fn malformed_and_same_uploader_stale_manifests_replace() {
+        let cases = ["malformed", "same-uploader-stale"];
         for case in cases {
             let server = MockServer::start().await;
             if case == "same-uploader-stale" {
@@ -1683,14 +1688,6 @@ mod tests {
                     let old_bytes = vec![3; PART_SIZE];
                     write_valid_manifest(&manifest_path, &old_bytes, UPLOADER_ID).await
                 }
-                "uploader-mismatch" => {
-                    write_valid_manifest(
-                        &manifest_path,
-                        &bytes,
-                        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-                    )
-                    .await
-                }
                 _ => unreachable!(),
             }
 
@@ -1701,6 +1698,81 @@ mod tests {
             )
             .await;
             assert!(matches!(result, Ok(MultipartOutcome::Completed(_))));
+            server.verify().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_or_uploader_identity_mismatch_preserves_manifest_without_network_requests() {
+        let old_uploader_identity =
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        for (case, provider) in [
+            ("uploader-identity", ProviderKind::S3),
+            ("provider", ProviderKind::IpfS3),
+        ] {
+            let server = MockServer::start().await;
+            let temp = tempfile::tempdir().unwrap();
+            let manifest_path = temp.path().join("archive.json");
+            let bytes = vec![4; PART_SIZE];
+            let old_object_key = format!("old-{case}-object-key-sentinel");
+            let old_upload_id = format!("old-{case}-upload-id-sentinel");
+            let object_sha256 = sha256_hex(&bytes);
+            let old_identity = manifest::ManifestIdentity {
+                provider,
+                uploader_identity_sha256: old_uploader_identity,
+                logical_object_id: "gallery-123",
+                object_sha256: &object_sha256,
+                object_len: bytes.len() as u64,
+                content_type: "application/octet-stream",
+                requested_entries_sha256: None,
+            };
+            let old_manifest = manifest::new_manifest(
+                &old_identity,
+                old_object_key.clone(),
+                old_upload_id.clone(),
+            )
+            .unwrap();
+            manifest::write_manifest_atomic(&manifest_path, &old_manifest)
+                .await
+                .unwrap();
+            let persisted_manifest = tokio::fs::read_to_string(&manifest_path).await.unwrap();
+
+            let error = match upload_multipart(
+                test_bucket(&server).as_ref(),
+                &reqwest::Client::new(),
+                standard_request(&bytes, Some(&manifest_path)),
+            )
+            .await
+            {
+                Err(error) => error,
+                Ok(_) => panic!("{case} mismatch must not resume or create a session"),
+            };
+
+            assert_eq!(
+                error.to_string(),
+                "multipart resume manifest belongs to a different uploader identity"
+            );
+            assert!(manifest_path.is_file());
+            assert_eq!(
+                tokio::fs::read_to_string(&manifest_path).await.unwrap(),
+                persisted_manifest
+            );
+            let manifest_path_display = manifest_path.to_string_lossy();
+            for forbidden in [
+                manifest_path_display.as_ref(),
+                old_object_key.as_str(),
+                old_upload_id.as_str(),
+                old_uploader_identity,
+                UPLOADER_ID,
+                "AKIA_TEST_SENTINEL",
+                "secret-test-sentinel",
+            ] {
+                assert!(
+                    !error.to_string().contains(forbidden),
+                    "{case} resume error leaked {forbidden}"
+                );
+            }
+            assert!(server.received_requests().await.unwrap().is_empty());
             server.verify().await;
         }
     }
