@@ -15,6 +15,19 @@ use tracing::{error, info, warn};
 use tracing_subscriber::fmt::time::ChronoLocal;
 use tracing_subscriber::{prelude::*, EnvFilter};
 
+fn should_build_eh_image_uploader(
+    eh_enabled: bool,
+    telegraph_enabled: bool,
+    provider: eh_client::ImageUploadProvider,
+) -> bool {
+    eh_enabled
+        && (telegraph_enabled
+            || matches!(
+                provider,
+                eh_client::ImageUploadProvider::S3 | eh_client::ImageUploadProvider::IpfS3
+            ))
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Load configuration
@@ -317,7 +330,11 @@ async fn main() -> Result<()> {
         }
     }
 
-    let eh_image_uploader = if eh_client.is_some() && telegraph_client.is_some() {
+    let eh_image_uploader = if should_build_eh_image_uploader(
+        eh_client.is_some(),
+        telegraph_client.is_some(),
+        config.image_upload.provider,
+    ) {
         Some(config.image_upload.build_uploader().await?)
     } else {
         None
@@ -522,4 +539,48 @@ async fn main() -> Result<()> {
 
     info!("✅ Shutdown complete");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use eh_client::ImageUploadProvider;
+
+    use super::should_build_eh_image_uploader;
+
+    #[test]
+    fn eh_image_uploader_policy_covers_telegraph_and_abort_matrix() {
+        let providers = [
+            ImageUploadProvider::Pixi,
+            ImageUploadProvider::S3,
+            ImageUploadProvider::Catbox,
+            ImageUploadProvider::IpfS3,
+        ];
+
+        for provider in providers {
+            assert!(!should_build_eh_image_uploader(false, false, provider));
+            assert!(!should_build_eh_image_uploader(false, true, provider));
+            assert!(should_build_eh_image_uploader(true, true, provider));
+        }
+
+        assert!(!should_build_eh_image_uploader(
+            true,
+            false,
+            ImageUploadProvider::Pixi,
+        ));
+        assert!(should_build_eh_image_uploader(
+            true,
+            false,
+            ImageUploadProvider::S3,
+        ));
+        assert!(!should_build_eh_image_uploader(
+            true,
+            false,
+            ImageUploadProvider::Catbox,
+        ));
+        assert!(should_build_eh_image_uploader(
+            true,
+            false,
+            ImageUploadProvider::IpfS3,
+        ));
+    }
 }
