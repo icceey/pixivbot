@@ -912,7 +912,7 @@ multipart_never_sends_options
 
 Add tests for:
 
-- valid manifest + ListParts `NoSuchUpload` + confirmed missing HEAD -> one new Create;
+- valid S3/ipfS3-image manifest + ListParts `NoSuchUpload` + confirmed missing HEAD -> one new Create;
 - second `NoSuchUpload` in the same call -> error and no third session;
 - `InvalidInventory` duplicate/out-of-range/empty-ETag parts and engine-detected wrong-size parts -> Abort old, clear manifest, one replacement;
 - malformed local JSON -> remove local file and create one session without attempting an unknown remote Abort;
@@ -921,9 +921,9 @@ Add tests for:
 
 - [ ] **Step 3: Write lost-Complete HEAD tests for all recovery modes**
 
-Use an existing valid manifest whose ListParts returns `NoSuchUpload`. `s3_head_matching_length_recovers_lost_complete` asserts no Create and `RecoveredHead { etag: None }`. `ipfs3_image_head_requires_matching_length_and_nonempty_cid_etag` asserts a quoted non-empty CID is preserved in `RecoveredHead`. `zip_head_never_guesses_entry_cids_and_starts_one_replacement` uses `HeadRecovery::Never`, asserts the HEAD archive ETag never enters completion evidence, and observes exactly one replacement Create.
+Use an existing valid manifest whose ListParts returns `NoSuchUpload`. `s3_head_matching_length_recovers_lost_complete` asserts no Create and `RecoveredHead { etag: None }`. `ipfs3_image_head_requires_matching_length_and_nonempty_cid_etag` asserts a quoted non-empty CID is preserved in `RecoveredHead`. `zip_head_never_replaces_without_a_head_request` uses `HeadRecovery::Never`, makes a rejecting HEAD mock expect zero requests, proves the old manifest is replaced, and observes exactly one replacement Create/ListParts/UploadPart/Complete sequence with `CompletionEvidence::Response`.
 
-Also assert 403, malformed/missing required HEAD headers, length mismatch, and non-404 non-2xx are errors. A confirmed 404 permits the one replacement.
+For S3 and ipfS3-image recovery, also assert 403, malformed/missing required HEAD headers, length mismatch, and non-404 non-2xx are errors. A confirmed 404 permits the one replacement.
 
 - [ ] **Step 4: Run RED**
 
@@ -933,7 +933,7 @@ Run:
 cargo test -p eh_client --lib s3_multipart::tests::multipart_only_classifies_explicit_operation_codes_as_unsupported -- --exact
 cargo test -p eh_client --lib s3_multipart::tests::multipart_complete_classifies_http_200_error_roots_before_provider_parsing -- --exact
 cargo test -p eh_client --lib s3_multipart::tests::s3_head_matching_length_recovers_lost_complete -- --exact
-cargo test -p eh_client --lib s3_multipart::tests::zip_head_never_guesses_entry_cids_and_starts_one_replacement -- --exact
+cargo test -p eh_client --lib s3_multipart::tests::zip_head_never_replaces_without_a_head_request -- --exact
 ```
 
 Expected: fallback/replacement/HEAD branches are absent and tests fail.
@@ -950,15 +950,14 @@ Maintain `replacement_used: bool` for one `upload_multipart` call. Catch both `M
 
 - [ ] **Step 7: Implement HEAD decision after NoSuchUpload**
 
-Call `bucket.head_object(&object_key)` only for a previously valid manifest. Interpret status strictly:
+For a previously valid manifest, call `bucket.head_object(&object_key)` only for `S3ByLength` and `IpfS3ImageByLengthAndEtag`. Interpret those statuses strictly:
 
 - `404`: confirmed missing; remove manifest and use the one replacement;
 - `2xx` + exact `content_length`: S3 returns `RecoveredHead { etag: None }`;
 - `2xx` + exact length + non-empty trimmed `e_tag`: ipfS3 image returns the literal ETag;
-- `HeadRecovery::Never`: even matching ZIP HEAD cannot recover entry CIDs; remove old manifest and use one replacement;
 - every other status or missing/malformed required header: error, no guessing and no replacement.
 
-Do not HEAD after malformed JSON, initial Create failure, or generic ListParts failure.
+For `HeadRecovery::Never`, return `Replace` before any HEAD because ZIP archive metadata cannot recover entry CIDs; the existing caller removes the confirmed-dead manifest and consumes its single replacement budget. Do not HEAD after malformed JSON, initial Create failure, generic ListParts failure, or `HeadRecovery::Never`.
 
 - [ ] **Step 8: Run GREEN and all shared-module tests**
 
@@ -1483,7 +1482,7 @@ Implementation subagents do not execute these commands; the orchestrator owns st
 | Sequential 8 MiB partitioning, 10,000 limit, sorted Complete, literal opaque/CID ETags | Task 5 |
 | Resume after process restart, response loss, missing/uncertain-only upload | Task 6 |
 | Stale session/invalid parts/malformed manifest/one replacement | Tasks 6-7 |
-| Lost Complete HEAD: S3 length, ipfS3 image length+CID, ZIP replacement | Task 7; provider result use Task 8 |
+| Lost Complete recovery: S3 HEAD length, ipfS3 image HEAD length+CID, ZIP zero HEAD requests plus one replacement | Task 7; provider result use Task 8 |
 | S3 public URL and ipfS3 image CID/gateway/warmup semantics | Task 8 |
 | ipfS3 ZIP Create-only `decompress-zip`; no extension on Upload/List/Complete/Abort | Task 9 |
 | Valid `DecompressZipResult`, ordered entry CIDs, archive CID never used | Task 9 |

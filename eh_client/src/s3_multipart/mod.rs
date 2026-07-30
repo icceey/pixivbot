@@ -716,6 +716,9 @@ async fn recover_lost_complete(
     expected_len: usize,
     recovery: HeadRecovery,
 ) -> crate::Result<HeadDecision> {
+    if recovery == HeadRecovery::Never {
+        return Ok(HeadDecision::Replace);
+    }
     let (head, status) = bucket.head_object(object_key).await.map_err(|error| {
         multipart_failure_error(list_parts::classify_s3_error(
             MultipartOperation::Head,
@@ -761,7 +764,7 @@ async fn recover_lost_complete(
                 etag: Some(etag),
             }))
         }
-        HeadRecovery::Never => Ok(HeadDecision::Replace),
+        HeadRecovery::Never => unreachable!("Never recovery returns before HEAD"),
     }
 }
 
@@ -1449,7 +1452,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn zip_head_never_guesses_entry_cids_and_starts_one_replacement() {
+    async fn zip_head_never_replaces_without_a_head_request() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(query_param("uploadId", UPLOAD_ID))
@@ -1458,12 +1461,8 @@ mod tests {
             .mount(&server)
             .await;
         Mock::given(method("HEAD"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .insert_header("Content-Length", PART_SIZE)
-                    .insert_header("ETag", "\"archive-cid-must-not-recover\""),
-            )
-            .expect(1)
+            .respond_with(ResponseTemplate::new(403))
+            .expect(0)
             .mount(&server)
             .await;
         mount_create_with_upload_id(&server, REPLACEMENT_UPLOAD_ID).await;
@@ -1491,6 +1490,19 @@ mod tests {
             CompletionEvidence::Response(_)
         ));
         assert!(manifest_path.exists());
+        let manifest: manifest::MultipartManifest =
+            serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
+        assert_eq!(manifest.upload_id, REPLACEMENT_UPLOAD_ID);
+        let requests = server.received_requests().await.unwrap();
+        assert_request_sequence(&requests, &["GET", "POST", "GET", "PUT", "POST"]);
+        assert_eq!(
+            query_value(&requests[0], "uploadId").as_deref(),
+            Some(UPLOAD_ID)
+        );
+        assert_eq!(
+            query_value(&requests[2], "uploadId").as_deref(),
+            Some(REPLACEMENT_UPLOAD_ID)
+        );
         server.verify().await;
     }
 
@@ -1540,10 +1552,12 @@ mod tests {
         let bytes = vec![4; PART_SIZE];
         write_valid_manifest(&manifest_path, &bytes, UPLOADER_ID).await;
 
+        let mut request = standard_request(&bytes, Some(&manifest_path));
+        request.head_recovery = HeadRecovery::S3ByLength;
         let result = upload_multipart(
             test_bucket(&server).as_ref(),
             &reqwest::Client::new(),
-            standard_request(&bytes, Some(&manifest_path)),
+            request,
         )
         .await
         .unwrap();
@@ -1567,18 +1581,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn second_no_such_upload_errors_without_a_third_session() {
+    async fn zip_replacement_budget_stops_after_one_no_such_upload() {
         let server = MockServer::start().await;
         mount_no_such_upload_list(&server, UPLOAD_ID).await;
-        mount_head(&server, 404, None, None).await;
-        mount_create_with_upload_id(&server, REPLACEMENT_UPLOAD_ID).await;
-        mount_no_such_upload_list(&server, REPLACEMENT_UPLOAD_ID).await;
-        Mock::given(method("POST"))
-            .and(query_param("uploads", ""))
-            .respond_with(ResponseTemplate::new(500))
+        Mock::given(method("HEAD"))
+            .respond_with(ResponseTemplate::new(403))
             .expect(0)
             .mount(&server)
             .await;
+        mount_create_with_upload_id(&server, REPLACEMENT_UPLOAD_ID).await;
+        mount_no_such_upload_list(&server, REPLACEMENT_UPLOAD_ID).await;
 
         let temp = tempfile::tempdir().unwrap();
         let manifest_path = temp.path().join("archive.json");
@@ -1597,6 +1609,17 @@ mod tests {
         };
         assert!(error.to_string().contains("ListParts"));
         assert!(manifest_path.exists());
+        let requests = server.received_requests().await.unwrap();
+        assert_request_sequence(&requests, &["GET", "POST", "GET"]);
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| {
+                    request.method.as_str() == "POST" && query_value(request, "uploads").is_some()
+                })
+                .count(),
+            1
+        );
         server.verify().await;
     }
 
