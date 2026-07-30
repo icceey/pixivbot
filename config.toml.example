@@ -85,6 +85,19 @@ download_original_threshold = 1
 # Image upload backend for Telegraph pages. Default provider is "pixi". Set
 # provider to "s3" to upload images to an S3-compatible object store, "catbox"
 # to use Catbox, or "ipfs3" to use an ipfS3 (S3-compatible IPFS gateway) store.
+# S3 and ipfS3 use multipart upload for images at or above
+# multipart_image_threshold_mb (the comparison is inclusive); smaller images use
+# PutObject. Set the threshold to 0 to disable image multipart uploads only. The
+# ipfS3 ZIP-first path is controlled by zip_extract_enabled; set it to false to
+# disable only that path, so ZIP multipart is not attempted.
+# Multipart capability is probed lazily on each real eligible object, never at
+# startup. The configured credentials need CreateMultipartUpload, UploadPart,
+# ListParts (AWS: s3:ListMultipartUploadParts), CompleteMultipartUpload, and
+# AbortMultipartUpload permissions. HEAD requires s3:GetObject on AWS. An
+# ambiguous or lost CompleteMultipartUpload response is verified with HEAD. The
+# uploader falls back to PutObject only when multipart is explicitly unsupported;
+# permission, authentication, and transient errors are reported instead of being
+# downgraded.
 # ----------------------------------------------------------------------------
 # [image_upload]
 # provider = "pixi"
@@ -98,6 +111,7 @@ download_original_threshold = 1
 # public_base_url = "https://cdn.example.com/pixivbot-images"
 # key_prefix = "eh"
 # path_style = true
+# multipart_image_threshold_mb = 8
 #
 # [image_upload.ipfs3]
 # # ipfS3 is an S3-compatible gateway in front of IPFS (Kubo). It returns the
@@ -121,14 +135,20 @@ download_original_threshold = 1
 # preview_rewrite_delay_sec = 600
 # key_prefix = "eh"
 # path_style = true
+# multipart_image_threshold_mb = 8
 # # Send non-blocking HEAD requests to gateway_url after upload to warm IPFS gateway cache.
 # warm_public_gateway_after_upload = false
-# # If your ipfS3 deployment supports the signed `decompress-zip` PutObject
-# # extension, EH Telegraph uploads can upload one ZIP and use each extracted
-# # entry's returned CID as {gateway}/{entry-CID}. The client derives an isolated
-# # extraction prefix and requires the default DecompressZipResult XML response.
-# # Leave disabled unless your provider implements this protocol.
-# zip_extract_enabled = false
+# # ZIP extraction is enabled by default. If your ipfS3 deployment supports the
+# # signed `decompress-zip` extension, EH Telegraph uploads can upload one ZIP
+# # and use each extracted entry's returned CID as {gateway}/{entry-CID}. The
+# # client derives an isolated extraction prefix and requires the default
+# # DecompressZipResult XML response. Set false to opt out explicitly.
+# # In multipart uploads, `decompress-zip` is signed only on CreateMultipartUpload;
+# # UploadPart, ListParts, CompleteMultipartUpload, AbortMultipartUpload, and HEAD
+# # never carry it. The compatible single-Put ZIP fallback still signs it on PutObject.
+# # A standard empty success or explicit unsupported S3 Error falls back per image;
+# # protocol, authentication, and transient failures are reported instead.
+# zip_extract_enabled = true
 #
 # [image_upload.catbox]
 # # Catbox uploads are public; userhash is optional. Anonymous uploads cannot be

@@ -11,7 +11,8 @@ use chrono::Local;
 use eh_client::{
     parser::DownloadCost, rewrite_ipfs_gateway_nodes, ArchiveArtifacts, ArchiveDownloadOptions,
     EhClient, EhGallery, ImageUploadInput, ImageUploader, IpfS3PreviewRewriteConfig,
-    TelegraphClient, TelegraphImageUrlPair, TelegraphRewriteData, ZipArchiveUploadInput,
+    TelegraphClient, TelegraphImageUrlPair, TelegraphRewriteData, UploadResumeContext,
+    ZipArchiveUploadInput,
 };
 use rand::RngExt;
 use std::sync::{Arc, LazyLock};
@@ -50,7 +51,97 @@ fn archive_artifacts_for_entry(
 
 async fn cleanup_archive_artifacts(cache_dir: &std::path::Path, entry: &eh_download_queue::Model) {
     let artifacts = archive_artifacts_for_entry(cache_dir, entry);
+    if artifacts.uploads_dir().exists() {
+        warn!(
+            "Preserving EH archive artifacts with multipart upload state for gid={} because this cleanup path has no Abort uploader",
+            entry.gid
+        );
+        return;
+    }
     if let Err(e) = artifacts.remove_all().await {
+        warn!(
+            "Failed to delete EH archive artifacts for gid={}: {}",
+            entry.gid, e
+        );
+    }
+}
+
+#[derive(Debug)]
+enum EhUploadStateAbortGateError {
+    NoAbortUploader { gid: i64 },
+    AbortFailed { gid: i64 },
+}
+
+impl std::fmt::Display for EhUploadStateAbortGateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoAbortUploader { gid } => write!(
+                f,
+                "Cannot safely remove incomplete EH multipart upload state for gid={}: no Abort uploader configured",
+                gid
+            ),
+            Self::AbortFailed { gid } => write!(
+                f,
+                "Failed to abort incomplete EH multipart uploads for gid={}",
+                gid
+            ),
+        }
+    }
+}
+
+impl std::error::Error for EhUploadStateAbortGateError {}
+
+/// Require a provider-specific terminal Abort before deleting persisted multipart
+/// upload state. The error intentionally identifies only the gallery gid: local
+/// manifests can contain remote upload identifiers and must remain private.
+async fn ensure_entry_upload_state_aborted(
+    entry: &eh_download_queue::Model,
+    abort_uploader: Option<&dyn ImageUploader>,
+) -> Result<UploadStateAbortPermit> {
+    let Some(zip_path) = entry.zip_path.as_deref() else {
+        return Ok(UploadStateAbortPermit);
+    };
+    let uploads_dir = ArchiveArtifacts::new(zip_path).uploads_dir().to_path_buf();
+    if !uploads_dir.exists() {
+        return Ok(UploadStateAbortPermit);
+    }
+    let abort_uploader = abort_uploader.ok_or_else(|| {
+        anyhow::Error::new(EhUploadStateAbortGateError::NoAbortUploader { gid: entry.gid })
+    })?;
+    abort_uploader
+        .abort_upload_state(&uploads_dir)
+        .await
+        .map_err(|_| {
+            anyhow::Error::new(EhUploadStateAbortGateError::AbortFailed { gid: entry.gid })
+        })?;
+    Ok(UploadStateAbortPermit)
+}
+
+struct UploadStateAbortPermit;
+
+async fn remove_entry_upload_state(
+    entry: &eh_download_queue::Model,
+    _permit: UploadStateAbortPermit,
+) {
+    let Some(zip_path) = entry.zip_path.as_deref() else {
+        return;
+    };
+    if let Err(e) = ArchiveArtifacts::new(zip_path).remove_upload_state().await {
+        warn!(
+            "Failed to delete EH upload state for gid={}: {}",
+            entry.gid, e
+        );
+    }
+}
+
+async fn remove_entry_archive_family(
+    entry: &eh_download_queue::Model,
+    _permit: UploadStateAbortPermit,
+) {
+    let Some(zip_path) = entry.zip_path.as_deref() else {
+        return;
+    };
+    if let Err(e) = ArchiveArtifacts::new(zip_path).remove_all().await {
         warn!(
             "Failed to delete EH archive artifacts for gid={}: {}",
             entry.gid, e
@@ -1027,6 +1118,7 @@ pub struct EhDownloadWorker {
     client: Arc<EhClient>,
     config: Arc<EhentaiConfig>,
     cache_dir: std::path::PathBuf,
+    startup_abort_uploader: Option<Arc<dyn ImageUploader>>,
 }
 
 impl EhDownloadWorker {
@@ -1035,19 +1127,25 @@ impl EhDownloadWorker {
         client: Arc<EhClient>,
         config: Arc<EhentaiConfig>,
         cache_dir: std::path::PathBuf,
+        startup_abort_uploader: Option<Arc<dyn ImageUploader>>,
     ) -> Self {
         Self {
             repo,
             client,
             config,
             cache_dir,
+            startup_abort_uploader,
         }
     }
 
     pub async fn run(self) {
         // Clean orphan cache files on startup (stale entry reset is done in main.rs)
         let eh_cache = self.cache_dir.join("eh_cache");
-        if let Err(e) = self.repo.cleanup_eh_cache_orphans(&eh_cache).await {
+        if let Err(e) = self
+            .repo
+            .cleanup_eh_cache_orphans(&eh_cache, self.startup_abort_uploader.as_deref())
+            .await
+        {
             warn!("Failed to cleanup eh cache orphans: {:#}", e);
         }
 
@@ -1318,6 +1416,7 @@ pub struct EhUploadWorker {
     notifier: Notifier,
     telegraph: Arc<TelegraphClient>,
     image_uploader: Arc<dyn ImageUploader>,
+    abort_uploader: Option<Arc<dyn ImageUploader>>,
     rewrite_config: Option<IpfS3PreviewRewriteConfig>,
     config: Arc<EhentaiConfig>,
 }
@@ -1325,6 +1424,7 @@ pub struct EhUploadWorker {
 struct ZipImageData {
     filename: String,
     data: Vec<u8>,
+    uploadable_order: usize,
 }
 
 fn is_uploadable_zip_image_name(name: &str) -> bool {
@@ -1353,6 +1453,7 @@ fn collect_uploadable_zip_entry_names(zip_path: &std::path::Path) -> Result<Vec<
 }
 
 impl EhUploadWorker {
+    #[cfg(test)]
     pub fn new(
         repo: Arc<Repo>,
         notifier: Notifier,
@@ -1361,14 +1462,42 @@ impl EhUploadWorker {
         rewrite_config: Option<IpfS3PreviewRewriteConfig>,
         config: Arc<EhentaiConfig>,
     ) -> Self {
+        Self::new_with_abort_uploader(
+            repo,
+            notifier,
+            telegraph,
+            image_uploader,
+            None,
+            rewrite_config,
+            config,
+        )
+    }
+
+    pub fn new_with_abort_uploader(
+        repo: Arc<Repo>,
+        notifier: Notifier,
+        telegraph: Arc<TelegraphClient>,
+        image_uploader: Arc<dyn ImageUploader>,
+        abort_uploader: Option<Arc<dyn ImageUploader>>,
+        rewrite_config: Option<IpfS3PreviewRewriteConfig>,
+        config: Arc<EhentaiConfig>,
+    ) -> Self {
         Self {
             repo,
             notifier,
             telegraph,
             image_uploader,
+            abort_uploader,
             rewrite_config,
             config,
         }
+    }
+
+    async fn abort_entry_upload_state(
+        &self,
+        entry: &eh_download_queue::Model,
+    ) -> Result<UploadStateAbortPermit> {
+        ensure_entry_upload_state_aborted(entry, self.abort_uploader.as_deref()).await
     }
 
     pub async fn run(self) {
@@ -1393,6 +1522,17 @@ impl EhUploadWorker {
         if let Err(e) = self.process(&entry).await {
             error!("Upload failed for entry {}: {:#}", entry.id, e);
 
+            // Cancellation and terminal-abort recovery may already have
+            // transitioned the claimed row. Preserve their error instead of
+            // attempting a stale CAS retry that would hide it.
+            if !self
+                .repo
+                .eh_download_is_active(entry.id, &entry.status)
+                .await?
+            {
+                return Err(e);
+            }
+
             // Check if this failure would be permanent
             let would_be_permanent = entry.retry_count + 1 > self.config.max_retry_count as i32;
 
@@ -1406,10 +1546,31 @@ impl EhUploadWorker {
                     .as_deref()
                     .is_some_and(|p| std::path::Path::new(p).exists())
             {
+                let abort_permit = match self.abort_entry_upload_state(&entry).await {
+                    Ok(permit) => permit,
+                    Err(abort_error) => {
+                        return match self
+                            .repo
+                            .defer_eh_upload_after_abort_failure(
+                                entry.id,
+                                self.config.download_poll_interval_sec as i64,
+                            )
+                            .await
+                        {
+                            Ok(()) => Err(abort_error),
+                            Err(defer_error) => Err(anyhow::anyhow!(
+                                "{}; failed to defer uploading row after Abort failure: {}",
+                                abort_error,
+                                defer_error
+                            )),
+                        }
+                    }
+                };
                 info!(
                     "Upload permanently failed for entry {}, falling back to archive delivery",
                     entry.id
                 );
+                remove_entry_upload_state(&entry, abort_permit).await;
                 let _ = self
                     .repo
                     .fallback_eh_upload_to_archive(
@@ -1431,8 +1592,8 @@ impl EhUploadWorker {
                 )
                 .await?;
             if permanent {
-                // Delete ZIP on permanent failure to free disk space
-                self.cleanup_zip(&entry).await;
+                let abort_permit = self.abort_entry_upload_state(&entry).await?;
+                remove_entry_archive_family(&entry, abort_permit).await;
                 let escaped_err = teloxide::utils::markdown::escape(&e.to_string());
                 let title = teloxide::utils::markdown::escape(&entry.title);
                 let msg = format!("⚠️ Telegraph 上传失败: {}\n\n📦 {}", escaped_err, title);
@@ -1457,6 +1618,8 @@ impl EhUploadWorker {
                 .await?
             {
                 info!("Skipping canceled EH upload entry {}", entry.id);
+                let abort_permit = self.abort_entry_upload_state(entry).await?;
+                remove_entry_upload_state(entry, abort_permit).await;
                 return Ok(());
             }
             info!(
@@ -1480,6 +1643,8 @@ impl EhUploadWorker {
             .await?
         {
             info!("Skipping canceled EH upload entry {}", entry.id);
+            let abort_permit = self.abort_entry_upload_state(entry).await?;
+            remove_entry_upload_state(entry, abort_permit).await;
             return Ok(());
         }
 
@@ -1488,6 +1653,7 @@ impl EhUploadWorker {
             .as_ref()
             .context("zip_path is None for downloaded entry")?;
         let zip_path = std::path::Path::new(zip_path);
+        let artifacts = ArchiveArtifacts::new(zip_path);
 
         // Collect uploadable image entry names once, preserving archive order.
         // This drives both the ZIP-first upload capability and the empty-ZIP
@@ -1505,6 +1671,7 @@ impl EhUploadWorker {
             let zip_bytes = tokio::fs::read(zip_path)
                 .await
                 .context("Failed to read zip for archive upload")?;
+            let archive_manifest_path = artifacts.uploads_dir().join("archive.json");
             let archive_input = ZipArchiveUploadInput {
                 filename: zip_path
                     .file_name()
@@ -1512,6 +1679,10 @@ impl EhUploadWorker {
                     .unwrap_or("gallery.zip"),
                 bytes: zip_bytes.as_slice(),
                 entry_names: &entry_names,
+                resume_context: Some(UploadResumeContext {
+                    manifest_path: &archive_manifest_path,
+                    logical_object_id: "archive",
+                }),
             };
             if let Some(url_pairs) = self
                 .image_uploader
@@ -1548,8 +1719,12 @@ impl EhUploadWorker {
                 })
                 .collect::<Vec<_>>();
 
-            for i in uploadable_image_indices {
-                let mut file = archive.by_index(i).context("Failed to read zip entry")?;
+            for (uploadable_order, archive_index) in
+                uploadable_image_indices.into_iter().enumerate()
+            {
+                let mut file = archive
+                    .by_index(archive_index)
+                    .context("Failed to read zip entry")?;
 
                 let mut data = Vec::new();
                 std::io::Read::read_to_end(&mut file, &mut data)
@@ -1561,7 +1736,11 @@ impl EhUploadWorker {
                     .to_string();
 
                 if image_tx
-                    .blocking_send(ZipImageData { filename, data })
+                    .blocking_send(ZipImageData {
+                        filename,
+                        data,
+                        uploadable_order,
+                    })
                     .is_err()
                 {
                     return Ok(());
@@ -1573,9 +1752,17 @@ impl EhUploadWorker {
 
         let mut all_url_pairs: Vec<TelegraphImageUrlPair> = Vec::new();
         while let Some(image) = image_rx.recv().await {
+            let logical_object_id = format!("image-{}", image.uploadable_order);
+            let manifest_path = artifacts
+                .uploads_dir()
+                .join(format!("{logical_object_id}.json"));
             let input = ImageUploadInput {
                 filename: &image.filename,
                 bytes: image.data.as_slice(),
+                resume_context: Some(UploadResumeContext {
+                    manifest_path: &manifest_path,
+                    logical_object_id: &logical_object_id,
+                }),
             };
             let urls = self
                 .image_uploader
@@ -1646,19 +1833,10 @@ impl EhUploadWorker {
             )
             .await?;
 
-        Ok(())
-    }
+        let abort_permit = self.abort_entry_upload_state(entry).await?;
+        remove_entry_upload_state(entry, abort_permit).await;
 
-    /// Delete the ZIP file for an entry if it exists (used on permanent failure).
-    async fn cleanup_zip(&self, entry: &eh_download_queue::Model) {
-        if let Some(ref zip_path) = entry.zip_path {
-            let path = std::path::Path::new(zip_path);
-            if path.exists() {
-                if let Err(e) = tokio::fs::remove_file(path).await {
-                    warn!("Failed to delete zip {}: {}", path.display(), e);
-                }
-            }
-        }
+        Ok(())
     }
 }
 
@@ -1683,10 +1861,12 @@ pub struct EhPublishWorker {
     notifier: Notifier,
     client: Arc<EhClient>,
     rewrite_delay_sec: Option<u64>,
+    abort_uploader: Option<Arc<dyn ImageUploader>>,
     config: Arc<EhentaiConfig>,
 }
 
 impl EhPublishWorker {
+    #[cfg(test)]
     pub fn new(
         repo: Arc<Repo>,
         notifier: Notifier,
@@ -1694,11 +1874,23 @@ impl EhPublishWorker {
         rewrite_delay_sec: Option<u64>,
         config: Arc<EhentaiConfig>,
     ) -> Self {
+        Self::new_with_abort_uploader(repo, notifier, client, rewrite_delay_sec, None, config)
+    }
+
+    pub fn new_with_abort_uploader(
+        repo: Arc<Repo>,
+        notifier: Notifier,
+        client: Arc<EhClient>,
+        rewrite_delay_sec: Option<u64>,
+        abort_uploader: Option<Arc<dyn ImageUploader>>,
+        config: Arc<EhentaiConfig>,
+    ) -> Self {
         Self {
             repo,
             notifier,
             client,
             rewrite_delay_sec,
+            abort_uploader,
             config,
         }
     }
@@ -1725,6 +1917,30 @@ impl EhPublishWorker {
         if let Err(e) = self.process(&entry).await {
             error!("Publish failed for entry {}: {:#}", entry.id, e);
 
+            if !self
+                .repo
+                .eh_download_is_active(entry.id, &entry.status)
+                .await?
+            {
+                return Err(e);
+            }
+
+            if e.downcast_ref::<EhUploadStateAbortGateError>().is_some() {
+                let target = if entry.telegraph_url.is_some() {
+                    STATUS_UPLOADED
+                } else {
+                    STATUS_DOWNLOADED
+                };
+                self.repo
+                    .defer_eh_publish_after_abort_failure(
+                        entry.id,
+                        target,
+                        self.config.download_poll_interval_sec as i64,
+                    )
+                    .await?;
+                return Err(e);
+            }
+
             // Missing ZIP: retry from STATUS_PUBLISHING back to STATUS_PENDING
             // so the download worker re-fetches the gallery.
             if e.downcast_ref::<MissingEhZip>().is_some() {
@@ -1739,7 +1955,10 @@ impl EhPublishWorker {
                     )
                     .await?;
                 if permanent {
-                    self.cleanup_zip(&updated).await;
+                    let abort_permit =
+                        ensure_entry_upload_state_aborted(&updated, self.abort_uploader.as_deref())
+                            .await?;
+                    remove_entry_archive_family(&updated, abort_permit).await;
                     let title = teloxide::utils::markdown::escape(&updated.title);
                     let msg = format!("⚠️ 下载失败: {}\n原因: cached EH ZIP is missing", title);
                     let _ = self
@@ -1767,8 +1986,10 @@ impl EhPublishWorker {
                 )
                 .await?;
             if permanent {
-                // Delete ZIP on permanent failure to free disk space
-                self.cleanup_zip(&entry).await;
+                let abort_permit =
+                    ensure_entry_upload_state_aborted(&entry, self.abort_uploader.as_deref())
+                        .await?;
+                remove_entry_archive_family(&entry, abort_permit).await;
                 let escaped = teloxide::utils::markdown::escape(&e.to_string());
                 let title = teloxide::utils::markdown::escape(&entry.title);
                 let msg = format!("⚠️ 发布失败: {}\n\n📦 {}", escaped, title);
@@ -1785,6 +2006,10 @@ impl EhPublishWorker {
     async fn process(&self, entry: &eh_download_queue::Model) -> Result<()> {
         let chat = get_chat_if_should_notify(&self.repo, entry.chat_id).await?;
         if chat.is_none() {
+            let _publish_cancel_guard = EH_PUBLISH_CANCEL_LOCK.lock().await;
+            if !self.ensure_entry_active(entry).await? {
+                return Ok(());
+            }
             // Chat disabled — defer without retry increment.  Determine the
             // correct ready status so the entry is picked up again when the
             // chat becomes available.
@@ -1829,10 +2054,13 @@ impl EhPublishWorker {
                     }
                 }
                 // At least one marker is set — the work is complete.
+                let abort_permit =
+                    ensure_entry_upload_state_aborted(entry, self.abort_uploader.as_deref())
+                        .await?;
                 self.repo
                     .mark_eh_download_done(entry.id, entry.file_size)
                     .await?;
-                self.cleanup_zip(entry).await;
+                remove_entry_archive_family(entry, abort_permit).await;
                 info!(
                     "Published eh gallery gid={} to chat {} (already sent, now done)",
                     entry.gid, entry.chat_id
@@ -1902,10 +2130,12 @@ impl EhPublishWorker {
         if !self.ensure_entry_active(entry).await? {
             return Ok(());
         }
+        let abort_permit =
+            ensure_entry_upload_state_aborted(entry, self.abort_uploader.as_deref()).await?;
         self.repo
             .mark_eh_download_done(entry.id, entry.file_size)
             .await?;
-        self.cleanup_zip(entry).await;
+        remove_entry_archive_family(entry, abort_permit).await;
         info!(
             "Published eh gallery gid={} to chat {}",
             entry.gid, entry.chat_id
@@ -1923,19 +2153,11 @@ impl EhPublishWorker {
                 "Skipping canceled EH publish entry {} for chat {}",
                 entry.id, entry.chat_id
             );
+            let abort_permit =
+                ensure_entry_upload_state_aborted(entry, self.abort_uploader.as_deref()).await?;
+            remove_entry_upload_state(entry, abort_permit).await;
         }
         Ok(active)
-    }
-
-    async fn cleanup_zip(&self, entry: &eh_download_queue::Model) {
-        if let Some(ref zip_path) = entry.zip_path {
-            let path = std::path::Path::new(zip_path);
-            if path.exists() {
-                if let Err(e) = tokio::fs::remove_file(path).await {
-                    warn!("Failed to delete zip {}: {}", path.display(), e);
-                }
-            }
-        }
     }
 
     fn build_caption(&self, entry: &eh_download_queue::Model) -> String {
@@ -2055,7 +2277,7 @@ fn sanitize_filename(s: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+mod unit_tests {
     use super::*;
 
     #[test]
@@ -2128,7 +2350,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod integration_tests {
+mod tests {
     use super::*;
     use crate::bot::notifier::Notifier;
     use crate::cache::FileCacheManager;
@@ -2219,6 +2441,51 @@ mod integration_tests {
             zip.write_all(data.as_bytes()).unwrap();
         }
         zip.finish().unwrap();
+    }
+
+    fn seed_archive_artifact_family(zip_path: &std::path::Path) -> ArchiveArtifacts {
+        let artifacts = ArchiveArtifacts::new(zip_path);
+        std::fs::write(artifacts.assembly_scratch(), b"partial").unwrap();
+        std::fs::create_dir_all(artifacts.parts_dir().join("nested")).unwrap();
+        std::fs::write(artifacts.parts_dir().join("nested/part-0001"), b"part").unwrap();
+        std::fs::create_dir_all(artifacts.uploads_dir().join("nested")).unwrap();
+        std::fs::write(artifacts.uploads_dir().join("archive.json"), b"archive").unwrap();
+        std::fs::write(
+            artifacts.uploads_dir().join("nested/image-0.json"),
+            b"image",
+        )
+        .unwrap();
+        artifacts
+    }
+
+    #[tokio::test]
+    async fn cleanup_archive_artifacts_preserves_upload_state_without_abort_capability() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        let temp = tempfile::tempdir().unwrap();
+        let cache_dir = temp.path().join("cache");
+        let zip_path = cache_dir.join("eh_cache").join("880_cleanup-token.zip");
+        std::fs::create_dir_all(zip_path.parent().unwrap()).unwrap();
+        create_test_zip(&zip_path, 1);
+        let artifacts = seed_archive_artifact_family(&zip_path);
+        let entry = insert_queue_entry(
+            &repo,
+            -100,
+            880,
+            "cleanup-token",
+            "Cleanup",
+            false,
+            STATUS_DOWNLOADED,
+            Some(zip_path.to_str().unwrap()),
+            None,
+        )
+        .await;
+
+        cleanup_archive_artifacts(&cache_dir, &entry).await;
+
+        assert!(artifacts.final_zip().exists());
+        assert!(artifacts.assembly_scratch().exists());
+        assert!(artifacts.parts_dir().exists());
+        assert!(artifacts.uploads_dir().join("archive.json").exists());
     }
 
     fn create_test_zip_with_names(path: &std::path::Path, names: &[&str]) {
@@ -3455,6 +3722,7 @@ mod integration_tests {
             make_eh_client(&eh_server),
             Arc::new(config),
             temp.path().to_path_buf(),
+            None,
         );
 
         worker.tick().await.unwrap();
@@ -3518,6 +3786,7 @@ mod integration_tests {
             make_eh_client(&eh_server),
             Arc::new(config),
             temp.path().to_path_buf(),
+            None,
         );
 
         worker.tick().await.unwrap();
@@ -3581,6 +3850,7 @@ mod integration_tests {
             make_eh_client(&eh_server),
             Arc::new(config),
             temp.path().to_path_buf(),
+            None,
         );
         worker.tick().await.unwrap();
 
@@ -3622,6 +3892,7 @@ mod integration_tests {
             make_eh_client(&eh_server),
             Arc::new(config),
             temp.path().to_path_buf(),
+            None,
         );
         worker.tick().await.unwrap();
 
@@ -3680,6 +3951,7 @@ mod integration_tests {
             make_eh_client(&eh_server),
             Arc::new(config),
             temp.path().to_path_buf(),
+            None,
         );
         worker.tick().await.unwrap();
 
@@ -3752,6 +4024,7 @@ mod integration_tests {
             make_eh_client(&eh_server),
             Arc::new(make_config()),
             temp.path().to_path_buf(),
+            None,
         );
         worker.tick().await.unwrap();
 
@@ -3826,6 +4099,7 @@ mod integration_tests {
             make_eh_client(&eh_server),
             Arc::new(config),
             temp.path().to_path_buf(),
+            None,
         );
         worker.tick().await.unwrap();
 
@@ -3905,6 +4179,7 @@ mod integration_tests {
             make_eh_client(&eh_server),
             Arc::new(make_config()),
             temp.path().to_path_buf(),
+            None,
         );
         worker.tick().await.unwrap();
 
@@ -3966,6 +4241,7 @@ mod integration_tests {
             make_eh_client(&eh_server),
             Arc::new(cfg),
             temp_dir.path().to_path_buf(),
+            None,
         );
 
         worker.tick().await.unwrap();
@@ -4043,6 +4319,7 @@ mod integration_tests {
             make_eh_client(&eh_server),
             Arc::new(cfg),
             temp_dir.path().to_path_buf(),
+            None,
         );
 
         worker.tick().await.unwrap();
@@ -4114,6 +4391,7 @@ mod integration_tests {
             make_eh_client(&eh_server),
             Arc::new(cfg),
             temp_dir.path().to_path_buf(),
+            None,
         );
 
         worker.tick().await.unwrap();
@@ -4187,6 +4465,7 @@ mod integration_tests {
             make_eh_client(&eh_server),
             Arc::new(cfg),
             temp_dir.path().to_path_buf(),
+            None,
         );
 
         worker.tick().await.unwrap();
@@ -4381,14 +4660,31 @@ mod integration_tests {
 
     // === ZIP-archive uploader tests ===
 
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct SeenResumeContext {
+        manifest_path: std::path::PathBuf,
+        logical_object_id: String,
+    }
+
+    fn copy_resume_context(context: eh_client::UploadResumeContext<'_>) -> SeenResumeContext {
+        SeenResumeContext {
+            manifest_path: context.manifest_path.to_path_buf(),
+            logical_object_id: context.logical_object_id.to_string(),
+        }
+    }
+
     /// Mock uploader that records whether the ZIP-archive path or the per-image
-    /// path was used, and remembers the entry names it observed.
+    /// path was used, remembers the entry names it observed, and copies resume
+    /// contexts before their borrowed input is dropped.
     #[derive(Default)]
     struct ZipFirstMockUploader {
         zip_calls: std::sync::atomic::AtomicUsize,
         image_calls: std::sync::atomic::AtomicUsize,
         seen_entries: std::sync::Mutex<Vec<String>>,
+        seen_zip_resume_contexts: std::sync::Mutex<Vec<SeenResumeContext>>,
+        seen_image_resume_contexts: std::sync::Mutex<Vec<SeenResumeContext>>,
         zip_fallback: bool,
+        fail_image_call: Option<usize>,
     }
 
     #[async_trait::async_trait]
@@ -4401,8 +4697,21 @@ mod integration_tests {
             &self,
             images: &[ImageUploadInput<'_>],
         ) -> eh_client::Result<Vec<String>> {
-            self.image_calls
+            let image_call = self
+                .image_calls
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut seen_contexts = self.seen_image_resume_contexts.lock().unwrap();
+            seen_contexts.extend(
+                images
+                    .iter()
+                    .filter_map(|image| image.resume_context.map(copy_resume_context)),
+            );
+            drop(seen_contexts);
+            if self.fail_image_call == Some(image_call) {
+                return Err(eh_client::Error::Other(
+                    "mock image upload failure".to_string(),
+                ));
+            }
             Ok(images
                 .iter()
                 .map(|image| format!("https://images.example/{}", image.filename))
@@ -4415,6 +4724,12 @@ mod integration_tests {
         ) -> eh_client::Result<Option<Vec<TelegraphImageUrlPair>>> {
             self.zip_calls
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(context) = archive.resume_context {
+                self.seen_zip_resume_contexts
+                    .lock()
+                    .unwrap()
+                    .push(copy_resume_context(context));
+            }
             *self.seen_entries.lock().unwrap() = archive.entry_names.to_vec();
             if self.zip_fallback {
                 return Ok(None);
@@ -4430,6 +4745,279 @@ mod integration_tests {
                     .collect(),
             ))
         }
+    }
+
+    #[derive(Default)]
+    struct TerminalCleanupMockUploader {
+        cleanup_calls: std::sync::Mutex<Vec<(std::path::PathBuf, bool)>>,
+        fail_abort: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl ImageUploader for TerminalCleanupMockUploader {
+        async fn upload_images(
+            &self,
+            _images: &[ImageUploadInput<'_>],
+        ) -> eh_client::Result<Vec<String>> {
+            Err(eh_client::Error::Other(
+                "mock image upload failure".to_string(),
+            ))
+        }
+
+        async fn abort_upload_state(&self, uploads_dir: &std::path::Path) -> eh_client::Result<()> {
+            self.cleanup_calls
+                .lock()
+                .unwrap()
+                .push((uploads_dir.to_path_buf(), uploads_dir.exists()));
+            if self.fail_abort {
+                return Err(eh_client::Error::Other(
+                    "mock terminal Abort failure".to_string(),
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct SwitchableAbortUploader {
+        cleanup_calls: std::sync::Mutex<Vec<(std::path::PathBuf, bool)>>,
+        fail_abort: std::sync::atomic::AtomicBool,
+    }
+
+    impl SwitchableAbortUploader {
+        fn set_fail_abort(&self, fail_abort: bool) {
+            self.fail_abort
+                .store(fail_abort, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ImageUploader for SwitchableAbortUploader {
+        async fn upload_images(
+            &self,
+            _images: &[ImageUploadInput<'_>],
+        ) -> eh_client::Result<Vec<String>> {
+            Err(eh_client::Error::Other(
+                "mock image upload failure".to_string(),
+            ))
+        }
+
+        async fn abort_upload_state(&self, uploads_dir: &std::path::Path) -> eh_client::Result<()> {
+            self.cleanup_calls
+                .lock()
+                .unwrap()
+                .push((uploads_dir.to_path_buf(), uploads_dir.exists()));
+            if self.fail_abort.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(eh_client::Error::Other(
+                    "mock switchable Abort failure".to_string(),
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    fn assert_terminal_cleanup_precedes_local_removal(
+        uploader: &TerminalCleanupMockUploader,
+        artifacts: &ArchiveArtifacts,
+    ) {
+        assert_eq!(
+            *uploader.cleanup_calls.lock().unwrap(),
+            vec![(artifacts.uploads_dir().to_path_buf(), true)]
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_worker_passes_stable_zip_resume_context() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        setup_chat(&repo, -100, true).await;
+        let tg_server = MockServer::start().await;
+        mock_telegraph_create_page(&tg_server).await;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let zip_path = temp_dir.path().join("archive.zip");
+        create_test_zip(&zip_path, 2);
+        let zip_path_str = zip_path.to_string_lossy().to_string();
+        let entry = insert_queue_entry(
+            &repo,
+            -100,
+            703,
+            "tok",
+            "Title",
+            true,
+            STATUS_DOWNLOADED,
+            Some(&zip_path_str),
+            None,
+        )
+        .await;
+        let uploader = Arc::new(ZipFirstMockUploader::default());
+        let worker = EhUploadWorker::new(
+            Arc::clone(&repo),
+            make_notifier(&tg_server),
+            make_telegraph_client(&tg_server),
+            uploader.clone(),
+            None,
+            Arc::new(make_config()),
+        );
+
+        worker.tick().await.unwrap();
+
+        assert_eq!(
+            *uploader.seen_zip_resume_contexts.lock().unwrap(),
+            vec![SeenResumeContext {
+                manifest_path: ArchiveArtifacts::new(&zip_path)
+                    .uploads_dir()
+                    .join("archive.json"),
+                logical_object_id: "archive".to_string(),
+            }]
+        );
+        let model = eh_download_queue::Entity::find_by_id(entry.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(model.status, STATUS_UPLOADED);
+    }
+
+    #[tokio::test]
+    async fn upload_worker_uses_original_uploadable_order_for_image_contexts() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        setup_chat(&repo, -100, true).await;
+        let tg_server = MockServer::start().await;
+        mock_telegraph_create_page(&tg_server).await;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let zip_path = temp_dir.path().join("mixed.zip");
+        create_test_zip_with_names(
+            &zip_path,
+            &[
+                "notes.txt",
+                "directory/",
+                "first.jpg",
+                "metadata.json",
+                "second.png",
+            ],
+        );
+        let artifacts = ArchiveArtifacts::new(&zip_path);
+        std::fs::create_dir_all(artifacts.uploads_dir()).unwrap();
+        std::fs::write(
+            artifacts.uploads_dir().join("archive.json"),
+            b"upload state",
+        )
+        .unwrap();
+        let zip_path_str = zip_path.to_string_lossy().to_string();
+        let entry = insert_queue_entry(
+            &repo,
+            -100,
+            704,
+            "tok",
+            "Title",
+            true,
+            STATUS_DOWNLOADED,
+            Some(&zip_path_str),
+            None,
+        )
+        .await;
+        let uploader = Arc::new(ZipFirstMockUploader {
+            zip_fallback: true,
+            fail_image_call: Some(1),
+            ..Default::default()
+        });
+        let abort_uploader = Arc::new(TerminalCleanupMockUploader::default());
+        let worker = EhUploadWorker::new_with_abort_uploader(
+            Arc::clone(&repo),
+            make_notifier(&tg_server),
+            make_telegraph_client(&tg_server),
+            uploader.clone(),
+            Some(abort_uploader),
+            None,
+            Arc::new(make_config()),
+        );
+
+        worker.tick().await.unwrap();
+        let retried = eh_download_queue::Entity::find_by_id(entry.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(retried.status, STATUS_DOWNLOADED);
+        assert!(
+            artifacts.uploads_dir().exists(),
+            "retryable upload failure should retain upload state"
+        );
+        let mut retry_active: eh_download_queue::ActiveModel = retried.into();
+        retry_active.next_retry_at = Set(None);
+        retry_active.update(repo.db()).await.unwrap();
+        worker.tick().await.unwrap();
+
+        let image_0 = SeenResumeContext {
+            manifest_path: artifacts.uploads_dir().join("image-0.json"),
+            logical_object_id: "image-0".to_string(),
+        };
+        let image_1 = SeenResumeContext {
+            manifest_path: artifacts.uploads_dir().join("image-1.json"),
+            logical_object_id: "image-1".to_string(),
+        };
+        assert_eq!(
+            *uploader.seen_image_resume_contexts.lock().unwrap(),
+            vec![image_0.clone(), image_1.clone(), image_0, image_1]
+        );
+        let model = eh_download_queue::Entity::find_by_id(entry.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(model.status, STATUS_UPLOADED);
+    }
+
+    #[tokio::test]
+    async fn successful_telegraph_upload_removes_upload_state_only() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        setup_chat(&repo, -100, true).await;
+        let tg_server = MockServer::start().await;
+        mock_telegraph_upload(&tg_server, 2).await;
+        mock_telegraph_create_page(&tg_server).await;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let zip_path = temp_dir.path().join("archive.zip");
+        create_test_zip(&zip_path, 2);
+        let artifacts = ArchiveArtifacts::new(&zip_path);
+        std::fs::create_dir_all(artifacts.uploads_dir()).unwrap();
+        std::fs::write(
+            artifacts.uploads_dir().join("archive.json"),
+            b"upload state",
+        )
+        .unwrap();
+        let zip_path_str = zip_path.to_string_lossy().to_string();
+        let entry = insert_queue_entry(
+            &repo,
+            -100,
+            705,
+            "tok",
+            "Title",
+            true,
+            STATUS_DOWNLOADED,
+            Some(&zip_path_str),
+            None,
+        )
+        .await;
+        let abort_uploader = Arc::new(TerminalCleanupMockUploader::default());
+        let worker = EhUploadWorker::new_with_abort_uploader(
+            Arc::clone(&repo),
+            make_notifier(&tg_server),
+            make_telegraph_client(&tg_server),
+            make_image_uploader(&tg_server),
+            Some(abort_uploader),
+            None,
+            Arc::new(make_config()),
+        );
+
+        worker.tick().await.unwrap();
+
+        let model = eh_download_queue::Entity::find_by_id(entry.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(model.status, STATUS_UPLOADED);
+        assert!(!artifacts.uploads_dir().exists());
+        assert!(artifacts.final_zip().exists());
     }
 
     #[tokio::test]
@@ -4607,7 +5195,7 @@ mod integration_tests {
     // === Publish Worker Tests ===
 
     #[tokio::test]
-    async fn test_publish_worker_no_telegraph() {
+    async fn test_publish_success_removes_whole_archive_family() {
         let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
         let tg_server = MockServer::start().await;
 
@@ -4616,6 +5204,7 @@ mod integration_tests {
         let temp = tempfile::tempdir().unwrap();
         let zip_path = temp.path().join("gallery.zip");
         create_test_zip(&zip_path, 2);
+        let artifacts = seed_archive_artifact_family(&zip_path);
         let zip_path_str = zip_path.to_string_lossy().to_string();
 
         let entry = insert_queue_entry(
@@ -4634,11 +5223,13 @@ mod integration_tests {
         mock_tg_send_document(&tg_server).await;
 
         let eh_server = MockServer::start().await;
-        let worker = EhPublishWorker::new(
+        let abort_uploader = Arc::new(TerminalCleanupMockUploader::default());
+        let worker = EhPublishWorker::new_with_abort_uploader(
             Arc::clone(&repo),
             make_notifier(&tg_server),
             make_eh_client(&eh_server),
             None,
+            Some(abort_uploader.clone()),
             Arc::new(make_config()),
         );
         worker.tick().await.unwrap();
@@ -4649,8 +5240,149 @@ mod integration_tests {
             .unwrap()
             .unwrap();
         assert_eq!(updated.status, "done");
-        // ZIP should be deleted
-        assert!(!zip_path.exists(), "ZIP should be deleted after publish");
+        assert!(!artifacts.final_zip().exists());
+        assert!(!artifacts.assembly_scratch().exists());
+        assert!(!artifacts.parts_dir().exists());
+        assert!(!artifacts.uploads_dir().exists());
+    }
+
+    #[tokio::test]
+    async fn test_publish_archive_only_abort_gate_retries_cleanup_without_resending() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        let tg_server = MockServer::start().await;
+        setup_chat(&repo, -100, true).await;
+        let temp = tempfile::tempdir().unwrap();
+        let zip_path = temp.path().join("abort-gated-archive-only.zip");
+        create_test_zip(&zip_path, 2);
+        let artifacts = seed_archive_artifact_family(&zip_path);
+        let entry = insert_queue_entry(
+            &repo,
+            -100,
+            123457,
+            "abort-gated",
+            "Archive Only",
+            true,
+            STATUS_DOWNLOADED,
+            Some(zip_path.to_str().unwrap()),
+            None,
+        )
+        .await;
+
+        repo.disable_eh_telegraph_for_unuploaded_entries()
+            .await
+            .unwrap();
+        let downgraded = eh_download_queue::Entity::find_by_id(entry.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(downgraded.status, STATUS_DOWNLOADED);
+        assert!(!downgraded.telegraph);
+
+        mock_tg_send_document(&tg_server).await;
+        let abort_uploader = Arc::new(SwitchableAbortUploader::default());
+        abort_uploader.set_fail_abort(true);
+        let eh_server = MockServer::start().await;
+        let mut config = make_config();
+        config.max_retry_count = 0;
+        let worker = EhPublishWorker::new_with_abort_uploader(
+            Arc::clone(&repo),
+            make_notifier(&tg_server),
+            make_eh_client(&eh_server),
+            None,
+            Some(abort_uploader.clone()),
+            Arc::new(config),
+        );
+
+        worker
+            .tick()
+            .await
+            .expect_err("Abort failure must retain the archive-only family");
+        let retry = eh_download_queue::Entity::find_by_id(entry.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(retry.status, STATUS_DOWNLOADED);
+        assert_eq!(retry.retry_count, 0);
+        assert!(retry.archive_sent_at.is_some());
+        assert!(artifacts.final_zip().exists());
+        assert!(artifacts.assembly_scratch().exists());
+        assert!(artifacts.parts_dir().exists());
+        assert!(artifacts.uploads_dir().join("archive.json").exists());
+
+        let mut retry_active: eh_download_queue::ActiveModel = retry.into();
+        retry_active.next_retry_at = Set(None);
+        retry_active.update(repo.db()).await.unwrap();
+        abort_uploader.set_fail_abort(false);
+
+        worker.tick().await.unwrap();
+        let done = eh_download_queue::Entity::find_by_id(entry.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(done.status, STATUS_DONE);
+        assert!(!artifacts.final_zip().exists());
+        assert!(!artifacts.uploads_dir().exists());
+        let document_sends = tg_server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| request.url.path().ends_with("/SendDocument"))
+            .count();
+        assert_eq!(
+            document_sends, 1,
+            "cleanup retry must not resend the archive"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_publish_archive_only_without_abort_uploader_preserves_family() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        let tg_server = MockServer::start().await;
+        setup_chat(&repo, -100, true).await;
+        let temp = tempfile::tempdir().unwrap();
+        let zip_path = temp.path().join("no-abort-uploader.zip");
+        create_test_zip(&zip_path, 2);
+        let artifacts = seed_archive_artifact_family(&zip_path);
+        let entry = insert_queue_entry(
+            &repo,
+            -100,
+            123458,
+            "no-abort",
+            "Archive Only",
+            false,
+            STATUS_DOWNLOADED,
+            Some(zip_path.to_str().unwrap()),
+            None,
+        )
+        .await;
+
+        mock_tg_send_document(&tg_server).await;
+        let worker = EhPublishWorker::new_with_abort_uploader(
+            Arc::clone(&repo),
+            make_notifier(&tg_server),
+            make_eh_client(&MockServer::start().await),
+            None,
+            None,
+            Arc::new(make_config()),
+        );
+
+        worker
+            .tick()
+            .await
+            .expect_err("archive-only publish with upload state needs an Abort uploader");
+        let retry = eh_download_queue::Entity::find_by_id(entry.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(retry.status, STATUS_DONE);
+        assert!(retry.archive_sent_at.is_some());
+        assert!(artifacts.final_zip().exists());
+        assert!(artifacts.uploads_dir().exists());
     }
 
     #[tokio::test]
@@ -4869,6 +5601,13 @@ mod integration_tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let zip_path = temp_dir.path().join("509.zip");
         create_test_zip(&zip_path, 2);
+        let artifacts = ArchiveArtifacts::new(&zip_path);
+        std::fs::create_dir_all(artifacts.uploads_dir()).unwrap();
+        std::fs::write(
+            artifacts.uploads_dir().join("archive.json"),
+            b"upload state",
+        )
+        .unwrap();
         let entry = insert_subscription_queue_entry(
             &repo,
             -100,
@@ -4888,11 +5627,13 @@ mod integration_tests {
             .await
             .unwrap();
 
-        let worker = EhPublishWorker::new(
+        let abort_uploader = Arc::new(TerminalCleanupMockUploader::default());
+        let worker = EhPublishWorker::new_with_abort_uploader(
             Arc::clone(&repo),
             notifier,
             make_eh_client(&MockServer::start().await),
             None,
+            Some(abort_uploader),
             config,
         );
         worker.process(&claimed).await.unwrap();
@@ -4905,10 +5646,74 @@ mod integration_tests {
         assert_eq!(model.status, STATUS_CANCELED);
         assert!(model.archive_sent_at.is_none());
         assert!(zip_path.exists(), "canceled publish should not clean ZIP");
+        assert!(
+            !artifacts.uploads_dir().exists(),
+            "canceled publish should remove upload state"
+        );
     }
 
     #[tokio::test]
-    async fn test_publish_no_surface_fails_not_done() {
+    async fn test_publish_cancellation_preserves_upload_state_when_abort_fails() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        setup_chat(&repo, -100, true).await;
+        let tg_server = MockServer::start().await;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let zip_path = temp_dir.path().join("publish-canceled-abort-fails.zip");
+        create_test_zip(&zip_path, 2);
+        let artifacts = ArchiveArtifacts::new(&zip_path);
+        std::fs::create_dir_all(artifacts.uploads_dir()).unwrap();
+        std::fs::write(
+            artifacts.uploads_dir().join("archive.json"),
+            b"upload state",
+        )
+        .unwrap();
+        let entry = insert_subscription_queue_entry(
+            &repo,
+            -100,
+            "123",
+            510,
+            "tok",
+            "Title",
+            false,
+            STATUS_DOWNLOADED,
+            Some(zip_path.to_str().unwrap()),
+            None,
+        )
+        .await;
+        let claimed = repo.get_next_for_publish().await.unwrap().unwrap();
+        repo.cancel_eh_subscription_queue_entries(123)
+            .await
+            .unwrap();
+        let abort_uploader = Arc::new(TerminalCleanupMockUploader {
+            fail_abort: true,
+            ..Default::default()
+        });
+        let worker = EhPublishWorker::new_with_abort_uploader(
+            Arc::clone(&repo),
+            make_notifier(&tg_server),
+            make_eh_client(&MockServer::start().await),
+            None,
+            Some(abort_uploader.clone()),
+            Arc::new(make_config()),
+        );
+
+        worker
+            .process(&claimed)
+            .await
+            .expect_err("publish cancellation must return an Abort failure");
+        let model = eh_download_queue::Entity::find_by_id(entry.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(model.status, STATUS_CANCELED);
+        assert!(zip_path.exists());
+        assert!(artifacts.uploads_dir().exists());
+        assert_terminal_cleanup_precedes_local_removal(&abort_uploader, &artifacts);
+    }
+
+    #[tokio::test]
+    async fn test_publish_permanent_failure_removes_whole_archive_family() {
         let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
         setup_chat(&repo, -100, true).await;
         let tg_server = MockServer::start().await;
@@ -4917,16 +5722,19 @@ mod integration_tests {
         cfg.send_archive = false;
         cfg.max_retry_count = 0;
         let config = Arc::new(cfg);
-        let worker = EhPublishWorker::new(
+        let abort_uploader = Arc::new(TerminalCleanupMockUploader::default());
+        let worker = EhPublishWorker::new_with_abort_uploader(
             Arc::clone(&repo),
             notifier,
             make_eh_client(&MockServer::start().await),
             None,
+            Some(abort_uploader),
             config,
         );
         let temp_dir = tempfile::tempdir().unwrap();
         let zip_path = temp_dir.path().join("503.zip");
         create_test_zip(&zip_path, 2);
+        let artifacts = seed_archive_artifact_family(&zip_path);
         let entry = insert_queue_entry(
             &repo,
             -100,
@@ -4948,6 +5756,10 @@ mod integration_tests {
             .unwrap();
         assert_eq!(model.status, STATUS_FAILED);
         assert!(model.error.unwrap().contains("no EH publish surface"));
+        assert!(!artifacts.final_zip().exists());
+        assert!(!artifacts.assembly_scratch().exists());
+        assert!(!artifacts.parts_dir().exists());
+        assert!(!artifacts.uploads_dir().exists());
     }
 
     #[tokio::test]
@@ -4993,7 +5805,7 @@ mod integration_tests {
     }
 
     #[tokio::test]
-    async fn test_upload_permanent_failure_falls_back_to_archive() {
+    async fn test_upload_permanent_failure_fallback_removes_upload_state_but_keeps_zip() {
         let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
         setup_chat(&repo, -100, true).await;
         let tg_server = MockServer::start().await;
@@ -5005,6 +5817,7 @@ mod integration_tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let zip_path = temp_dir.path().join("505.zip");
         create_test_zip(&zip_path, 2);
+        let artifacts = seed_archive_artifact_family(&zip_path);
         let entry = insert_queue_entry(
             &repo,
             -100,
@@ -5017,12 +5830,14 @@ mod integration_tests {
             None,
         )
         .await;
+        let uploader = Arc::new(TerminalCleanupMockUploader::default());
 
-        let worker = EhUploadWorker::new(
+        let worker = EhUploadWorker::new_with_abort_uploader(
             Arc::clone(&repo),
             notifier,
             make_telegraph_client(&tg_server),
-            make_image_uploader(&tg_server),
+            uploader.clone(),
+            Some(uploader.clone()),
             None,
             config,
         );
@@ -5040,6 +5855,319 @@ mod integration_tests {
             zip_path.exists(),
             "ZIP file should be preserved after archive fallback"
         );
+        assert!(
+            !artifacts.uploads_dir().exists(),
+            "archive fallback should discard upload resume state"
+        );
+        assert!(
+            artifacts.assembly_scratch().exists(),
+            "archive fallback should not change download scratch semantics"
+        );
+        assert!(
+            artifacts.parts_dir().exists(),
+            "archive fallback should not change download parts semantics"
+        );
+        assert_terminal_cleanup_precedes_local_removal(&uploader, &artifacts);
+    }
+
+    #[tokio::test]
+    async fn test_upload_permanent_failure_fallback_preserves_family_when_abort_fails() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        setup_chat(&repo, -100, true).await;
+        let tg_server = MockServer::start().await;
+        let notifier = make_notifier(&tg_server);
+        let mut cfg = make_config();
+        cfg.max_retry_count = 0;
+        cfg.send_archive = true;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let zip_path = temp_dir.path().join("505-abort-fails.zip");
+        create_test_zip(&zip_path, 2);
+        let artifacts = seed_archive_artifact_family(&zip_path);
+        let entry = insert_queue_entry(
+            &repo,
+            -100,
+            505,
+            "tok",
+            "Title",
+            true,
+            STATUS_DOWNLOADED,
+            Some(zip_path.to_str().unwrap()),
+            None,
+        )
+        .await;
+        let uploader = Arc::new(TerminalCleanupMockUploader {
+            fail_abort: true,
+            ..Default::default()
+        });
+        let worker = EhUploadWorker::new_with_abort_uploader(
+            Arc::clone(&repo),
+            notifier,
+            make_telegraph_client(&tg_server),
+            uploader.clone(),
+            Some(uploader.clone()),
+            None,
+            Arc::new(cfg),
+        );
+
+        let error = worker.tick().await.expect_err(
+            "Abort failure must be returned instead of falling back to archive delivery",
+        );
+        assert!(error
+            .to_string()
+            .contains("Failed to abort incomplete EH multipart uploads for gid=505"));
+        let model = eh_download_queue::Entity::find_by_id(entry.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(model.status, STATUS_DOWNLOADED);
+        assert!(
+            model.telegraph,
+            "Abort failure must not enter archive fallback"
+        );
+        assert_eq!(model.retry_count, 0, "defer must not spend a retry");
+        assert!(model.next_retry_at.is_some(), "defer must schedule a retry");
+        assert!(zip_path.exists(), "Abort failure must retain the final ZIP");
+        assert!(artifacts.uploads_dir().exists());
+        assert!(artifacts.uploads_dir().join("archive.json").exists());
+        assert_terminal_cleanup_precedes_local_removal(&uploader, &artifacts);
+    }
+
+    #[tokio::test]
+    async fn test_upload_permanent_failure_without_fallback_removes_whole_archive_family() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        setup_chat(&repo, -100, true).await;
+        let tg_server = MockServer::start().await;
+        let notifier = make_notifier(&tg_server);
+        let mut cfg = make_config();
+        cfg.max_retry_count = 0;
+        cfg.send_archive = false;
+        let config = Arc::new(cfg);
+        let temp_dir = tempfile::tempdir().unwrap();
+        let zip_path = temp_dir.path().join("506.zip");
+        create_test_zip(&zip_path, 2);
+        let artifacts = seed_archive_artifact_family(&zip_path);
+        let entry = insert_queue_entry(
+            &repo,
+            -100,
+            506,
+            "tok",
+            "Title",
+            true,
+            STATUS_DOWNLOADED,
+            Some(zip_path.to_str().unwrap()),
+            None,
+        )
+        .await;
+        let uploader = Arc::new(TerminalCleanupMockUploader::default());
+
+        let worker = EhUploadWorker::new_with_abort_uploader(
+            Arc::clone(&repo),
+            notifier,
+            make_telegraph_client(&tg_server),
+            uploader.clone(),
+            Some(uploader.clone()),
+            None,
+            config,
+        );
+        worker.tick().await.unwrap();
+
+        let model = eh_download_queue::Entity::find_by_id(entry.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(model.status, STATUS_FAILED);
+        assert!(!artifacts.final_zip().exists());
+        assert!(!artifacts.assembly_scratch().exists());
+        assert!(!artifacts.parts_dir().exists());
+        assert!(!artifacts.uploads_dir().exists());
+        assert_terminal_cleanup_precedes_local_removal(&uploader, &artifacts);
+    }
+
+    #[tokio::test]
+    async fn test_upload_permanent_failure_without_fallback_preserves_family_when_abort_fails() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        setup_chat(&repo, -100, true).await;
+        let tg_server = MockServer::start().await;
+        let notifier = make_notifier(&tg_server);
+        let mut cfg = make_config();
+        cfg.max_retry_count = 0;
+        cfg.send_archive = false;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let zip_path = temp_dir.path().join("506-abort-fails.zip");
+        create_test_zip(&zip_path, 2);
+        let artifacts = seed_archive_artifact_family(&zip_path);
+        let entry = insert_queue_entry(
+            &repo,
+            -100,
+            506,
+            "tok",
+            "Title",
+            true,
+            STATUS_DOWNLOADED,
+            Some(zip_path.to_str().unwrap()),
+            None,
+        )
+        .await;
+        let uploader = Arc::new(TerminalCleanupMockUploader {
+            fail_abort: true,
+            ..Default::default()
+        });
+        let worker = EhUploadWorker::new_with_abort_uploader(
+            Arc::clone(&repo),
+            notifier,
+            make_telegraph_client(&tg_server),
+            uploader.clone(),
+            Some(uploader.clone()),
+            None,
+            Arc::new(cfg),
+        );
+
+        worker
+            .tick()
+            .await
+            .expect_err("Abort failure must be returned after marking the upload failed");
+        let model = eh_download_queue::Entity::find_by_id(entry.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(model.status, STATUS_FAILED);
+        assert!(artifacts.final_zip().exists());
+        assert!(artifacts.assembly_scratch().exists());
+        assert!(artifacts.parts_dir().exists());
+        assert!(artifacts.uploads_dir().exists());
+        assert!(artifacts.uploads_dir().join("archive.json").exists());
+        assert_terminal_cleanup_precedes_local_removal(&uploader, &artifacts);
+    }
+
+    #[tokio::test]
+    async fn test_upload_canceled_after_claim_removes_upload_state_without_sending() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        setup_chat(&repo, -100, true).await;
+        let tg_server = MockServer::start().await;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let zip_path = temp_dir.path().join("507-canceled.zip");
+        create_test_zip(&zip_path, 2);
+        let artifacts = ArchiveArtifacts::new(&zip_path);
+        std::fs::create_dir_all(artifacts.uploads_dir()).unwrap();
+        std::fs::write(
+            artifacts.uploads_dir().join("archive.json"),
+            b"upload state",
+        )
+        .unwrap();
+        let entry = insert_subscription_queue_entry(
+            &repo,
+            -100,
+            "123",
+            507,
+            "tok",
+            "Title",
+            true,
+            STATUS_DOWNLOADED,
+            Some(zip_path.to_str().unwrap()),
+            None,
+        )
+        .await;
+        let claimed = repo.get_next_for_upload().await.unwrap().unwrap();
+        assert_eq!(claimed.id, entry.id);
+        repo.cancel_eh_subscription_queue_entries(123)
+            .await
+            .unwrap();
+        let uploader = Arc::new(TerminalCleanupMockUploader::default());
+
+        let worker = EhUploadWorker::new_with_abort_uploader(
+            Arc::clone(&repo),
+            make_notifier(&tg_server),
+            make_telegraph_client(&tg_server),
+            uploader.clone(),
+            Some(uploader.clone()),
+            None,
+            Arc::new(make_config()),
+        );
+        worker.process(&claimed).await.unwrap();
+
+        let model = eh_download_queue::Entity::find_by_id(entry.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(model.status, STATUS_CANCELED);
+        assert!(zip_path.exists(), "canceled upload should not clean ZIP");
+        assert!(!artifacts.uploads_dir().exists());
+        assert!(
+            tg_server.received_requests().await.unwrap().is_empty(),
+            "canceled upload must not contact upload or Telegraph services"
+        );
+        assert_terminal_cleanup_precedes_local_removal(&uploader, &artifacts);
+    }
+
+    #[tokio::test]
+    async fn test_upload_canceled_after_claim_preserves_upload_state_when_abort_fails() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        setup_chat(&repo, -100, true).await;
+        let tg_server = MockServer::start().await;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let zip_path = temp_dir.path().join("507-canceled-abort-fails.zip");
+        create_test_zip(&zip_path, 2);
+        let artifacts = ArchiveArtifacts::new(&zip_path);
+        std::fs::create_dir_all(artifacts.uploads_dir()).unwrap();
+        let manifest = artifacts.uploads_dir().join("archive.json");
+        std::fs::write(&manifest, b"upload state").unwrap();
+        let entry = insert_subscription_queue_entry(
+            &repo,
+            -100,
+            "123",
+            507,
+            "tok",
+            "Title",
+            true,
+            STATUS_DOWNLOADED,
+            Some(zip_path.to_str().unwrap()),
+            None,
+        )
+        .await;
+        let claimed = repo.get_next_for_upload().await.unwrap().unwrap();
+        assert_eq!(claimed.id, entry.id);
+        repo.cancel_eh_subscription_queue_entries(123)
+            .await
+            .unwrap();
+        let uploader = Arc::new(TerminalCleanupMockUploader {
+            fail_abort: true,
+            ..Default::default()
+        });
+        let worker = EhUploadWorker::new_with_abort_uploader(
+            Arc::clone(&repo),
+            make_notifier(&tg_server),
+            make_telegraph_client(&tg_server),
+            uploader.clone(),
+            Some(uploader.clone()),
+            None,
+            Arc::new(make_config()),
+        );
+
+        worker
+            .process(&claimed)
+            .await
+            .expect_err("cancellation must return an Abort failure");
+        let model = eh_download_queue::Entity::find_by_id(entry.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(model.status, STATUS_CANCELED);
+        assert!(zip_path.exists(), "canceled upload must not clean ZIP");
+        assert!(artifacts.uploads_dir().exists());
+        assert!(
+            manifest.exists(),
+            "failed Abort must retain upload manifest"
+        );
+        assert!(
+            tg_server.received_requests().await.unwrap().is_empty(),
+            "canceled upload must not contact upload or Telegraph services"
+        );
+        assert_terminal_cleanup_precedes_local_removal(&uploader, &artifacts);
     }
 
     #[tokio::test]
@@ -5094,6 +6222,13 @@ mod integration_tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let zip_path = temp_dir.path().join("507.zip");
         create_test_zip(&zip_path, 2);
+        let artifacts = ArchiveArtifacts::new(&zip_path);
+        std::fs::create_dir_all(artifacts.uploads_dir()).unwrap();
+        std::fs::write(
+            artifacts.uploads_dir().join("archive.json"),
+            b"upload state",
+        )
+        .unwrap();
         let entry = insert_queue_entry(
             &repo,
             -100,
@@ -5124,6 +6259,11 @@ mod integration_tests {
         assert_eq!(model.status, STATUS_DOWNLOADED);
         assert_eq!(model.retry_count, 0);
         assert!(model.next_retry_at.is_some());
+        assert!(zip_path.exists());
+        assert!(
+            artifacts.uploads_dir().exists(),
+            "chat deferral should retain upload state"
+        );
     }
 
     #[tokio::test]
@@ -5228,6 +6368,7 @@ mod integration_tests {
             make_eh_client(&eh_server),
             Arc::new(config),
             temp.path().to_path_buf(),
+            None,
         );
 
         worker.tick().await.unwrap();
@@ -5297,6 +6438,7 @@ mod integration_tests {
             make_eh_client(&eh_server),
             Arc::new(config),
             temp.path().to_path_buf(),
+            None,
         );
 
         worker.tick().await.unwrap();
@@ -5353,6 +6495,7 @@ mod integration_tests {
             make_eh_client(&eh_server),
             Arc::new(config),
             temp.path().to_path_buf(),
+            None,
         );
 
         worker.tick().await.unwrap();
@@ -5405,6 +6548,7 @@ mod integration_tests {
             make_eh_client(&eh_server),
             Arc::new(config),
             temp.path().to_path_buf(),
+            None,
         );
 
         worker.tick().await.unwrap();
@@ -5474,6 +6618,7 @@ mod integration_tests {
             make_eh_client(&eh_server),
             Arc::new(config),
             temp.path().to_path_buf(),
+            None,
         );
 
         worker.tick().await.unwrap();
@@ -5548,6 +6693,7 @@ mod integration_tests {
             make_eh_client(&eh_server),
             Arc::new(config),
             temp.path().to_path_buf(),
+            None,
         );
 
         worker.tick().await.unwrap();
@@ -6503,6 +7649,7 @@ mod integration_tests {
             Arc::clone(&client),
             Arc::clone(&config),
             temp.path().to_path_buf(),
+            None,
         );
         let background_worker = EhBackgroundDownloadWorker::new(
             Arc::clone(&repo),
@@ -6622,6 +7769,7 @@ mod integration_tests {
             make_eh_client(&eh_server),
             Arc::new(config),
             temp.path().to_path_buf(),
+            None,
         );
 
         worker.tick().await.unwrap();
@@ -6679,6 +7827,7 @@ mod integration_tests {
             make_eh_client(&eh_server),
             Arc::new(config),
             temp.path().to_path_buf(),
+            None,
         );
 
         worker.tick().await.unwrap();

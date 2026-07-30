@@ -15,6 +15,19 @@ use tracing::{error, info, warn};
 use tracing_subscriber::fmt::time::ChronoLocal;
 use tracing_subscriber::{prelude::*, EnvFilter};
 
+fn should_build_eh_image_uploader(
+    eh_enabled: bool,
+    telegraph_enabled: bool,
+    provider: eh_client::ImageUploadProvider,
+) -> bool {
+    eh_enabled
+        && (telegraph_enabled
+            || matches!(
+                provider,
+                eh_client::ImageUploadProvider::S3 | eh_client::ImageUploadProvider::IpfS3
+            ))
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Load configuration
@@ -317,6 +330,24 @@ async fn main() -> Result<()> {
         }
     }
 
+    let eh_image_uploader = if should_build_eh_image_uploader(
+        eh_client.is_some(),
+        telegraph_client.is_some(),
+        config.image_upload.provider,
+    ) {
+        Some(config.image_upload.build_uploader().await?)
+    } else {
+        None
+    };
+    let eh_startup_abort_uploader = if matches!(
+        config.image_upload.provider,
+        eh_client::ImageUploadProvider::S3 | eh_client::ImageUploadProvider::IpfS3
+    ) {
+        eh_image_uploader.clone()
+    } else {
+        None
+    };
+
     let eh_engine_handle = if let Some(ref eh_client) = eh_client {
         let eh_engine = scheduler::EhEngine::new(
             repo.clone(),
@@ -341,6 +372,7 @@ async fn main() -> Result<()> {
             std::sync::Arc::clone(eh_client),
             std::sync::Arc::new(config.ehentai.clone()),
             eh_cache_dir.clone(),
+            eh_startup_abort_uploader.clone(),
         );
         info!("✅ E-Hentai download worker initialized");
         Some(tokio::spawn(async move { worker.run().await }))
@@ -367,13 +399,15 @@ async fn main() -> Result<()> {
     };
 
     let eh_upload_worker_handle = if eh_client.is_some() {
-        if let Some(ref telegraph) = telegraph_client {
-            let image_uploader = config.image_upload.build_uploader().await?;
-            let worker = scheduler::EhUploadWorker::new(
+        if let (Some(telegraph), Some(image_uploader)) =
+            (telegraph_client.as_ref(), eh_image_uploader.as_ref())
+        {
+            let worker = scheduler::EhUploadWorker::new_with_abort_uploader(
                 repo.clone(),
                 notifier.clone(),
                 std::sync::Arc::clone(telegraph),
-                image_uploader,
+                std::sync::Arc::clone(image_uploader),
+                eh_startup_abort_uploader.clone(),
                 eh_telegraph_rewrite_config.clone(),
                 std::sync::Arc::new(config.ehentai.clone()),
             );
@@ -388,7 +422,7 @@ async fn main() -> Result<()> {
     };
 
     let eh_publish_worker_handle = if let Some(ref eh_client) = eh_client {
-        let worker = scheduler::EhPublishWorker::new(
+        let worker = scheduler::EhPublishWorker::new_with_abort_uploader(
             repo.clone(),
             notifier.clone(),
             std::sync::Arc::clone(eh_client),
@@ -399,6 +433,7 @@ async fn main() -> Result<()> {
             } else {
                 None
             },
+            eh_startup_abort_uploader.clone(),
             std::sync::Arc::new(config.ehentai.clone()),
         );
         info!("✅ E-Hentai publish worker initialized");
@@ -504,4 +539,48 @@ async fn main() -> Result<()> {
 
     info!("✅ Shutdown complete");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use eh_client::ImageUploadProvider;
+
+    use super::should_build_eh_image_uploader;
+
+    #[test]
+    fn eh_image_uploader_policy_covers_telegraph_and_abort_matrix() {
+        let providers = [
+            ImageUploadProvider::Pixi,
+            ImageUploadProvider::S3,
+            ImageUploadProvider::Catbox,
+            ImageUploadProvider::IpfS3,
+        ];
+
+        for provider in providers {
+            assert!(!should_build_eh_image_uploader(false, false, provider));
+            assert!(!should_build_eh_image_uploader(false, true, provider));
+            assert!(should_build_eh_image_uploader(true, true, provider));
+        }
+
+        assert!(!should_build_eh_image_uploader(
+            true,
+            false,
+            ImageUploadProvider::Pixi,
+        ));
+        assert!(should_build_eh_image_uploader(
+            true,
+            false,
+            ImageUploadProvider::S3,
+        ));
+        assert!(!should_build_eh_image_uploader(
+            true,
+            false,
+            ImageUploadProvider::Catbox,
+        ));
+        assert!(should_build_eh_image_uploader(
+            true,
+            false,
+            ImageUploadProvider::IpfS3,
+        ));
+    }
 }

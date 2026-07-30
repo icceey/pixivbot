@@ -5,6 +5,9 @@ pub mod models;
 pub mod parser;
 pub mod telegraph;
 
+#[allow(dead_code)]
+mod s3_multipart;
+
 pub use archive_download::{ArchiveArtifacts, ArchiveDownloadOptions};
 pub use client::{EhClient, EhClientBuilder};
 pub use error::{Error, Result};
@@ -14,5 +17,5 @@ pub use telegraph::{
     ImageUploadInput, ImageUploadProvider, ImageUploader, IpfS3PreviewRewriteConfig, IpfS3Uploader,
     IpfS3UploaderConfig, PixiUploader, S3Uploader, S3UploaderConfig, TelegraphClient,
     TelegraphGalleryPageResult, TelegraphImageUrlPair, TelegraphRewriteData, TelegraphRewritePage,
-    ZipArchiveUploadInput,
+    UploadResumeContext, ZipArchiveUploadInput,
 };

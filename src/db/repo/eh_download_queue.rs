@@ -2,7 +2,7 @@ use super::Repo;
 use crate::db::entities::eh_download_queue;
 use anyhow::{Context, Result};
 use chrono::{Local, Timelike};
-use eh_client::ArchiveArtifacts;
+use eh_client::{ArchiveArtifacts, ImageUploader};
 use sea_orm::prelude::DateTime;
 use sea_orm::sea_query::{Expr, SimpleExpr};
 use sea_orm::{
@@ -2683,6 +2683,84 @@ impl Repo {
         Ok(())
     }
 
+    /// Recover an upload-stage Abort failure without spending a retry.
+    ///
+    /// This intentionally accepts only `STATUS_UPLOADING`: publish-stage rows
+    /// have different completion and retry semantics and must not be released
+    /// through the upload fallback path.
+    pub async fn defer_eh_upload_after_abort_failure(
+        &self,
+        id: i32,
+        delay_secs: i64,
+    ) -> Result<()> {
+        let result = eh_download_queue::Entity::update_many()
+            .col_expr(
+                eh_download_queue::Column::Status,
+                Expr::value(STATUS_DOWNLOADED),
+            )
+            .col_expr(
+                eh_download_queue::Column::NextRetryAt,
+                Expr::value(Local::now().naive_local() + chrono::Duration::seconds(delay_secs)),
+            )
+            .filter(eh_download_queue::Column::Id.eq(id))
+            .filter(eh_download_queue::Column::Status.eq(STATUS_UPLOADING))
+            .exec(&self.db)
+            .await
+            .context("Failed to defer EH upload after multipart Abort failure")?;
+
+        if result.rows_affected != 1 {
+            anyhow::bail!(
+                "Cannot defer EH upload {} after multipart Abort failure: expected status '{}'",
+                id,
+                STATUS_UPLOADING
+            );
+        }
+        Ok(())
+    }
+
+    /// Recover a publish-stage Abort-gate failure without spending a retry.
+    ///
+    /// Only a claimed publish row may use this path. The target is selected
+    /// from whether Telegraph upload succeeded, so sent markers remain intact
+    /// and the next publish claim only completes local cleanup.
+    pub async fn defer_eh_publish_after_abort_failure(
+        &self,
+        id: i32,
+        target_status: &str,
+        delay_secs: i64,
+    ) -> Result<()> {
+        if !matches!(target_status, STATUS_DOWNLOADED | STATUS_UPLOADED) {
+            anyhow::bail!(
+                "defer_eh_publish_after_abort_failure: invalid target status '{}' (expected downloaded or uploaded)",
+                target_status
+            );
+        }
+
+        let result = eh_download_queue::Entity::update_many()
+            .col_expr(
+                eh_download_queue::Column::Status,
+                Expr::value(target_status),
+            )
+            .col_expr(
+                eh_download_queue::Column::NextRetryAt,
+                Expr::value(Local::now().naive_local() + chrono::Duration::seconds(delay_secs)),
+            )
+            .filter(eh_download_queue::Column::Id.eq(id))
+            .filter(eh_download_queue::Column::Status.eq(STATUS_PUBLISHING))
+            .exec(&self.db)
+            .await
+            .context("Failed to defer EH publish after multipart Abort failure")?;
+
+        if result.rows_affected != 1 {
+            anyhow::bail!(
+                "Cannot defer EH publish {} after multipart Abort failure: expected status '{}'",
+                id,
+                STATUS_PUBLISHING
+            );
+        }
+        Ok(())
+    }
+
     /// Schedule a retry for an entry: set status back to target_status, increment retry_count,
     /// set next_retry_at to now + backoff. If retry_count exceeds max, set status=failed.
     /// Returns (model, is_permanent_failure).
@@ -3331,7 +3409,11 @@ impl Repo {
 
     /// Delete ZIP/partial ZIP files in the cache dir that have no corresponding
     /// active or retryable queue entry.
-    pub async fn cleanup_eh_cache_orphans(&self, cache_dir: &std::path::Path) -> Result<()> {
+    pub async fn cleanup_eh_cache_orphans(
+        &self,
+        cache_dir: &std::path::Path,
+        abort_uploader: Option<&dyn ImageUploader>,
+    ) -> Result<()> {
         if !cache_dir.exists() {
             return Ok(());
         }
@@ -3366,6 +3448,24 @@ impl Repo {
 
         for (final_zip, artifacts) in artifact_families {
             let result = if !active_final_identities.contains(&final_zip) {
+                if artifacts.uploads_dir().exists() {
+                    let Some(uploader) = abort_uploader else {
+                        warn!(
+                            "Preserving EH orphan upload state because no S3/ipfS3 abort uploader is configured"
+                        );
+                        continue;
+                    };
+                    if uploader
+                        .abort_upload_state(artifacts.uploads_dir())
+                        .await
+                        .is_err()
+                    {
+                        warn!(
+                            "Failed to abort EH orphan upload state; preserving local archive family"
+                        );
+                        continue;
+                    }
+                }
                 artifacts.remove_all().await
             } else if final_zip.exists() {
                 artifacts.remove_multipart_state().await
@@ -3402,6 +3502,37 @@ mod tests {
     use crate::db::repo::tests_helpers;
     use chrono::{Duration, NaiveDate, Utc};
     use sea_orm::{sea_query::Expr, ConnectionTrait, DbBackend, Statement};
+
+    #[derive(Default)]
+    struct RecordingAbortUploader {
+        aborts: std::sync::Mutex<Vec<(std::path::PathBuf, bool)>>,
+        fail_abort: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl ImageUploader for RecordingAbortUploader {
+        async fn upload_images(
+            &self,
+            _images: &[eh_client::ImageUploadInput<'_>],
+        ) -> eh_client::Result<Vec<String>> {
+            Err(eh_client::Error::Other(
+                "recording uploader upload_images must not be called".to_string(),
+            ))
+        }
+
+        async fn abort_upload_state(&self, uploads_dir: &std::path::Path) -> eh_client::Result<()> {
+            self.aborts
+                .lock()
+                .unwrap()
+                .push((uploads_dir.to_path_buf(), uploads_dir.exists()));
+            if self.fail_abort {
+                return Err(eh_client::Error::Other(
+                    "recording uploader abort failure".to_string(),
+                ));
+            }
+            Ok(())
+        }
+    }
 
     async fn set_download_claim_fields(
         repo: &Repo,
@@ -4103,6 +4234,137 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_defer_eh_upload_after_abort_failure_only_accepts_uploading() {
+        let repo = tests_helpers::setup_test_db().await.unwrap();
+        let uploading = repo
+            .enqueue_eh_download(-100, 56, "uploading", "Title", true, SOURCE_DIRECT)
+            .await
+            .unwrap();
+        Entity::update_many()
+            .col_expr(Column::Status, Expr::value(STATUS_UPLOADING))
+            .filter(Column::Id.eq(uploading.id))
+            .exec(repo.db())
+            .await
+            .unwrap();
+
+        repo.defer_eh_upload_after_abort_failure(uploading.id, 60)
+            .await
+            .expect("uploading row should be deferred after an Abort failure");
+        let uploading = Entity::find_by_id(uploading.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(uploading.status, STATUS_DOWNLOADED);
+        assert_eq!(uploading.retry_count, 0);
+        assert!(uploading.next_retry_at.is_some());
+
+        let publishing = repo
+            .enqueue_eh_download(-100, 57, "publishing", "Title", false, SOURCE_DIRECT)
+            .await
+            .unwrap();
+        Entity::update_many()
+            .col_expr(Column::Status, Expr::value(STATUS_PUBLISHING))
+            .filter(Column::Id.eq(publishing.id))
+            .exec(repo.db())
+            .await
+            .unwrap();
+
+        let error = repo
+            .defer_eh_upload_after_abort_failure(publishing.id, 60)
+            .await
+            .expect_err("publish rows must not use the upload-stage Abort recovery CAS");
+        assert!(error.to_string().contains("expected status 'uploading'"));
+        let publishing = Entity::find_by_id(publishing.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(publishing.status, STATUS_PUBLISHING);
+    }
+
+    #[tokio::test]
+    async fn test_defer_eh_publish_after_abort_failure_only_accepts_publishing_targets() {
+        let repo = tests_helpers::setup_test_db().await.unwrap();
+        let downloaded = repo
+            .enqueue_eh_download(-100, 58, "downloaded", "Title", false, SOURCE_DIRECT)
+            .await
+            .unwrap();
+        Entity::update_many()
+            .col_expr(Column::Status, Expr::value(STATUS_PUBLISHING))
+            .col_expr(Column::RetryCount, Expr::value(7))
+            .col_expr(Column::Error, Expr::value("existing publish error"))
+            .filter(Column::Id.eq(downloaded.id))
+            .exec(repo.db())
+            .await
+            .unwrap();
+        repo.mark_eh_archive_sent(downloaded.id).await.unwrap();
+
+        repo.defer_eh_publish_after_abort_failure(downloaded.id, STATUS_DOWNLOADED, 60)
+            .await
+            .expect("publishing row should defer to downloaded after an Abort failure");
+        let downloaded = Entity::find_by_id(downloaded.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(downloaded.status, STATUS_DOWNLOADED);
+        assert_eq!(downloaded.retry_count, 7);
+        assert_eq!(downloaded.error.as_deref(), Some("existing publish error"));
+        assert!(downloaded.archive_sent_at.is_some());
+        assert!(downloaded.next_retry_at.is_some());
+
+        let uploaded = repo
+            .enqueue_eh_download(-100, 59, "uploaded", "Title", true, SOURCE_DIRECT)
+            .await
+            .unwrap();
+        Entity::update_many()
+            .col_expr(Column::Status, Expr::value(STATUS_PUBLISHING))
+            .filter(Column::Id.eq(uploaded.id))
+            .exec(repo.db())
+            .await
+            .unwrap();
+        repo.defer_eh_publish_after_abort_failure(uploaded.id, STATUS_UPLOADED, 60)
+            .await
+            .expect("publishing row should defer to uploaded after an Abort failure");
+        let uploaded = Entity::find_by_id(uploaded.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(uploaded.status, STATUS_UPLOADED);
+        assert_eq!(uploaded.retry_count, 0);
+
+        let uploading = repo
+            .enqueue_eh_download(-100, 60, "uploading", "Title", false, SOURCE_DIRECT)
+            .await
+            .unwrap();
+        Entity::update_many()
+            .col_expr(Column::Status, Expr::value(STATUS_UPLOADING))
+            .filter(Column::Id.eq(uploading.id))
+            .exec(repo.db())
+            .await
+            .unwrap();
+        let error = repo
+            .defer_eh_publish_after_abort_failure(uploading.id, STATUS_DOWNLOADED, 60)
+            .await
+            .expect_err("uploading rows must not use the publish-stage Abort recovery CAS");
+        assert!(error.to_string().contains("expected status 'publishing'"));
+
+        let error = repo
+            .defer_eh_publish_after_abort_failure(uploading.id, STATUS_PENDING, 60)
+            .await
+            .expect_err("publish Abort recovery must reject invalid targets");
+        assert!(error.to_string().contains("invalid target status"));
+        let uploading = Entity::find_by_id(uploading.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(uploading.status, STATUS_UPLOADING);
+    }
+
+    #[tokio::test]
     async fn test_enqueue_merges_telegraph_and_direct_source() {
         let repo = tests_helpers::setup_test_db().await.unwrap();
         let first = repo
@@ -4151,7 +4413,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_cleanup_eh_cache_orphans_removes_partial_without_active_zip() {
+    async fn test_cleanup_eh_cache_orphans_aborts_orphan_upload_state_before_removal_and_preserves_active_state(
+    ) {
         let repo = tests_helpers::setup_test_db().await.unwrap();
         let temp = tempfile::tempdir().unwrap();
         let cache_dir = temp.path();
@@ -4159,20 +4422,28 @@ mod tests {
         let orphan_zip = cache_dir.join("orphan.zip");
         let orphan_part = cache_dir.join("orphan.zip.part");
         let orphan_parts = cache_dir.join("orphan.zip.parts");
+        let orphan_uploads = cache_dir.join("orphan.zip.uploads");
         let active_zip = cache_dir.join("active.zip");
         let active_part = cache_dir.join("active.zip.part");
         let active_parts = cache_dir.join("active.zip.parts");
+        let active_uploads = cache_dir.join("active.zip.uploads");
         let unrelated = cache_dir.join("notes").join("keep.txt");
         std::fs::write(&orphan_zip, b"zip").unwrap();
         std::fs::write(&orphan_part, b"partial").unwrap();
         std::fs::create_dir_all(orphan_parts.join("nested")).unwrap();
         std::fs::write(orphan_parts.join("manifest.json"), b"manifest").unwrap();
         std::fs::write(orphan_parts.join("nested").join("part-0001"), b"part").unwrap();
+        std::fs::create_dir_all(orphan_uploads.join("nested")).unwrap();
+        std::fs::write(orphan_uploads.join("archive.json"), b"archive").unwrap();
+        std::fs::write(orphan_uploads.join("nested").join("image-0.json"), b"image").unwrap();
         std::fs::write(&active_zip, b"zip").unwrap();
         std::fs::write(&active_part, b"partial").unwrap();
         std::fs::create_dir_all(active_parts.join("nested")).unwrap();
         std::fs::write(active_parts.join("manifest.json"), b"manifest").unwrap();
         std::fs::write(active_parts.join("nested").join("part-0001"), b"part").unwrap();
+        std::fs::create_dir_all(active_uploads.join("nested")).unwrap();
+        std::fs::write(active_uploads.join("archive.json"), b"archive").unwrap();
+        std::fs::write(active_uploads.join("nested").join("image-0.json"), b"image").unwrap();
         std::fs::create_dir_all(unrelated.parent().unwrap()).unwrap();
         std::fs::write(&unrelated, b"keep").unwrap();
 
@@ -4186,7 +4457,16 @@ mod tests {
             .await
             .unwrap();
 
-        repo.cleanup_eh_cache_orphans(cache_dir).await.unwrap();
+        let uploader = RecordingAbortUploader::default();
+        repo.cleanup_eh_cache_orphans(cache_dir, Some(&uploader))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            *uploader.aborts.lock().unwrap(),
+            vec![(orphan_uploads.clone(), true)],
+            "only the orphan upload state should be aborted before removal"
+        );
 
         assert!(!orphan_zip.exists(), "orphan final ZIP should be removed");
         assert!(
@@ -4197,6 +4477,10 @@ mod tests {
             !orphan_parts.exists(),
             "orphan multipart state should be removed recursively"
         );
+        assert!(
+            !orphan_uploads.exists(),
+            "orphan upload state should be removed recursively"
+        );
         assert!(active_zip.exists(), "active final ZIP should be kept");
         assert!(
             !active_part.exists(),
@@ -4205,6 +4489,11 @@ mod tests {
         assert!(
             !active_parts.exists(),
             "active final ZIP should discard stale multipart state"
+        );
+        assert!(
+            active_uploads.join("archive.json").exists()
+                && active_uploads.join("nested").join("image-0.json").exists(),
+            "active final ZIP should keep resumable upload state"
         );
         assert!(
             unrelated.exists(),
@@ -4227,14 +4516,25 @@ mod tests {
 
         let part = cache_dir.join("88_tok.zip.part");
         let parts_dir = cache_dir.join("88_tok.zip.parts");
+        let uploads_dir = cache_dir.join("88_tok.zip.uploads");
         std::fs::write(&part, b"partial").unwrap();
         std::fs::create_dir_all(parts_dir.join("nested")).unwrap();
         std::fs::write(parts_dir.join("manifest.json"), b"manifest").unwrap();
         std::fs::write(parts_dir.join("nested").join("part-0001"), b"part").unwrap();
+        std::fs::create_dir_all(uploads_dir.join("nested")).unwrap();
+        std::fs::write(uploads_dir.join("archive.json"), b"archive").unwrap();
+        std::fs::write(uploads_dir.join("nested").join("image-0.json"), b"image").unwrap();
 
         let reset = repo.reset_stale_eh_downloads().await.unwrap();
         assert_eq!(reset, 1);
-        repo.cleanup_eh_cache_orphans(cache_dir).await.unwrap();
+        let uploader = RecordingAbortUploader::default();
+        repo.cleanup_eh_cache_orphans(cache_dir, Some(&uploader))
+            .await
+            .unwrap();
+        assert!(
+            uploader.aborts.lock().unwrap().is_empty(),
+            "pending resume state must not be aborted"
+        );
 
         assert!(
             part.exists(),
@@ -4244,6 +4544,10 @@ mod tests {
             parts_dir.exists(),
             "pending retry multipart state should be kept for resumable download"
         );
+        assert!(
+            uploads_dir.exists(),
+            "pending retry upload state should be kept for resumable upload"
+        );
 
         Entity::update_many()
             .col_expr(Column::Status, Expr::value(STATUS_CANCELED))
@@ -4252,7 +4556,14 @@ mod tests {
             .await
             .unwrap();
 
-        repo.cleanup_eh_cache_orphans(cache_dir).await.unwrap();
+        repo.cleanup_eh_cache_orphans(cache_dir, Some(&uploader))
+            .await
+            .unwrap();
+        assert_eq!(
+            *uploader.aborts.lock().unwrap(),
+            vec![(uploads_dir.clone(), true)],
+            "canceled state must be aborted before terminal deletion"
+        );
         assert!(
             !part.exists(),
             "canceled queue partial should be removed as orphan"
@@ -4260,6 +4571,90 @@ mod tests {
         assert!(
             !parts_dir.exists(),
             "canceled queue multipart state should be removed recursively"
+        );
+        assert!(
+            !uploads_dir.exists(),
+            "canceled queue upload state should be removed recursively"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_eh_cache_orphans_retains_upload_state_without_abort_uploader() {
+        let repo = tests_helpers::setup_test_db().await.unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let cache_dir = temp.path();
+
+        let retained_zip = cache_dir.join("retained.zip");
+        let retained_part = cache_dir.join("retained.zip.part");
+        let retained_uploads = cache_dir.join("retained.zip.uploads");
+        let removable_zip = cache_dir.join("removable.zip");
+        std::fs::write(&retained_zip, b"zip").unwrap();
+        std::fs::write(&retained_part, b"partial").unwrap();
+        std::fs::create_dir_all(&retained_uploads).unwrap();
+        std::fs::write(retained_uploads.join("archive.json"), b"manifest").unwrap();
+        std::fs::write(&removable_zip, b"zip").unwrap();
+
+        repo.cleanup_eh_cache_orphans(cache_dir, None)
+            .await
+            .unwrap();
+
+        assert!(
+            retained_zip.exists(),
+            "upload-state family must be retained"
+        );
+        assert!(retained_part.exists(), "family scratch must be retained");
+        assert!(
+            retained_uploads.exists(),
+            "the only remote upload IDs must not be discarded"
+        );
+        assert!(
+            !removable_zip.exists(),
+            "an orphan without upload state must retain existing cleanup behavior"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_eh_cache_orphans_preserves_family_when_abort_fails() {
+        let repo = tests_helpers::setup_test_db().await.unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let cache_dir = temp.path();
+        let orphan_zip = cache_dir.join("abort-fails.zip");
+        let orphan_part = cache_dir.join("abort-fails.zip.part");
+        let orphan_uploads = cache_dir.join("abort-fails.zip.uploads");
+        let manifest = orphan_uploads.join("archive.json");
+        std::fs::write(&orphan_zip, b"zip").unwrap();
+        std::fs::write(&orphan_part, b"partial").unwrap();
+        std::fs::create_dir_all(&orphan_uploads).unwrap();
+        std::fs::write(&manifest, b"manifest").unwrap();
+        let uploader = RecordingAbortUploader {
+            fail_abort: true,
+            ..Default::default()
+        };
+
+        repo.cleanup_eh_cache_orphans(cache_dir, Some(&uploader))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            *uploader.aborts.lock().unwrap(),
+            vec![(orphan_uploads.clone(), true)],
+            "Abort must observe the manifest directory before cleanup considers deletion"
+        );
+        assert!(
+            orphan_zip.exists(),
+            "Abort failure must retain the final ZIP"
+        );
+        assert!(
+            orphan_part.exists(),
+            "Abort failure must retain family scratch"
+        );
+        assert!(
+            orphan_uploads.exists(),
+            "Abort failure must retain upload state"
+        );
+        assert!(
+            manifest.exists(),
+            "Abort failure must retain the upload manifest"
         );
     }
 
