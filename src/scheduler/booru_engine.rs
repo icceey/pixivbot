@@ -72,6 +72,11 @@ fn booru_post_has_image_url(post: &booru_client::BooruPost) -> bool {
     post.sample_url.is_some() || post.jpeg_url.is_some() || post.file_url.is_some()
 }
 
+fn dedupe_booru_posts_by_id(posts: &[booru_client::BooruPost]) -> Vec<&booru_client::BooruPost> {
+    let mut seen = HashSet::new();
+    posts.iter().filter(|post| seen.insert(post.id)).collect()
+}
+
 pub struct BooruEngine {
     repo: Arc<Repo>,
     notifier: Notifier,
@@ -400,9 +405,9 @@ impl BooruEngine {
             }
         };
 
-        // `posts` is constant for this task; build the reference vec once and reuse
+        // `posts` is constant for this task; build the deduplicated reference vec once and reuse
         // across all subscriptions to avoid per-subscription allocations.
-        let post_refs: Vec<&booru_client::BooruPost> = posts.iter().collect();
+        let post_refs = dedupe_booru_posts_by_id(&posts);
 
         for sub in &subscriptions {
             let chat = match get_chat_if_should_notify(&self.repo, sub.chat_id).await {
@@ -659,12 +664,17 @@ impl BooruEngine {
         let has_existing_state = sub_state.is_some();
         let prev_state = sub_state.unwrap_or_else(|| BooruTagState::cleared(0));
         let latest_id = prev_state.latest_post_id;
+        let unique_posts = dedupe_booru_posts_by_id(posts);
 
         if !has_score_fav_filter {
             let new_posts: Vec<&booru_client::BooruPost> = if has_existing_state {
-                posts.iter().filter(|p| p.id > latest_id).collect()
+                unique_posts
+                    .iter()
+                    .copied()
+                    .filter(|p| p.id > latest_id)
+                    .collect()
             } else {
-                posts.iter().take(1).collect()
+                unique_posts.iter().take(1).copied().collect()
             };
 
             if new_posts.is_empty() {
@@ -772,8 +782,9 @@ impl BooruEngine {
         let mut hot_posts = live_hot;
 
         let hot_ids: HashSet<u64> = hot_posts.iter().map(|h| h.id).collect();
-        let mut candidate_posts: Vec<&booru_client::BooruPost> = posts
+        let mut candidate_posts: Vec<&booru_client::BooruPost> = unique_posts
             .iter()
+            .copied()
             .filter(|p| p.id > latest_id || hot_ids.contains(&p.id))
             // Mirror non-grace path (line ~653): skip posts without any image URL
             // upfront. Letting them through would consume MAX_GRACE_SEND_ATTEMPTS
@@ -1312,6 +1323,25 @@ mod tests {
         let queued = BooruEngine::post_to_queued(&post);
         assert_eq!(queued.jpeg_url.as_deref(), Some("jpeg-only"));
         assert_eq!(queued_booru_post_image_urls(&queued)[0], "jpeg-only");
+    }
+
+    #[test]
+    fn duplicate_booru_posts_are_deduplicated_before_push_selection() {
+        let posts = vec![
+            make_post(101, "first", 0, BooruRating::Safe),
+            make_post(101, "duplicate", 0, BooruRating::Safe),
+            make_post(100, "older", 0, BooruRating::Safe),
+        ];
+
+        let deduped = dedupe_booru_posts_by_id(&posts);
+        let ids: Vec<u64> = deduped.iter().map(|post| post.id).collect();
+
+        assert_eq!(
+            ids,
+            vec![101, 100],
+            "duplicate booru API rows must not be queued for a second scheduler push",
+        );
+        assert_eq!(deduped[0].tags, "first");
     }
 
     #[test]
