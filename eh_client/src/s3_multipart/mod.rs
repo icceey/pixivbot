@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU8, Ordering};
 
@@ -26,11 +27,20 @@ pub(crate) fn fingerprint_fields(fields: &[&str]) -> String {
         hash.update(u64::try_from(field.len()).unwrap_or(u64::MAX).to_be_bytes());
         hash.update(field.as_bytes());
     }
-    format!("{:x}", hash.finalize())
+    digest_hex(hash.finalize())
 }
 
 pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    digest_hex(Sha256::digest(bytes))
+}
+
+fn digest_hex(digest: impl AsRef<[u8]>) -> String {
+    let digest = digest.as_ref();
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        write!(&mut hex, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    hex
 }
 
 pub(crate) fn requested_entries_fingerprint(entry_names: &[String]) -> String {
@@ -831,6 +841,18 @@ mod tests {
     const UPLOAD_ID: &str = "upload-id";
     const REPLACEMENT_UPLOAD_ID: &str = "replacement-upload-id";
     const UPLOADER_ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    #[test]
+    fn sha256_helpers_emit_lowercase_hex_digests() {
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(
+            fingerprint_fields(&["alpha", "beta"]),
+            "5d11bfa62398519b90c0222e68c982726982c36ae6653482b4748dedad2f5531"
+        );
+    }
 
     #[derive(Clone)]
     struct CreateManifestParentFile {
