@@ -118,6 +118,8 @@ pub const TELEGRAPH_REWRITE_STATUS_PENDING: &str = "pending";
 pub const TELEGRAPH_REWRITE_STATUS_REWRITING: &str = "rewriting";
 #[allow(dead_code)] // Historical queue-row rewrite state is query-compatible but no longer claimed.
 pub const TELEGRAPH_REWRITE_STATUS_FAILED: &str = "failed";
+const NO_CONFIGURED_EH_DELIVERY_PUBLISH_SURFACE_ERROR: &str =
+    "No configured EH delivery publish surface";
 #[allow(dead_code)]
 const MAIN_DOWNLOAD_RECENT_WINDOW_HOURS: i64 = 2;
 
@@ -188,6 +190,10 @@ fn eh_delivery_is_ready_for_publish(
     }
     let archive_required = send_archive && delivery.archive_sent_at.is_none();
     let telegraph_required = delivery.telegraph && delivery.telegraph_sent_at.is_none();
+    let has_requested_surface = send_archive
+        || delivery.telegraph
+        || delivery.archive_sent_at.is_some()
+        || delivery.telegraph_sent_at.is_some();
     let telegraph_ready =
         job.telegraph_status == TELEGRAPH_STATUS_READY && job.telegraph_url.is_some();
 
@@ -201,7 +207,17 @@ fn eh_delivery_is_ready_for_publish(
     let archive_ready = job.status == JOB_STATUS_DOWNLOADED && job.zip_path.is_some();
     (archive_required && archive_ready)
         || (telegraph_required && telegraph_ready)
-        || (!archive_required && !telegraph_required)
+        || (!archive_required && !telegraph_required && has_requested_surface)
+}
+
+fn eh_delivery_has_no_configured_publish_surface(
+    delivery: &eh_download_queue::Model,
+    send_archive: bool,
+) -> bool {
+    !send_archive
+        && !delivery.telegraph
+        && delivery.archive_sent_at.is_none()
+        && delivery.telegraph_sent_at.is_none()
 }
 
 fn eh_job_cleanup_is_none_filter(job_id: i32) -> SimpleExpr {
@@ -2136,10 +2152,56 @@ impl Repo {
                 .await
                 .context("Failed to fetch due shared EH deliveries for publish")?;
 
+            let mut settled_no_surface_delivery = false;
             for (delivery, job) in candidates {
                 let Some(job) = job else {
                     continue;
                 };
+                if eh_delivery_has_no_configured_publish_surface(&delivery, send_archive) {
+                    let failed = eh_download_queue::Entity::update_many()
+                        .col_expr(
+                            eh_download_queue::Column::Status,
+                            Expr::value(STATUS_FAILED),
+                        )
+                        .col_expr(
+                            eh_download_queue::Column::Error,
+                            Expr::value(Some(
+                                NO_CONFIGURED_EH_DELIVERY_PUBLISH_SURFACE_ERROR.to_string(),
+                            )),
+                        )
+                        .col_expr(
+                            eh_download_queue::Column::CompletedAt,
+                            Expr::value(Some(now)),
+                        )
+                        .col_expr(
+                            eh_download_queue::Column::NextRetryAt,
+                            Expr::value(None::<DateTime>),
+                        )
+                        .filter(eh_download_queue::Column::Id.eq(delivery.id))
+                        .filter(eh_download_queue::Column::JobId.eq(job.id))
+                        .filter(eh_download_queue::Column::Status.eq(STATUS_WAITING))
+                        .filter(eh_download_queue::Column::Telegraph.eq(false))
+                        .filter(eh_download_queue::Column::ArchiveSentAt.is_null())
+                        .filter(eh_download_queue::Column::TelegraphSentAt.is_null())
+                        .filter(eh_job_cleanup_is_none_filter(job.id))
+                        .filter(claim_generation_filter(delivery.started_at))
+                        .filter(
+                            eh_download_queue::Column::NextRetryAt
+                                .is_null()
+                                .or(eh_download_queue::Column::NextRetryAt.lte(now)),
+                        )
+                        .exec(&txn)
+                        .await
+                        .context("Failed to fail shared EH delivery without a publish surface")?;
+                    if failed.rows_affected == 1 {
+                        self.recompute_eh_job_telegraph_requirement_in_txn(&txn, job.id)
+                            .await?;
+                        self.evaluate_eh_job_liveness_in_txn(&txn, job.id, send_archive)
+                            .await?;
+                        settled_no_surface_delivery = true;
+                    }
+                    continue;
+                }
                 if !eh_delivery_is_ready_for_publish(&delivery, &job, send_archive) {
                     continue;
                 }
@@ -2190,24 +2252,32 @@ impl Repo {
                     .await
                     .context("Failed to reread shared EH job for delivery claim")?
                     .context("Shared EH job changed before delivery claim readback")?;
-                return Ok(Some(EhDeliveryClaim {
-                    delivery: claimed_delivery,
-                    job: claimed_job,
-                }));
+                return Ok((
+                    Some(EhDeliveryClaim {
+                        delivery: claimed_delivery,
+                        job: claimed_job,
+                    }),
+                    settled_no_surface_delivery,
+                ));
             }
 
-            Ok(None)
+            Ok((None, settled_no_surface_delivery))
         }
         .await;
 
         match result {
-            Ok(Some(claim)) => {
+            Ok((Some(claim), _)) => {
                 txn.commit()
                     .await
                     .context("Failed to commit shared EH delivery publish claim transaction")?;
                 Ok(Some(claim))
             }
-            Ok(None) => {
+            Ok((None, true)) => txn
+                .commit()
+                .await
+                .context("Failed to commit shared EH no-surface delivery settlement transaction")
+                .map(|()| None),
+            Ok((None, false)) => {
                 txn.rollback().await.context(
                     "Failed to roll back empty shared EH delivery publish claim transaction",
                 )?;
@@ -5247,6 +5317,104 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_publish_selector_fails_delivery_without_configured_surface() {
+        let repo = tests_helpers::setup_test_db().await.unwrap();
+        let delivery = repo
+            .enqueue_eh_download(
+                -100,
+                912,
+                "tok",
+                "No surface",
+                false,
+                SOURCE_DIRECT,
+                &EhGalleryVariant::archive("1280x"),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            repo.get_next_eh_delivery_for_publish(false)
+                .await
+                .unwrap()
+                .is_none(),
+            "a consumerless delivery must not be claimed for publishing"
+        );
+
+        let failed = Entity::find_by_id(delivery.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(failed.status, STATUS_FAILED);
+        assert!(failed.completed_at.is_some());
+        assert_eq!(
+            failed.error.as_deref(),
+            Some("No configured EH delivery publish surface")
+        );
+        assert_ne!(failed.status, STATUS_DONE);
+        assert!(
+            repo.get_next_eh_job_for_download().await.unwrap().is_none(),
+            "a consumerless job must not remain download-claimable"
+        );
+        let job = job_for_delivery(&repo, &failed).await;
+        assert_eq!(job.status, JOB_STATUS_RETIRED);
+    }
+
+    #[tokio::test]
+    async fn test_publish_selector_claims_marker_complete_requested_surface() {
+        let repo = tests_helpers::setup_test_db().await.unwrap();
+        let delivery = repo
+            .enqueue_eh_download(
+                -100,
+                913,
+                "tok",
+                "Marker complete",
+                false,
+                SOURCE_DIRECT,
+                &EhGalleryVariant::archive("1280x"),
+            )
+            .await
+            .unwrap();
+        let download = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        repo.mark_eh_job_downloaded(
+            download.id,
+            download.started_at.unwrap(),
+            5000,
+            "/tmp/913.zip",
+            0,
+        )
+        .await
+        .unwrap();
+        let claim = repo
+            .get_next_eh_delivery_for_publish(true)
+            .await
+            .unwrap()
+            .unwrap();
+        repo.mark_eh_archive_delivery_sent(claim.delivery.id)
+            .await
+            .unwrap();
+        Entity::update_many()
+            .col_expr(Column::Status, Expr::value(STATUS_WAITING))
+            .col_expr(Column::NextRetryAt, Expr::value(None::<DateTime>))
+            .filter(Column::Id.eq(delivery.id))
+            .exec(repo.db())
+            .await
+            .unwrap();
+
+        let marker_complete = repo
+            .get_next_eh_delivery_for_publish(false)
+            .await
+            .unwrap()
+            .expect("a requested surface with a sent marker must be claimable to finish");
+        assert_eq!(marker_complete.delivery.id, delivery.id);
+        let done = repo
+            .mark_eh_delivery_done(marker_complete.delivery.id, marker_complete.job.id, false)
+            .await
+            .unwrap();
+        assert_eq!(done.status, STATUS_DONE);
+    }
+
+    #[tokio::test]
     async fn test_dirty_cleanup_job_cannot_be_claimed_or_reread_for_publish() {
         let repo = tests_helpers::setup_test_db().await.unwrap();
         let delivery = repo
@@ -8275,6 +8443,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_disable_telegraph_without_token_downgrades_undownloaded_rows() {
+        let repo = tests_helpers::setup_test_db().await.unwrap();
+        let model = repo
+            .enqueue_eh_download(
+                -100,
+                911,
+                "tok",
+                "Title",
+                true,
+                SOURCE_DIRECT,
+                &EhGalleryVariant::archive("1280x"),
+            )
+            .await
+            .unwrap();
+        let initial_job = job_for_delivery(&repo, &model).await;
+        assert_eq!(initial_job.status, JOB_STATUS_PENDING);
+        assert_eq!(
+            initial_job.telegraph_status,
+            crate::db::repo::eh_gallery_jobs::TELEGRAPH_STATUS_NOT_REQUIRED
+        );
+
+        let changed = repo
+            .disable_eh_telegraph_for_unuploaded_jobs()
+            .await
+            .unwrap();
+        assert_eq!(changed, 1);
+
+        let delivery = Entity::find_by_id(model.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!delivery.telegraph);
+        assert!(delivery.telegraph_subscription_ids.is_none());
+        let job = job_for_delivery(&repo, &delivery).await;
+        assert!(!job.telegraph_required);
+        assert_eq!(
+            job.telegraph_status,
+            crate::db::repo::eh_gallery_jobs::TELEGRAPH_STATUS_NOT_REQUIRED
+        );
+
+        let download = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        assert_eq!(download.id, job.id);
+        repo.mark_eh_job_downloaded(
+            download.id,
+            download.started_at.unwrap(),
+            5000,
+            "/tmp/911.zip",
+            0,
+        )
+        .await
+        .unwrap();
+        assert!(
+            repo.get_next_eh_job_for_upload().await.unwrap().is_none(),
+            "downgraded undownloaded work must not become upload-claimable after download"
+        );
+    }
+
+    #[tokio::test]
     async fn test_disable_telegraph_without_token_preserves_uploaded_rows_with_url() {
         let repo = tests_helpers::setup_test_db().await.unwrap();
         let model = repo
@@ -8645,6 +8872,16 @@ mod tests {
             )
             .await
             .unwrap();
+        let download = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        repo.mark_eh_job_downloaded(
+            download.id,
+            download.started_at.unwrap(),
+            5000,
+            "/tmp/703.zip",
+            0,
+        )
+        .await
+        .unwrap();
         repo.db
             .execute(Statement::from_string(
                 DbBackend::Sqlite,
@@ -8660,7 +8897,7 @@ mod tests {
             .unwrap();
 
         let error = repo
-            .get_next_eh_delivery_for_publish(false)
+            .get_next_eh_delivery_for_publish(true)
             .await
             .expect_err("a missing readback must fail the claim transaction");
         assert!(error

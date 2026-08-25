@@ -2258,7 +2258,10 @@ impl Repo {
         let result: Result<u64> = async {
             let jobs = eh_gallery_jobs::Entity::find()
                 .filter(eh_gallery_jobs::Column::TelegraphRequired.eq(true))
-                .filter(eh_gallery_jobs::Column::TelegraphStatus.eq(TELEGRAPH_STATUS_PENDING))
+                .filter(
+                    eh_gallery_jobs::Column::TelegraphStatus
+                        .is_in([TELEGRAPH_STATUS_NOT_REQUIRED, TELEGRAPH_STATUS_PENDING]),
+                )
                 .order_by(eh_gallery_jobs::Column::Id, Order::Asc)
                 .all(&txn)
                 .await
