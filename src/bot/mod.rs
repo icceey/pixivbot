@@ -7,7 +7,7 @@ pub mod notifier;
 pub mod state;
 
 use crate::booru::BooruSiteRegistry;
-use crate::config::TelegramConfig;
+use crate::config::{EhentaiConfig, TelegramConfig};
 use crate::db::repo::Repo;
 use crate::db::types::UserRole;
 use crate::pixiv::client::PixivClient;
@@ -47,6 +47,7 @@ pub async fn run(
     log_dir: String,
     booru_registry: Arc<BooruSiteRegistry>,
     eh_client: Option<Arc<eh_client::EhClient>>,
+    eh_config: Arc<EhentaiConfig>,
     has_telegraph: bool,
 ) -> Result<()> {
     info!("Starting Telegram Bot...");
@@ -85,6 +86,7 @@ pub async fn run(
         log_dir,
         booru_registry,
         eh_client,
+        eh_config,
         has_telegraph,
     );
 

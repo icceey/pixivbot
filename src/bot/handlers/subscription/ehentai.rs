@@ -5,6 +5,7 @@ use crate::db::repo::eh_download_queue::{
     SOURCE_DIRECT, STATUS_CANCELED, STATUS_DONE, STATUS_DOWNLOADED, STATUS_DOWNLOADING,
     STATUS_FAILED, STATUS_PENDING, STATUS_PUBLISHING, STATUS_UPLOADED, STATUS_UPLOADING,
 };
+use crate::db::repo::eh_gallery_jobs::EhGalleryVariant;
 use crate::db::types::{EhFilter, EhTaskKey, TagFilter, TaskType};
 use crate::utils::args;
 use eh_client::EhCategory;
@@ -407,6 +408,11 @@ impl BotHandler {
         };
 
         // Enqueue download
+        let variant = EhGalleryVariant::for_request(
+            eh_client.is_logged_in(),
+            SOURCE_DIRECT,
+            self.eh_config.as_ref(),
+        );
         if let Err(e) = self
             .repo
             .enqueue_eh_download(
@@ -416,6 +422,7 @@ impl BotHandler {
                 &metadata.title,
                 telegraph,
                 SOURCE_DIRECT,
+                &variant,
             )
             .await
         {
@@ -535,6 +542,11 @@ impl BotHandler {
         };
 
         // Enqueue download with telegraph=true (processor handles upload)
+        let variant = EhGalleryVariant::for_request(
+            eh_client.is_logged_in(),
+            SOURCE_DIRECT,
+            self.eh_config.as_ref(),
+        );
         if let Err(e) = self
             .repo
             .enqueue_eh_download(
@@ -544,6 +556,7 @@ impl BotHandler {
                 &metadata.title,
                 true, // always telegraph
                 SOURCE_DIRECT,
+                &variant,
             )
             .await
         {

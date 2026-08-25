@@ -2,6 +2,7 @@ use crate::booru::BooruSiteRegistry;
 use crate::bot::link_handler::{parse_pixiv_links, PixivLink};
 use crate::bot::notifier::{DownloadButtonConfig, Notifier, ThrottledBot};
 use crate::bot::Command;
+use crate::config::EhentaiConfig;
 use crate::db::repo::Repo;
 use crate::db::types::{TagFilter, TaskType, UserRole};
 use crate::pixiv::client::PixivClient;
@@ -36,6 +37,7 @@ pub struct BotHandler {
     pub(crate) log_dir: String,
     pub(crate) booru_registry: Arc<BooruSiteRegistry>,
     pub(crate) eh_client: Option<Arc<eh_client::EhClient>>,
+    pub(crate) eh_config: Arc<EhentaiConfig>,
     pub(crate) has_telegraph: bool,
 }
 
@@ -59,6 +61,7 @@ impl BotHandler {
         log_dir: String,
         booru_registry: Arc<BooruSiteRegistry>,
         eh_client: Option<Arc<eh_client::EhClient>>,
+        eh_config: Arc<EhentaiConfig>,
         has_telegraph: bool,
     ) -> Self {
         Self {
@@ -75,6 +78,7 @@ impl BotHandler {
             log_dir,
             booru_registry,
             eh_client,
+            eh_config,
             has_telegraph,
         }
     }

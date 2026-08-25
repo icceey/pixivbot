@@ -9,6 +9,7 @@ use crate::bot::link_handler::{
 };
 use crate::bot::notifier::ThrottledBot;
 use crate::bot::BotHandler;
+use crate::db::repo::eh_gallery_jobs::EhGalleryVariant;
 use anyhow::{Context, Result};
 use chrono::Local;
 use regex::Regex;
@@ -95,6 +96,11 @@ impl BotHandler {
                     Ok(m) if !m.is_empty() => m[0].title.clone(),
                     _ => format!("gallery_{}", gid),
                 };
+                let variant = EhGalleryVariant::for_request(
+                    eh_client.is_logged_in(),
+                    crate::db::repo::eh_download_queue::SOURCE_DIRECT,
+                    self.eh_config.as_ref(),
+                );
                 if let Err(e) = self
                     .repo
                     .enqueue_eh_download(
@@ -104,6 +110,7 @@ impl BotHandler {
                         &title,
                         false,
                         crate::db::repo::eh_download_queue::SOURCE_DIRECT,
+                        &variant,
                     )
                     .await
                 {

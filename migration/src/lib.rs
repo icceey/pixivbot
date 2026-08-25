@@ -14,6 +14,7 @@ mod m20260707_000300_eh_background_download;
 mod m20260707_000400_eh_telegraph_rewrite;
 mod m20260718_000000_eh_download_gp_cost;
 mod m20260719_000000_eh_gp_spend_attempts;
+mod m20260824_000000_eh_shared_gallery_jobs;
 
 pub struct Migrator;
 
@@ -35,6 +36,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260707_000400_eh_telegraph_rewrite::Migration),
             Box::new(m20260718_000000_eh_download_gp_cost::Migration),
             Box::new(m20260719_000000_eh_gp_spend_attempts::Migration),
+            Box::new(m20260824_000000_eh_shared_gallery_jobs::Migration),
         ]
     }
 }

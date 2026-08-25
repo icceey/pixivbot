@@ -11,6 +11,8 @@ use serde::{Deserialize, Serialize};
 pub struct Model {
     #[sea_orm(primary_key)]
     pub id: i32,
+    #[sea_orm(nullable)]
+    pub job_id: Option<i32>,
     pub chat_id: i64,
     pub gid: i64,
     pub token: String,
@@ -89,6 +91,20 @@ pub struct Model {
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
-pub enum Relation {}
+pub enum Relation {
+    #[sea_orm(
+        belongs_to = "super::eh_gallery_jobs::Entity",
+        from = "Column::JobId",
+        to = "super::eh_gallery_jobs::Column::Id",
+        on_delete = "SetNull"
+    )]
+    Job,
+}
+
+impl Related<super::eh_gallery_jobs::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::Job.def()
+    }
+}
 
 impl ActiveModelBehavior for ActiveModel {}

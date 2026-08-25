@@ -5,6 +5,31 @@ use chrono::{Duration, Local};
 use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
 
 impl Repo {
+    /// Record one GP charge attempt owned by a shared-gallery download job.
+    /// Each reservation represents a source archive POST, never a delivery.
+    pub async fn append_eh_job_gp_spend_attempt(
+        &self,
+        job_id: i32,
+        gid: i64,
+        gp_cost: i64,
+    ) -> Result<eh_gp_spend_attempts::Model> {
+        if gp_cost <= 0 {
+            anyhow::bail!("EH GP spend attempt cost must be positive, got {gp_cost}");
+        }
+
+        eh_gp_spend_attempts::ActiveModel {
+            job_id: Set(Some(job_id)),
+            queue_id: Set(None),
+            gid: Set(gid),
+            gp_cost: Set(gp_cost),
+            created_at: Set(Local::now().naive_local()),
+            ..Default::default()
+        }
+        .insert(&self.db)
+        .await
+        .context("Failed to append shared EH job GP spend attempt")
+    }
+
     /// Record a GP charge attempt for an EH archive download.
     ///
     /// Every call inserts a distinct ledger row, even for the same queue entry.
@@ -58,7 +83,9 @@ impl Repo {
 #[cfg(test)]
 mod tests {
     use super::super::tests_helpers::setup_test_db;
-    use crate::db::entities::{eh_download_queue, eh_gp_spend_attempts};
+    use crate::db::entities::{
+        eh_download_completions, eh_download_queue, eh_gallery_jobs, eh_gp_spend_attempts,
+    };
     use anyhow::{bail, Result};
     use chrono::{Duration, Local};
     use migration::{MigrationTrait, Migrator, MigratorTrait, SchemaManager};
@@ -70,6 +97,7 @@ mod tests {
     const TABLE: &str = "eh_gp_spend_attempts";
     const CREATED_AT_INDEX: &str = "idx_eh_gp_spend_attempts_created_at";
     const MIGRATION_NAME: &str = "m20260719_000000_eh_gp_spend_attempts";
+    const SHARED_JOBS_MIGRATION_NAME: &str = "m20260824_000000_eh_shared_gallery_jobs";
 
     async fn new_db() -> Result<DatabaseConnection> {
         let db = Database::connect("sqlite::memory:").await?;
@@ -102,6 +130,78 @@ mod tests {
         Ok(())
     }
 
+    fn shared_jobs_target_migration() -> Result<Box<dyn MigrationTrait>> {
+        Migrator::migrations()
+            .into_iter()
+            .find(|migration| migration.name() == SHARED_JOBS_MIGRATION_NAME)
+            .ok_or_else(|| {
+                anyhow::anyhow!("migration {SHARED_JOBS_MIGRATION_NAME} is not registered")
+            })
+    }
+
+    async fn migrate_shared_jobs_up(db: &DatabaseConnection) -> Result<()> {
+        shared_jobs_target_migration()?
+            .up(&SchemaManager::new(db))
+            .await?;
+        Ok(())
+    }
+
+    async fn create_legacy_shared_jobs_tables(db: &DatabaseConnection) -> Result<()> {
+        db.execute_unprepared(
+            "CREATE TABLE eh_download_queue (\
+                id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, \
+                chat_id INTEGER NOT NULL, \
+                gid INTEGER NOT NULL, \
+                token TEXT NOT NULL, \
+                title TEXT NOT NULL, \
+                telegraph BOOLEAN NOT NULL DEFAULT 0, \
+                source TEXT NOT NULL DEFAULT 'subscription', \
+                subscription_ids TEXT, \
+                telegraph_subscription_ids TEXT, \
+                status TEXT NOT NULL DEFAULT 'pending', \
+                file_size INTEGER NOT NULL DEFAULT 0, \
+                gp_cost INTEGER NOT NULL DEFAULT 0, \
+                error TEXT, \
+                retry_count INTEGER NOT NULL DEFAULT 0, \
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, \
+                started_at TIMESTAMP, \
+                completed_at TIMESTAMP, \
+                zip_path TEXT, \
+                telegraph_url TEXT, \
+                next_retry_at TIMESTAMP, \
+                archive_sent_at TIMESTAMP, \
+                telegraph_sent_at TIMESTAMP, \
+                background_download_status TEXT, \
+                background_download_started_at TIMESTAMP, \
+                background_download_next_retry_at TIMESTAMP, \
+                background_download_attempt_count INTEGER NOT NULL DEFAULT 0, \
+                background_download_error TEXT, \
+                telegraph_rewrite_data TEXT, \
+                telegraph_rewrite_status TEXT, \
+                telegraph_rewrite_after TIMESTAMP, \
+                telegraph_rewrite_started_at TIMESTAMP, \
+                telegraph_rewrite_next_retry_at TIMESTAMP, \
+                telegraph_rewrite_retry_count INTEGER NOT NULL DEFAULT 0, \
+                telegraph_rewrite_error TEXT, \
+                telegraph_rewritten_at TIMESTAMP, \
+                UNIQUE(chat_id, gid)\
+            )",
+        )
+        .await?;
+        db.execute_unprepared(
+            "CREATE TABLE eh_gp_spend_attempts (\
+                id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, \
+                queue_id INTEGER, \
+                gid INTEGER NOT NULL, \
+                gp_cost INTEGER NOT NULL CHECK (gp_cost > 0), \
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, \
+                FOREIGN KEY (queue_id) REFERENCES eh_download_queue(id) ON DELETE SET NULL\
+            )",
+        )
+        .await?;
+        Ok(())
+    }
+
     async fn migration_table_exists(db: &DatabaseConnection) -> Result<bool> {
         let row = db
             .query_one(Statement::from_string(
@@ -126,6 +226,39 @@ mod tests {
             .await?
             .expect("SELECT EXISTS returns one row");
         Ok(row.try_get("", "present")?)
+    }
+
+    async fn sqlite_master_entry_exists(
+        db: &DatabaseConnection,
+        object_type: &str,
+        name: &str,
+    ) -> Result<bool> {
+        let row = db
+            .query_one(Statement::from_string(
+                DbBackend::Sqlite,
+                format!(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = '{object_type}' AND name = '{name}') AS present"
+                ),
+            ))
+            .await?
+            .expect("SELECT EXISTS returns one row");
+        Ok(row.try_get("", "present")?)
+    }
+
+    async fn table_has_column(
+        db: &DatabaseConnection,
+        table: &str,
+        expected_column: &str,
+    ) -> Result<bool> {
+        let columns = db
+            .query_all(Statement::from_string(
+                DbBackend::Sqlite,
+                format!("PRAGMA table_info({table})"),
+            ))
+            .await?;
+        Ok(columns.iter().any(|column| {
+            column.try_get::<String>("", "name").ok().as_deref() == Some(expected_column)
+        }))
     }
 
     #[tokio::test]
@@ -172,6 +305,287 @@ mod tests {
 
         assert!(migration_table_exists(&db).await?);
         assert!(migration_created_at_index_exists(&db).await?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn migration_groups_active_legacy_variants_and_leaves_terminal_history_unbound(
+    ) -> Result<()> {
+        let db = new_db().await?;
+        create_legacy_shared_jobs_tables(&db).await?;
+        db.execute_unprepared(
+            "INSERT INTO eh_download_queue (\
+                id, chat_id, gid, token, title, telegraph, source, subscription_ids, \
+                telegraph_subscription_ids, status, file_size, gp_cost, error, retry_count, \
+                created_at, started_at, completed_at, zip_path, telegraph_url, next_retry_at, \
+                archive_sent_at, telegraph_sent_at, background_download_status, \
+                background_download_started_at, background_download_next_retry_at, \
+                background_download_attempt_count, background_download_error, \
+                telegraph_rewrite_data, telegraph_rewrite_status, telegraph_rewrite_after, \
+                telegraph_rewrite_started_at, telegraph_rewrite_next_retry_at, \
+                telegraph_rewrite_retry_count, telegraph_rewrite_error, telegraph_rewritten_at\
+             ) VALUES \
+                (1, 10, 101, 'token-101', 'Subscription first', 0, 'subscription', '1', NULL, 'pending', 0, 0, NULL, 0, '2026-08-01 00:00:00', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 0, NULL, NULL, NULL, NULL, NULL, NULL, 0, NULL, NULL), \
+                (2, 20, 101, 'token-101', 'Subscription second', 1, 'subscription', '2', '2', 'uploading', 123, 456, 'old error', 3, '2026-08-02 00:00:00', '2026-08-02 01:00:00', '2026-08-02 02:00:00', '/old/subscription.zip', 'https://old.example/subscription', '2026-08-02 03:00:00', '2026-08-02 04:00:00', NULL, 'running', '2026-08-02 05:00:00', '2026-08-02 06:00:00', 2, 'background error', 'rewrite data', 'rewriting', '2026-08-02 07:00:00', '2026-08-02 08:00:00', '2026-08-02 09:00:00', 4, 'rewrite error', '2026-08-02 10:00:00'), \
+                (3, 30, 101, 'token-101', 'Direct first', 1, 'direct', NULL, NULL, 'downloaded', 10, 20, 'direct error', 1, '2026-08-03 00:00:00', '2026-08-03 01:00:00', '2026-08-03 02:00:00', '/old/direct.zip', 'https://old.example/direct', '2026-08-03 03:00:00', NULL, '2026-08-03 04:00:00', 'pending', '2026-08-03 05:00:00', '2026-08-03 06:00:00', 1, 'direct background error', NULL, NULL, NULL, NULL, NULL, 0, NULL, NULL), \
+                (4, 40, 102, 'token-102', 'Other gallery', 0, 'subscription', '3', NULL, 'publishing', 0, 0, NULL, 0, '2026-08-04 00:00:00', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 0, NULL, NULL, NULL, NULL, NULL, NULL, 0, NULL, NULL), \
+                (5, 50, 101, 'token-101', 'Terminal history', 0, 'subscription', '4', NULL, 'done', 999, 0, 'terminal error', 9, '2026-08-05 00:00:00', '2026-08-05 01:00:00', '2026-08-05 02:00:00', '/terminal.zip', NULL, '2026-08-05 03:00:00', '2026-08-05 04:00:00', '2026-08-05 05:00:00', 'failed', '2026-08-05 06:00:00', '2026-08-05 07:00:00', 8, 'terminal background error', 'terminal rewrite', 'failed', '2026-08-05 08:00:00', '2026-08-05 09:00:00', '2026-08-05 10:00:00', 7, 'terminal rewrite error', '2026-08-05 11:00:00')",
+        )
+        .await?;
+
+        migrate_shared_jobs_up(&db).await?;
+
+        let jobs = db
+            .query_all(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT gid, token, download_mode, resolution, title, status, telegraph_required, telegraph_status, created_at FROM eh_gallery_jobs ORDER BY gid, resolution".to_owned(),
+            ))
+            .await?;
+        assert_eq!(jobs.len(), 3);
+        assert_eq!(jobs[0].try_get::<i64>("", "gid")?, 101);
+        assert_eq!(jobs[0].try_get::<String>("", "download_mode")?, "legacy");
+        assert_eq!(jobs[0].try_get::<String>("", "resolution")?, "direct");
+        assert_eq!(jobs[0].try_get::<String>("", "title")?, "Direct first");
+        assert!(!jobs[0].try_get::<bool>("", "telegraph_required")?);
+        assert_eq!(
+            jobs[0].try_get::<String>("", "telegraph_status")?,
+            "not_required"
+        );
+        assert_eq!(jobs[1].try_get::<i64>("", "gid")?, 101);
+        assert_eq!(jobs[1].try_get::<String>("", "resolution")?, "subscription");
+        assert_eq!(
+            jobs[1].try_get::<String>("", "title")?,
+            "Subscription first"
+        );
+        assert!(jobs[1].try_get::<bool>("", "telegraph_required")?);
+        assert_eq!(
+            jobs[1].try_get::<String>("", "telegraph_status")?,
+            "pending"
+        );
+        assert_eq!(jobs[2].try_get::<i64>("", "gid")?, 102);
+        assert_eq!(jobs[2].try_get::<String>("", "resolution")?, "subscription");
+
+        let active = db
+            .query_all(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT id, job_id, status, started_at, completed_at, error, retry_count, next_retry_at, file_size, gp_cost, zip_path, telegraph_url, background_download_status, background_download_started_at, background_download_next_retry_at, background_download_attempt_count, background_download_error, telegraph_rewrite_data, telegraph_rewrite_status, telegraph_rewrite_after, telegraph_rewrite_started_at, telegraph_rewrite_next_retry_at, telegraph_rewrite_retry_count, telegraph_rewrite_error, telegraph_rewritten_at, subscription_ids, telegraph_subscription_ids, archive_sent_at, telegraph_sent_at FROM eh_download_queue WHERE id IN (1, 2, 3, 4) ORDER BY id".to_owned(),
+            ))
+            .await?;
+        assert_eq!(active.len(), 4);
+        for row in &active {
+            assert!(row.try_get::<Option<i64>>("", "job_id")?.is_some());
+            assert_eq!(row.try_get::<String>("", "status")?, "waiting");
+            assert_eq!(row.try_get::<Option<String>>("", "started_at")?, None);
+            assert_eq!(row.try_get::<Option<String>>("", "completed_at")?, None);
+            assert_eq!(row.try_get::<Option<String>>("", "error")?, None);
+            assert_eq!(row.try_get::<i64>("", "retry_count")?, 0);
+            assert_eq!(row.try_get::<Option<String>>("", "next_retry_at")?, None);
+            assert_eq!(row.try_get::<i64>("", "file_size")?, 0);
+            assert_eq!(row.try_get::<i64>("", "gp_cost")?, 0);
+            assert_eq!(row.try_get::<Option<String>>("", "zip_path")?, None);
+            assert_eq!(row.try_get::<Option<String>>("", "telegraph_url")?, None);
+            assert_eq!(
+                row.try_get::<Option<String>>("", "background_download_status")?,
+                None
+            );
+            assert_eq!(
+                row.try_get::<Option<String>>("", "background_download_started_at")?,
+                None
+            );
+            assert_eq!(
+                row.try_get::<Option<String>>("", "background_download_next_retry_at")?,
+                None
+            );
+            assert_eq!(
+                row.try_get::<i64>("", "background_download_attempt_count")?,
+                0
+            );
+            assert_eq!(
+                row.try_get::<Option<String>>("", "background_download_error")?,
+                None
+            );
+            assert_eq!(
+                row.try_get::<Option<String>>("", "telegraph_rewrite_data")?,
+                None
+            );
+            assert_eq!(
+                row.try_get::<Option<String>>("", "telegraph_rewrite_status")?,
+                None
+            );
+            assert_eq!(
+                row.try_get::<Option<String>>("", "telegraph_rewrite_after")?,
+                None
+            );
+            assert_eq!(
+                row.try_get::<Option<String>>("", "telegraph_rewrite_started_at")?,
+                None
+            );
+            assert_eq!(
+                row.try_get::<Option<String>>("", "telegraph_rewrite_next_retry_at")?,
+                None
+            );
+            assert_eq!(row.try_get::<i64>("", "telegraph_rewrite_retry_count")?, 0);
+            assert_eq!(
+                row.try_get::<Option<String>>("", "telegraph_rewrite_error")?,
+                None
+            );
+            assert_eq!(
+                row.try_get::<Option<String>>("", "telegraph_rewritten_at")?,
+                None
+            );
+        }
+        assert_eq!(
+            active[1].try_get::<Option<String>>("", "subscription_ids")?,
+            Some("2".to_owned())
+        );
+        assert_eq!(
+            active[1].try_get::<Option<String>>("", "telegraph_subscription_ids")?,
+            Some("2".to_owned())
+        );
+        assert_eq!(
+            active[1].try_get::<Option<String>>("", "archive_sent_at")?,
+            Some("2026-08-02 04:00:00".to_owned())
+        );
+        assert_eq!(
+            active[2].try_get::<Option<String>>("", "telegraph_sent_at")?,
+            Some("2026-08-03 04:00:00".to_owned())
+        );
+
+        let terminal = db
+            .query_one(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT job_id, status, file_size, error FROM eh_download_queue WHERE id = 5"
+                    .to_owned(),
+            ))
+            .await?
+            .expect("terminal history row exists");
+        assert_eq!(terminal.try_get::<Option<i64>>("", "job_id")?, None);
+        assert_eq!(terminal.try_get::<String>("", "status")?, "done");
+        assert_eq!(terminal.try_get::<i64>("", "file_size")?, 999);
+        assert_eq!(
+            terminal.try_get::<Option<String>>("", "error")?,
+            Some("terminal error".to_owned())
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn migration_backfills_append_only_download_completions_before_clearing_compatibility(
+    ) -> Result<()> {
+        let db = new_db().await?;
+        create_legacy_shared_jobs_tables(&db).await?;
+        db.execute_unprepared(
+            "INSERT INTO eh_download_queue (id, chat_id, gid, token, title, source, status, file_size, completed_at) VALUES \
+                (1, 10, 201, 'active-201', 'Active 201', 'subscription', 'downloaded', 111, '2026-08-10 01:00:00'), \
+                (2, 20, 202, 'active-202', 'Active 202', 'direct', 'pending', 222, '2026-08-10 02:00:00'), \
+                (3, 30, 203, 'terminal-203', 'Terminal 203', 'subscription', 'done', 333, '2026-08-10 03:00:00'), \
+                (4, 40, 204, 'terminal-204', 'Terminal 204', 'direct', 'canceled', 444, '2026-08-10 04:00:00'), \
+                (5, 50, 205, 'zero-size', 'Zero size', 'subscription', 'done', 0, '2026-08-10 05:00:00'), \
+                (6, 60, 206, 'no-completion', 'No completion', 'direct', 'failed', 555, NULL)",
+        )
+        .await?;
+
+        migrate_shared_jobs_up(&db).await?;
+
+        let completions = db
+            .query_all(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT job_id, gid, file_size, created_at FROM eh_download_completions ORDER BY gid"
+                    .to_owned(),
+            ))
+            .await?;
+        assert_eq!(completions.len(), 4);
+        assert_eq!(completions[0].try_get::<i64>("", "file_size")?, 111);
+        assert_eq!(completions[1].try_get::<i64>("", "file_size")?, 222);
+        assert_eq!(completions[2].try_get::<i64>("", "file_size")?, 333);
+        assert_eq!(completions[3].try_get::<i64>("", "file_size")?, 444);
+        assert_eq!(
+            completions[0].try_get::<String>("", "created_at")?,
+            "2026-08-10 01:00:00"
+        );
+        assert_eq!(
+            completions[1].try_get::<String>("", "created_at")?,
+            "2026-08-10 02:00:00"
+        );
+        assert!(completions[0]
+            .try_get::<Option<i64>>("", "job_id")?
+            .is_some());
+        assert!(completions[1]
+            .try_get::<Option<i64>>("", "job_id")?
+            .is_some());
+        assert_eq!(completions[2].try_get::<Option<i64>>("", "job_id")?, None);
+        assert_eq!(completions[3].try_get::<Option<i64>>("", "job_id")?, None);
+
+        let active_deliveries = db
+            .query_all(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT id, job_id, file_size, completed_at FROM eh_download_queue WHERE id IN (1, 2) ORDER BY id"
+                    .to_owned(),
+            ))
+            .await?;
+        assert_eq!(
+            completions[0].try_get::<Option<i64>>("", "job_id")?,
+            active_deliveries[0].try_get::<Option<i64>>("", "job_id")?
+        );
+        assert_eq!(
+            completions[1].try_get::<Option<i64>>("", "job_id")?,
+            active_deliveries[1].try_get::<Option<i64>>("", "job_id")?
+        );
+        for delivery in active_deliveries {
+            assert_eq!(delivery.try_get::<i64>("", "file_size")?, 0);
+            assert_eq!(
+                delivery.try_get::<Option<String>>("", "completed_at")?,
+                None
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn migration_rolls_back_ddl_when_legacy_backfill_fails() -> Result<()> {
+        let db = new_db().await?;
+        db.execute_unprepared(
+            "CREATE TABLE eh_download_queue (\
+                id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, \
+                gid INTEGER NOT NULL, \
+                token TEXT NOT NULL, \
+                title TEXT NOT NULL, \
+                telegraph BOOLEAN NOT NULL DEFAULT 0, \
+                telegraph_sent_at TIMESTAMP, \
+                status TEXT NOT NULL DEFAULT 'pending', \
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP\
+            )",
+        )
+        .await?;
+        db.execute_unprepared(
+            "CREATE TABLE eh_gp_spend_attempts (id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL)",
+        )
+        .await?;
+
+        let error = migrate_shared_jobs_up(&db)
+            .await
+            .expect_err("missing source must make the legacy grouping backfill fail after DDL");
+        assert!(error.to_string().contains("source"));
+        assert!(
+            !sqlite_master_entry_exists(&db, "table", "eh_gallery_jobs").await?,
+            "failed SQLite migration must roll back the job table"
+        );
+        assert!(
+            !sqlite_master_entry_exists(&db, "table", "eh_download_completions").await?,
+            "failed SQLite migration must roll back the completion table"
+        );
+        assert!(
+            !sqlite_master_entry_exists(&db, "index", "idx_eh_download_queue_job_id").await?,
+            "failed SQLite migration must roll back dependent indexes"
+        );
+        assert!(
+            !table_has_column(&db, "eh_download_queue", "job_id").await?,
+            "failed SQLite migration must roll back the queue job_id column"
+        );
+        assert!(
+            !table_has_column(&db, "eh_gp_spend_attempts", "job_id").await?,
+            "failed SQLite migration must roll back the ledger job_id column"
+        );
         Ok(())
     }
 
@@ -344,10 +758,128 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shared_job_test_schema_enforces_variant_and_foreign_keys() -> Result<()> {
+        let repo = setup_test_db().await?;
+        let db = repo.db();
+        let job = eh_gallery_jobs::ActiveModel {
+            gid: Set(301),
+            token: Set("shared-token".to_owned()),
+            download_mode: Set("archive".to_owned()),
+            title: Set("Shared job".to_owned()),
+            ..Default::default()
+        }
+        .insert(db)
+        .await?;
+        assert_eq!(job.resolution, "");
+        assert_eq!(job.status, "pending");
+        assert_eq!(job.telegraph_status, "not_required");
+        assert!(!job.telegraph_required);
+        assert_eq!(job.file_size, 0);
+        assert_eq!(job.gp_cost, 0);
+        assert_eq!(job.retry_count, 0);
+        assert_eq!(job.cleanup_status, "none");
+        assert_eq!(job.background_download_attempt_count, 0);
+        assert_eq!(job.telegraph_rewrite_retry_count, 0);
+
+        eh_gallery_jobs::ActiveModel {
+            gid: Set(301),
+            token: Set("shared-token".to_owned()),
+            download_mode: Set("archive".to_owned()),
+            resolution: Set("large".to_owned()),
+            title: Set("Large variant".to_owned()),
+            ..Default::default()
+        }
+        .insert(db)
+        .await?;
+        assert!(
+            eh_gallery_jobs::ActiveModel {
+                gid: Set(301),
+                token: Set("shared-token".to_owned()),
+                download_mode: Set("archive".to_owned()),
+                title: Set("Duplicate variant".to_owned()),
+                ..Default::default()
+            }
+            .insert(db)
+            .await
+            .is_err(),
+            "identical gallery job variants must be unique"
+        );
+
+        let queue = eh_download_queue::ActiveModel {
+            job_id: Set(Some(job.id)),
+            chat_id: Set(1),
+            gid: Set(301),
+            token: Set("shared-token".to_owned()),
+            title: Set("Delivery".to_owned()),
+            telegraph: Set(false),
+            source: Set("direct".to_owned()),
+            status: Set("waiting".to_owned()),
+            ..Default::default()
+        }
+        .insert(db)
+        .await?;
+        let gp_attempt = eh_gp_spend_attempts::ActiveModel {
+            job_id: Set(Some(job.id)),
+            queue_id: Set(Some(queue.id)),
+            gid: Set(301),
+            gp_cost: Set(7),
+            ..Default::default()
+        }
+        .insert(db)
+        .await?;
+        let completion = eh_download_completions::ActiveModel {
+            job_id: Set(Some(job.id)),
+            gid: Set(301),
+            file_size: Set(4096),
+            ..Default::default()
+        }
+        .insert(db)
+        .await?;
+
+        db.execute_unprepared(&format!(
+            "DELETE FROM eh_gallery_jobs WHERE id = {}",
+            job.id
+        ))
+        .await?;
+
+        assert_eq!(
+            eh_download_queue::Entity::find_by_id(queue.id)
+                .one(db)
+                .await?
+                .expect("queue delivery survives job deletion")
+                .job_id,
+            None
+        );
+        assert_eq!(
+            eh_gp_spend_attempts::Entity::find_by_id(gp_attempt.id)
+                .one(db)
+                .await?
+                .expect("GP ledger entry survives job deletion")
+                .job_id,
+            None
+        );
+        let completion_after_delete = eh_download_completions::Entity::find_by_id(completion.id)
+            .one(db)
+            .await?
+            .expect("completion ledger entry survives job deletion");
+        assert_eq!(completion_after_delete.job_id, None);
+        assert_eq!(completion_after_delete.file_size, 4096);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn append_eh_gp_spend_attempt_inserts_positive_attempt() -> Result<()> {
         let repo = setup_test_db().await?;
         let queue = repo
-            .enqueue_eh_download(1, 101, "token", "title", false, "direct")
+            .enqueue_eh_download(
+                1,
+                101,
+                "token",
+                "title",
+                false,
+                "direct",
+                &crate::db::repo::eh_gallery_jobs::EhGalleryVariant::archive("1280x"),
+            )
             .await?;
 
         let attempt = repo
@@ -368,7 +900,15 @@ mod tests {
     async fn append_eh_gp_spend_attempt_keeps_each_attempt_for_a_queue() -> Result<()> {
         let repo = setup_test_db().await?;
         let queue = repo
-            .enqueue_eh_download(1, 102, "token", "title", false, "direct")
+            .enqueue_eh_download(
+                1,
+                102,
+                "token",
+                "title",
+                false,
+                "direct",
+                &crate::db::repo::eh_gallery_jobs::EhGalleryVariant::archive("1280x"),
+            )
             .await?;
 
         let first = repo
@@ -450,7 +990,15 @@ mod tests {
     async fn get_eh_gp_cost_in_window_reads_only_the_ledger() -> Result<()> {
         let repo = setup_test_db().await?;
         let queue = repo
-            .enqueue_eh_download(1, 106, "token", "title", false, "direct")
+            .enqueue_eh_download(
+                1,
+                106,
+                "token",
+                "title",
+                false,
+                "direct",
+                &crate::db::repo::eh_gallery_jobs::EhGalleryVariant::archive("1280x"),
+            )
             .await?;
         let queue_id = queue.id;
         let mut queue: eh_download_queue::ActiveModel = queue.into();

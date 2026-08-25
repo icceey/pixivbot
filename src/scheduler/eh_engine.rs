@@ -1,6 +1,6 @@
 use crate::bot::notifier::Notifier;
 use crate::config::EhentaiConfig;
-use crate::db::entities::{eh_download_queue, subscriptions};
+use crate::db::entities::{eh_download_queue, eh_gallery_jobs, subscriptions};
 use crate::db::repo::Repo;
 use crate::db::types::{
     EhFilter, EhPendingGallery, EhTagState, EhTaskKey, SubscriptionState, TaskType,
@@ -22,7 +22,12 @@ use tokio::task::JoinSet;
 use tracing::{debug, error, info, warn};
 
 use crate::db::repo::eh_download_queue::{
-    EH_PUBLISH_CANCEL_LOCK, STATUS_DOWNLOADED, STATUS_PENDING, STATUS_UPLOADED,
+    EhDeliveryClaim, EH_CHAT_LOCKS, SOURCE_DIRECT, SOURCE_SUBSCRIPTION, STATUS_PUBLISHING,
+};
+use crate::db::repo::eh_gallery_jobs::{
+    eh_gallery_job_artifact_path, EhCleanupFinalizeOutcome, EhGalleryVariant,
+    EhJobUploadFailureOutcome, DOWNLOAD_MODE_ARCHIVE, DOWNLOAD_MODE_IMAGES, DOWNLOAD_MODE_LEGACY,
+    JOB_STATUS_DOWNLOADED, JOB_STATUS_DOWNLOADING, TELEGRAPH_STATUS_READY,
 };
 
 /// Maximum search pages to fetch per tick (safety cap).
@@ -38,6 +43,7 @@ const SLOW_DOWNLOAD_BYTES_PER_SEC: u64 = 1024 * 1024;
 
 static EH_GP_BUDGET_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
+#[cfg(test)]
 fn archive_artifacts_for_entry(
     cache_dir: &std::path::Path,
     entry: &eh_download_queue::Model,
@@ -49,19 +55,43 @@ fn archive_artifacts_for_entry(
     )
 }
 
+fn archive_artifacts_for_job(
+    cache_dir: &std::path::Path,
+    job: &eh_gallery_jobs::Model,
+) -> ArchiveArtifacts {
+    ArchiveArtifacts::new(eh_gallery_job_artifact_path(
+        &cache_dir.join("eh_cache"),
+        job,
+    ))
+}
+
+#[cfg(test)]
 async fn cleanup_archive_artifacts(cache_dir: &std::path::Path, entry: &eh_download_queue::Model) {
-    let artifacts = archive_artifacts_for_entry(cache_dir, entry);
+    cleanup_archive_artifacts_for_gid(
+        cache_dir,
+        entry.gid,
+        archive_artifacts_for_entry(cache_dir, entry),
+    )
+    .await;
+}
+
+#[cfg(test)]
+async fn cleanup_archive_artifacts_for_gid(
+    _cache_dir: &std::path::Path,
+    gid: i64,
+    artifacts: ArchiveArtifacts,
+) {
     if artifacts.uploads_dir().exists() {
         warn!(
             "Preserving EH archive artifacts with multipart upload state for gid={} because this cleanup path has no Abort uploader",
-            entry.gid
+            gid
         );
         return;
     }
     if let Err(e) = artifacts.remove_all().await {
         warn!(
             "Failed to delete EH archive artifacts for gid={}: {}",
-            entry.gid, e
+            gid, e
         );
     }
 }
@@ -94,11 +124,11 @@ impl std::error::Error for EhUploadStateAbortGateError {}
 /// Require a provider-specific terminal Abort before deleting persisted multipart
 /// upload state. The error intentionally identifies only the gallery gid: local
 /// manifests can contain remote upload identifiers and must remain private.
-async fn ensure_entry_upload_state_aborted(
-    entry: &eh_download_queue::Model,
+async fn ensure_job_upload_state_aborted(
+    job: &eh_gallery_jobs::Model,
     abort_uploader: Option<&dyn ImageUploader>,
 ) -> Result<UploadStateAbortPermit> {
-    let Some(zip_path) = entry.zip_path.as_deref() else {
+    let Some(zip_path) = job.zip_path.as_deref() else {
         return Ok(UploadStateAbortPermit);
     };
     let uploads_dir = ArchiveArtifacts::new(zip_path).uploads_dir().to_path_buf();
@@ -106,47 +136,108 @@ async fn ensure_entry_upload_state_aborted(
         return Ok(UploadStateAbortPermit);
     }
     let abort_uploader = abort_uploader.ok_or_else(|| {
-        anyhow::Error::new(EhUploadStateAbortGateError::NoAbortUploader { gid: entry.gid })
+        anyhow::Error::new(EhUploadStateAbortGateError::NoAbortUploader { gid: job.gid })
     })?;
     abort_uploader
         .abort_upload_state(&uploads_dir)
         .await
         .map_err(|_| {
-            anyhow::Error::new(EhUploadStateAbortGateError::AbortFailed { gid: entry.gid })
+            anyhow::Error::new(EhUploadStateAbortGateError::AbortFailed { gid: job.gid })
         })?;
     Ok(UploadStateAbortPermit)
 }
 
 struct UploadStateAbortPermit;
 
-async fn remove_entry_upload_state(
-    entry: &eh_download_queue::Model,
-    _permit: UploadStateAbortPermit,
-) {
-    let Some(zip_path) = entry.zip_path.as_deref() else {
+async fn remove_job_upload_state(job: &eh_gallery_jobs::Model, _permit: UploadStateAbortPermit) {
+    let Some(zip_path) = job.zip_path.as_deref() else {
         return;
     };
-    if let Err(e) = ArchiveArtifacts::new(zip_path).remove_upload_state().await {
+    if let Err(error) = ArchiveArtifacts::new(zip_path).remove_upload_state().await {
         warn!(
-            "Failed to delete EH upload state for gid={}: {}",
-            entry.gid, e
+            "Failed to delete shared EH upload state for job {} gid={}: {}",
+            job.id, job.gid, error
         );
     }
 }
 
-async fn remove_entry_archive_family(
-    entry: &eh_download_queue::Model,
-    _permit: UploadStateAbortPermit,
-) {
-    let Some(zip_path) = entry.zip_path.as_deref() else {
-        return;
-    };
-    if let Err(e) = ArchiveArtifacts::new(zip_path).remove_all().await {
-        warn!(
-            "Failed to delete EH archive artifacts for gid={}: {}",
-            entry.gid, e
-        );
+/// Execute exactly one durable artifact-cleanup claim.  Provider Abort always
+/// completes before local removal; any error records a retryable internal
+/// failure and leaves the job non-claimable for normal downloads.
+async fn execute_eh_job_cleanup(
+    repo: &Repo,
+    job: &eh_gallery_jobs::Model,
+    abort_uploader: Option<&dyn ImageUploader>,
+    retry_delay_secs: i64,
+    send_archive: bool,
+) -> Result<EhCleanupFinalizeOutcome> {
+    let generation = job
+        .cleanup_started_at
+        .context("Claimed shared EH artifact cleanup is missing its generation")?;
+    let result: Result<Option<EhCleanupFinalizeOutcome>> = async {
+        let _permit = ensure_job_upload_state_aborted(job, abort_uploader).await?;
+        if let Some(zip_path) = job.zip_path.as_deref() {
+            ArchiveArtifacts::new(zip_path)
+                .remove_all()
+                .await
+                .context("Failed to remove shared EH archive artifact family after Abort")?;
+        }
+        repo.finalize_eh_job_cleanup(job.id, generation, send_archive)
+            .await
     }
+    .await;
+    match result {
+        Ok(Some(outcome)) => Ok(outcome),
+        Ok(None) => Ok(EhCleanupFinalizeOutcome::Stale),
+        Err(error) => {
+            let record_error = repo
+                .record_eh_job_cleanup_failure(
+                    job.id,
+                    generation,
+                    &format!("{error:#}"),
+                    retry_delay_secs,
+                )
+                .await;
+            if let Err(record_error) = record_error {
+                return Err(error.context(format!(
+                    "Failed to persist shared EH cleanup failure: {record_error:#}"
+                )));
+            }
+            Err(error)
+        }
+    }
+}
+
+/// Claim and execute one due shared-artifact cleanup generation.
+async fn run_eh_job_cleanup_maintenance_once(
+    repo: &Repo,
+    abort_uploader: Option<&dyn ImageUploader>,
+    retry_delay_secs: i64,
+    send_archive: bool,
+) -> Result<Option<EhCleanupFinalizeOutcome>> {
+    let Some(job) = repo.get_next_eh_job_for_cleanup().await? else {
+        return Ok(None);
+    };
+    execute_eh_job_cleanup(repo, &job, abort_uploader, retry_delay_secs, send_archive)
+        .await
+        .map(Some)
+}
+
+/// Startup drains due cleanup work before workers can claim normal sources.
+pub async fn drain_eh_job_cleanup_maintenance(
+    repo: &Repo,
+    abort_uploader: Option<&dyn ImageUploader>,
+    retry_delay_secs: i64,
+    send_archive: bool,
+) -> Result<u64> {
+    let mut drained = 0;
+    while run_eh_job_cleanup_maintenance_once(repo, abort_uploader, retry_delay_secs, send_archive)
+        .await?
+        .is_some()
+    {
+        drained += 1;
+    }
+    Ok(drained)
 }
 
 fn gp_rate_defer_delay_secs(window_hours: u64) -> i64 {
@@ -275,7 +366,8 @@ fn archive_cost_policy_reject_reason(
 async fn check_and_reserve_archive_cost(
     repo: &Repo,
     config: &EhentaiConfig,
-    queue_id: i32,
+    job_id: Option<i32>,
+    queue_id: Option<i32>,
     gid: i64,
     cost: &DownloadCost,
 ) -> Result<ArchiveCostCheck> {
@@ -285,9 +377,9 @@ async fn check_and_reserve_archive_cost(
     }
 
     // 2. Byte rate limit
-    let downloaded_bytes = repo
-        .get_eh_downloaded_bytes_in_window(config.download_rate_window_hours)
-        .await?;
+    let window_hours = i64::try_from(config.download_rate_window_hours)
+        .context("EH download rate window hours exceed the supported range")?;
+    let downloaded_bytes = repo.get_eh_downloaded_bytes_in_window(window_hours).await?;
     if downloaded_bytes >= config.download_rate_limit_bytes() as i64 {
         return Ok(ArchiveCostCheck::Defer {
             delay_secs: config.download_poll_interval_sec.max(60) as i64,
@@ -334,14 +426,33 @@ async fn check_and_reserve_archive_cost(
                 ),
             });
         }
-        repo.append_eh_gp_spend_attempt(queue_id, gid, gp_cost)
-            .await?;
+        append_archive_cost_attempt(repo, job_id, queue_id, gid, gp_cost).await?;
     } else {
-        repo.append_eh_gp_spend_attempt(queue_id, gid, gp_cost)
-            .await?;
+        append_archive_cost_attempt(repo, job_id, queue_id, gid, gp_cost).await?;
     }
 
     Ok(ArchiveCostCheck::Proceed)
+}
+
+async fn append_archive_cost_attempt(
+    repo: &Repo,
+    job_id: Option<i32>,
+    queue_id: Option<i32>,
+    gid: i64,
+    gp_cost: i64,
+) -> Result<()> {
+    match (job_id, queue_id) {
+        (Some(job_id), None) => {
+            repo.append_eh_job_gp_spend_attempt(job_id, gid, gp_cost)
+                .await?;
+        }
+        (None, Some(queue_id)) => {
+            repo.append_eh_gp_spend_attempt(queue_id, gid, gp_cost)
+                .await?;
+        }
+        _ => anyhow::bail!("EH archive cost reservation requires exactly one ledger owner"),
+    }
+    Ok(())
 }
 
 pub struct EhBackgroundDownloadWorker {
@@ -384,9 +495,11 @@ impl EhBackgroundDownloadWorker {
         // configured window is already saturated. Without this, the background
         // worker would happily spawn N concurrent archive POSTs (each of which
         // can spend GP) even when the main worker has already deferred.
+        let window_hours = i64::try_from(self.config.download_rate_window_hours)
+            .context("EH download rate window hours exceed the supported range")?;
         let downloaded_bytes = self
             .repo
-            .get_eh_downloaded_bytes_in_window(self.config.download_rate_window_hours)
+            .get_eh_downloaded_bytes_in_window(window_hours)
             .await?;
         if downloaded_bytes >= self.config.download_rate_limit_bytes() as i64 {
             info!(
@@ -399,7 +512,7 @@ impl EhBackgroundDownloadWorker {
         let concurrency = self.config.background_download_concurrency.max(1);
         let mut tasks = JoinSet::new();
         for _ in 0..concurrency {
-            let Some(entry) = self.repo.get_next_for_background_download().await? else {
+            let Some(job) = self.repo.get_next_eh_job_for_background_download().await? else {
                 break;
             };
             let worker = Self::new(
@@ -408,22 +521,98 @@ impl EhBackgroundDownloadWorker {
                 Arc::clone(&self.config),
                 self.cache_dir.clone(),
             );
-            tasks.spawn(async move { worker.process_claimed(entry).await });
+            tasks.spawn(async move { worker.process_claimed(job).await });
         }
 
         drain_background_download_tasks(&mut tasks).await
     }
 
-    async fn process_claimed(&self, entry: eh_download_queue::Model) -> Result<()> {
-        match self.download_claimed(&entry).await {
+    async fn process_claimed(&self, job: eh_gallery_jobs::Model) -> Result<()> {
+        let expected_started_at = job.started_at.context(
+            "Cannot process shared EH gallery background job: missing download claim started_at",
+        )?;
+        if !self.repo.eh_job_has_active_deliveries(job.id).await? {
+            self.repo
+                .retire_eh_job_without_active_deliveries(&job)
+                .await?;
+            info!("Retired consumerless shared EH background job {}", job.id);
+            return Ok(());
+        }
+
+        let zip_path = archive_artifacts_for_job(&self.cache_dir, &job)
+            .final_zip()
+            .to_path_buf();
+        let zip_path_str = zip_path.to_string_lossy().to_string();
+        if !self
+            .repo
+            .persist_eh_job_archive_artifact_ownership(
+                job.id,
+                expected_started_at,
+                &zip_path_str,
+                true,
+            )
+            .await?
+        {
+            info!(
+                "Skipping stale shared EH background job {} before touching its archive family",
+                job.id
+            );
+            return Ok(());
+        }
+
+        let deliveries = self.repo.get_active_eh_job_deliveries(job.id).await?;
+        let mut has_active_delivery = false;
+        let mut has_notifiable_delivery = false;
+        for delivery in deliveries {
+            if !self
+                .repo
+                .eh_download_is_active(delivery.id, &delivery.status, self.config.send_archive)
+                .await?
+            {
+                continue;
+            }
+            has_active_delivery = true;
+            if get_chat_if_should_notify(&self.repo, delivery.chat_id)
+                .await?
+                .is_some()
+            {
+                has_notifiable_delivery = true;
+                break;
+            }
+        }
+        if !has_active_delivery {
+            self.repo
+                .retire_eh_job_without_active_deliveries(&job)
+                .await?;
+            info!("Retired canceled shared EH background job {}", job.id);
+            return Ok(());
+        }
+        if !has_notifiable_delivery {
+            let reason = "no active destination is notifiable";
+            info!(
+                "Deferring shared EH background gid={} because {}",
+                job.gid, reason
+            );
+            self.repo
+                .defer_eh_job_background_download(
+                    job.id,
+                    self.config.download_poll_interval_sec as i64,
+                    reason,
+                )
+                .await?;
+            return Ok(());
+        }
+
+        match self.download_claimed(&job).await {
             Ok(BackgroundDownloadOutcome::Completed {
                 file_size,
                 zip_path,
                 gp_cost,
             }) => {
                 self.repo
-                    .mark_eh_background_download_downloaded(
-                        entry.id,
+                    .mark_eh_job_background_downloaded(
+                        job.id,
+                        expected_started_at,
                         file_size as i64,
                         &zip_path.to_string_lossy(),
                         gp_cost,
@@ -431,32 +620,35 @@ impl EhBackgroundDownloadWorker {
                     .await?;
             }
             Ok(BackgroundDownloadOutcome::Deferred { reason }) => {
-                // Non-error defer: the entry has already been pushed back in the
-                // background queue by `defer_eh_background_download`. Do NOT
-                // call `schedule_eh_background_download_retry` - quota defer is
-                // not a failure and must not burn attempt_count.
+                // Non-error defer: `download_claimed` has already returned the
+                // shared job to the background queue. Do NOT schedule a retry:
+                // quota defer is not a failure and must not burn attempt_count.
                 debug!(
                     "EH background download gid={} deferred without retry increment: {}",
-                    entry.gid, reason
+                    job.gid, reason
                 );
+                self.repo
+                    .evaluate_eh_job_liveness(job.id, self.config.send_archive)
+                    .await?;
             }
             Ok(BackgroundDownloadOutcome::Rejected { reason }) => {
                 self.repo
-                    .fail_eh_background_download_for_archive_policy(&entry, &reason)
+                    .fail_eh_job_background_download_for_archive_policy(&job, &reason)
                     .await
                     .map_err(|error| error.context(ArchivePolicyTransitionError))?;
                 warn!(
                     "Rejecting EH background download for gid={} due to archive policy: {}",
-                    entry.gid, reason
+                    job.gid, reason
                 );
             }
             Err(e) => {
                 // Real failure (network, parse, etc.): schedule a retry and
                 // increment attempt_count. May become permanent.
-                let (_, permanent) = self
+                let (failed_job, permanent) = self
                     .repo
-                    .schedule_eh_background_download_retry(
-                        entry.id,
+                    .schedule_eh_job_background_retry(
+                        job.id,
+                        expected_started_at,
                         &e.to_string(),
                         self.config.background_download_max_attempts,
                     )
@@ -464,9 +656,15 @@ impl EhBackgroundDownloadWorker {
                 if permanent {
                     warn!(
                         "Permanent background EH download failure for gid={}: {}",
-                        entry.gid, e
+                        job.gid, e
                     );
-                    cleanup_archive_artifacts(&self.cache_dir, &entry).await;
+                    self.repo
+                        .evaluate_eh_job_liveness(failed_job.id, self.config.send_archive)
+                        .await?;
+                } else {
+                    self.repo
+                        .evaluate_eh_job_liveness(failed_job.id, self.config.send_archive)
+                        .await?;
                 }
             }
         }
@@ -475,21 +673,35 @@ impl EhBackgroundDownloadWorker {
 
     async fn download_claimed(
         &self,
-        entry: &eh_download_queue::Model,
+        job: &eh_gallery_jobs::Model,
     ) -> Result<BackgroundDownloadOutcome> {
-        let gid = entry.gid as u64;
-        let token = &entry.token;
+        let gid = job.gid as u64;
+        let token = &job.token;
         let eh_cache = self.cache_dir.join("eh_cache");
         tokio::fs::create_dir_all(&eh_cache).await?;
-        let artifacts = archive_artifacts_for_entry(&self.cache_dir, entry);
+        let artifacts = archive_artifacts_for_job(&self.cache_dir, job);
         let zip_path = artifacts.final_zip().to_path_buf();
 
-        let (file_size, gp_cost) = if self.client.is_logged_in() {
-            let resolution = if entry.source == "direct" {
-                &self.config.download_resolution
-            } else {
-                &self.config.subscription_resolution
-            };
+        let archive_resolution = match job.download_mode.as_str() {
+            DOWNLOAD_MODE_ARCHIVE => Some(job.resolution.as_str()),
+            DOWNLOAD_MODE_IMAGES => None,
+            DOWNLOAD_MODE_LEGACY if self.client.is_logged_in() => match job.resolution.as_str() {
+                SOURCE_DIRECT => Some(self.config.download_resolution.as_str()),
+                SOURCE_SUBSCRIPTION => Some(self.config.subscription_resolution.as_str()),
+                resolution => anyhow::bail!(
+                    "Cannot resolve legacy shared EH gallery background job {} with resolution '{}'",
+                    job.id,
+                    resolution
+                ),
+            },
+            DOWNLOAD_MODE_LEGACY => None,
+            mode => anyhow::bail!(
+                "Cannot download shared EH gallery background job {} with unsupported mode '{}'",
+                job.id,
+                mode
+            ),
+        };
+        let (file_size, gp_cost) = if let Some(resolution) = archive_resolution {
             let archive_request = self
                 .client
                 .prepare_archive_download(gid, token, resolution)
@@ -510,8 +722,9 @@ impl EhBackgroundDownloadWorker {
             match check_and_reserve_archive_cost(
                 self.repo.as_ref(),
                 self.config.as_ref(),
-                entry.id,
-                entry.gid,
+                Some(job.id),
+                None,
+                job.gid,
                 archive_request.cost(),
             )
             .await?
@@ -528,7 +741,7 @@ impl EhBackgroundDownloadWorker {
                     // retryable failure, it just needs to wait for the window
                     // to recover.
                     self.repo
-                        .defer_eh_background_download(entry.id, delay_secs, &reason)
+                        .defer_eh_job_background_download(job.id, delay_secs, &reason)
                         .await?;
                     return Ok(BackgroundDownloadOutcome::Deferred { reason });
                 }
@@ -836,6 +1049,11 @@ impl EhEngine {
         mut remaining_slots: usize,
         telegraph_default: bool,
     ) -> Result<(subscriptions::Model, EhTagState, usize)> {
+        let variant = EhGalleryVariant::for_request(
+            self.client.is_logged_in(),
+            SOURCE_SUBSCRIPTION,
+            self.config.as_ref(),
+        );
         if !self.repo.subscription_exists(sub.id).await? {
             info!(
                 "Skipping pending EH backlog for removed subscription {}",
@@ -867,12 +1085,13 @@ impl EhEngine {
                     &pending.token,
                     &pending.title,
                     telegraph_default,
+                    &variant,
                 )
                 .await
             {
                 if !self.repo.subscription_exists(sub.id).await? {
                     self.repo
-                        .cancel_eh_subscription_queue_entries(sub.id)
+                        .cancel_eh_subscription_queue_entries(sub.id, self.config.send_archive)
                         .await?;
                     info!(
                         "Skipping pending EH gallery {} for removed subscription {}",
@@ -894,7 +1113,7 @@ impl EhEngine {
             }
             if !self.repo.subscription_exists(sub.id).await? {
                 self.repo
-                    .cancel_eh_subscription_queue_entries(sub.id)
+                    .cancel_eh_subscription_queue_entries(sub.id, self.config.send_archive)
                     .await?;
                 info!(
                     "Removed pending EH gallery {} owner for deleted subscription {}",
@@ -914,7 +1133,7 @@ impl EhEngine {
         state.trim_pushed(self.config.pushed_cap);
         if !self.repo.subscription_exists(sub.id).await? {
             self.repo
-                .cancel_eh_subscription_queue_entries(sub.id)
+                .cancel_eh_subscription_queue_entries(sub.id, self.config.send_archive)
                 .await?;
             return Ok((sub.clone(), state, 0));
         }
@@ -937,6 +1156,11 @@ impl EhEngine {
             return Ok(());
         }
         let mut state = eh_tag_subscription_state(sub).unwrap_or_else(EhTagState::cleared);
+        let variant = EhGalleryVariant::for_request(
+            self.client.is_logged_in(),
+            SOURCE_SUBSCRIPTION,
+            self.config.as_ref(),
+        );
 
         let sub_filter = sub.eh_filter.as_ref();
         let mut remaining_slots = max_push;
@@ -1000,12 +1224,13 @@ impl EhEngine {
                     &gallery.token,
                     &gallery.title,
                     telegraph_default,
+                    &variant,
                 )
                 .await
             {
                 if !self.repo.subscription_exists(sub.id).await? {
                     self.repo
-                        .cancel_eh_subscription_queue_entries(sub.id)
+                        .cancel_eh_subscription_queue_entries(sub.id, self.config.send_archive)
                         .await?;
                     info!(
                         "Skipping EH gallery {} for removed subscription {}",
@@ -1027,7 +1252,7 @@ impl EhEngine {
             }
             if !self.repo.subscription_exists(sub.id).await? {
                 self.repo
-                    .cancel_eh_subscription_queue_entries(sub.id)
+                    .cancel_eh_subscription_queue_entries(sub.id, self.config.send_archive)
                     .await?;
                 info!(
                     "Removed EH gallery {} owner for deleted subscription {}",
@@ -1052,7 +1277,7 @@ impl EhEngine {
         state.trim_pushed(self.config.pushed_cap);
         if !self.repo.subscription_exists(sub.id).await? {
             self.repo
-                .cancel_eh_subscription_queue_entries(sub.id)
+                .cancel_eh_subscription_queue_entries(sub.id, self.config.send_archive)
                 .await?;
             return Ok(());
         }
@@ -1139,16 +1364,6 @@ impl EhDownloadWorker {
     }
 
     pub async fn run(self) {
-        // Clean orphan cache files on startup (stale entry reset is done in main.rs)
-        let eh_cache = self.cache_dir.join("eh_cache");
-        if let Err(e) = self
-            .repo
-            .cleanup_eh_cache_orphans(&eh_cache, self.startup_abort_uploader.as_deref())
-            .await
-        {
-            warn!("Failed to cleanup eh cache orphans: {:#}", e);
-        }
-
         let poll = self.config.download_poll_interval_sec.max(10);
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(poll));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1162,10 +1377,20 @@ impl EhDownloadWorker {
     }
 
     async fn tick(&self) -> Result<()> {
+        run_eh_job_cleanup_maintenance_once(
+            self.repo.as_ref(),
+            self.startup_abort_uploader.as_deref(),
+            self.config.download_poll_interval_sec as i64,
+            self.config.send_archive,
+        )
+        .await?;
+
         // Rate limit check
+        let window_hours = i64::try_from(self.config.download_rate_window_hours)
+            .context("EH download rate window hours exceed the supported range")?;
         let downloaded_bytes = self
             .repo
-            .get_eh_downloaded_bytes_in_window(self.config.download_rate_window_hours)
+            .get_eh_downloaded_bytes_in_window(window_hours)
             .await?;
 
         if downloaded_bytes >= self.config.download_rate_limit_bytes() as i64 {
@@ -1173,13 +1398,13 @@ impl EhDownloadWorker {
             return Ok(());
         }
 
-        let entry = self.repo.get_next_for_download().await?;
-        let Some(entry) = entry else {
+        let job = self.repo.get_next_eh_job_for_download().await?;
+        let Some(job) = job else {
             return Ok(());
         };
 
-        if let Err(e) = self.process(&entry).await {
-            error!("Download failed for entry {}: {:#}", entry.id, e);
+        if let Err(e) = self.process(&job).await {
+            error!("Download failed for shared EH job {}: {:#}", job.id, e);
 
             if e.downcast_ref::<ArchivePolicyTransitionError>().is_some() {
                 return Err(e);
@@ -1208,40 +1433,52 @@ impl EhDownloadWorker {
                     && should_schedule_background_download(failures, bytes_delta, elapsed)
                 {
                     info!(
-                        "Scheduling EH gid={} for background download after {} failed attempts, {} bytes in {:?} over {} archive attempts",
-                        entry.gid, failures, bytes_delta, elapsed, attempts
+                        "Handing shared EH gid={} to background download after {} failed attempts, {} bytes in {:?} over {} archive attempts",
+                        job.gid, failures, bytes_delta, elapsed, attempts
                     );
                     self.repo
-                        .schedule_eh_background_download_from(
-                            entry.id,
-                            &entry.status,
+                        .schedule_eh_job_background_download(
+                            job.id,
+                            JOB_STATUS_DOWNLOADING,
                             &e.to_string(),
                         )
                         .await?;
                 } else {
                     self.repo
-                        .defer_eh_download(
-                            entry.id,
-                            STATUS_PENDING,
+                        .defer_eh_job_download(
+                            job.id,
                             self.config.download_poll_interval_sec as i64,
                         )
                         .await?;
                 }
+                self.repo
+                    .evaluate_eh_job_liveness(job.id, self.config.send_archive)
+                    .await?;
             } else {
-                let (_, permanent) = self
+                let expected_started_at = job.started_at.context(
+                    "Cannot schedule shared EH gallery job retry: missing download claim started_at",
+                )?;
+                let (failed_job, permanent) = self
                     .repo
-                    .schedule_eh_retry_from(
-                        entry.id,
-                        &entry.status,
-                        STATUS_PENDING,
+                    .schedule_eh_job_download_retry(
+                        job.id,
+                        expected_started_at,
                         &e.to_string(),
                         self.config.max_retry_count,
                     )
                     .await?;
                 if permanent {
-                    warn!("Permanent download failure for gid={}: {}", entry.gid, e);
-                    // Delete partial ZIP if it exists — only on unrecoverable failure
-                    self.cleanup_zip(&entry).await;
+                    warn!(
+                        "Permanent shared EH download failure for gid={}: {}",
+                        job.gid, e
+                    );
+                    self.repo
+                        .evaluate_eh_job_liveness(failed_job.id, self.config.send_archive)
+                        .await?;
+                } else {
+                    self.repo
+                        .evaluate_eh_job_liveness(failed_job.id, self.config.send_archive)
+                        .await?;
                 }
             }
         }
@@ -1249,63 +1486,108 @@ impl EhDownloadWorker {
         Ok(())
     }
 
-    async fn process(&self, entry: &eh_download_queue::Model) -> Result<()> {
-        let gid = entry.gid as u64;
-        let token = &entry.token;
+    async fn process(&self, job: &eh_gallery_jobs::Model) -> Result<()> {
+        let gid = job.gid as u64;
+        let token = &job.token;
+        let expected_started_at = job
+            .started_at
+            .context("Cannot process shared EH gallery job: missing download claim started_at")?;
 
-        // Check chat is enabled before downloading
-        let chat = get_chat_if_should_notify(&self.repo, entry.chat_id).await?;
-        if chat.is_none() {
-            let _publish_cancel_guard = EH_PUBLISH_CANCEL_LOCK.lock().await;
+        if !self.repo.eh_job_has_active_deliveries(job.id).await? {
+            self.repo
+                .retire_eh_job_without_active_deliveries(job)
+                .await?;
+            info!("Retired consumerless shared EH gallery job {}", job.id);
+            return Ok(());
+        }
+
+        let zip_path = archive_artifacts_for_job(&self.cache_dir, job)
+            .final_zip()
+            .to_path_buf();
+        let zip_path_str = zip_path.to_string_lossy().to_string();
+        if !self
+            .repo
+            .persist_eh_job_archive_artifact_ownership(
+                job.id,
+                expected_started_at,
+                &zip_path_str,
+                false,
+            )
+            .await?
+        {
+            info!(
+                "Skipping stale shared EH gallery job {} before touching its archive family",
+                job.id
+            );
+            return Ok(());
+        }
+
+        let deliveries = self.repo.get_active_eh_job_deliveries(job.id).await?;
+        let mut has_active_delivery = false;
+        let mut has_notifiable_delivery = false;
+        for delivery in deliveries {
             if !self
                 .repo
-                .eh_download_is_active(entry.id, &entry.status)
+                .eh_download_is_active(delivery.id, &delivery.status, self.config.send_archive)
                 .await?
             {
-                info!("Skipping canceled EH download entry {}", entry.id);
-                return Ok(());
+                continue;
             }
-            info!(
-                "Deferring download for gid={} — chat {} not notifiable",
-                gid, entry.chat_id
-            );
-            // Defer (no retry increment): the entry stays pending until the chat
-            // is available again.
+            has_active_delivery = true;
+            if get_chat_if_should_notify(&self.repo, delivery.chat_id)
+                .await?
+                .is_some()
+            {
+                has_notifiable_delivery = true;
+                break;
+            }
+        }
+        if !has_active_delivery {
             self.repo
-                .defer_eh_download(
-                    entry.id,
-                    STATUS_PENDING,
-                    self.config.download_poll_interval_sec as i64,
-                )
+                .retire_eh_job_without_active_deliveries(job)
+                .await?;
+            info!("Retired canceled shared EH gallery job {}", job.id);
+            return Ok(());
+        }
+        if !has_notifiable_delivery {
+            info!(
+                "Deferring shared EH gallery gid={} because no active destination is notifiable",
+                gid
+            );
+            self.repo
+                .defer_eh_job_download(job.id, self.config.download_poll_interval_sec as i64)
                 .await?;
             return Ok(());
         }
 
-        let _publish_cancel_guard = EH_PUBLISH_CANCEL_LOCK.lock().await;
-        if !self
-            .repo
-            .eh_download_is_active(entry.id, &entry.status)
-            .await?
-        {
-            info!("Skipping canceled EH download entry {}", entry.id);
-            return Ok(());
-        }
-
+        // Artifact ownership was durably recorded before this filesystem write.
         // Ensure cache dir exists
         let eh_cache = self.cache_dir.join("eh_cache");
         tokio::fs::create_dir_all(&eh_cache).await?;
-        let artifacts = archive_artifacts_for_entry(&self.cache_dir, entry);
+        let artifacts = archive_artifacts_for_job(&self.cache_dir, job);
         let zip_path = artifacts.final_zip().to_path_buf();
-        let zip_path_str = zip_path.to_string_lossy().to_string();
 
         // Download
-        let (file_size, gp_cost) = if self.client.is_logged_in() {
-            let resolution = if entry.source == "direct" {
-                &self.config.download_resolution
-            } else {
-                &self.config.subscription_resolution
-            };
-
+        let archive_resolution = match job.download_mode.as_str() {
+            DOWNLOAD_MODE_ARCHIVE => Some(job.resolution.as_str()),
+            DOWNLOAD_MODE_IMAGES => None,
+            DOWNLOAD_MODE_LEGACY if self.client.is_logged_in() => match job.resolution.as_str() {
+                SOURCE_DIRECT => Some(self.config.download_resolution.as_str()),
+                SOURCE_SUBSCRIPTION => Some(self.config.subscription_resolution.as_str()),
+                resolution => anyhow::bail!(
+                    "Cannot resolve legacy shared EH gallery job {} with resolution '{}'",
+                    job.id,
+                    resolution
+                ),
+            },
+            DOWNLOAD_MODE_LEGACY => None,
+            mode => anyhow::bail!(
+                "Cannot download shared EH gallery job {} with unsupported mode '{}'",
+                job.id,
+                mode
+            ),
+        };
+        let (file_size, gp_cost) = if let Some(resolution) = archive_resolution {
             let archive_request = self
                 .client
                 .prepare_archive_download(gid, token, resolution)
@@ -1315,7 +1597,7 @@ impl EhDownloadWorker {
                 archive_cost_policy_reject_reason(self.config.as_ref(), archive_request.cost())
             {
                 self.repo
-                    .fail_eh_download_for_archive_policy(entry, &reason)
+                    .fail_eh_job_for_archive_policy(job, &reason)
                     .await
                     .map_err(|error| error.context(ArchivePolicyTransitionError))?;
                 warn!(
@@ -1334,8 +1616,9 @@ impl EhDownloadWorker {
             match check_and_reserve_archive_cost(
                 self.repo.as_ref(),
                 self.config.as_ref(),
-                entry.id,
-                entry.gid,
+                Some(job.id),
+                None,
+                job.gid,
                 archive_request.cost(),
             )
             .await?
@@ -1346,14 +1629,12 @@ impl EhDownloadWorker {
                         "Deferring EH download for gid={} ({}), no reservation or POST",
                         gid, reason
                     );
-                    self.repo
-                        .defer_eh_download(entry.id, STATUS_PENDING, delay_secs)
-                        .await?;
+                    self.repo.defer_eh_job_download(job.id, delay_secs).await?;
                     return Ok(());
                 }
                 ArchiveCostCheck::Reject { reason } => {
                     self.repo
-                        .fail_eh_download_for_archive_policy(entry, &reason)
+                        .fail_eh_job_for_archive_policy(job, &reason)
                         .await
                         .map_err(|error| error.context(ArchivePolicyTransitionError))?;
                     warn!(
@@ -1395,15 +1676,16 @@ impl EhDownloadWorker {
         );
 
         self.repo
-            .mark_eh_download_downloaded(entry.id, file_size as i64, &zip_path_str, gp_cost)
+            .mark_eh_job_downloaded(
+                job.id,
+                expected_started_at,
+                file_size as i64,
+                &zip_path_str,
+                gp_cost,
+            )
             .await?;
 
         Ok(())
-    }
-
-    /// Delete the archive artifact family for an entry on permanent failure.
-    async fn cleanup_zip(&self, entry: &eh_download_queue::Model) {
-        cleanup_archive_artifacts(&self.cache_dir, entry).await;
     }
 }
 
@@ -1493,11 +1775,11 @@ impl EhUploadWorker {
         }
     }
 
-    async fn abort_entry_upload_state(
+    async fn abort_job_upload_state(
         &self,
-        entry: &eh_download_queue::Model,
+        job: &eh_gallery_jobs::Model,
     ) -> Result<UploadStateAbortPermit> {
-        ensure_entry_upload_state_aborted(entry, self.abort_uploader.as_deref()).await
+        ensure_job_upload_state_aborted(job, self.abort_uploader.as_deref()).await
     }
 
     pub async fn run(self) {
@@ -1514,144 +1796,56 @@ impl EhUploadWorker {
     }
 
     async fn tick(&self) -> Result<()> {
-        let entry = self.repo.get_next_for_upload().await?;
-        let Some(entry) = entry else {
+        let job = self.repo.get_next_eh_job_for_upload().await?;
+        let Some(job) = job else {
             return Ok(());
         };
+        let expected_started_at = job
+            .started_at
+            .context("Claimed shared EH gallery upload is missing started_at")?;
 
-        if let Err(e) = self.process(&entry).await {
-            error!("Upload failed for entry {}: {:#}", entry.id, e);
-
-            // Cancellation and terminal-abort recovery may already have
-            // transitioned the claimed row. Preserve their error instead of
-            // attempting a stale CAS retry that would hide it.
-            if !self
+        if let Err(error) = self.process(&job).await {
+            error!("Upload failed for shared EH job {}: {:#}", job.id, error);
+            match self
                 .repo
-                .eh_download_is_active(entry.id, &entry.status)
+                .record_eh_job_upload_failure(
+                    job.id,
+                    expected_started_at,
+                    &format!("{error:#}"),
+                    self.config.max_retry_count,
+                    self.config.send_archive,
+                )
                 .await?
             {
-                return Err(e);
-            }
-
-            // Check if this failure would be permanent
-            let would_be_permanent = entry.retry_count + 1 > self.config.max_retry_count as i32;
-
-            // Permanent failure fallback: if archive delivery is configured
-            // and the ZIP file still exists, downgrade to archive-only instead
-            // of marking the entry as failed.
-            if would_be_permanent
-                && self.config.send_archive
-                && entry
-                    .zip_path
-                    .as_deref()
-                    .is_some_and(|p| std::path::Path::new(p).exists())
-            {
-                let abort_permit = match self.abort_entry_upload_state(&entry).await {
-                    Ok(permit) => permit,
-                    Err(abort_error) => {
-                        return match self
-                            .repo
-                            .defer_eh_upload_after_abort_failure(
-                                entry.id,
-                                self.config.download_poll_interval_sec as i64,
-                            )
+                EhJobUploadFailureOutcome::RetryScheduled(_) => {}
+                EhJobUploadFailureOutcome::Stale => return Err(error),
+                EhJobUploadFailureOutcome::Terminal { job: _, deliveries } => {
+                    for delivery in deliveries {
+                        let title = teloxide::utils::markdown::escape(&delivery.title);
+                        let message = format!("⚠️ Telegraph 上传失败，请稍后重试\n\n📦 {}", title);
+                        if let Err(notify_error) = self
+                            .notifier
+                            .send_text(teloxide::types::ChatId(delivery.chat_id), &message, false)
                             .await
                         {
-                            Ok(()) => Err(abort_error),
-                            Err(defer_error) => Err(anyhow::anyhow!(
-                                "{}; failed to defer uploading row after Abort failure: {}",
-                                abort_error,
-                                defer_error
-                            )),
+                            error!(
+                                "Failed to notify EH Telegraph delivery {} in chat {} after terminal upload failure: {:#}",
+                                delivery.delivery_id, delivery.chat_id, notify_error
+                            );
                         }
                     }
-                };
-                info!(
-                    "Upload permanently failed for entry {}, falling back to archive delivery",
-                    entry.id
-                );
-                remove_entry_upload_state(&entry, abort_permit).await;
-                let _ = self
-                    .repo
-                    .fallback_eh_upload_to_archive(
-                        entry.id,
-                        &format!("Telegraph upload failed, falling back to archive: {:#}", e),
-                    )
-                    .await?;
-                return Ok(());
-            }
-
-            let (_, permanent) = self
-                .repo
-                .schedule_eh_retry_from(
-                    entry.id,
-                    &entry.status,
-                    STATUS_DOWNLOADED,
-                    &e.to_string(),
-                    self.config.max_retry_count,
-                )
-                .await?;
-            if permanent {
-                let abort_permit = self.abort_entry_upload_state(&entry).await?;
-                remove_entry_archive_family(&entry, abort_permit).await;
-                let escaped_err = teloxide::utils::markdown::escape(&e.to_string());
-                let title = teloxide::utils::markdown::escape(&entry.title);
-                let msg = format!("⚠️ Telegraph 上传失败: {}\n\n📦 {}", escaped_err, title);
-                let _ = self
-                    .notifier
-                    .send_text(teloxide::types::ChatId(entry.chat_id), &msg, false)
-                    .await;
+                }
             }
         }
 
         Ok(())
     }
 
-    async fn process(&self, entry: &eh_download_queue::Model) -> Result<()> {
-        // Check chat is enabled before doing upload work (avoid wasting image upload quota)
-        let chat = get_chat_if_should_notify(&self.repo, entry.chat_id).await?;
-        if chat.is_none() {
-            let _publish_cancel_guard = EH_PUBLISH_CANCEL_LOCK.lock().await;
-            if !self
-                .repo
-                .eh_download_is_active(entry.id, &entry.status)
-                .await?
-            {
-                info!("Skipping canceled EH upload entry {}", entry.id);
-                let abort_permit = self.abort_entry_upload_state(entry).await?;
-                remove_entry_upload_state(entry, abort_permit).await;
-                return Ok(());
-            }
-            info!(
-                "Deferring upload for entry {} — chat {} not notifiable",
-                entry.id, entry.chat_id
-            );
-            self.repo
-                .defer_eh_download(
-                    entry.id,
-                    STATUS_DOWNLOADED,
-                    self.config.download_poll_interval_sec as i64,
-                )
-                .await?;
-            return Ok(());
-        }
-
-        let _publish_cancel_guard = EH_PUBLISH_CANCEL_LOCK.lock().await;
-        if !self
-            .repo
-            .eh_download_is_active(entry.id, &entry.status)
-            .await?
-        {
-            info!("Skipping canceled EH upload entry {}", entry.id);
-            let abort_permit = self.abort_entry_upload_state(entry).await?;
-            remove_entry_upload_state(entry, abort_permit).await;
-            return Ok(());
-        }
-
-        let zip_path = entry
+    async fn process(&self, job: &eh_gallery_jobs::Model) -> Result<()> {
+        let zip_path = job
             .zip_path
             .as_ref()
-            .context("zip_path is None for downloaded entry")?;
+            .context("zip_path is None for downloaded shared EH job")?;
         let zip_path = std::path::Path::new(zip_path);
         let artifacts = ArchiveArtifacts::new(zip_path);
 
@@ -1697,8 +1891,7 @@ impl EhUploadWorker {
                         entry_names.len()
                     );
                 }
-                self.create_telegraph_page_for_entry(entry, &url_pairs)
-                    .await?;
+                self.create_telegraph_page_for_job(job, &url_pairs).await?;
                 return Ok(());
             }
         }
@@ -1778,7 +1971,7 @@ impl EhUploadWorker {
             anyhow::bail!("No images uploaded by configured image uploader");
         }
 
-        self.create_telegraph_page_for_entry(entry, &all_url_pairs)
+        self.create_telegraph_page_for_job(job, &all_url_pairs)
             .await?;
 
         Ok(())
@@ -1790,15 +1983,15 @@ impl EhUploadWorker {
     ///
     /// Shared by the ZIP-first path (when the uploader returns URL pairs for
     /// the whole archive) and the per-image extraction path.
-    async fn create_telegraph_page_for_entry(
+    async fn create_telegraph_page_for_job(
         &self,
-        entry: &eh_download_queue::Model,
+        job: &eh_gallery_jobs::Model,
         all_url_pairs: &[TelegraphImageUrlPair],
     ) -> Result<()> {
-        let title = if entry.title.is_empty() {
+        let title = if job.title.is_empty() {
             "Gallery"
         } else {
-            &entry.title
+            &job.title
         };
 
         let result = self
@@ -1823,18 +2016,29 @@ impl EhUploadWorker {
             .context("Failed to serialize Telegraph rewrite data")?;
         let page_url = result.first_page_url;
 
-        info!("Created telegraph page for gid={}: {}", entry.gid, page_url);
+        info!(
+            "Created telegraph page for shared EH job {} gid={}: {}",
+            job.id, job.gid, page_url
+        );
 
         self.repo
-            .mark_eh_download_uploaded_with_rewrite(
-                entry.id,
+            .mark_eh_job_telegraph_ready(
+                job.id,
+                job.started_at
+                    .context("Claimed shared EH upload is missing started_at")?,
                 &page_url,
                 rewrite_data_json.as_deref(),
+                self.config.send_archive,
             )
             .await?;
 
-        let abort_permit = self.abort_entry_upload_state(entry).await?;
-        remove_entry_upload_state(entry, abort_permit).await;
+        match self.abort_job_upload_state(job).await {
+            Ok(abort_permit) => remove_job_upload_state(job, abort_permit).await,
+            Err(abort_error) => warn!(
+                "Preserving completed shared EH upload state for job {} because Abort cleanup failed: {:#}",
+                job.id, abort_error
+            ),
+        }
 
         Ok(())
     }
@@ -1844,25 +2048,29 @@ impl EhUploadWorker {
 // Stage 4: EhPublishWorker — Send archive ZIP and/or Telegraph link to Telegram chat
 // ============================================================================
 
-/// Raised when the cached ZIP file required for archive delivery is missing.
-#[derive(Debug)]
-struct MissingEhZip;
-
-impl std::fmt::Display for MissingEhZip {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("cached EH ZIP is missing")
-    }
-}
-
-impl std::error::Error for MissingEhZip {}
-
 pub struct EhPublishWorker {
     repo: Arc<Repo>,
     notifier: Notifier,
     client: Arc<EhClient>,
     rewrite_delay_sec: Option<u64>,
-    abort_uploader: Option<Arc<dyn ImageUploader>>,
     config: Arc<EhentaiConfig>,
+    #[cfg(test)]
+    publish_send_hook: Option<EhPublishSendHook>,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct EhPublishSendHook {
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+    after_done: Option<EhPublishCompletionHook>,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct EhPublishCompletionHook {
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
 }
 
 impl EhPublishWorker {
@@ -1882,7 +2090,7 @@ impl EhPublishWorker {
         notifier: Notifier,
         client: Arc<EhClient>,
         rewrite_delay_sec: Option<u64>,
-        abort_uploader: Option<Arc<dyn ImageUploader>>,
+        _abort_uploader: Option<Arc<dyn ImageUploader>>,
         config: Arc<EhentaiConfig>,
     ) -> Self {
         Self {
@@ -1890,9 +2098,16 @@ impl EhPublishWorker {
             notifier,
             client,
             rewrite_delay_sec,
-            abort_uploader,
             config,
+            #[cfg(test)]
+            publish_send_hook: None,
         }
+    }
+
+    #[cfg(test)]
+    fn with_test_send_hook(mut self, publish_send_hook: EhPublishSendHook) -> Self {
+        self.publish_send_hook = Some(publish_send_hook);
+        self
     }
 
     pub async fn run(self) {
@@ -1909,255 +2124,270 @@ impl EhPublishWorker {
     }
 
     async fn tick(&self) -> Result<()> {
-        let entry = self.repo.get_next_for_publish().await?;
-        let Some(entry) = entry else {
-            return Ok(());
-        };
+        let concurrency = self.config.publish_concurrency_clamped();
+        let mut tasks = JoinSet::new();
+        let mut no_more_claims = false;
+        let mut first_error = None;
 
-        if let Err(e) = self.process(&entry).await {
-            error!("Publish failed for entry {}: {:#}", entry.id, e);
-
-            if !self
-                .repo
-                .eh_download_is_active(entry.id, &entry.status)
-                .await?
-            {
-                return Err(e);
-            }
-
-            if e.downcast_ref::<EhUploadStateAbortGateError>().is_some() {
-                let target = if entry.telegraph_url.is_some() {
-                    STATUS_UPLOADED
-                } else {
-                    STATUS_DOWNLOADED
-                };
-                self.repo
-                    .defer_eh_publish_after_abort_failure(
-                        entry.id,
-                        target,
-                        self.config.download_poll_interval_sec as i64,
-                    )
-                    .await?;
-                return Err(e);
-            }
-
-            // Missing ZIP: retry from STATUS_PUBLISHING back to STATUS_PENDING
-            // so the download worker re-fetches the gallery.
-            if e.downcast_ref::<MissingEhZip>().is_some() {
-                let (updated, permanent) = self
+        loop {
+            while tasks.len() < concurrency && !no_more_claims {
+                match self
                     .repo
-                    .schedule_eh_retry_from(
-                        entry.id,
-                        &entry.status,
-                        STATUS_PENDING,
-                        &format!("cached EH ZIP is missing for {}", entry.title),
-                        self.config.max_retry_count,
-                    )
-                    .await?;
-                if permanent {
-                    let abort_permit =
-                        ensure_entry_upload_state_aborted(&updated, self.abort_uploader.as_deref())
-                            .await?;
-                    remove_entry_archive_family(&updated, abort_permit).await;
-                    let title = teloxide::utils::markdown::escape(&updated.title);
-                    let msg = format!("⚠️ 下载失败: {}\n原因: cached EH ZIP is missing", title);
-                    let _ = self
-                        .notifier
-                        .send_text(teloxide::types::ChatId(entry.chat_id), &msg, false)
-                        .await;
-                }
-                return Ok(());
+                    .get_next_eh_delivery_for_publish(self.config.send_archive)
+                    .await
+                {
+                    Ok(Some(claim)) => {
+                        let worker = Self {
+                            repo: Arc::clone(&self.repo),
+                            notifier: self.notifier.clone(),
+                            client: Arc::clone(&self.client),
+                            rewrite_delay_sec: self.rewrite_delay_sec,
+                            config: Arc::clone(&self.config),
+                            #[cfg(test)]
+                            publish_send_hook: self.publish_send_hook.clone(),
+                        };
+                        tasks.spawn(async move { worker.process_claimed(claim).await });
+                    }
+                    Ok(None) => {
+                        no_more_claims = true;
+                        break;
+                    }
+                    Err(error) => {
+                        error!("Failed to claim shared EH publish delivery: {:#}", error);
+                        if first_error.is_none() {
+                            first_error = Some(error);
+                        }
+                        no_more_claims = true;
+                        break;
+                    }
+                };
             }
 
-            // Regular retry: go back to the pre-publish status
-            let target = if entry.telegraph_url.is_some() {
-                STATUS_UPLOADED
-            } else {
-                STATUS_DOWNLOADED
+            let Some(result) = tasks.join_next().await else {
+                break;
             };
-            let (_, permanent) = self
-                .repo
-                .schedule_eh_retry_from(
-                    entry.id,
-                    &entry.status,
-                    target,
-                    &e.to_string(),
-                    self.config.max_retry_count,
-                )
-                .await?;
-            if permanent {
-                let abort_permit =
-                    ensure_entry_upload_state_aborted(&entry, self.abort_uploader.as_deref())
-                        .await?;
-                remove_entry_archive_family(&entry, abort_permit).await;
-                let escaped = teloxide::utils::markdown::escape(&e.to_string());
-                let title = teloxide::utils::markdown::escape(&entry.title);
-                let msg = format!("⚠️ 发布失败: {}\n\n📦 {}", escaped, title);
-                let _ = self
-                    .notifier
-                    .send_text(teloxide::types::ChatId(entry.chat_id), &msg, false)
-                    .await;
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    error!("Shared EH publish delivery task failed: {:#}", error);
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
+                Err(error) => {
+                    let error =
+                        anyhow::Error::new(error).context("shared EH publish task join failed");
+                    error!("Shared EH publish delivery task join failed: {:#}", error);
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
             }
         }
 
-        Ok(())
+        if let Some(error) = first_error {
+            Err(error.context("one or more shared EH publish deliveries failed"))
+        } else {
+            Ok(())
+        }
     }
 
-    async fn process(&self, entry: &eh_download_queue::Model) -> Result<()> {
-        let chat = get_chat_if_should_notify(&self.repo, entry.chat_id).await?;
-        if chat.is_none() {
-            let _publish_cancel_guard = EH_PUBLISH_CANCEL_LOCK.lock().await;
-            if !self.ensure_entry_active(entry).await? {
-                return Ok(());
-            }
-            // Chat disabled — defer without retry increment.  Determine the
-            // correct ready status so the entry is picked up again when the
-            // chat becomes available.
-            let target = if entry.telegraph_url.is_some() {
-                STATUS_UPLOADED
-            } else {
-                STATUS_DOWNLOADED
-            };
+    async fn process_claimed(&self, claim: EhDeliveryClaim) -> Result<()> {
+        let _chat_guard = EH_CHAT_LOCKS.lock_chat(claim.delivery.chat_id).await;
+        let Some(EhDeliveryClaim { delivery, job }) = self
+            .repo
+            .get_eh_delivery_publish_claim(claim.delivery.id)
+            .await?
+        else {
+            return Ok(());
+        };
+        if !self
+            .repo
+            .eh_delivery_is_active(delivery.id, STATUS_PUBLISHING, self.config.send_archive)
+            .await?
+        {
             info!(
-                "Deferring publish for entry {} — chat {} not notifiable, releasing to {}",
-                entry.id, entry.chat_id, target
+                "Skipping inactive shared EH publish delivery {} for chat {}",
+                delivery.id, delivery.chat_id
             );
+            return Ok(());
+        }
+        if get_chat_if_should_notify(&self.repo, delivery.chat_id)
+            .await?
+            .is_none()
+        {
             self.repo
-                .defer_eh_download(
-                    entry.id,
-                    target,
+                .defer_eh_delivery_publish(
+                    delivery.id,
+                    self.config.download_poll_interval_sec as i64,
+                )
+                .await?;
+            info!(
+                "Deferred shared EH publish delivery {} because chat {} is not notifiable",
+                delivery.id, delivery.chat_id
+            );
+            return Ok(());
+        }
+
+        let archive_required = self.config.send_archive && delivery.archive_sent_at.is_none();
+        let telegraph_required = delivery.telegraph && delivery.telegraph_sent_at.is_none();
+        if telegraph_required
+            && (job.telegraph_status != TELEGRAPH_STATUS_READY || job.telegraph_url.is_none())
+        {
+            self.repo
+                .defer_eh_delivery_publish(
+                    delivery.id,
                     self.config.download_poll_interval_sec as i64,
                 )
                 .await?;
             return Ok(());
         }
-        let chat_id = teloxide::types::ChatId(entry.chat_id);
-
-        let _publish_cancel_guard = EH_PUBLISH_CANCEL_LOCK.lock().await;
-
-        if !self.ensure_entry_active(entry).await? {
+        if archive_required && (job.status != JOB_STATUS_DOWNLOADED || job.zip_path.is_none()) {
+            self.repo
+                .defer_eh_delivery_publish(
+                    delivery.id,
+                    self.config.download_poll_interval_sec as i64,
+                )
+                .await?;
             return Ok(());
         }
 
-        // Determine which surfaces need to be sent.
-        let archive_required = self.config.send_archive && entry.archive_sent_at.is_none();
-        let telegraph_required = entry.telegraph_url.is_some() && entry.telegraph_sent_at.is_none();
-
-        // If both markers are already set, just mark done.
-        if !archive_required && !telegraph_required {
-            if entry.archive_sent_at.is_some() || entry.telegraph_sent_at.is_some() {
-                if entry.telegraph_sent_at.is_some() {
-                    if let Some(delay_sec) = self.rewrite_delay_sec {
-                        self.repo
-                            .schedule_eh_telegraph_rewrite_after_send(entry.id, delay_sec as i64)
-                            .await?;
-                    }
-                }
-                // At least one marker is set — the work is complete.
-                let abort_permit =
-                    ensure_entry_upload_state_aborted(entry, self.abort_uploader.as_deref())
-                        .await?;
-                self.repo
-                    .mark_eh_download_done(entry.id, entry.file_size)
-                    .await?;
-                remove_entry_archive_family(entry, abort_permit).await;
-                info!(
-                    "Published eh gallery gid={} to chat {} (already sent, now done)",
-                    entry.gid, entry.chat_id
-                );
-                return Ok(());
-            }
-            // Neither marker set and nothing to send — no publish surface.
-            anyhow::bail!("no EH publish surface for queue entry {}", entry.id);
-        }
-
-        // Validate archive prerequisites
         if archive_required {
-            let zip_path = entry.zip_path.as_deref().ok_or(MissingEhZip)?;
+            let zip_path = job.zip_path.as_deref().expect("archive path checked above");
             if !std::path::Path::new(zip_path).exists() {
-                return Err(MissingEhZip.into());
+                self.handle_missing_zip(&delivery, &job).await?;
+                return Ok(());
             }
         }
 
-        // Send archive if required
+        let chat_id = teloxide::types::ChatId(delivery.chat_id);
         if archive_required {
-            if !self.ensure_entry_active(entry).await? {
-                return Ok(());
+            let zip_path = std::path::Path::new(
+                job.zip_path
+                    .as_deref()
+                    .expect("archive path checked before send"),
+            );
+            let caption = self.build_caption(&delivery);
+            let filename = format!("{}.zip", sanitize_filename(&delivery.title));
+            #[cfg(test)]
+            if let Some(hook) = &self.publish_send_hook {
+                hook.entered.notify_one();
+                hook.release.notified().await;
             }
-            let zip_path = entry.zip_path.as_deref().expect("zip_path checked above");
-            let zip_path = std::path::Path::new(zip_path);
-            let caption = self.build_caption(entry);
-            let filename = format!("{}.zip", sanitize_filename(&entry.title));
-            self.notifier
+            if let Err(error) = self
+                .notifier
                 .send_document(chat_id, zip_path, &filename, &caption)
                 .await
-                .context("Failed to send archive document")?;
-            if !self.ensure_entry_active(entry).await? {
+                .context("Failed to send archive document")
+            {
+                self.retry_delivery_after_send_failure(&delivery, error)
+                    .await?;
                 return Ok(());
             }
-            self.repo.mark_eh_archive_sent(entry.id).await?;
+            self.repo.mark_eh_archive_delivery_sent(delivery.id).await?;
         }
 
-        // Send Telegraph link if required
         if telegraph_required {
-            if !self.ensure_entry_active(entry).await? {
-                return Ok(());
-            }
-            let telegraph_url = entry
+            let telegraph_url = job
                 .telegraph_url
                 .as_deref()
-                .expect("telegraph_url checked above");
+                .expect("Telegraph readiness checked before send");
             let link_text = format!(
                 "📄 [Telegraph 链接]({})",
                 teloxide::utils::markdown::escape_link_url(telegraph_url)
             );
-            self.notifier
+            if let Err(error) = self
+                .notifier
                 .send_text(chat_id, &link_text, false)
                 .await
-                .context("Failed to send telegraph link")?;
-            if !self.ensure_entry_active(entry).await? {
+                .context("Failed to send Telegraph link")
+            {
+                self.retry_delivery_after_send_failure(&delivery, error)
+                    .await?;
                 return Ok(());
             }
             self.repo
-                .mark_eh_telegraph_sent_and_schedule_rewrite(
-                    entry.id,
+                .mark_eh_telegraph_delivery_sent(
+                    delivery.id,
+                    job.id,
                     self.rewrite_delay_sec.map(|delay| delay as i64),
                 )
                 .await?;
         }
 
-        // Both surfaces are now sent — mark done and clean up ZIP.
-        if !self.ensure_entry_active(entry).await? {
-            return Ok(());
-        }
-        let abort_permit =
-            ensure_entry_upload_state_aborted(entry, self.abort_uploader.as_deref()).await?;
         self.repo
-            .mark_eh_download_done(entry.id, entry.file_size)
+            .mark_eh_delivery_done(delivery.id, job.id, self.config.send_archive)
             .await?;
-        remove_entry_archive_family(entry, abort_permit).await;
+        #[cfg(test)]
+        if let Some(hook) = self
+            .publish_send_hook
+            .as_ref()
+            .and_then(|hook| hook.after_done.as_ref())
+        {
+            hook.entered.notify_one();
+            hook.release.notified().await;
+        }
         info!(
-            "Published eh gallery gid={} to chat {}",
-            entry.gid, entry.chat_id
+            "Published shared EH gallery gid={} job={} to chat {}",
+            job.gid, job.id, delivery.chat_id
         );
         Ok(())
     }
 
-    async fn ensure_entry_active(&self, entry: &eh_download_queue::Model) -> Result<bool> {
-        let active = self
-            .repo
-            .eh_download_is_active(entry.id, &entry.status)
+    async fn handle_missing_zip(
+        &self,
+        delivery: &eh_download_queue::Model,
+        job: &eh_gallery_jobs::Model,
+    ) -> Result<()> {
+        self.repo
+            .defer_eh_delivery_publish(delivery.id, self.config.download_poll_interval_sec as i64)
             .await?;
-        if !active {
-            info!(
-                "Skipping canceled EH publish entry {} for chat {}",
-                entry.id, entry.chat_id
+        let expected_zip_path = job
+            .zip_path
+            .as_deref()
+            .context("Missing shared EH ZIP reset requires a persisted path")?;
+        let expected_started_at = job
+            .started_at
+            .context("Missing shared EH ZIP reset requires a persisted generation")?;
+        let reset = self
+            .repo
+            .reset_eh_job_for_missing_zip(job.id, expected_started_at, expected_zip_path)
+            .await?;
+        if reset {
+            warn!(
+                "Reset shared EH job {} after its cached ZIP disappeared during delivery {}",
+                job.id, delivery.id
             );
-            let abort_permit =
-                ensure_entry_upload_state_aborted(entry, self.abort_uploader.as_deref()).await?;
-            remove_entry_upload_state(entry, abort_permit).await;
         }
-        Ok(active)
+        Ok(())
+    }
+
+    async fn retry_delivery_after_send_failure(
+        &self,
+        delivery: &eh_download_queue::Model,
+        error: anyhow::Error,
+    ) -> Result<()> {
+        let (_updated, terminal) = self
+            .repo
+            .schedule_eh_delivery_retry(
+                delivery.id,
+                &format!("{:#}", error),
+                self.config.max_retry_count,
+                self.config.send_archive,
+            )
+            .await?;
+        if terminal {
+            warn!(
+                "Shared EH publish delivery {} for chat {} exhausted retries: {:#}",
+                delivery.id, delivery.chat_id, error
+            );
+        } else {
+            warn!(
+                "Shared EH publish delivery {} for chat {} will retry: {:#}",
+                delivery.id, delivery.chat_id, error
+            );
+        }
+        Ok(())
     }
 
     fn build_caption(&self, entry: &eh_download_queue::Model) -> String {
@@ -2181,6 +2411,7 @@ impl EhPublishWorker {
 pub struct EhTelegraphRewriteWorker {
     repo: Arc<Repo>,
     telegraph: Arc<TelegraphClient>,
+    send_archive: bool,
     config: Arc<EhentaiConfig>,
 }
 
@@ -2188,11 +2419,13 @@ impl EhTelegraphRewriteWorker {
     pub fn new(
         repo: Arc<Repo>,
         telegraph: Arc<TelegraphClient>,
+        send_archive: bool,
         config: Arc<EhentaiConfig>,
     ) -> Self {
         Self {
             repo,
             telegraph,
+            send_archive,
             config,
         }
     }
@@ -2211,37 +2444,64 @@ impl EhTelegraphRewriteWorker {
     }
 
     async fn tick(&self) -> Result<()> {
-        let entry = self.repo.get_next_for_telegraph_rewrite().await?;
-        let Some(entry) = entry else {
+        let job = self.repo.get_next_eh_job_for_telegraph_rewrite().await?;
+        let Some(job) = job else {
             return Ok(());
         };
+        let generation = job
+            .telegraph_rewrite_started_at
+            .context("claimed shared EH Telegraph rewrite is missing its generation")?;
 
-        if let Err(e) = self.process(&entry).await {
-            error!("Telegraph rewrite failed for entry {}: {:#}", entry.id, e);
-            let permanent = self
+        if let Err(e) = self.process(&job).await {
+            error!("Telegraph rewrite failed for job {}: {:#}", job.id, e);
+            let terminal = self
                 .repo
-                .schedule_eh_telegraph_rewrite_retry(
-                    entry.id,
-                    &e.to_string(),
+                .schedule_eh_job_telegraph_rewrite_retry(
+                    job.id,
+                    generation,
+                    &format!("{:#}", e),
                     self.config.max_retry_count,
                 )
                 .await?;
-            if permanent {
+            if terminal {
+                self.repo
+                    .evaluate_eh_job_liveness(job.id, self.send_archive)
+                    .await?;
                 warn!(
-                    "Telegraph rewrite permanently failed for entry {} after retries",
-                    entry.id
+                    "Telegraph rewrite permanently failed for job {} after retries",
+                    job.id
                 );
             }
+            return Ok(());
+        }
+
+        if self
+            .repo
+            .mark_eh_job_telegraph_rewritten(job.id, generation)
+            .await?
+        {
+            self.repo
+                .evaluate_eh_job_liveness(job.id, self.send_archive)
+                .await?;
+            info!(
+                "Rewrote Telegraph page URLs for shared EH gid={} job {}",
+                job.gid, job.id
+            );
+        } else {
+            warn!(
+                "Ignoring stale completion for shared EH Telegraph rewrite job {}",
+                job.id
+            );
         }
 
         Ok(())
     }
 
-    async fn process(&self, entry: &eh_download_queue::Model) -> Result<()> {
-        let data_json = entry
+    async fn process(&self, job: &eh_gallery_jobs::Model) -> Result<()> {
+        let data_json = job
             .telegraph_rewrite_data
             .as_deref()
-            .context("telegraph_rewrite_data missing for claimed rewrite")?;
+            .context("shared job telegraph_rewrite_data missing for claimed rewrite")?;
         let data: TelegraphRewriteData = serde_json::from_str(data_json)
             .context("Failed to deserialize Telegraph rewrite data")?;
 
@@ -2256,12 +2516,6 @@ impl EhTelegraphRewriteWorker {
                 .await
                 .with_context(|| format!("Failed to edit Telegraph page {}", page.path))?;
         }
-
-        self.repo.mark_eh_telegraph_rewritten(entry.id).await?;
-        info!(
-            "Rewrote Telegraph page URLs for EH gid={} entry {}",
-            entry.gid, entry.id
-        );
         Ok(())
     }
 }
@@ -2356,10 +2610,12 @@ mod tests {
     use crate::cache::FileCacheManager;
     use crate::config::EhentaiConfig;
     use crate::db::entities::tasks;
-    use crate::db::entities::{eh_download_queue, eh_gp_spend_attempts};
+    use crate::db::entities::{
+        eh_download_completions, eh_download_queue, eh_gallery_jobs, eh_gp_spend_attempts,
+    };
     use crate::db::repo::eh_download_queue::{
         BACKGROUND_STATUS_PENDING, SOURCE_DIRECT, SOURCE_SUBSCRIPTION, STATUS_CANCELED,
-        STATUS_DONE, STATUS_DOWNLOADED, STATUS_FAILED, STATUS_PENDING, STATUS_UPLOADED,
+        STATUS_DONE, STATUS_DOWNLOADED, STATUS_FAILED, STATUS_PENDING,
     };
     use crate::db::repo::tests_helpers;
     use crate::pixiv::downloader::Downloader;
@@ -2368,8 +2624,8 @@ mod tests {
     use reqwest::Client;
     use sea_orm::sea_query::Expr;
     use sea_orm::{
-        ActiveModelTrait, ColumnTrait, ConnectionTrait, DbBackend, EntityTrait, QueryFilter, Set,
-        Statement,
+        ActiveModelTrait, ColumnTrait, ConnectionTrait, DbBackend, EntityTrait, PaginatorTrait,
+        QueryFilter, Set, Statement,
     };
     use std::io::Write;
     use teloxide::requests::RequesterExt;
@@ -2486,6 +2742,569 @@ mod tests {
         assert!(artifacts.assembly_scratch().exists());
         assert!(artifacts.parts_dir().exists());
         assert!(artifacts.uploads_dir().join("archive.json").exists());
+    }
+
+    #[tokio::test]
+    async fn shared_zip_survives_first_delivery_and_is_removed_after_final_consumer() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        let temp_dir = tempfile::tempdir().unwrap();
+        let zip_path = temp_dir.path().join("shared-consumers.zip");
+        create_test_zip(&zip_path, 1);
+        let (job, deliveries) = seed_downloaded_job_with_deliveries(
+            &repo,
+            881,
+            "consumers",
+            "Shared consumers",
+            &zip_path,
+            &[(-100, false, "First"), (-200, false, "Second")],
+        )
+        .await;
+
+        eh_download_queue::Entity::update_many()
+            .col_expr(
+                eh_download_queue::Column::Status,
+                Expr::value(crate::db::repo::eh_gallery_jobs::DELIVERY_STATUS_DONE),
+            )
+            .filter(eh_download_queue::Column::Id.eq(deliveries[0].id))
+            .exec(repo.db())
+            .await
+            .unwrap();
+        repo.evaluate_eh_job_liveness(job.id, true).await.unwrap();
+        let after_first = eh_gallery_jobs::Entity::find_by_id(job.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after_first.cleanup_status,
+            crate::db::repo::eh_gallery_jobs::CLEANUP_STATUS_NONE
+        );
+        assert!(
+            zip_path.exists(),
+            "the second active consumer still owns the ZIP"
+        );
+
+        eh_download_queue::Entity::update_many()
+            .col_expr(
+                eh_download_queue::Column::Status,
+                Expr::value(crate::db::repo::eh_gallery_jobs::DELIVERY_STATUS_DONE),
+            )
+            .filter(eh_download_queue::Column::Id.eq(deliveries[1].id))
+            .exec(repo.db())
+            .await
+            .unwrap();
+        repo.evaluate_eh_job_liveness(job.id, true).await.unwrap();
+        let scheduled = eh_gallery_jobs::Entity::find_by_id(job.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            scheduled.cleanup_status,
+            crate::db::repo::eh_gallery_jobs::CLEANUP_STATUS_PENDING
+        );
+        assert!(
+            zip_path.exists(),
+            "liveness schedules but never removes artifacts"
+        );
+
+        assert_eq!(
+            run_eh_job_cleanup_maintenance_once(repo.as_ref(), None, 1, true)
+                .await
+                .unwrap(),
+            Some(EhCleanupFinalizeOutcome::CleanRetired)
+        );
+        assert!(
+            !zip_path.exists(),
+            "maintenance removes the final consumer ZIP"
+        );
+    }
+
+    #[tokio::test]
+    async fn abort_failure_then_enqueue_blocks_download_until_cleanup_succeeds() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        let temp_dir = tempfile::tempdir().unwrap();
+        let zip_path = temp_dir.path().join("abort-first.zip");
+        create_test_zip(&zip_path, 1);
+        let variant = EhGalleryVariant::archive("1280x");
+        let first = repo
+            .enqueue_eh_download(
+                -100,
+                882,
+                "abort",
+                "Abort first",
+                false,
+                SOURCE_DIRECT,
+                &variant,
+            )
+            .await
+            .unwrap();
+        let downloaded = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        repo.mark_eh_job_downloaded(
+            downloaded.id,
+            downloaded.started_at.unwrap(),
+            10,
+            &zip_path.to_string_lossy(),
+            0,
+        )
+        .await
+        .unwrap();
+        let artifacts = seed_archive_artifact_family(&zip_path);
+        eh_download_queue::Entity::update_many()
+            .col_expr(
+                eh_download_queue::Column::Status,
+                Expr::value(STATUS_CANCELED),
+            )
+            .filter(eh_download_queue::Column::Id.eq(first.id))
+            .exec(repo.db())
+            .await
+            .unwrap();
+        repo.evaluate_eh_job_liveness(downloaded.id, true)
+            .await
+            .unwrap();
+
+        let rebound = repo
+            .enqueue_eh_download(
+                -200,
+                882,
+                "abort",
+                "Abort first",
+                false,
+                SOURCE_DIRECT,
+                &variant,
+            )
+            .await
+            .unwrap();
+        assert_eq!(rebound.job_id, Some(downloaded.id));
+        let failing_uploader = TerminalCleanupMockUploader {
+            fail_abort: true,
+            ..Default::default()
+        };
+        assert!(run_eh_job_cleanup_maintenance_once(
+            repo.as_ref(),
+            Some(&failing_uploader),
+            0,
+            true
+        )
+        .await
+        .is_err());
+        assert_terminal_cleanup_precedes_local_removal(&failing_uploader, &artifacts);
+        let failed = eh_gallery_jobs::Entity::find_by_id(downloaded.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            failed.cleanup_status,
+            crate::db::repo::eh_gallery_jobs::CLEANUP_STATUS_FAILED
+        );
+        assert!(failed.cleanup_next_retry_at.is_some());
+        assert!(artifacts.final_zip().exists());
+        assert!(artifacts.uploads_dir().join("archive.json").exists());
+        assert!(repo.get_next_eh_job_for_download().await.unwrap().is_none());
+
+        let successful_uploader = TerminalCleanupMockUploader::default();
+        assert_eq!(
+            run_eh_job_cleanup_maintenance_once(repo.as_ref(), Some(&successful_uploader), 0, true)
+                .await
+                .unwrap(),
+            Some(EhCleanupFinalizeOutcome::ReactivatedPending)
+        );
+        assert!(!artifacts.final_zip().exists());
+        assert!(!artifacts.uploads_dir().exists());
+        let replacement = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        repo.mark_eh_job_downloaded(
+            replacement.id,
+            replacement.started_at.unwrap(),
+            20,
+            "/tmp/replacement.zip",
+            0,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            eh_download_completions::Entity::find()
+                .filter(eh_download_completions::Column::JobId.eq(downloaded.id))
+                .count(repo.db())
+                .await
+                .unwrap(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_consumerless_upload_keeps_owned_family_through_abort_failure() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        let temp_dir = tempfile::tempdir().unwrap();
+        let zip_path = temp_dir.path().join("stale-upload-owned.zip");
+        create_test_zip(&zip_path, 1);
+        let artifacts = seed_archive_artifact_family(&zip_path);
+        let variant = EhGalleryVariant::archive("1280x");
+        let canceled = repo
+            .enqueue_eh_subscription_download(
+                -100,
+                8821,
+                8822,
+                "stale-upload",
+                "Stale upload",
+                true,
+                &variant,
+            )
+            .await
+            .unwrap();
+        let download = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        repo.mark_eh_job_downloaded(
+            download.id,
+            download.started_at.unwrap(),
+            10,
+            &zip_path.to_string_lossy(),
+            0,
+        )
+        .await
+        .unwrap();
+        let upload = repo.get_next_eh_job_for_upload().await.unwrap().unwrap();
+        repo.cancel_eh_subscription_queue_entries(8821, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            eh_gallery_jobs::Entity::find_by_id(upload.id)
+                .one(repo.db())
+                .await
+                .unwrap()
+                .unwrap()
+                .cleanup_status,
+            crate::db::repo::eh_gallery_jobs::CLEANUP_STATUS_NONE
+        );
+
+        assert_eq!(
+            repo.reset_stale_eh_shared_work(60, 60)
+                .await
+                .unwrap()
+                .uploads,
+            1
+        );
+        let stale = eh_gallery_jobs::Entity::find_by_id(upload.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stale.telegraph_status,
+            crate::db::repo::eh_gallery_jobs::TELEGRAPH_STATUS_NOT_REQUIRED
+        );
+        assert_eq!(
+            stale.cleanup_status,
+            crate::db::repo::eh_gallery_jobs::CLEANUP_STATUS_PENDING
+        );
+        assert_eq!(stale.zip_path.as_deref(), zip_path.to_str());
+
+        let rebound = repo
+            .enqueue_eh_download(
+                -200,
+                8822,
+                "stale-upload",
+                "Stale upload",
+                true,
+                SOURCE_DIRECT,
+                &variant,
+            )
+            .await
+            .unwrap();
+        assert_eq!(rebound.job_id, Some(upload.id));
+        assert!(repo.get_next_eh_job_for_download().await.unwrap().is_none());
+        assert!(repo
+            .get_next_eh_delivery_for_publish(false)
+            .await
+            .unwrap()
+            .is_none());
+
+        let failing_uploader = TerminalCleanupMockUploader {
+            fail_abort: true,
+            ..Default::default()
+        };
+        assert!(run_eh_job_cleanup_maintenance_once(
+            repo.as_ref(),
+            Some(&failing_uploader),
+            0,
+            true
+        )
+        .await
+        .is_err());
+        let failed = eh_gallery_jobs::Entity::find_by_id(upload.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            failed.cleanup_status,
+            crate::db::repo::eh_gallery_jobs::CLEANUP_STATUS_FAILED
+        );
+        assert_eq!(failed.zip_path.as_deref(), zip_path.to_str());
+        assert!(artifacts.final_zip().exists());
+        assert!(artifacts.uploads_dir().exists());
+        assert!(repo.get_next_eh_job_for_download().await.unwrap().is_none());
+
+        let successful_uploader = TerminalCleanupMockUploader::default();
+        assert_eq!(
+            run_eh_job_cleanup_maintenance_once(
+                repo.as_ref(),
+                Some(&successful_uploader),
+                0,
+                true,
+            )
+            .await
+            .unwrap(),
+            Some(EhCleanupFinalizeOutcome::ReactivatedPending)
+        );
+        assert!(!artifacts.final_zip().exists());
+        assert!(!artifacts.uploads_dir().exists());
+        assert_eq!(
+            repo.get_next_eh_job_for_download()
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            upload.id
+        );
+        assert_eq!(canceled.job_id, Some(upload.id));
+    }
+
+    #[tokio::test]
+    async fn normal_late_completion_keeps_owned_family_until_cleanup_reactivates() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        let temp_dir = tempfile::tempdir().unwrap();
+        let variant = EhGalleryVariant::archive("1280x");
+        let first = repo
+            .enqueue_eh_download(
+                -100,
+                883,
+                "normal-late",
+                "Normal late completion",
+                false,
+                SOURCE_DIRECT,
+                &variant,
+            )
+            .await
+            .unwrap();
+        let claimed = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        let zip_path = archive_artifacts_for_job(temp_dir.path(), &claimed)
+            .final_zip()
+            .to_path_buf();
+        std::fs::create_dir_all(zip_path.parent().unwrap()).unwrap();
+        create_test_zip(&zip_path, 1);
+        let artifacts = seed_archive_artifact_family(&zip_path);
+        assert!(repo
+            .persist_eh_job_archive_artifact_ownership(
+                claimed.id,
+                claimed.started_at.unwrap(),
+                &zip_path.to_string_lossy(),
+                false,
+            )
+            .await
+            .unwrap());
+        eh_download_queue::Entity::update_many()
+            .col_expr(
+                eh_download_queue::Column::Status,
+                Expr::value(STATUS_CANCELED),
+            )
+            .filter(eh_download_queue::Column::Id.eq(first.id))
+            .exec(repo.db())
+            .await
+            .unwrap();
+
+        repo.evaluate_eh_job_liveness(claimed.id, true)
+            .await
+            .unwrap();
+        let in_flight = job_for_delivery(&repo, &first).await;
+        assert_eq!(
+            in_flight.status,
+            crate::db::repo::eh_gallery_jobs::JOB_STATUS_DOWNLOADING,
+            "cancellation must not retire an in-flight normal writer"
+        );
+        assert_eq!(
+            in_flight.cleanup_status,
+            crate::db::repo::eh_gallery_jobs::CLEANUP_STATUS_NONE,
+            "cleanup must not race a normal writer"
+        );
+
+        repo.mark_eh_job_downloaded(
+            claimed.id,
+            claimed.started_at.unwrap(),
+            10,
+            &zip_path.to_string_lossy(),
+            0,
+        )
+        .await
+        .unwrap();
+        let settled = job_for_delivery(&repo, &first).await;
+        assert_eq!(
+            settled.cleanup_status,
+            crate::db::repo::eh_gallery_jobs::CLEANUP_STATUS_PENDING
+        );
+
+        let rebound = repo
+            .enqueue_eh_download(
+                -200,
+                883,
+                "normal-late",
+                "Normal late completion",
+                false,
+                SOURCE_DIRECT,
+                &variant,
+            )
+            .await
+            .unwrap();
+        assert_eq!(rebound.job_id, Some(claimed.id));
+        assert!(repo.get_next_eh_job_for_download().await.unwrap().is_none());
+
+        let uploader = TerminalCleanupMockUploader::default();
+        assert_eq!(
+            run_eh_job_cleanup_maintenance_once(repo.as_ref(), Some(&uploader), 0, true)
+                .await
+                .unwrap(),
+            Some(EhCleanupFinalizeOutcome::ReactivatedPending)
+        );
+        assert!(!artifacts.final_zip().exists());
+        assert!(!artifacts.assembly_scratch().exists());
+        assert!(!artifacts.parts_dir().exists());
+        assert!(!artifacts.uploads_dir().exists());
+        assert_eq!(
+            repo.get_next_eh_job_for_download()
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            claimed.id
+        );
+    }
+
+    #[tokio::test]
+    async fn background_late_completion_keeps_owned_family_until_cleanup_reactivates() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        let temp_dir = tempfile::tempdir().unwrap();
+        let variant = EhGalleryVariant::archive("1280x");
+        let first = repo
+            .enqueue_eh_download(
+                -100,
+                884,
+                "background-late",
+                "Background late completion",
+                false,
+                SOURCE_DIRECT,
+                &variant,
+            )
+            .await
+            .unwrap();
+        let normal_claim = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        repo.schedule_eh_job_background_download(
+            normal_claim.id,
+            normal_claim.status.as_str(),
+            "test handoff",
+        )
+        .await
+        .unwrap();
+        let claimed = repo
+            .get_next_eh_job_for_background_download()
+            .await
+            .unwrap()
+            .unwrap();
+        let zip_path = archive_artifacts_for_job(temp_dir.path(), &claimed)
+            .final_zip()
+            .to_path_buf();
+        std::fs::create_dir_all(zip_path.parent().unwrap()).unwrap();
+        create_test_zip(&zip_path, 1);
+        let artifacts = seed_archive_artifact_family(&zip_path);
+        assert!(repo
+            .persist_eh_job_archive_artifact_ownership(
+                claimed.id,
+                claimed.started_at.unwrap(),
+                &zip_path.to_string_lossy(),
+                true,
+            )
+            .await
+            .unwrap());
+        eh_download_queue::Entity::update_many()
+            .col_expr(
+                eh_download_queue::Column::Status,
+                Expr::value(STATUS_CANCELED),
+            )
+            .filter(eh_download_queue::Column::Id.eq(first.id))
+            .exec(repo.db())
+            .await
+            .unwrap();
+
+        repo.evaluate_eh_job_liveness(claimed.id, true)
+            .await
+            .unwrap();
+        let in_flight = job_for_delivery(&repo, &first).await;
+        assert_eq!(
+            in_flight.status,
+            crate::db::repo::eh_gallery_jobs::JOB_STATUS_PENDING,
+            "cancellation must not retire an in-flight background writer"
+        );
+        assert_eq!(
+            in_flight.background_download_status.as_deref(),
+            Some(crate::db::repo::eh_gallery_jobs::BACKGROUND_STATUS_RUNNING)
+        );
+        assert_eq!(
+            in_flight.cleanup_status,
+            crate::db::repo::eh_gallery_jobs::CLEANUP_STATUS_NONE,
+            "cleanup must not race a background writer"
+        );
+
+        repo.mark_eh_job_background_downloaded(
+            claimed.id,
+            claimed.started_at.unwrap(),
+            10,
+            &zip_path.to_string_lossy(),
+            0,
+        )
+        .await
+        .unwrap();
+        let settled = job_for_delivery(&repo, &first).await;
+        assert_eq!(
+            settled.cleanup_status,
+            crate::db::repo::eh_gallery_jobs::CLEANUP_STATUS_PENDING
+        );
+
+        let rebound = repo
+            .enqueue_eh_download(
+                -200,
+                884,
+                "background-late",
+                "Background late completion",
+                false,
+                SOURCE_DIRECT,
+                &variant,
+            )
+            .await
+            .unwrap();
+        assert_eq!(rebound.job_id, Some(claimed.id));
+        assert!(repo
+            .get_next_eh_job_for_background_download()
+            .await
+            .unwrap()
+            .is_none());
+
+        let uploader = TerminalCleanupMockUploader::default();
+        assert_eq!(
+            run_eh_job_cleanup_maintenance_once(repo.as_ref(), Some(&uploader), 0, true)
+                .await
+                .unwrap(),
+            Some(EhCleanupFinalizeOutcome::ReactivatedPending)
+        );
+        assert!(!artifacts.final_zip().exists());
+        assert!(!artifacts.assembly_scratch().exists());
+        assert!(!artifacts.parts_dir().exists());
+        assert!(!artifacts.uploads_dir().exists());
+        assert_eq!(
+            repo.get_next_eh_job_for_download()
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            claimed.id
+        );
     }
 
     fn create_test_zip_with_names(path: &std::path::Path, names: &[&str]) {
@@ -2637,6 +3456,43 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/botfake_token/SendDocument"))
             .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(server)
+            .await;
+    }
+
+    #[derive(Debug)]
+    struct TelegramDocumentChat(i64);
+
+    impl wiremock::Match for TelegramDocumentChat {
+        fn matches(&self, request: &wiremock::Request) -> bool {
+            let body = String::from_utf8_lossy(&request.body);
+            let chat_id = self.0.to_string();
+            body.contains("name=\"chat_id\"") && body.lines().any(|line| line.trim() == chat_id)
+        }
+    }
+
+    async fn mock_tg_send_document_for_chat(
+        server: &MockServer,
+        chat_id: i64,
+        status: u16,
+        delay: Option<Duration>,
+    ) {
+        let body = if status == 200 {
+            serde_json::json!({
+                "ok": true,
+                "result": {"message_id": 42, "date": 1700000000, "chat": {"id": chat_id, "type": "private"}}
+            })
+        } else {
+            serde_json::json!({"ok": false, "description": "mock send failure"})
+        };
+        let mut response = ResponseTemplate::new(status).set_body_json(body);
+        if let Some(delay) = delay {
+            response = response.set_delay(delay);
+        }
+        Mock::given(method("POST"))
+            .and(path("/botfake_token/SendDocument"))
+            .and(TelegramDocumentChat(chat_id))
+            .respond_with(response)
             .mount(server)
             .await;
     }
@@ -2936,7 +3792,35 @@ mod tests {
         telegraph_url: Option<&str>,
     ) -> eh_download_queue::Model {
         let now = Local::now().naive_local();
+        let job_id = if matches!(status, STATUS_PENDING | STATUS_DOWNLOADED) {
+            Some(
+                eh_gallery_jobs::ActiveModel {
+                    gid: Set(gid),
+                    token: Set(token.to_string()),
+                    download_mode: Set(DOWNLOAD_MODE_ARCHIVE.to_string()),
+                    resolution: Set("1280x".to_string()),
+                    title: Set(title.to_string()),
+                    status: Set(status.to_string()),
+                    telegraph_status: Set(if status == STATUS_DOWNLOADED && telegraph {
+                        crate::db::repo::eh_gallery_jobs::TELEGRAPH_STATUS_PENDING.to_string()
+                    } else {
+                        crate::db::repo::eh_gallery_jobs::TELEGRAPH_STATUS_NOT_REQUIRED.to_string()
+                    }),
+                    telegraph_required: Set(telegraph),
+                    zip_path: Set(zip_path.map(str::to_string)),
+                    created_at: Set(now),
+                    ..Default::default()
+                }
+                .insert(repo.db())
+                .await
+                .unwrap()
+                .id,
+            )
+        } else {
+            None
+        };
         let active = eh_download_queue::ActiveModel {
+            job_id: Set(job_id),
             chat_id: Set(chat_id),
             gid: Set(gid),
             token: Set(token.to_string()),
@@ -2958,6 +3842,193 @@ mod tests {
         active.insert(repo.db()).await.unwrap()
     }
 
+    async fn job_for_delivery(
+        repo: &Repo,
+        delivery: &eh_download_queue::Model,
+    ) -> eh_gallery_jobs::Model {
+        eh_gallery_jobs::Entity::find_by_id(delivery.job_id.unwrap())
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    async fn migrate_seeded_delivery_to_waiting(
+        repo: &Repo,
+        delivery: eh_download_queue::Model,
+    ) -> eh_download_queue::Model {
+        let mut active: eh_download_queue::ActiveModel = delivery.into();
+        active.status = Set(crate::db::repo::eh_gallery_jobs::DELIVERY_STATUS_WAITING.to_string());
+        active.update(repo.db()).await.unwrap()
+    }
+
+    async fn seed_downloaded_job_with_deliveries(
+        repo: &Repo,
+        gid: i64,
+        token: &str,
+        job_title: &str,
+        zip_path: &std::path::Path,
+        deliveries: &[(i64, bool, &str)],
+    ) -> (eh_gallery_jobs::Model, Vec<eh_download_queue::Model>) {
+        let now = Local::now().naive_local();
+        let telegraph_required = deliveries.iter().any(|(_, telegraph, _)| *telegraph);
+        let job = eh_gallery_jobs::ActiveModel {
+            gid: Set(gid),
+            token: Set(token.to_string()),
+            download_mode: Set(DOWNLOAD_MODE_ARCHIVE.to_string()),
+            resolution: Set("1280x".to_string()),
+            title: Set(job_title.to_string()),
+            status: Set(crate::db::repo::eh_gallery_jobs::JOB_STATUS_DOWNLOADED.to_string()),
+            telegraph_status: Set(if telegraph_required {
+                crate::db::repo::eh_gallery_jobs::TELEGRAPH_STATUS_PENDING.to_string()
+            } else {
+                crate::db::repo::eh_gallery_jobs::TELEGRAPH_STATUS_NOT_REQUIRED.to_string()
+            }),
+            telegraph_required: Set(telegraph_required),
+            file_size: Set(std::fs::metadata(zip_path).unwrap().len() as i64),
+            zip_path: Set(Some(zip_path.to_string_lossy().to_string())),
+            cleanup_status: Set(crate::db::repo::eh_gallery_jobs::CLEANUP_STATUS_NONE.to_string()),
+            created_at: Set(now),
+            ..Default::default()
+        }
+        .insert(repo.db())
+        .await
+        .unwrap();
+        let mut seeded = Vec::with_capacity(deliveries.len());
+        for (chat_id, telegraph, title) in deliveries {
+            seeded.push(
+                eh_download_queue::ActiveModel {
+                    job_id: Set(Some(job.id)),
+                    chat_id: Set(*chat_id),
+                    gid: Set(gid),
+                    token: Set(token.to_string()),
+                    title: Set((*title).to_string()),
+                    telegraph: Set(*telegraph),
+                    source: Set(SOURCE_DIRECT.to_string()),
+                    status: Set(
+                        crate::db::repo::eh_gallery_jobs::DELIVERY_STATUS_WAITING.to_string()
+                    ),
+                    created_at: Set(now),
+                    ..Default::default()
+                }
+                .insert(repo.db())
+                .await
+                .unwrap(),
+            );
+        }
+        (job, seeded)
+    }
+
+    async fn seed_ready_telegraph_job_with_deliveries(
+        repo: &Repo,
+        gid: i64,
+        deliveries: &[(i64, Option<i32>)],
+    ) -> (eh_gallery_jobs::Model, Vec<eh_download_queue::Model>) {
+        let variant = EhGalleryVariant::archive("1280x");
+        let mut seeded = Vec::with_capacity(deliveries.len());
+        for (chat_id, subscription_id) in deliveries {
+            let delivery = if let Some(subscription_id) = subscription_id {
+                repo.enqueue_eh_subscription_download(
+                    *chat_id,
+                    *subscription_id,
+                    gid,
+                    "token",
+                    "Shared Gallery",
+                    true,
+                    &variant,
+                )
+                .await
+                .unwrap()
+            } else {
+                repo.enqueue_eh_download(
+                    *chat_id,
+                    gid,
+                    "token",
+                    "Shared Gallery",
+                    true,
+                    SOURCE_DIRECT,
+                    &variant,
+                )
+                .await
+                .unwrap()
+            };
+            seeded.push(delivery);
+        }
+
+        let job_id = seeded[0].job_id.unwrap();
+        let rewrite_data = serde_json::json!({
+            "pages": [{
+                "path": "Shared-Gallery-01-01",
+                "title": "Shared Gallery",
+                "content": [{
+                    "tag": "img",
+                    "attrs": {"src": "https://preview.example/ipfs/cid"}
+                }]
+            }],
+            "preview_gateway_url": "https://preview.example",
+            "public_gateway_url": "https://public.example"
+        })
+        .to_string();
+        eh_gallery_jobs::Entity::update_many()
+            .col_expr(
+                eh_gallery_jobs::Column::Status,
+                Expr::value(crate::db::repo::eh_gallery_jobs::JOB_STATUS_DOWNLOADED),
+            )
+            .col_expr(
+                eh_gallery_jobs::Column::TelegraphStatus,
+                Expr::value(crate::db::repo::eh_gallery_jobs::TELEGRAPH_STATUS_READY),
+            )
+            .col_expr(
+                eh_gallery_jobs::Column::TelegraphUrl,
+                Expr::value(Some("https://telegra.ph/Shared-Gallery-01-01".to_string())),
+            )
+            .col_expr(
+                eh_gallery_jobs::Column::TelegraphRewriteData,
+                Expr::value(Some(rewrite_data)),
+            )
+            .col_expr(
+                eh_gallery_jobs::Column::ZipPath,
+                Expr::value(Some("shared-gallery.zip".to_string())),
+            )
+            .filter(eh_gallery_jobs::Column::Id.eq(job_id))
+            .exec(repo.db())
+            .await
+            .unwrap();
+        eh_download_queue::Entity::update_many()
+            .col_expr(
+                eh_download_queue::Column::Status,
+                Expr::value(crate::db::repo::eh_gallery_jobs::DELIVERY_STATUS_PUBLISHING),
+            )
+            .filter(eh_download_queue::Column::JobId.eq(job_id))
+            .exec(repo.db())
+            .await
+            .unwrap();
+
+        let job = eh_gallery_jobs::Entity::find_by_id(job_id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        let deliveries = eh_download_queue::Entity::find()
+            .filter(eh_download_queue::Column::JobId.eq(job_id))
+            .all(repo.db())
+            .await
+            .unwrap();
+        (job, deliveries)
+    }
+
+    async fn handoff_job_to_background(repo: &Repo, delivery: &eh_download_queue::Model) {
+        repo.schedule_eh_job_background_download(
+            delivery
+                .job_id
+                .expect("background worker test delivery has a shared job"),
+            crate::db::repo::eh_gallery_jobs::JOB_STATUS_PENDING,
+            "test setup",
+        )
+        .await
+        .unwrap();
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn insert_subscription_queue_entry(
         repo: &Repo,
@@ -2972,7 +4043,35 @@ mod tests {
         telegraph_url: Option<&str>,
     ) -> eh_download_queue::Model {
         let now = Local::now().naive_local();
+        let job_id = if matches!(status, STATUS_PENDING | STATUS_DOWNLOADED) {
+            Some(
+                eh_gallery_jobs::ActiveModel {
+                    gid: Set(gid),
+                    token: Set(token.to_string()),
+                    download_mode: Set(DOWNLOAD_MODE_ARCHIVE.to_string()),
+                    resolution: Set("1280x".to_string()),
+                    title: Set(title.to_string()),
+                    status: Set(status.to_string()),
+                    telegraph_status: Set(if status == STATUS_DOWNLOADED && telegraph {
+                        crate::db::repo::eh_gallery_jobs::TELEGRAPH_STATUS_PENDING.to_string()
+                    } else {
+                        crate::db::repo::eh_gallery_jobs::TELEGRAPH_STATUS_NOT_REQUIRED.to_string()
+                    }),
+                    telegraph_required: Set(telegraph),
+                    zip_path: Set(zip_path.map(str::to_string)),
+                    created_at: Set(now),
+                    ..Default::default()
+                }
+                .insert(repo.db())
+                .await
+                .unwrap()
+                .id,
+            )
+        } else {
+            None
+        };
         let active = eh_download_queue::ActiveModel {
+            job_id: Set(job_id),
             chat_id: Set(chat_id),
             gid: Set(gid),
             token: Set(token.to_string()),
@@ -3187,10 +4286,11 @@ mod tests {
         );
         engine.tick().await.unwrap();
 
-        let claimed_download = repo.get_next_for_download().await.unwrap().unwrap();
-        assert!(claimed_download.telegraph);
-        repo.mark_eh_download_downloaded(
+        let claimed_download = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        assert!(claimed_download.telegraph_required);
+        repo.mark_eh_job_downloaded(
             claimed_download.id,
+            claimed_download.started_at.unwrap(),
             100,
             "data/test_cache/archive.zip",
             0,
@@ -3198,8 +4298,8 @@ mod tests {
         .await
         .unwrap();
 
-        let claimed_upload = repo.get_next_for_upload().await.unwrap().unwrap();
-        assert_eq!(claimed_upload.gid, claimed_download.gid);
+        let claimed_upload = repo.get_next_eh_job_for_upload().await.unwrap().unwrap();
+        assert_eq!(claimed_upload.id, claimed_download.id);
     }
 
     #[tokio::test]
@@ -3248,20 +4348,32 @@ mod tests {
         );
         engine.tick().await.unwrap();
 
-        let claimed_download = repo.get_next_for_download().await.unwrap().unwrap();
-        assert!(!claimed_download.telegraph);
-        repo.mark_eh_download_downloaded(
-            claimed_download.id,
-            100,
-            "data/test_cache/archive.zip",
-            0,
-        )
-        .await
-        .unwrap();
+        let claimed_download = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        assert!(!claimed_download.telegraph_required);
+        let downloaded = repo
+            .mark_eh_job_downloaded(
+                claimed_download.id,
+                claimed_download.started_at.unwrap(),
+                100,
+                "data/test_cache/archive.zip",
+                0,
+            )
+            .await
+            .unwrap();
 
-        assert!(repo.get_next_for_upload().await.unwrap().is_none());
-        let claimed_publish = repo.get_next_for_publish().await.unwrap().unwrap();
-        assert_eq!(claimed_publish.gid, claimed_download.gid);
+        assert!(!downloaded.telegraph_required);
+        assert!(repo.get_next_eh_job_for_upload().await.unwrap().is_none());
+        let delivery = eh_download_queue::Entity::find()
+            .filter(eh_download_queue::Column::JobId.eq(downloaded.id))
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!delivery.telegraph);
+        assert_eq!(
+            delivery.status,
+            crate::db::repo::eh_gallery_jobs::DELIVERY_STATUS_WAITING
+        );
     }
 
     #[tokio::test]
@@ -3686,6 +4798,157 @@ mod tests {
     // === Download Worker Tests ===
 
     #[tokio::test]
+    async fn two_chats_share_one_archive_post_one_gp_attempt_and_one_artifact() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        let eh_server = MockServer::start().await;
+        let temp = tempfile::tempdir().unwrap();
+        let variant = EhGalleryVariant::archive("1280x");
+
+        setup_chat(&repo, -100, true).await;
+        setup_chat(&repo, -200, true).await;
+        let first = repo
+            .enqueue_eh_download(
+                -100,
+                123456,
+                "abcdef0123",
+                "Shared paid gallery",
+                false,
+                SOURCE_DIRECT,
+                &variant,
+            )
+            .await
+            .unwrap();
+        let second = repo
+            .enqueue_eh_download(
+                -200,
+                123456,
+                "abcdef0123",
+                "Shared paid gallery",
+                false,
+                SOURCE_DIRECT,
+                &variant,
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.job_id, second.job_id);
+
+        mock_eh_archiver_page_with_cost(&eh_server, 123456, "abcdef0123", "218 GP", "218 GP").await;
+        let download_url = format!("{}/archive/123456/token/0", eh_server.uri());
+        mock_eh_archiver_post(&eh_server, &download_url).await;
+        let zip_temp = tempfile::tempdir().unwrap();
+        let source_zip = zip_temp.path().join("shared.zip");
+        create_test_zip(&source_zip, 1);
+        mock_eh_archive_download(
+            &eh_server,
+            "/archive/123456/token/0",
+            std::fs::read(source_zip).unwrap(),
+        )
+        .await;
+
+        let mut config = make_config();
+        config.max_archive_gp_cost = 218;
+        config.background_download_enabled = false;
+        let worker = EhDownloadWorker::new(
+            Arc::clone(&repo),
+            make_eh_client(&eh_server),
+            Arc::new(config),
+            temp.path().to_path_buf(),
+            None,
+        );
+        worker.tick().await.unwrap();
+
+        let job_id = first.job_id.unwrap();
+        let job = eh_gallery_jobs::Entity::find_by_id(job_id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.status, "downloaded");
+        assert_eq!(job.gp_cost, 218);
+        assert!(std::path::Path::new(job.zip_path.as_deref().unwrap()).exists());
+        let deliveries = eh_download_queue::Entity::find()
+            .filter(eh_download_queue::Column::JobId.eq(job_id))
+            .all(repo.db())
+            .await
+            .unwrap();
+        assert_eq!(deliveries.len(), 2);
+        assert!(deliveries
+            .iter()
+            .all(|delivery| delivery.status == "waiting"));
+        let attempts = gp_attempts(repo.as_ref()).await;
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].job_id, Some(job_id));
+        assert_eq!(attempts[0].queue_id, None);
+        let completions = eh_download_completions::Entity::find()
+            .filter(eh_download_completions::Column::JobId.eq(job_id))
+            .all(repo.db())
+            .await
+            .unwrap();
+        assert_eq!(completions.len(), 1);
+        assert_eq!(
+            eh_server
+                .received_requests()
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|request| {
+                    request.method.as_str() == "POST" && request.url.path() == "/archiver.php"
+                })
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn artifact_identity_contains_job_and_sanitized_variant() {
+        let repo = tests_helpers::setup_test_db().await.unwrap();
+        let archive = eh_gallery_jobs::ActiveModel {
+            gid: Set(42),
+            token: Set("tok/en?".to_string()),
+            download_mode: Set("archive".to_string()),
+            resolution: Set("1280x/unsafe".to_string()),
+            title: Set("Archive".to_string()),
+            ..Default::default()
+        }
+        .insert(repo.db())
+        .await
+        .unwrap();
+        let images = eh_gallery_jobs::ActiveModel {
+            gid: Set(43),
+            token: Set("im:age".to_string()),
+            download_mode: Set("images".to_string()),
+            resolution: Set(String::new()),
+            title: Set("Images".to_string()),
+            ..Default::default()
+        }
+        .insert(repo.db())
+        .await
+        .unwrap();
+        let cache = tempfile::tempdir().unwrap();
+
+        let archive_name = archive_artifacts_for_job(cache.path(), &archive)
+            .final_zip()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let images_name = archive_artifacts_for_job(cache.path(), &images)
+            .final_zip()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(
+            archive_name,
+            format!("42_tok_en__j{}_archive_1280x_unsafe.zip", archive.id)
+        );
+        assert_eq!(
+            images_name,
+            format!("43_im_age_j{}_images_none.zip", images.id)
+        );
+    }
+
+    #[tokio::test]
     async fn test_download_worker_downloads_archive() {
         let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
         let eh_server = MockServer::start().await;
@@ -3727,11 +4990,7 @@ mod tests {
 
         worker.tick().await.unwrap();
 
-        let updated = eh_download_queue::Entity::find_by_id(entry.id)
-            .one(repo.db())
-            .await
-            .unwrap()
-            .unwrap();
+        let updated = job_for_delivery(&repo, &entry).await;
         assert_eq!(updated.status, STATUS_DOWNLOADED);
         assert!(updated.zip_path.is_some());
         assert!(updated.file_size > 0);
@@ -3791,11 +5050,7 @@ mod tests {
 
         worker.tick().await.unwrap();
 
-        let updated = eh_download_queue::Entity::find_by_id(entry.id)
-            .one(repo.db())
-            .await
-            .unwrap()
-            .unwrap();
+        let updated = job_for_delivery(&repo, &entry).await;
         assert_eq!(updated.status, STATUS_DOWNLOADED);
     }
 
@@ -3807,28 +5062,18 @@ mod tests {
 
         setup_chat(&repo, -100, true).await;
 
-        // Pre-fill a done entry to hit rate limit
+        // Pre-fill the completion ledger to hit the shared rate limit.
         let now = Local::now().naive_local();
-        let big = eh_download_queue::ActiveModel {
-            chat_id: Set(-100),
+        eh_download_completions::ActiveModel {
+            job_id: Set(None),
             gid: Set(999999),
-            token: Set("x".into()),
-            title: Set("Big".into()),
-            telegraph: Set(false),
-            source: Set(SOURCE_DIRECT.into()),
-            status: Set("done".into()),
             file_size: Set(11_000_000_000),
-            error: Set(None),
-            retry_count: Set(0),
             created_at: Set(now),
-            started_at: Set(Some(now)),
-            completed_at: Set(Some(now)),
-            zip_path: Set(None),
-            telegraph_url: Set(None),
-            next_retry_at: Set(None),
             ..Default::default()
-        };
-        big.insert(repo.db()).await.unwrap();
+        }
+        .insert(repo.db())
+        .await
+        .unwrap();
 
         let entry = insert_queue_entry(
             &repo,
@@ -3854,11 +5099,7 @@ mod tests {
         );
         worker.tick().await.unwrap();
 
-        let updated = eh_download_queue::Entity::find_by_id(entry.id)
-            .one(repo.db())
-            .await
-            .unwrap()
-            .unwrap();
+        let updated = job_for_delivery(&repo, &entry).await;
         assert_eq!(
             updated.status, "pending",
             "should remain pending due to rate limit"
@@ -3896,12 +5137,8 @@ mod tests {
         );
         worker.tick().await.unwrap();
 
-        let updated = eh_download_queue::Entity::find_by_id(entry.id)
-            .one(repo.db())
-            .await
-            .unwrap()
-            .unwrap();
-        // Chat disabled → entry goes back to pending with retry scheduled (not silently done)
+        let updated = job_for_delivery(&repo, &entry).await;
+        // Chat disabled → shared job goes back to pending with retry scheduled.
         assert_eq!(
             updated.status, "pending",
             "should be pending for retry, not silently done"
@@ -3955,11 +5192,7 @@ mod tests {
         );
         worker.tick().await.unwrap();
 
-        let updated = eh_download_queue::Entity::find_by_id(entry.id)
-            .one(repo.db())
-            .await
-            .unwrap()
-            .unwrap();
+        let updated = job_for_delivery(&repo, &entry).await;
         assert_eq!(
             updated.status, "pending",
             "should be back to pending for retry"
@@ -3991,19 +5224,22 @@ mod tests {
         )
         .await;
 
-        eh_download_queue::Entity::update_many()
+        let job = job_for_delivery(&repo, &entry).await;
+        eh_gallery_jobs::Entity::update_many()
             .col_expr(
-                eh_download_queue::Column::RetryCount,
+                eh_gallery_jobs::Column::RetryCount,
                 Expr::value(make_config().max_retry_count as i32),
             )
-            .filter(eh_download_queue::Column::Id.eq(entry.id))
+            .filter(eh_gallery_jobs::Column::Id.eq(job.id))
             .exec(repo.db())
             .await
             .unwrap();
 
         let eh_cache = temp.path().join("eh_cache");
         std::fs::create_dir_all(&eh_cache).unwrap();
-        let zip_path = eh_cache.join("123456_abcdef0123.zip");
+        let zip_path = archive_artifacts_for_job(temp.path(), &job)
+            .final_zip()
+            .to_path_buf();
         let part_path = zip_path.with_extension("zip.part");
         let parts_dir = zip_path.with_extension("zip.parts");
         std::fs::write(&zip_path, b"PK\x03\x04stale").unwrap();
@@ -4028,12 +5264,25 @@ mod tests {
         );
         worker.tick().await.unwrap();
 
-        let updated = eh_download_queue::Entity::find_by_id(entry.id)
-            .one(repo.db())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(updated.status, STATUS_FAILED);
+        let updated = job_for_delivery(&repo, &entry).await;
+        assert_eq!(
+            updated.status,
+            crate::db::repo::eh_gallery_jobs::JOB_STATUS_RETIRED
+        );
+        assert_eq!(
+            updated.cleanup_status,
+            crate::db::repo::eh_gallery_jobs::CLEANUP_STATUS_PENDING
+        );
+        assert!(
+            zip_path.exists(),
+            "cleanup ownership is durable before local removal"
+        );
+        assert_eq!(
+            run_eh_job_cleanup_maintenance_once(repo.as_ref(), None, 0, true)
+                .await
+                .unwrap(),
+            Some(EhCleanupFinalizeOutcome::CleanRetired)
+        );
         assert!(!zip_path.exists(), "final ZIP should be cleaned");
         assert!(!part_path.exists(), "partial ZIP should be cleaned");
         assert!(
@@ -4061,6 +5310,7 @@ mod tests {
             None,
         )
         .await;
+        let job = job_for_delivery(&repo, &entry).await;
 
         mock_eh_gallery_page(&eh_server, 123456, "abcdef0123").await;
         let download_url = format!("{}/archive/123456/token/0", eh_server.uri());
@@ -4070,7 +5320,9 @@ mod tests {
         // runs validate_content_range. Content-Range start=1 matches existing_len=1.
         let eh_cache = temp.path().join("eh_cache");
         tokio::fs::create_dir_all(&eh_cache).await.unwrap();
-        let part_path = eh_cache.join("123456_abcdef0123.zip.part");
+        let part_path = archive_artifacts_for_job(temp.path(), &job)
+            .final_zip()
+            .with_extension("zip.part");
         tokio::fs::write(&part_path, b"x").await.unwrap();
 
         // 206 with valid Content-Range (start=1==existing_len, end+1==total → validate passes)
@@ -4103,11 +5355,7 @@ mod tests {
         );
         worker.tick().await.unwrap();
 
-        let updated = eh_download_queue::Entity::find_by_id(entry.id)
-            .one(repo.db())
-            .await
-            .unwrap()
-            .unwrap();
+        let updated = job_for_delivery(&repo, &entry).await;
         assert_eq!(
             updated.status, STATUS_PENDING,
             "should be pending for deferred retry"
@@ -4118,7 +5366,7 @@ mod tests {
         );
         assert!(
             updated.next_retry_at.is_some(),
-            "should have next_retry_at set by defer_eh_download"
+            "should have next_retry_at set by defer_eh_job_download"
         );
 
         // .part file should be preserved for resumption.
@@ -4135,7 +5383,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_download_worker_schedules_slow_progress_for_background_download() {
+    async fn test_download_worker_slow_progress_hands_off_shared_job_to_background() {
         let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
         let eh_server = MockServer::start().await;
         let temp = tempfile::tempdir().unwrap();
@@ -4153,6 +5401,7 @@ mod tests {
             None,
         )
         .await;
+        let job = job_for_delivery(&repo, &entry).await;
 
         mock_eh_gallery_page(&eh_server, 123456, "abcdef0123").await;
         let download_url = format!("{}/archive/123456/token/0", eh_server.uri());
@@ -4160,7 +5409,9 @@ mod tests {
 
         let eh_cache = temp.path().join("eh_cache");
         tokio::fs::create_dir_all(&eh_cache).await.unwrap();
-        let part_path = eh_cache.join("123456_abcdef0123.zip.part");
+        let part_path = archive_artifacts_for_job(temp.path(), &job)
+            .final_zip()
+            .with_extension("zip.part");
         tokio::fs::write(&part_path, b"x").await.unwrap();
 
         Mock::given(method("GET"))
@@ -4174,27 +5425,26 @@ mod tests {
             .mount(&eh_server)
             .await;
 
+        let mut config = make_config();
+        config.background_download_enabled = true;
         let worker = EhDownloadWorker::new(
             Arc::clone(&repo),
             make_eh_client(&eh_server),
-            Arc::new(make_config()),
+            Arc::new(config),
             temp.path().to_path_buf(),
             None,
         );
         worker.tick().await.unwrap();
 
-        let updated = eh_download_queue::Entity::find_by_id(entry.id)
-            .one(repo.db())
-            .await
-            .unwrap()
-            .unwrap();
+        let updated = job_for_delivery(&repo, &entry).await;
         assert_eq!(updated.status, STATUS_PENDING);
         assert_eq!(updated.retry_count, 0);
         assert_eq!(
             updated.background_download_status.as_deref(),
-            Some(crate::db::repo::eh_download_queue::BACKGROUND_STATUS_PENDING)
+            Some(crate::db::repo::eh_gallery_jobs::BACKGROUND_STATUS_PENDING)
         );
         assert!(updated.background_download_next_retry_at.is_some());
+        assert!(updated.next_retry_at.is_none());
         assert!(part_path.exists());
     }
 
@@ -4246,12 +5496,15 @@ mod tests {
 
         worker.tick().await.unwrap();
 
-        let model = eh_download_queue::Entity::find_by_id(entry.id)
-            .one(repo.db())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(model.status, STATUS_FAILED);
+        let model = job_for_delivery(&repo, &entry).await;
+        assert_eq!(
+            model.status,
+            crate::db::repo::eh_gallery_jobs::JOB_STATUS_RETIRED
+        );
+        assert_eq!(
+            model.cleanup_status,
+            crate::db::repo::eh_gallery_jobs::CLEANUP_STATUS_PENDING
+        );
         assert!(
             model
                 .error
@@ -4324,11 +5577,7 @@ mod tests {
 
         worker.tick().await.unwrap();
 
-        let model = eh_download_queue::Entity::find_by_id(entry.id)
-            .one(repo.db())
-            .await
-            .unwrap()
-            .unwrap();
+        let model = job_for_delivery(&repo, &entry).await;
         assert_eq!(model.status, STATUS_FAILED);
         assert_eq!(
             model.error.as_deref(),
@@ -4396,11 +5645,7 @@ mod tests {
 
         worker.tick().await.unwrap();
 
-        let model = eh_download_queue::Entity::find_by_id(entry.id)
-            .one(repo.db())
-            .await
-            .unwrap()
-            .unwrap();
+        let model = job_for_delivery(&repo, &entry).await;
         assert_eq!(model.status, STATUS_DOWNLOADED);
         let requests = eh_server.received_requests().await.unwrap();
         assert_eq!(
@@ -4470,11 +5715,7 @@ mod tests {
 
         worker.tick().await.unwrap();
 
-        let model = eh_download_queue::Entity::find_by_id(entry.id)
-            .one(repo.db())
-            .await
-            .unwrap()
-            .unwrap();
+        let model = job_for_delivery(&repo, &entry).await;
         assert_eq!(model.status, STATUS_DOWNLOADED);
         assert!(model.zip_path.is_some());
         assert!(model.file_size > 0);
@@ -4539,12 +5780,11 @@ mod tests {
         );
         worker.tick().await.unwrap();
 
-        let updated = eh_download_queue::Entity::find_by_id(entry.id)
-            .one(repo.db())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(updated.status, STATUS_UPLOADED);
+        let updated = job_for_delivery(&repo, &entry).await;
+        assert_eq!(
+            updated.telegraph_status,
+            crate::db::repo::eh_gallery_jobs::TELEGRAPH_STATUS_READY
+        );
         assert!(updated.telegraph_url.is_some());
     }
 
@@ -4595,12 +5835,11 @@ mod tests {
         );
         worker.tick().await.unwrap();
 
-        let updated = eh_download_queue::Entity::find_by_id(entry.id)
-            .one(repo.db())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(updated.status, STATUS_UPLOADED);
+        let updated = job_for_delivery(&repo, &entry).await;
+        assert_eq!(
+            updated.telegraph_status,
+            crate::db::repo::eh_gallery_jobs::TELEGRAPH_STATUS_READY
+        );
     }
 
     #[tokio::test]
@@ -4646,11 +5885,7 @@ mod tests {
         );
         worker.tick().await.unwrap();
 
-        let updated = eh_download_queue::Entity::find_by_id(entry.id)
-            .one(repo.db())
-            .await
-            .unwrap()
-            .unwrap();
+        let updated = job_for_delivery(&repo, &entry).await;
         assert_eq!(
             updated.status, STATUS_DOWNLOADED,
             "should be back to downloaded for retry"
@@ -4753,6 +5988,20 @@ mod tests {
         fail_abort: bool,
     }
 
+    struct AlwaysFailUploader {
+        message: String,
+    }
+
+    #[async_trait::async_trait]
+    impl ImageUploader for AlwaysFailUploader {
+        async fn upload_images(
+            &self,
+            _images: &[ImageUploadInput<'_>],
+        ) -> eh_client::Result<Vec<String>> {
+            Err(eh_client::Error::Other(self.message.clone()))
+        }
+    }
+
     #[async_trait::async_trait]
     impl ImageUploader for TerminalCleanupMockUploader {
         async fn upload_images(
@@ -4778,44 +6027,6 @@ mod tests {
         }
     }
 
-    #[derive(Default)]
-    struct SwitchableAbortUploader {
-        cleanup_calls: std::sync::Mutex<Vec<(std::path::PathBuf, bool)>>,
-        fail_abort: std::sync::atomic::AtomicBool,
-    }
-
-    impl SwitchableAbortUploader {
-        fn set_fail_abort(&self, fail_abort: bool) {
-            self.fail_abort
-                .store(fail_abort, std::sync::atomic::Ordering::SeqCst);
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl ImageUploader for SwitchableAbortUploader {
-        async fn upload_images(
-            &self,
-            _images: &[ImageUploadInput<'_>],
-        ) -> eh_client::Result<Vec<String>> {
-            Err(eh_client::Error::Other(
-                "mock image upload failure".to_string(),
-            ))
-        }
-
-        async fn abort_upload_state(&self, uploads_dir: &std::path::Path) -> eh_client::Result<()> {
-            self.cleanup_calls
-                .lock()
-                .unwrap()
-                .push((uploads_dir.to_path_buf(), uploads_dir.exists()));
-            if self.fail_abort.load(std::sync::atomic::Ordering::SeqCst) {
-                return Err(eh_client::Error::Other(
-                    "mock switchable Abort failure".to_string(),
-                ));
-            }
-            Ok(())
-        }
-    }
-
     fn assert_terminal_cleanup_precedes_local_removal(
         uploader: &TerminalCleanupMockUploader,
         artifacts: &ArchiveArtifacts,
@@ -4824,6 +6035,438 @@ mod tests {
             *uploader.cleanup_calls.lock().unwrap(),
             vec![(artifacts.uploads_dir().to_path_buf(), true)]
         );
+    }
+
+    #[tokio::test]
+    async fn two_telegraph_deliveries_upload_zip_and_create_page_once() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        let tg_server = MockServer::start().await;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let zip_path = temp_dir.path().join("shared-gallery.zip");
+        create_test_zip(&zip_path, 2);
+        let (job, deliveries) = seed_downloaded_job_with_deliveries(
+            &repo,
+            710,
+            "token",
+            "Shared Gallery",
+            &zip_path,
+            &[(-100, true, "T1"), (-200, true, "T2")],
+        )
+        .await;
+        let uploader = Arc::new(ZipFirstMockUploader::default());
+        let body = serde_json::json!({
+            "ok": true,
+            "result": {"url": "https://telegra.ph/Shared-Gallery-01-01"}
+        });
+        Mock::given(method("POST"))
+            .and(path("/createPage"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .expect(1)
+            .mount(&tg_server)
+            .await;
+        let worker = EhUploadWorker::new(
+            Arc::clone(&repo),
+            make_notifier(&tg_server),
+            make_telegraph_client(&tg_server),
+            uploader.clone(),
+            Some(IpfS3PreviewRewriteConfig {
+                preview_gateway_url: "https://preview.example".to_string(),
+                public_gateway_url: "https://public.example".to_string(),
+                delay_sec: 60,
+            }),
+            Arc::new(make_config()),
+        );
+
+        worker.tick().await.unwrap();
+        worker.tick().await.unwrap();
+
+        assert_eq!(
+            uploader.zip_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            uploader
+                .image_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        let ready = eh_gallery_jobs::Entity::find_by_id(job.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            ready.telegraph_status,
+            crate::db::repo::eh_gallery_jobs::TELEGRAPH_STATUS_READY
+        );
+        assert_eq!(
+            ready.telegraph_url.as_deref(),
+            Some("https://telegra.ph/Shared-Gallery-01-01")
+        );
+        assert!(
+            ready.telegraph_rewrite_data.is_some(),
+            "create-page rewrite payload must be persisted once on the shared job"
+        );
+        for delivery in deliveries {
+            let delivery = eh_download_queue::Entity::find_by_id(delivery.id)
+                .one(repo.db())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                delivery.status,
+                crate::db::repo::eh_gallery_jobs::DELIVERY_STATUS_WAITING
+            );
+            assert_eq!(delivery.telegraph_url, None);
+            assert_eq!(delivery.telegraph_rewrite_data, None);
+        }
+    }
+
+    #[tokio::test]
+    async fn first_telegraph_delivery_schedules_one_job_rewrite() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        let tg_server = MockServer::start().await;
+        let (job, deliveries) =
+            seed_ready_telegraph_job_with_deliveries(&repo, 712, &[(-100, None), (-200, None)])
+                .await;
+
+        repo.mark_eh_telegraph_delivery_sent(deliveries[0].id, job.id, Some(0))
+            .await
+            .unwrap();
+        let after_first = eh_gallery_jobs::Entity::find_by_id(job.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        let scheduled_after = after_first.telegraph_rewrite_after.unwrap();
+        assert_eq!(
+            after_first.telegraph_rewrite_status.as_deref(),
+            Some(crate::db::repo::eh_gallery_jobs::TELEGRAPH_REWRITE_STATUS_PENDING)
+        );
+        let marked_first = eh_download_queue::Entity::find_by_id(deliveries[0].id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        let untouched_second = eh_download_queue::Entity::find_by_id(deliveries[1].id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(marked_first.telegraph_sent_at.is_some());
+        assert!(untouched_second.telegraph_sent_at.is_none());
+
+        repo.mark_eh_telegraph_delivery_sent(deliveries[0].id, job.id, Some(7200))
+            .await
+            .unwrap();
+
+        repo.mark_eh_telegraph_delivery_sent(deliveries[1].id, job.id, Some(3600))
+            .await
+            .unwrap();
+        let after_second = eh_gallery_jobs::Entity::find_by_id(job.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after_second.telegraph_rewrite_after, Some(scheduled_after));
+
+        Mock::given(method("POST"))
+            .and(path("/editPage"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": {"url": "https://telegra.ph/Shared-Gallery-01-01"}
+            })))
+            .expect(1)
+            .mount(&tg_server)
+            .await;
+        let worker = EhTelegraphRewriteWorker::new(
+            Arc::clone(&repo),
+            make_telegraph_client(&tg_server),
+            true,
+            Arc::new(make_config()),
+        );
+        worker.tick().await.unwrap();
+
+        let requests = tg_server.received_requests().await.unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.url.path() == "/editPage")
+                .count(),
+            1
+        );
+        let rewritten = eh_gallery_jobs::Entity::find_by_id(job.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(rewritten.telegraph_rewritten_at.is_some());
+        assert!(repo
+            .get_next_eh_job_for_telegraph_rewrite()
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn job_telegraph_rewrite_worker_edits_each_page_once() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        let tg_server = MockServer::start().await;
+        let (job, deliveries) =
+            seed_ready_telegraph_job_with_deliveries(&repo, 714, &[(-100, None)]).await;
+        let rewrite_data = serde_json::json!({
+            "pages": [
+                {
+                    "path": "Shared-Gallery-01-01",
+                    "title": "Shared Gallery 1",
+                    "content": [{
+                        "tag": "img",
+                        "attrs": {"src": "https://preview.example/ipfs/first"}
+                    }]
+                },
+                {
+                    "path": "Shared-Gallery-01-02",
+                    "title": "Shared Gallery 2",
+                    "content": [{
+                        "tag": "img",
+                        "attrs": {"src": "https://preview.example/ipfs/second"}
+                    }]
+                }
+            ],
+            "preview_gateway_url": "https://preview.example",
+            "public_gateway_url": "https://public.example"
+        })
+        .to_string();
+        eh_gallery_jobs::Entity::update_many()
+            .col_expr(
+                eh_gallery_jobs::Column::TelegraphRewriteData,
+                Expr::value(Some(rewrite_data)),
+            )
+            .filter(eh_gallery_jobs::Column::Id.eq(job.id))
+            .exec(repo.db())
+            .await
+            .unwrap();
+        repo.mark_eh_telegraph_delivery_sent(deliveries[0].id, job.id, Some(0))
+            .await
+            .unwrap();
+
+        Mock::given(method("POST"))
+            .and(path("/editPage"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": {"url": "https://telegra.ph/Shared-Gallery"}
+            })))
+            .expect(2)
+            .mount(&tg_server)
+            .await;
+        let worker = EhTelegraphRewriteWorker::new(
+            Arc::clone(&repo),
+            make_telegraph_client(&tg_server),
+            true,
+            Arc::new(make_config()),
+        );
+        worker.tick().await.unwrap();
+
+        let requests = tg_server.received_requests().await.unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.url.path() == "/editPage")
+                .count(),
+            2
+        );
+        for request in requests
+            .iter()
+            .filter(|request| request.url.path() == "/editPage")
+        {
+            let content = url::form_urlencoded::parse(&request.body)
+                .find(|(key, _)| key == "content")
+                .unwrap()
+                .1
+                .into_owned();
+            assert!(content.contains("https://public.example/ipfs/"));
+            assert!(!content.contains("https://preview.example/ipfs/"));
+        }
+    }
+
+    #[tokio::test]
+    async fn final_delivery_with_delayed_rewrite_keeps_payload_until_rewrite_is_terminal() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        let tg_server = MockServer::start().await;
+        let (job, deliveries) =
+            seed_ready_telegraph_job_with_deliveries(&repo, 713, &[(-100, Some(812))]).await;
+
+        repo.mark_eh_telegraph_delivery_sent(deliveries[0].id, job.id, Some(60))
+            .await
+            .unwrap();
+        repo.cancel_eh_subscription_queue_entries(812, true)
+            .await
+            .unwrap();
+        let interleaved = eh_gallery_jobs::Entity::find_by_id(job.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(
+            interleaved.status,
+            crate::db::repo::eh_gallery_jobs::JOB_STATUS_RETIRED
+        );
+        assert_eq!(
+            interleaved.telegraph_rewrite_status.as_deref(),
+            Some(crate::db::repo::eh_gallery_jobs::TELEGRAPH_REWRITE_STATUS_PENDING)
+        );
+        assert!(interleaved.telegraph_rewrite_data.is_some());
+
+        eh_gallery_jobs::Entity::update_many()
+            .col_expr(
+                eh_gallery_jobs::Column::TelegraphRewriteAfter,
+                Expr::value(Local::now().naive_local() - chrono::Duration::seconds(1)),
+            )
+            .filter(eh_gallery_jobs::Column::Id.eq(job.id))
+            .exec(repo.db())
+            .await
+            .unwrap();
+        Mock::given(method("POST"))
+            .and(path("/editPage"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(1)
+            .mount(&tg_server)
+            .await;
+        let mut config = make_config();
+        config.max_retry_count = 0;
+        let worker = EhTelegraphRewriteWorker::new(
+            Arc::clone(&repo),
+            make_telegraph_client(&tg_server),
+            true,
+            Arc::new(config),
+        );
+        worker.tick().await.unwrap();
+
+        let terminal = eh_gallery_jobs::Entity::find_by_id(job.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            terminal.telegraph_rewrite_status.as_deref(),
+            Some(crate::db::repo::eh_gallery_jobs::TELEGRAPH_REWRITE_STATUS_FAILED)
+        );
+        assert_eq!(
+            terminal.status,
+            crate::db::repo::eh_gallery_jobs::JOB_STATUS_RETIRED
+        );
+        assert!(terminal.telegraph_rewrite_data.is_none());
+        assert_eq!(
+            terminal.cleanup_status,
+            crate::db::repo::eh_gallery_jobs::CLEANUP_STATUS_PENDING
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_upload_notifies_each_telegraph_chat_once_and_never_archive_only() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        let tg_server = MockServer::start().await;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let zip_path = temp_dir.path().join("terminal-shared-gallery.zip");
+        create_test_zip(&zip_path, 1);
+        let (job, deliveries) = seed_downloaded_job_with_deliveries(
+            &repo,
+            711,
+            "token",
+            "Shared Gallery",
+            &zip_path,
+            &[
+                (-100, true, "T1"),
+                (-200, true, "T2"),
+                (-300, false, "Archive"),
+            ],
+        )
+        .await;
+        let response = serde_json::json!({
+            "ok": true,
+            "result": {
+                "message_id": 43,
+                "date": 1700000000,
+                "chat": {"id": -100, "type": "private"}
+            }
+        });
+        Mock::given(method("POST"))
+            .and(path("/botfake_token/SendMessage"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(response))
+            .expect(2)
+            .mount(&tg_server)
+            .await;
+        let mut config = make_config();
+        config.max_retry_count = 0;
+        let worker = EhUploadWorker::new(
+            Arc::clone(&repo),
+            make_notifier(&tg_server),
+            make_telegraph_client(&tg_server),
+            Arc::new(AlwaysFailUploader {
+                message: "sqlite secret; /private/path; multipart upload id=abc".to_string(),
+            }),
+            None,
+            Arc::new(config),
+        );
+
+        worker.tick().await.unwrap();
+        worker.tick().await.unwrap();
+
+        let requests = tg_server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|request| request.url.path() == "/botfake_token/SendMessage")
+            .map(|request| serde_json::from_slice::<serde_json::Value>(&request.body).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            requests
+                .iter()
+                .map(|body| body["chat_id"].as_i64().unwrap())
+                .collect::<Vec<_>>(),
+            vec![-100, -200]
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .map(|body| body["text"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec![
+                "⚠️ Telegraph 上传失败，请稍后重试\n\n📦 T1",
+                "⚠️ Telegraph 上传失败，请稍后重试\n\n📦 T2",
+            ]
+        );
+        assert!(requests.iter().all(|body| {
+            let text = body["text"].as_str().unwrap();
+            !text.contains("sqlite secret")
+                && !text.contains("/private/path")
+                && !text.contains("upload id")
+        }));
+
+        let failed_job = eh_gallery_jobs::Entity::find_by_id(job.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            failed_job.telegraph_status,
+            crate::db::repo::eh_gallery_jobs::TELEGRAPH_STATUS_FAILED
+        );
+        assert!(failed_job.error.unwrap().contains("sqlite secret"));
+        for (delivery, expected_status) in deliveries.iter().zip([
+            crate::db::repo::eh_gallery_jobs::DELIVERY_STATUS_FAILED,
+            crate::db::repo::eh_gallery_jobs::DELIVERY_STATUS_FAILED,
+            crate::db::repo::eh_gallery_jobs::DELIVERY_STATUS_WAITING,
+        ]) {
+            let delivery = eh_download_queue::Entity::find_by_id(delivery.id)
+                .one(repo.db())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(delivery.status, expected_status);
+            assert_eq!(delivery.error, None);
+        }
     }
 
     #[tokio::test]
@@ -4869,12 +6512,11 @@ mod tests {
                 logical_object_id: "archive".to_string(),
             }]
         );
-        let model = eh_download_queue::Entity::find_by_id(entry.id)
-            .one(repo.db())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(model.status, STATUS_UPLOADED);
+        let job = job_for_delivery(&repo, &entry).await;
+        assert_eq!(
+            job.telegraph_status,
+            crate::db::repo::eh_gallery_jobs::TELEGRAPH_STATUS_READY
+        );
     }
 
     #[tokio::test]
@@ -4932,17 +6574,16 @@ mod tests {
         );
 
         worker.tick().await.unwrap();
-        let retried = eh_download_queue::Entity::find_by_id(entry.id)
-            .one(repo.db())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(retried.status, STATUS_DOWNLOADED);
+        let retried = job_for_delivery(&repo, &entry).await;
+        assert_eq!(
+            retried.telegraph_status,
+            crate::db::repo::eh_gallery_jobs::TELEGRAPH_STATUS_PENDING
+        );
         assert!(
             artifacts.uploads_dir().exists(),
             "retryable upload failure should retain upload state"
         );
-        let mut retry_active: eh_download_queue::ActiveModel = retried.into();
+        let mut retry_active: eh_gallery_jobs::ActiveModel = retried.into();
         retry_active.next_retry_at = Set(None);
         retry_active.update(repo.db()).await.unwrap();
         worker.tick().await.unwrap();
@@ -4959,12 +6600,11 @@ mod tests {
             *uploader.seen_image_resume_contexts.lock().unwrap(),
             vec![image_0.clone(), image_1.clone(), image_0, image_1]
         );
-        let model = eh_download_queue::Entity::find_by_id(entry.id)
-            .one(repo.db())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(model.status, STATUS_UPLOADED);
+        let job = job_for_delivery(&repo, &entry).await;
+        assert_eq!(
+            job.telegraph_status,
+            crate::db::repo::eh_gallery_jobs::TELEGRAPH_STATUS_READY
+        );
     }
 
     #[tokio::test]
@@ -5010,12 +6650,11 @@ mod tests {
 
         worker.tick().await.unwrap();
 
-        let model = eh_download_queue::Entity::find_by_id(entry.id)
-            .one(repo.db())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(model.status, STATUS_UPLOADED);
+        let job = job_for_delivery(&repo, &entry).await;
+        assert_eq!(
+            job.telegraph_status,
+            crate::db::repo::eh_gallery_jobs::TELEGRAPH_STATUS_READY
+        );
         assert!(!artifacts.uploads_dir().exists());
         assert!(artifacts.final_zip().exists());
     }
@@ -5069,12 +6708,11 @@ mod tests {
             *uploader.seen_entries.lock().unwrap(),
             vec!["page000.jpg".to_string(), "page001.jpg".to_string()]
         );
-        let model = eh_download_queue::Entity::find_by_id(entry.id)
-            .one(repo.db())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(model.status, STATUS_UPLOADED);
+        let job = job_for_delivery(&repo, &entry).await;
+        assert_eq!(
+            job.telegraph_status,
+            crate::db::repo::eh_gallery_jobs::TELEGRAPH_STATUS_READY
+        );
     }
 
     #[tokio::test]
@@ -5128,13 +6766,12 @@ mod tests {
             *uploader.seen_entries.lock().unwrap(),
             vec!["dir\\page000.jpg".to_string(), "page001.jpg".to_string()]
         );
-        let model = eh_download_queue::Entity::find_by_id(entry.id)
-            .one(repo.db())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(model.status, STATUS_UPLOADED);
-        assert!(model.telegraph_url.is_some());
+        let job = job_for_delivery(&repo, &entry).await;
+        assert_eq!(
+            job.telegraph_status,
+            crate::db::repo::eh_gallery_jobs::TELEGRAPH_STATUS_READY
+        );
+        assert!(job.telegraph_url.is_some());
     }
 
     #[tokio::test]
@@ -5184,18 +6821,17 @@ mod tests {
                 .load(std::sync::atomic::Ordering::SeqCst),
             1
         );
-        let model = eh_download_queue::Entity::find_by_id(entry.id)
-            .one(repo.db())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(model.status, STATUS_UPLOADED);
+        let job = job_for_delivery(&repo, &entry).await;
+        assert_eq!(
+            job.telegraph_status,
+            crate::db::repo::eh_gallery_jobs::TELEGRAPH_STATUS_READY
+        );
     }
 
     // === Publish Worker Tests ===
 
     #[tokio::test]
-    async fn test_publish_success_removes_whole_archive_family() {
+    async fn test_publish_success_records_liveness_without_cleanup() {
         let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
         let tg_server = MockServer::start().await;
 
@@ -5205,31 +6841,25 @@ mod tests {
         let zip_path = temp.path().join("gallery.zip");
         create_test_zip(&zip_path, 2);
         let artifacts = seed_archive_artifact_family(&zip_path);
-        let zip_path_str = zip_path.to_string_lossy().to_string();
-
-        let entry = insert_queue_entry(
+        let (job, deliveries) = seed_downloaded_job_with_deliveries(
             &repo,
-            -100,
             123456,
             "abcdef0123",
             "Test Gallery",
-            false,
-            STATUS_DOWNLOADED,
-            Some(&zip_path_str),
-            None,
+            &zip_path,
+            &[(-100, false, "Test Gallery")],
         )
         .await;
+        let entry = &deliveries[0];
 
         mock_tg_send_document(&tg_server).await;
 
         let eh_server = MockServer::start().await;
-        let abort_uploader = Arc::new(TerminalCleanupMockUploader::default());
-        let worker = EhPublishWorker::new_with_abort_uploader(
+        let worker = EhPublishWorker::new(
             Arc::clone(&repo),
             make_notifier(&tg_server),
             make_eh_client(&eh_server),
             None,
-            Some(abort_uploader.clone()),
             Arc::new(make_config()),
         );
         worker.tick().await.unwrap();
@@ -5240,14 +6870,232 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(updated.status, "done");
-        assert!(!artifacts.final_zip().exists());
-        assert!(!artifacts.assembly_scratch().exists());
-        assert!(!artifacts.parts_dir().exists());
-        assert!(!artifacts.uploads_dir().exists());
+        assert!(artifacts.final_zip().exists());
+        assert!(artifacts.assembly_scratch().exists());
+        assert!(artifacts.parts_dir().exists());
+        assert!(artifacts.uploads_dir().exists());
+        assert_eq!(
+            job_for_delivery(&repo, &updated).await.cleanup_status,
+            crate::db::repo::eh_gallery_jobs::CLEANUP_STATUS_PENDING
+        );
+        assert_eq!(updated.job_id, Some(job.id));
     }
 
     #[tokio::test]
-    async fn test_publish_archive_only_abort_gate_retries_cleanup_without_resending() {
+    async fn publish_send_serializes_concurrent_enqueue_into_a_clean_next_wave() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        setup_chat(&repo, -100, true).await;
+        let tg_server = MockServer::start().await;
+        let eh_server = MockServer::start().await;
+        let temp = tempfile::tempdir().unwrap();
+        let zip_path = temp.path().join("serialized-wave.zip");
+        create_test_zip(&zip_path, 1);
+        let (old_job, deliveries) = seed_downloaded_job_with_deliveries(
+            &repo,
+            910,
+            "old-token",
+            "Old wave",
+            &zip_path,
+            &[(-100, false, "Old wave")],
+        )
+        .await;
+        mock_tg_send_document(&tg_server).await;
+
+        let send_entered = Arc::new(tokio::sync::Notify::new());
+        let release_send = Arc::new(tokio::sync::Notify::new());
+        let done_entered = Arc::new(tokio::sync::Notify::new());
+        let release_done = Arc::new(tokio::sync::Notify::new());
+        let worker = EhPublishWorker::new(
+            Arc::clone(&repo),
+            make_notifier(&tg_server),
+            make_eh_client(&eh_server),
+            None,
+            Arc::new(make_config()),
+        )
+        .with_test_send_hook(EhPublishSendHook {
+            entered: Arc::clone(&send_entered),
+            release: Arc::clone(&release_send),
+            after_done: Some(EhPublishCompletionHook {
+                entered: Arc::clone(&done_entered),
+                release: Arc::clone(&release_done),
+            }),
+        });
+        let claim = repo
+            .get_next_eh_delivery_for_publish(true)
+            .await
+            .unwrap()
+            .unwrap();
+        let publish = tokio::spawn(async move { worker.process_claimed(claim).await });
+        tokio::time::timeout(Duration::from_secs(5), send_entered.notified())
+            .await
+            .expect("publisher must enter the real document send");
+
+        let enqueue_waiting = Arc::new(tokio::sync::Notify::new());
+        let enqueue_acquired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let enqueue_hook = crate::db::repo::eh_gallery_jobs::EhEnqueueChatLockHook {
+            waiting: Arc::clone(&enqueue_waiting),
+            acquired: Arc::clone(&enqueue_acquired),
+        };
+        let enqueue_repo = Arc::clone(&repo);
+        let enqueue = tokio::spawn(async move {
+            crate::db::repo::eh_gallery_jobs::EH_ENQUEUE_CHAT_LOCK_HOOK
+                .scope(enqueue_hook, async move {
+                    enqueue_repo
+                        .enqueue_eh_download(
+                            -100,
+                            910,
+                            "new-token",
+                            "New wave",
+                            false,
+                            SOURCE_DIRECT,
+                            &EhGalleryVariant::archive("original"),
+                        )
+                        .await
+                })
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), enqueue_waiting.notified())
+            .await
+            .expect("enqueue must attempt the chat lock after send begins");
+        assert!(
+            !enqueue_acquired.load(std::sync::atomic::Ordering::SeqCst),
+            "enqueue must remain behind the in-flight publisher's chat lock"
+        );
+
+        let in_flight = eh_download_queue::Entity::find_by_id(deliveries[0].id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(in_flight.status, STATUS_PUBLISHING);
+        assert!(in_flight.archive_sent_at.is_none());
+
+        release_send.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), done_entered.notified())
+            .await
+            .expect("the old wave must persist completion before releasing the chat lock");
+        let old_wave = eh_download_queue::Entity::find_by_id(deliveries[0].id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(old_wave.status, STATUS_DONE);
+        assert!(old_wave.archive_sent_at.is_some());
+
+        release_done.notify_one();
+        publish.await.unwrap().unwrap();
+        let new_wave = enqueue.await.unwrap().unwrap();
+        assert!(enqueue_acquired.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(
+            new_wave.status,
+            crate::db::repo::eh_gallery_jobs::DELIVERY_STATUS_WAITING
+        );
+        assert_ne!(new_wave.job_id, Some(old_job.id));
+        assert!(new_wave.archive_sent_at.is_none());
+        assert!(new_wave.telegraph_sent_at.is_none());
+        assert!(new_wave.started_at.is_none());
+        assert!(new_wave.completed_at.is_none());
+        assert_eq!(new_wave.retry_count, 0);
+        assert_eq!(
+            tg_server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|request| request.url.path().ends_with("/SendDocument"))
+                .count(),
+            1,
+            "the old wave must send exactly once before a new wave can begin"
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_tick_drains_started_sibling_before_returning_refill_claim_error() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        setup_chat(&repo, -100, true).await;
+        setup_chat(&repo, -200, true).await;
+        let tg_server = MockServer::start().await;
+        let eh_server = MockServer::start().await;
+        let temp = tempfile::tempdir().unwrap();
+        let zip_path = temp.path().join("claim-error-drain.zip");
+        create_test_zip(&zip_path, 1);
+        let (_, deliveries) = seed_downloaded_job_with_deliveries(
+            &repo,
+            911,
+            "claim-error",
+            "Claim error drain",
+            &zip_path,
+            &[(-100, false, "First"), (-200, false, "Second")],
+        )
+        .await;
+        mock_tg_send_document_for_chat(&tg_server, -100, 200, None).await;
+        repo.db()
+            .execute(Statement::from_string(
+                DbBackend::Sqlite,
+                format!(
+                    "CREATE TRIGGER delete_second_publish_readback AFTER UPDATE OF status ON eh_download_queue \
+                     WHEN NEW.id = {} AND NEW.status = 'publishing' BEGIN \
+                         DELETE FROM eh_download_queue WHERE id = NEW.id; \
+                     END;",
+                    deliveries[1].id
+                ),
+            ))
+            .await
+            .unwrap();
+
+        let send_entered = Arc::new(tokio::sync::Notify::new());
+        let release_send = Arc::new(tokio::sync::Notify::new());
+        let mut config = make_config();
+        config.publish_concurrency = 2;
+        let worker = EhPublishWorker::new(
+            Arc::clone(&repo),
+            make_notifier(&tg_server),
+            make_eh_client(&eh_server),
+            None,
+            Arc::new(config),
+        )
+        .with_test_send_hook(EhPublishSendHook {
+            entered: Arc::clone(&send_entered),
+            release: Arc::clone(&release_send),
+            after_done: None,
+        });
+        let tick = tokio::spawn(async move { worker.tick().await });
+        tokio::time::timeout(Duration::from_secs(5), send_entered.notified())
+            .await
+            .expect("the first claimed sibling must reach its send hook");
+        tokio::task::yield_now().await;
+        assert!(
+            !tick.is_finished(),
+            "a refill claim error must drain the already-started sibling rather than drop it"
+        );
+
+        release_send.notify_one();
+        let error = tick
+            .await
+            .unwrap()
+            .expect_err("the refill readback failure must be returned after draining");
+        assert!(format!("{:#}", error)
+            .contains("Shared EH delivery changed before publish claim readback"));
+        let first = eh_download_queue::Entity::find_by_id(deliveries[0].id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        let second = eh_download_queue::Entity::find_by_id(deliveries[1].id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.status, STATUS_DONE);
+        assert_eq!(
+            second.status,
+            crate::db::repo::eh_gallery_jobs::DELIVERY_STATUS_WAITING,
+            "the failed refill transaction must not leave a publishing claim"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_publish_archive_only_keeps_family_for_task9_cleanup() {
         let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
         let tg_server = MockServer::start().await;
         setup_chat(&repo, -100, true).await;
@@ -5255,66 +7103,26 @@ mod tests {
         let zip_path = temp.path().join("abort-gated-archive-only.zip");
         create_test_zip(&zip_path, 2);
         let artifacts = seed_archive_artifact_family(&zip_path);
-        let entry = insert_queue_entry(
+        let (_, deliveries) = seed_downloaded_job_with_deliveries(
             &repo,
-            -100,
             123457,
             "abort-gated",
             "Archive Only",
-            true,
-            STATUS_DOWNLOADED,
-            Some(zip_path.to_str().unwrap()),
-            None,
+            &zip_path,
+            &[(-100, false, "Archive Only")],
         )
         .await;
-
-        repo.disable_eh_telegraph_for_unuploaded_entries()
-            .await
-            .unwrap();
-        let downgraded = eh_download_queue::Entity::find_by_id(entry.id)
-            .one(repo.db())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(downgraded.status, STATUS_DOWNLOADED);
-        assert!(!downgraded.telegraph);
+        let entry = &deliveries[0];
 
         mock_tg_send_document(&tg_server).await;
-        let abort_uploader = Arc::new(SwitchableAbortUploader::default());
-        abort_uploader.set_fail_abort(true);
         let eh_server = MockServer::start().await;
-        let mut config = make_config();
-        config.max_retry_count = 0;
-        let worker = EhPublishWorker::new_with_abort_uploader(
+        let worker = EhPublishWorker::new(
             Arc::clone(&repo),
             make_notifier(&tg_server),
             make_eh_client(&eh_server),
             None,
-            Some(abort_uploader.clone()),
-            Arc::new(config),
+            Arc::new(make_config()),
         );
-
-        worker
-            .tick()
-            .await
-            .expect_err("Abort failure must retain the archive-only family");
-        let retry = eh_download_queue::Entity::find_by_id(entry.id)
-            .one(repo.db())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(retry.status, STATUS_DOWNLOADED);
-        assert_eq!(retry.retry_count, 0);
-        assert!(retry.archive_sent_at.is_some());
-        assert!(artifacts.final_zip().exists());
-        assert!(artifacts.assembly_scratch().exists());
-        assert!(artifacts.parts_dir().exists());
-        assert!(artifacts.uploads_dir().join("archive.json").exists());
-
-        let mut retry_active: eh_download_queue::ActiveModel = retry.into();
-        retry_active.next_retry_at = Set(None);
-        retry_active.update(repo.db()).await.unwrap();
-        abort_uploader.set_fail_abort(false);
 
         worker.tick().await.unwrap();
         let done = eh_download_queue::Entity::find_by_id(entry.id)
@@ -5323,8 +7131,11 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(done.status, STATUS_DONE);
-        assert!(!artifacts.final_zip().exists());
-        assert!(!artifacts.uploads_dir().exists());
+        assert!(done.archive_sent_at.is_some());
+        assert!(artifacts.final_zip().exists());
+        assert!(artifacts.assembly_scratch().exists());
+        assert!(artifacts.parts_dir().exists());
+        assert!(artifacts.uploads_dir().join("archive.json").exists());
         let document_sends = tg_server
             .received_requests()
             .await
@@ -5334,12 +7145,12 @@ mod tests {
             .count();
         assert_eq!(
             document_sends, 1,
-            "cleanup retry must not resend the archive"
+            "delivery completion must not create a cleanup resend"
         );
     }
 
     #[tokio::test]
-    async fn test_publish_archive_only_without_abort_uploader_preserves_family() {
+    async fn test_publish_archive_only_needs_no_abort_uploader() {
         let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
         let tg_server = MockServer::start().await;
         setup_chat(&repo, -100, true).await;
@@ -5347,40 +7158,34 @@ mod tests {
         let zip_path = temp.path().join("no-abort-uploader.zip");
         create_test_zip(&zip_path, 2);
         let artifacts = seed_archive_artifact_family(&zip_path);
-        let entry = insert_queue_entry(
+        let (_, deliveries) = seed_downloaded_job_with_deliveries(
             &repo,
-            -100,
             123458,
             "no-abort",
             "Archive Only",
-            false,
-            STATUS_DOWNLOADED,
-            Some(zip_path.to_str().unwrap()),
-            None,
+            &zip_path,
+            &[(-100, false, "Archive Only")],
         )
         .await;
+        let entry = &deliveries[0];
 
         mock_tg_send_document(&tg_server).await;
-        let worker = EhPublishWorker::new_with_abort_uploader(
+        let worker = EhPublishWorker::new(
             Arc::clone(&repo),
             make_notifier(&tg_server),
             make_eh_client(&MockServer::start().await),
             None,
-            None,
             Arc::new(make_config()),
         );
 
-        worker
-            .tick()
-            .await
-            .expect_err("archive-only publish with upload state needs an Abort uploader");
-        let retry = eh_download_queue::Entity::find_by_id(entry.id)
+        worker.tick().await.unwrap();
+        let done = eh_download_queue::Entity::find_by_id(entry.id)
             .one(repo.db())
             .await
             .unwrap()
             .unwrap();
-        assert_ne!(retry.status, STATUS_DONE);
-        assert!(retry.archive_sent_at.is_some());
+        assert_eq!(done.status, STATUS_DONE);
+        assert!(done.archive_sent_at.is_some());
         assert!(artifacts.final_zip().exists());
         assert!(artifacts.uploads_dir().exists());
     }
@@ -5395,20 +7200,29 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let zip_path = temp.path().join("gallery.zip");
         create_test_zip(&zip_path, 2);
-        let zip_path_str = zip_path.to_string_lossy().to_string();
-
-        let entry = insert_queue_entry(
+        let (job, deliveries) = seed_downloaded_job_with_deliveries(
             &repo,
-            -100,
             123456,
             "abcdef0123",
             "Test Gallery",
-            true,
-            STATUS_UPLOADED,
-            Some(&zip_path_str),
-            Some("https://telegra.ph/Test-01-01"),
+            &zip_path,
+            &[(-100, true, "Test Gallery")],
         )
         .await;
+        let entry = &deliveries[0];
+        eh_gallery_jobs::Entity::update_many()
+            .col_expr(
+                eh_gallery_jobs::Column::TelegraphStatus,
+                Expr::value(crate::db::repo::eh_gallery_jobs::TELEGRAPH_STATUS_READY),
+            )
+            .col_expr(
+                eh_gallery_jobs::Column::TelegraphUrl,
+                Expr::value(Some("https://telegra.ph/Test-01-01".to_string())),
+            )
+            .filter(eh_gallery_jobs::Column::Id.eq(job.id))
+            .exec(repo.db())
+            .await
+            .unwrap();
 
         mock_tg_send_document(&tg_server).await;
         mock_tg_send_message(&tg_server).await;
@@ -5450,20 +7264,16 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let zip_path = temp.path().join("gallery.zip");
         create_test_zip(&zip_path, 2);
-        let zip_path_str = zip_path.to_string_lossy().to_string();
-
-        let entry = insert_queue_entry(
+        let (_, deliveries) = seed_downloaded_job_with_deliveries(
             &repo,
-            -100,
             123456,
             "abcdef0123",
             "Test",
-            false,
-            STATUS_DOWNLOADED,
-            Some(&zip_path_str),
-            None,
+            &zip_path,
+            &[(-100, false, "Test")],
         )
         .await;
+        let entry = &deliveries[0];
 
         let eh_server = MockServer::start().await;
         let worker = EhPublishWorker::new(
@@ -5480,10 +7290,11 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        // Chat disabled → entry goes back to downloaded with retry (not silently done)
+        // Chat disabled → delivery goes back to waiting with retry (not silently done)
         assert_eq!(
-            updated.status, STATUS_DOWNLOADED,
-            "should be back to downloaded for retry"
+            updated.status,
+            crate::db::repo::eh_gallery_jobs::DELIVERY_STATUS_WAITING,
+            "should be back to waiting for retry"
         );
         assert_eq!(
             updated.retry_count, 0,
@@ -5505,18 +7316,29 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let zip_path = temp_dir.path().join("501.zip");
         create_test_zip(&zip_path, 2);
-        let entry = insert_queue_entry(
+        let (job, deliveries) = seed_downloaded_job_with_deliveries(
             &repo,
-            -100,
             501,
             "tok",
             "Title",
-            true,
-            STATUS_UPLOADED,
-            Some(zip_path.to_str().unwrap()),
-            Some("https://telegra.ph/page"),
+            &zip_path,
+            &[(-100, true, "Title")],
         )
         .await;
+        let entry = &deliveries[0];
+        eh_gallery_jobs::Entity::update_many()
+            .col_expr(
+                eh_gallery_jobs::Column::TelegraphStatus,
+                Expr::value(crate::db::repo::eh_gallery_jobs::TELEGRAPH_STATUS_READY),
+            )
+            .col_expr(
+                eh_gallery_jobs::Column::TelegraphUrl,
+                Expr::value(Some("https://telegra.ph/page".to_string())),
+            )
+            .filter(eh_gallery_jobs::Column::Id.eq(job.id))
+            .exec(repo.db())
+            .await
+            .unwrap();
 
         // Pre-set archive_sent_at directly (bypassing the publishing guard for test setup)
         eh_download_queue::Entity::update_many()
@@ -5552,24 +7374,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_publish_missing_zip_retries_download_instead_of_done() {
+    async fn test_publish_missing_zip_resets_shared_download_instead_of_done() {
         let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
         setup_chat(&repo, -100, true).await;
         let tg_server = MockServer::start().await;
         let notifier = make_notifier(&tg_server);
         let config = Arc::new(make_config());
-        let entry = insert_queue_entry(
+        let temp = tempfile::tempdir().unwrap();
+        let zip_path = temp.path().join("missing.zip");
+        create_test_zip(&zip_path, 1);
+        let (job, deliveries) = seed_downloaded_job_with_deliveries(
             &repo,
-            -100,
             502,
             "tok",
             "Title",
-            false,
-            STATUS_DOWNLOADED,
-            Some("data/test_cache/missing.zip"),
-            None,
+            &zip_path,
+            &[(-100, false, "Title")],
         )
         .await;
+        let entry = &deliveries[0];
+        eh_gallery_jobs::Entity::update_many()
+            .col_expr(
+                eh_gallery_jobs::Column::StartedAt,
+                Expr::value(Some(Local::now().naive_local())),
+            )
+            .filter(eh_gallery_jobs::Column::Id.eq(job.id))
+            .exec(repo.db())
+            .await
+            .unwrap();
+        std::fs::remove_file(&zip_path).unwrap();
 
         let eh_server = MockServer::start().await;
         let worker = EhPublishWorker::new(
@@ -5586,9 +7419,20 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(model.status, STATUS_PENDING);
-        assert_eq!(model.retry_count, 1);
+        assert_eq!(
+            model.status,
+            crate::db::repo::eh_gallery_jobs::DELIVERY_STATUS_WAITING
+        );
+        assert_eq!(model.retry_count, 0);
         assert!(model.next_retry_at.is_some());
+        let reset = job_for_delivery(&repo, &model).await;
+        assert_eq!(reset.id, job.id);
+        assert_eq!(
+            reset.status,
+            crate::db::repo::eh_gallery_jobs::JOB_STATUS_PENDING
+        );
+        assert_eq!(reset.retry_count, 1);
+        assert!(reset.zip_path.is_none());
     }
 
     #[tokio::test]
@@ -5621,22 +7465,25 @@ mod tests {
             None,
         )
         .await;
-        let claimed = repo.get_next_for_publish().await.unwrap().unwrap();
-        assert_eq!(claimed.id, entry.id);
-        repo.cancel_eh_subscription_queue_entries(123)
+        let entry = migrate_seeded_delivery_to_waiting(&repo, entry).await;
+        let claimed = repo
+            .get_next_eh_delivery_for_publish(true)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed.delivery.id, entry.id);
+        repo.cancel_eh_subscription_queue_entries(123, true)
             .await
             .unwrap();
 
-        let abort_uploader = Arc::new(TerminalCleanupMockUploader::default());
-        let worker = EhPublishWorker::new_with_abort_uploader(
+        let worker = EhPublishWorker::new(
             Arc::clone(&repo),
             notifier,
             make_eh_client(&MockServer::start().await),
             None,
-            Some(abort_uploader),
             config,
         );
-        worker.process(&claimed).await.unwrap();
+        worker.process_claimed(claimed).await.unwrap();
 
         let model = eh_download_queue::Entity::find_by_id(entry.id)
             .one(repo.db())
@@ -5645,15 +7492,18 @@ mod tests {
             .unwrap();
         assert_eq!(model.status, STATUS_CANCELED);
         assert!(model.archive_sent_at.is_none());
-        assert!(zip_path.exists(), "canceled publish should not clean ZIP");
         assert!(
-            !artifacts.uploads_dir().exists(),
-            "canceled publish should remove upload state"
+            zip_path.exists(),
+            "canceled publish must not clean shared ZIP"
+        );
+        assert!(
+            artifacts.uploads_dir().exists(),
+            "Task 9 cleanup owns the shared upload-state lifecycle"
         );
     }
 
     #[tokio::test]
-    async fn test_publish_cancellation_preserves_upload_state_when_abort_fails() {
+    async fn test_publish_cancellation_leaves_upload_state_for_liveness_cleanup() {
         let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
         setup_chat(&repo, -100, true).await;
         let tg_server = MockServer::start().await;
@@ -5680,27 +7530,24 @@ mod tests {
             None,
         )
         .await;
-        let claimed = repo.get_next_for_publish().await.unwrap().unwrap();
-        repo.cancel_eh_subscription_queue_entries(123)
+        let entry = migrate_seeded_delivery_to_waiting(&repo, entry).await;
+        let claimed = repo
+            .get_next_eh_delivery_for_publish(true)
+            .await
+            .unwrap()
+            .unwrap();
+        repo.cancel_eh_subscription_queue_entries(123, true)
             .await
             .unwrap();
-        let abort_uploader = Arc::new(TerminalCleanupMockUploader {
-            fail_abort: true,
-            ..Default::default()
-        });
-        let worker = EhPublishWorker::new_with_abort_uploader(
+        let worker = EhPublishWorker::new(
             Arc::clone(&repo),
             make_notifier(&tg_server),
             make_eh_client(&MockServer::start().await),
             None,
-            Some(abort_uploader.clone()),
             Arc::new(make_config()),
         );
 
-        worker
-            .process(&claimed)
-            .await
-            .expect_err("publish cancellation must return an Abort failure");
+        worker.process_claimed(claimed).await.unwrap();
         let model = eh_download_queue::Entity::find_by_id(entry.id)
             .one(repo.db())
             .await
@@ -5709,44 +7556,39 @@ mod tests {
         assert_eq!(model.status, STATUS_CANCELED);
         assert!(zip_path.exists());
         assert!(artifacts.uploads_dir().exists());
-        assert_terminal_cleanup_precedes_local_removal(&abort_uploader, &artifacts);
     }
 
     #[tokio::test]
-    async fn test_publish_permanent_failure_removes_whole_archive_family() {
+    async fn test_publish_terminal_send_failure_is_delivery_local_and_keeps_shared_family() {
         let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
         setup_chat(&repo, -100, true).await;
         let tg_server = MockServer::start().await;
-        let notifier = make_notifier(&tg_server);
         let mut cfg = make_config();
-        cfg.send_archive = false;
+        cfg.send_archive = true;
         cfg.max_retry_count = 0;
         let config = Arc::new(cfg);
-        let abort_uploader = Arc::new(TerminalCleanupMockUploader::default());
-        let worker = EhPublishWorker::new_with_abort_uploader(
-            Arc::clone(&repo),
-            notifier,
-            make_eh_client(&MockServer::start().await),
-            None,
-            Some(abort_uploader),
-            config,
-        );
         let temp_dir = tempfile::tempdir().unwrap();
         let zip_path = temp_dir.path().join("503.zip");
         create_test_zip(&zip_path, 2);
         let artifacts = seed_archive_artifact_family(&zip_path);
-        let entry = insert_queue_entry(
+        let (job, deliveries) = seed_downloaded_job_with_deliveries(
             &repo,
-            -100,
             503,
             "tok",
             "Title",
-            false,
-            STATUS_DOWNLOADED,
-            Some(zip_path.to_str().unwrap()),
-            None,
+            &zip_path,
+            &[(-100, false, "Title")],
         )
         .await;
+        let entry = &deliveries[0];
+        mock_tg_send_document_for_chat(&tg_server, -100, 500, None).await;
+        let worker = EhPublishWorker::new(
+            Arc::clone(&repo),
+            make_notifier(&tg_server),
+            make_eh_client(&MockServer::start().await),
+            None,
+            config,
+        );
 
         worker.tick().await.unwrap();
         let model = eh_download_queue::Entity::find_by_id(entry.id)
@@ -5755,11 +7597,26 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(model.status, STATUS_FAILED);
-        assert!(model.error.unwrap().contains("no EH publish surface"));
-        assert!(!artifacts.final_zip().exists());
-        assert!(!artifacts.assembly_scratch().exists());
-        assert!(!artifacts.parts_dir().exists());
-        assert!(!artifacts.uploads_dir().exists());
+        assert!(model
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("Failed to send archive document"));
+        assert_eq!(model.retry_count, 1);
+        let retired = job_for_delivery(&repo, &model).await;
+        assert_eq!(retired.id, job.id);
+        assert_eq!(
+            retired.status,
+            crate::db::repo::eh_gallery_jobs::JOB_STATUS_RETIRED
+        );
+        assert_eq!(
+            retired.cleanup_status,
+            crate::db::repo::eh_gallery_jobs::CLEANUP_STATUS_PENDING
+        );
+        assert!(artifacts.final_zip().exists());
+        assert!(artifacts.assembly_scratch().exists());
+        assert!(artifacts.parts_dir().exists());
+        assert!(artifacts.uploads_dir().exists());
     }
 
     #[tokio::test]
@@ -5772,18 +7629,16 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let zip_path = temp_dir.path().join("504.zip");
         create_test_zip(&zip_path, 2);
-        let entry = insert_queue_entry(
+        let (_, deliveries) = seed_downloaded_job_with_deliveries(
             &repo,
-            -100,
             504,
             "tok",
             "Title",
-            false,
-            STATUS_DOWNLOADED,
-            Some(zip_path.to_str().unwrap()),
-            None,
+            &zip_path,
+            &[(-100, false, "Title")],
         )
         .await;
+        let entry = &deliveries[0];
 
         let eh_server = MockServer::start().await;
         let worker = EhPublishWorker::new(
@@ -5799,13 +7654,16 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(model.status, STATUS_DOWNLOADED);
+        assert_eq!(
+            model.status,
+            crate::db::repo::eh_gallery_jobs::DELIVERY_STATUS_WAITING
+        );
         assert_eq!(model.retry_count, 0);
         assert!(model.next_retry_at.is_some());
     }
 
     #[tokio::test]
-    async fn test_upload_permanent_failure_fallback_removes_upload_state_but_keeps_zip() {
+    async fn test_upload_terminal_failure_removes_upload_state_but_keeps_zip_for_archive_mode() {
         let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
         setup_chat(&repo, -100, true).await;
         let tg_server = MockServer::start().await;
@@ -5830,6 +7688,7 @@ mod tests {
             None,
         )
         .await;
+        let entry = migrate_seeded_delivery_to_waiting(&repo, entry).await;
         let uploader = Arc::new(TerminalCleanupMockUploader::default());
 
         let worker = EhUploadWorker::new_with_abort_uploader(
@@ -5847,31 +7706,45 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(model.status, STATUS_DOWNLOADED);
-        assert!(!model.telegraph);
-        assert_eq!(model.retry_count, 0);
-        assert!(model.next_retry_at.is_none());
+        assert_eq!(model.status, STATUS_FAILED);
+        assert!(model.telegraph);
+        assert_eq!(model.error, None);
+        let job = job_for_delivery(&repo, &entry).await;
+        assert_eq!(
+            job.telegraph_status,
+            crate::db::repo::eh_gallery_jobs::TELEGRAPH_STATUS_FAILED
+        );
+        assert_eq!(job.retry_count, 1);
+        assert!(job.next_retry_at.is_none());
+        assert_eq!(
+            job.cleanup_status,
+            crate::db::repo::eh_gallery_jobs::CLEANUP_STATUS_PENDING
+        );
         assert!(
             zip_path.exists(),
-            "ZIP file should be preserved after archive fallback"
+            "liveness schedules rather than deleting the retired archive family"
         );
         assert!(
-            !artifacts.uploads_dir().exists(),
-            "archive fallback should discard upload resume state"
+            artifacts.uploads_dir().exists(),
+            "maintenance owns the Abort and local removal"
         );
-        assert!(
-            artifacts.assembly_scratch().exists(),
-            "archive fallback should not change download scratch semantics"
+        assert!(artifacts.assembly_scratch().exists());
+        assert!(artifacts.parts_dir().exists());
+        assert_eq!(
+            run_eh_job_cleanup_maintenance_once(repo.as_ref(), Some(uploader.as_ref()), 1, true)
+                .await
+                .unwrap(),
+            Some(EhCleanupFinalizeOutcome::CleanRetired)
         );
-        assert!(
-            artifacts.parts_dir().exists(),
-            "archive fallback should not change download parts semantics"
-        );
+        assert!(!zip_path.exists());
+        assert!(!artifacts.uploads_dir().exists());
+        assert!(!artifacts.assembly_scratch().exists());
+        assert!(!artifacts.parts_dir().exists());
         assert_terminal_cleanup_precedes_local_removal(&uploader, &artifacts);
     }
 
     #[tokio::test]
-    async fn test_upload_permanent_failure_fallback_preserves_family_when_abort_fails() {
+    async fn test_upload_terminal_failure_preserves_family_when_abort_fails() {
         let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
         setup_chat(&repo, -100, true).await;
         let tg_server = MockServer::start().await;
@@ -5895,6 +7768,7 @@ mod tests {
             None,
         )
         .await;
+        let entry = migrate_seeded_delivery_to_waiting(&repo, entry).await;
         let uploader = Arc::new(TerminalCleanupMockUploader {
             fail_abort: true,
             ..Default::default()
@@ -5909,28 +7783,113 @@ mod tests {
             Arc::new(cfg),
         );
 
-        let error = worker.tick().await.expect_err(
-            "Abort failure must be returned instead of falling back to archive delivery",
-        );
-        assert!(error
-            .to_string()
-            .contains("Failed to abort incomplete EH multipart uploads for gid=505"));
+        worker.tick().await.unwrap();
         let model = eh_download_queue::Entity::find_by_id(entry.id)
             .one(repo.db())
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(model.status, STATUS_DOWNLOADED);
+        assert_eq!(
+            model.status,
+            crate::db::repo::eh_gallery_jobs::DELIVERY_STATUS_FAILED
+        );
         assert!(
             model.telegraph,
             "Abort failure must not enter archive fallback"
         );
-        assert_eq!(model.retry_count, 0, "defer must not spend a retry");
-        assert!(model.next_retry_at.is_some(), "defer must schedule a retry");
+        let job = job_for_delivery(&repo, &entry).await;
+        assert_eq!(job.retry_count, 1);
+        assert_eq!(
+            job.telegraph_status,
+            crate::db::repo::eh_gallery_jobs::TELEGRAPH_STATUS_FAILED
+        );
+        assert_eq!(
+            job.cleanup_status,
+            crate::db::repo::eh_gallery_jobs::CLEANUP_STATUS_PENDING
+        );
+        assert!(run_eh_job_cleanup_maintenance_once(
+            repo.as_ref(),
+            Some(uploader.as_ref()),
+            1,
+            true
+        )
+        .await
+        .is_err());
+        let failed_cleanup = job_for_delivery(&repo, &entry).await;
+        assert_eq!(
+            failed_cleanup.cleanup_status,
+            crate::db::repo::eh_gallery_jobs::CLEANUP_STATUS_FAILED
+        );
         assert!(zip_path.exists(), "Abort failure must retain the final ZIP");
         assert!(artifacts.uploads_dir().exists());
         assert!(artifacts.uploads_dir().join("archive.json").exists());
         assert_terminal_cleanup_precedes_local_removal(&uploader, &artifacts);
+    }
+
+    #[tokio::test]
+    async fn test_upload_terminal_failure_without_abort_uploader_preserves_job_family() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        let tg_server = MockServer::start().await;
+        let mut config = make_config();
+        config.max_retry_count = 0;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let zip_path = temp_dir.path().join("505-no-abort-uploader.zip");
+        create_test_zip(&zip_path, 2);
+        let artifacts = seed_archive_artifact_family(&zip_path);
+        let entry = insert_queue_entry(
+            &repo,
+            -100,
+            515,
+            "tok",
+            "Title",
+            true,
+            STATUS_DOWNLOADED,
+            Some(zip_path.to_str().unwrap()),
+            None,
+        )
+        .await;
+        let entry = migrate_seeded_delivery_to_waiting(&repo, entry).await;
+        let worker = EhUploadWorker::new(
+            Arc::clone(&repo),
+            make_notifier(&tg_server),
+            make_telegraph_client(&tg_server),
+            Arc::new(TerminalCleanupMockUploader::default()),
+            None,
+            Arc::new(config),
+        );
+
+        worker.tick().await.unwrap();
+        let error = run_eh_job_cleanup_maintenance_once(repo.as_ref(), None, 1, true)
+            .await
+            .expect_err("missing Abort uploader must fail closed during maintenance");
+        assert!(error.to_string().contains("no Abort uploader configured"));
+        let job = job_for_delivery(&repo, &entry).await;
+        assert_eq!(
+            job.status,
+            crate::db::repo::eh_gallery_jobs::JOB_STATUS_RETIRED
+        );
+        assert_eq!(
+            job.telegraph_status,
+            crate::db::repo::eh_gallery_jobs::TELEGRAPH_STATUS_FAILED
+        );
+        assert_eq!(job.retry_count, 1);
+        assert_eq!(
+            job.cleanup_status,
+            crate::db::repo::eh_gallery_jobs::CLEANUP_STATUS_FAILED
+        );
+        let delivery = eh_download_queue::Entity::find_by_id(entry.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            delivery.status,
+            crate::db::repo::eh_gallery_jobs::DELIVERY_STATUS_FAILED
+        );
+        assert!(artifacts.final_zip().exists());
+        assert!(artifacts.assembly_scratch().exists());
+        assert!(artifacts.parts_dir().exists());
+        assert!(artifacts.uploads_dir().join("archive.json").exists());
     }
 
     #[tokio::test]
@@ -5959,6 +7918,7 @@ mod tests {
             None,
         )
         .await;
+        let entry = migrate_seeded_delivery_to_waiting(&repo, entry).await;
         let uploader = Arc::new(TerminalCleanupMockUploader::default());
 
         let worker = EhUploadWorker::new_with_abort_uploader(
@@ -5972,12 +7932,34 @@ mod tests {
         );
         worker.tick().await.unwrap();
 
-        let model = eh_download_queue::Entity::find_by_id(entry.id)
+        let delivery = eh_download_queue::Entity::find_by_id(entry.id)
             .one(repo.db())
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(model.status, STATUS_FAILED);
+        assert_eq!(delivery.status, STATUS_FAILED);
+        assert_eq!(delivery.error, None);
+        let job = job_for_delivery(&repo, &entry).await;
+        assert_eq!(
+            job.status,
+            crate::db::repo::eh_gallery_jobs::JOB_STATUS_RETIRED
+        );
+        assert_eq!(
+            job.telegraph_status,
+            crate::db::repo::eh_gallery_jobs::TELEGRAPH_STATUS_FAILED
+        );
+        assert_eq!(job.retry_count, 1);
+        assert!(job.next_retry_at.is_none());
+        assert_eq!(
+            job.cleanup_status,
+            crate::db::repo::eh_gallery_jobs::CLEANUP_STATUS_PENDING
+        );
+        assert_eq!(
+            run_eh_job_cleanup_maintenance_once(repo.as_ref(), Some(uploader.as_ref()), 1, true)
+                .await
+                .unwrap(),
+            Some(EhCleanupFinalizeOutcome::CleanRetired)
+        );
         assert!(!artifacts.final_zip().exists());
         assert!(!artifacts.assembly_scratch().exists());
         assert!(!artifacts.parts_dir().exists());
@@ -6010,6 +7992,7 @@ mod tests {
             None,
         )
         .await;
+        let entry = migrate_seeded_delivery_to_waiting(&repo, entry).await;
         let uploader = Arc::new(TerminalCleanupMockUploader {
             fail_abort: true,
             ..Default::default()
@@ -6024,16 +8007,44 @@ mod tests {
             Arc::new(cfg),
         );
 
-        worker
-            .tick()
-            .await
-            .expect_err("Abort failure must be returned after marking the upload failed");
-        let model = eh_download_queue::Entity::find_by_id(entry.id)
+        worker.tick().await.unwrap();
+        let delivery = eh_download_queue::Entity::find_by_id(entry.id)
             .one(repo.db())
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(model.status, STATUS_FAILED);
+        assert_eq!(
+            delivery.status,
+            crate::db::repo::eh_gallery_jobs::DELIVERY_STATUS_FAILED
+        );
+        assert_eq!(delivery.error, None);
+        let job = job_for_delivery(&repo, &entry).await;
+        assert_eq!(
+            job.status,
+            crate::db::repo::eh_gallery_jobs::JOB_STATUS_RETIRED
+        );
+        assert_eq!(
+            job.telegraph_status,
+            crate::db::repo::eh_gallery_jobs::TELEGRAPH_STATUS_FAILED
+        );
+        assert_eq!(job.retry_count, 1);
+        assert_eq!(
+            job.cleanup_status,
+            crate::db::repo::eh_gallery_jobs::CLEANUP_STATUS_PENDING
+        );
+        assert!(run_eh_job_cleanup_maintenance_once(
+            repo.as_ref(),
+            Some(uploader.as_ref()),
+            1,
+            true
+        )
+        .await
+        .is_err());
+        let failed_cleanup = job_for_delivery(&repo, &entry).await;
+        assert_eq!(
+            failed_cleanup.cleanup_status,
+            crate::db::repo::eh_gallery_jobs::CLEANUP_STATUS_FAILED
+        );
         assert!(artifacts.final_zip().exists());
         assert!(artifacts.assembly_scratch().exists());
         assert!(artifacts.parts_dir().exists());
@@ -6070,19 +8081,22 @@ mod tests {
             None,
         )
         .await;
-        let claimed = repo.get_next_for_upload().await.unwrap().unwrap();
-        assert_eq!(claimed.id, entry.id);
-        repo.cancel_eh_subscription_queue_entries(123)
+        let entry = migrate_seeded_delivery_to_waiting(&repo, entry).await;
+        mock_telegraph_create_page(&tg_server).await;
+        let claimed = repo.get_next_eh_job_for_upload().await.unwrap().unwrap();
+        assert_eq!(claimed.id, entry.job_id.unwrap());
+        repo.cancel_eh_subscription_queue_entries(123, true)
             .await
             .unwrap();
-        let uploader = Arc::new(TerminalCleanupMockUploader::default());
+        let uploader = Arc::new(ZipFirstMockUploader::default());
+        let abort_uploader = Arc::new(TerminalCleanupMockUploader::default());
 
         let worker = EhUploadWorker::new_with_abort_uploader(
             Arc::clone(&repo),
             make_notifier(&tg_server),
             make_telegraph_client(&tg_server),
             uploader.clone(),
-            Some(uploader.clone()),
+            Some(abort_uploader.clone()),
             None,
             Arc::new(make_config()),
         );
@@ -6096,11 +8110,17 @@ mod tests {
         assert_eq!(model.status, STATUS_CANCELED);
         assert!(zip_path.exists(), "canceled upload should not clean ZIP");
         assert!(!artifacts.uploads_dir().exists());
-        assert!(
-            tg_server.received_requests().await.unwrap().is_empty(),
-            "canceled upload must not contact upload or Telegraph services"
+        let job = job_for_delivery(&repo, &entry).await;
+        assert_eq!(
+            job.telegraph_status,
+            crate::db::repo::eh_gallery_jobs::TELEGRAPH_STATUS_READY
         );
-        assert_terminal_cleanup_precedes_local_removal(&uploader, &artifacts);
+        assert_eq!(
+            uploader.zip_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "cancellation after claim must not interrupt the shared upload"
+        );
+        assert_terminal_cleanup_precedes_local_removal(&abort_uploader, &artifacts);
     }
 
     #[tokio::test]
@@ -6128,12 +8148,15 @@ mod tests {
             None,
         )
         .await;
-        let claimed = repo.get_next_for_upload().await.unwrap().unwrap();
-        assert_eq!(claimed.id, entry.id);
-        repo.cancel_eh_subscription_queue_entries(123)
+        let entry = migrate_seeded_delivery_to_waiting(&repo, entry).await;
+        mock_telegraph_create_page(&tg_server).await;
+        let claimed = repo.get_next_eh_job_for_upload().await.unwrap().unwrap();
+        assert_eq!(claimed.id, entry.job_id.unwrap());
+        repo.cancel_eh_subscription_queue_entries(123, true)
             .await
             .unwrap();
-        let uploader = Arc::new(TerminalCleanupMockUploader {
+        let uploader = Arc::new(ZipFirstMockUploader::default());
+        let abort_uploader = Arc::new(TerminalCleanupMockUploader {
             fail_abort: true,
             ..Default::default()
         });
@@ -6142,15 +8165,12 @@ mod tests {
             make_notifier(&tg_server),
             make_telegraph_client(&tg_server),
             uploader.clone(),
-            Some(uploader.clone()),
+            Some(abort_uploader.clone()),
             None,
             Arc::new(make_config()),
         );
 
-        worker
-            .process(&claimed)
-            .await
-            .expect_err("cancellation must return an Abort failure");
+        worker.process(&claimed).await.unwrap();
         let model = eh_download_queue::Entity::find_by_id(entry.id)
             .one(repo.db())
             .await
@@ -6163,11 +8183,17 @@ mod tests {
             manifest.exists(),
             "failed Abort must retain upload manifest"
         );
-        assert!(
-            tg_server.received_requests().await.unwrap().is_empty(),
-            "canceled upload must not contact upload or Telegraph services"
+        let job = job_for_delivery(&repo, &entry).await;
+        assert_eq!(
+            job.telegraph_status,
+            crate::db::repo::eh_gallery_jobs::TELEGRAPH_STATUS_READY
         );
-        assert_terminal_cleanup_precedes_local_removal(&uploader, &artifacts);
+        assert_eq!(
+            uploader.zip_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "cancellation after claim must not suppress page creation"
+        );
+        assert_terminal_cleanup_precedes_local_removal(&abort_uploader, &artifacts);
     }
 
     #[tokio::test]
@@ -6192,6 +8218,7 @@ mod tests {
             None,
         )
         .await;
+        let entry = migrate_seeded_delivery_to_waiting(&repo, entry).await;
 
         let worker = EhUploadWorker::new(
             Arc::clone(&repo),
@@ -6207,13 +8234,14 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        // Missing ZIP file → no fallback; permanent failure path.
+        // Missing ZIP file reaches the shared terminal failure path.
         assert_eq!(model.status, STATUS_FAILED);
-        assert!(model.error.is_some(), "should have error set");
+        assert_eq!(model.error, None, "provider errors stay on the shared job");
+        assert!(job_for_delivery(&repo, &entry).await.error.is_some());
     }
 
     #[tokio::test]
-    async fn test_upload_worker_chat_disabled_defer_does_not_increment_retry() {
+    async fn test_upload_worker_ignores_per_chat_notification_gate() {
         let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
         setup_chat(&repo, -100, false).await; // disabled
         let tg_server = MockServer::start().await;
@@ -6222,13 +8250,6 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let zip_path = temp_dir.path().join("507.zip");
         create_test_zip(&zip_path, 2);
-        let artifacts = ArchiveArtifacts::new(&zip_path);
-        std::fs::create_dir_all(artifacts.uploads_dir()).unwrap();
-        std::fs::write(
-            artifacts.uploads_dir().join("archive.json"),
-            b"upload state",
-        )
-        .unwrap();
         let entry = insert_queue_entry(
             &repo,
             -100,
@@ -6241,6 +8262,9 @@ mod tests {
             None,
         )
         .await;
+        let entry = migrate_seeded_delivery_to_waiting(&repo, entry).await;
+        mock_telegraph_upload(&tg_server, 2).await;
+        mock_telegraph_create_page(&tg_server).await;
 
         let worker = EhUploadWorker::new(
             Arc::clone(&repo),
@@ -6251,19 +8275,14 @@ mod tests {
             config,
         );
         worker.tick().await.unwrap();
-        let model = eh_download_queue::Entity::find_by_id(entry.id)
-            .one(repo.db())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(model.status, STATUS_DOWNLOADED);
-        assert_eq!(model.retry_count, 0);
-        assert!(model.next_retry_at.is_some());
-        assert!(zip_path.exists());
-        assert!(
-            artifacts.uploads_dir().exists(),
-            "chat deferral should retain upload state"
+        let job = job_for_delivery(&repo, &entry).await;
+        assert_eq!(job.retry_count, 0);
+        assert_eq!(job.next_retry_at, None);
+        assert_eq!(
+            job.telegraph_status,
+            crate::db::repo::eh_gallery_jobs::TELEGRAPH_STATUS_READY
         );
+        assert!(zip_path.exists());
     }
 
     #[tokio::test]
@@ -6277,18 +8296,16 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let zip_path = temp_dir.path().join("508.zip");
         create_test_zip(&zip_path, 2);
-        let entry = insert_queue_entry(
+        let (_, deliveries) = seed_downloaded_job_with_deliveries(
             &repo,
-            -100,
             508,
             "tok",
             "Title",
-            true,
-            STATUS_UPLOADED,
-            Some(zip_path.to_str().unwrap()),
-            Some("https://telegra.ph/508"),
+            &zip_path,
+            &[(-100, true, "Title")],
         )
         .await;
+        let entry = &deliveries[0];
 
         // Pre-set both markers to simulate a completed-but-not-done entry.
         eh_download_queue::Entity::update_many()
@@ -6321,6 +8338,563 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(model.status, STATUS_DONE);
+    }
+
+    #[tokio::test]
+    async fn publish_worker_claims_at_most_two_deliveries_and_refills() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        let tg_server = MockServer::start().await;
+        let eh_server = MockServer::start().await;
+        let temp = tempfile::tempdir().unwrap();
+        let zip_path = temp.path().join("shared.zip");
+        create_test_zip(&zip_path, 1);
+        for chat_id in [-100, -200, -300] {
+            setup_chat(&repo, chat_id, true).await;
+            mock_tg_send_document_for_chat(
+                &tg_server,
+                chat_id,
+                200,
+                Some(Duration::from_millis(200)),
+            )
+            .await;
+        }
+        let (job, _) = seed_downloaded_job_with_deliveries(
+            &repo,
+            900,
+            "publish-two",
+            "Shared Publish",
+            &zip_path,
+            &[
+                (-100, false, "One"),
+                (-200, false, "Two"),
+                (-300, false, "Three"),
+            ],
+        )
+        .await;
+        let mut config = make_config();
+        config.publish_concurrency = 2;
+        let worker = EhPublishWorker::new(
+            Arc::clone(&repo),
+            make_notifier(&tg_server),
+            make_eh_client(&eh_server),
+            None,
+            Arc::new(config),
+        );
+
+        let running = tokio::spawn(async move { worker.tick().await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let in_flight = eh_download_queue::Entity::find()
+            .filter(eh_download_queue::Column::JobId.eq(job.id))
+            .filter(eh_download_queue::Column::Status.eq(STATUS_PUBLISHING))
+            .all(repo.db())
+            .await
+            .unwrap();
+        let waiting = eh_download_queue::Entity::find()
+            .filter(eh_download_queue::Column::JobId.eq(job.id))
+            .filter(
+                eh_download_queue::Column::Status
+                    .eq(crate::db::repo::eh_gallery_jobs::DELIVERY_STATUS_WAITING),
+            )
+            .all(repo.db())
+            .await
+            .unwrap();
+        assert_eq!(in_flight.len(), 2);
+        assert_eq!(waiting.len(), 1);
+
+        running.await.unwrap().unwrap();
+        let done = eh_download_queue::Entity::find()
+            .filter(eh_download_queue::Column::JobId.eq(job.id))
+            .filter(eh_download_queue::Column::Status.eq(STATUS_DONE))
+            .all(repo.db())
+            .await
+            .unwrap();
+        assert_eq!(done.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn telegram_failure_retries_only_one_delivery_without_repeating_shared_work() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        let tg_server = MockServer::start().await;
+        let eh_server = MockServer::start().await;
+        let temp = tempfile::tempdir().unwrap();
+        let zip_path = temp.path().join("shared.zip");
+        create_test_zip(&zip_path, 1);
+        setup_chat(&repo, -100, true).await;
+        setup_chat(&repo, -200, true).await;
+        mock_tg_send_document_for_chat(&tg_server, -100, 500, None).await;
+        mock_tg_send_document_for_chat(&tg_server, -200, 200, None).await;
+        let (job, deliveries) = seed_downloaded_job_with_deliveries(
+            &repo,
+            901,
+            "publish-retry",
+            "Shared Retry",
+            &zip_path,
+            &[(-100, false, "Failing"), (-200, false, "Working")],
+        )
+        .await;
+        let worker = EhPublishWorker::new(
+            Arc::clone(&repo),
+            make_notifier(&tg_server),
+            make_eh_client(&eh_server),
+            None,
+            Arc::new(make_config()),
+        );
+
+        worker.tick().await.unwrap();
+
+        let failed = eh_download_queue::Entity::find_by_id(deliveries[0].id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        let succeeded = eh_download_queue::Entity::find_by_id(deliveries[1].id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            failed.status,
+            crate::db::repo::eh_gallery_jobs::DELIVERY_STATUS_WAITING
+        );
+        assert_eq!(failed.retry_count, 1);
+        assert_eq!(succeeded.status, STATUS_DONE);
+        assert_eq!(
+            job_for_delivery(&repo, &succeeded).await.status,
+            JOB_STATUS_DOWNLOADED
+        );
+        assert!(eh_server.received_requests().await.unwrap().is_empty());
+        assert_eq!(job.id, succeeded.job_id.unwrap());
+    }
+
+    #[tokio::test]
+    async fn archive_only_delivery_bypasses_upload_wait_and_disabled_chat_does_not_block_sibling() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        let tg_server = MockServer::start().await;
+        let eh_server = MockServer::start().await;
+        let temp = tempfile::tempdir().unwrap();
+        let zip_path = temp.path().join("archive-only.zip");
+        create_test_zip(&zip_path, 1);
+        setup_chat(&repo, -100, false).await;
+        setup_chat(&repo, -200, true).await;
+        mock_tg_send_document_for_chat(&tg_server, -200, 200, None).await;
+        let (job, deliveries) = seed_downloaded_job_with_deliveries(
+            &repo,
+            902,
+            "archive-only",
+            "Archive Only",
+            &zip_path,
+            &[(-100, false, "Disabled"), (-200, false, "Enabled")],
+        )
+        .await;
+        eh_gallery_jobs::Entity::update_many()
+            .col_expr(
+                eh_gallery_jobs::Column::TelegraphRequired,
+                Expr::value(true),
+            )
+            .col_expr(
+                eh_gallery_jobs::Column::TelegraphStatus,
+                Expr::value(crate::db::repo::eh_gallery_jobs::TELEGRAPH_STATUS_UPLOADING),
+            )
+            .filter(eh_gallery_jobs::Column::Id.eq(job.id))
+            .exec(repo.db())
+            .await
+            .unwrap();
+        let worker = EhPublishWorker::new(
+            Arc::clone(&repo),
+            make_notifier(&tg_server),
+            make_eh_client(&eh_server),
+            None,
+            Arc::new(make_config()),
+        );
+
+        worker.tick().await.unwrap();
+
+        let deferred = eh_download_queue::Entity::find_by_id(deliveries[0].id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        let done = eh_download_queue::Entity::find_by_id(deliveries[1].id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            deferred.status,
+            crate::db::repo::eh_gallery_jobs::DELIVERY_STATUS_WAITING
+        );
+        assert_eq!(deferred.retry_count, 0);
+        assert!(deferred.next_retry_at.is_some());
+        assert_eq!(done.status, STATUS_DONE);
+        assert_eq!(
+            job_for_delivery(&repo, &done).await.telegraph_status,
+            crate::db::repo::eh_gallery_jobs::TELEGRAPH_STATUS_UPLOADING
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_ready_zip_resets_one_job_generation_for_all_archive_consumers() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        let tg_server = MockServer::start().await;
+        let eh_server = MockServer::start().await;
+        let temp = tempfile::tempdir().unwrap();
+        let zip_path = temp.path().join("gone.zip");
+        create_test_zip(&zip_path, 1);
+        setup_chat(&repo, -100, true).await;
+        setup_chat(&repo, -200, true).await;
+        let (job, _) = seed_downloaded_job_with_deliveries(
+            &repo,
+            903,
+            "missing-zip",
+            "Missing ZIP",
+            &zip_path,
+            &[(-100, false, "First"), (-200, false, "Second")],
+        )
+        .await;
+        let expected_started_at = Local::now().naive_local();
+        eh_gallery_jobs::Entity::update_many()
+            .col_expr(
+                eh_gallery_jobs::Column::StartedAt,
+                Expr::value(Some(expected_started_at)),
+            )
+            .filter(eh_gallery_jobs::Column::Id.eq(job.id))
+            .exec(repo.db())
+            .await
+            .unwrap();
+        std::fs::remove_file(&zip_path).unwrap();
+        let claim = repo
+            .get_next_eh_delivery_for_publish(true)
+            .await
+            .unwrap()
+            .unwrap();
+        let expected_zip_path = claim.job.zip_path.clone().unwrap();
+        let worker = EhPublishWorker::new(
+            Arc::clone(&repo),
+            make_notifier(&tg_server),
+            make_eh_client(&eh_server),
+            None,
+            Arc::new(make_config()),
+        );
+
+        worker
+            .handle_missing_zip(&claim.delivery, &claim.job)
+            .await
+            .unwrap();
+
+        assert!(
+            repo.get_next_eh_delivery_for_publish(true)
+                .await
+                .unwrap()
+                .is_none(),
+            "the reset job is not publishable until its shared redownload is due"
+        );
+        let reset = eh_gallery_jobs::Entity::find_by_id(job.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            reset.status,
+            crate::db::repo::eh_gallery_jobs::JOB_STATUS_PENDING
+        );
+        assert!(reset.zip_path.is_none());
+        assert_eq!(reset.retry_count, 1);
+        let waiting = eh_download_queue::Entity::find()
+            .filter(eh_download_queue::Column::JobId.eq(job.id))
+            .filter(
+                eh_download_queue::Column::Status
+                    .eq(crate::db::repo::eh_gallery_jobs::DELIVERY_STATUS_WAITING),
+            )
+            .all(repo.db())
+            .await
+            .unwrap();
+        assert_eq!(waiting.len(), 2);
+        assert!(
+            !repo
+                .reset_eh_job_for_missing_zip(job.id, expected_started_at, &expected_zip_path,)
+                .await
+                .unwrap(),
+            "the second concurrent-style reset must not consume another shared retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn late_telegraph_demand_missing_zip_defers_archive_and_advances_upload_generation() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        let tg_server = MockServer::start().await;
+        let eh_server = MockServer::start().await;
+        let temp = tempfile::tempdir().unwrap();
+        let zip_path = temp.path().join("late-demand-gone.zip");
+        create_test_zip(&zip_path, 1);
+        let variant = EhGalleryVariant::archive("1280x");
+        let archive = repo
+            .enqueue_eh_download(
+                -100,
+                905,
+                "late-demand",
+                "Late demand",
+                false,
+                SOURCE_DIRECT,
+                &variant,
+            )
+            .await
+            .unwrap();
+        repo.enqueue_eh_download(
+            -200,
+            905,
+            "late-demand",
+            "Late demand",
+            true,
+            SOURCE_DIRECT,
+            &variant,
+        )
+        .await
+        .unwrap();
+        let download = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        let downloaded_generation = download.started_at.unwrap();
+        repo.mark_eh_job_downloaded(
+            download.id,
+            downloaded_generation,
+            10,
+            zip_path.to_str().unwrap(),
+            0,
+        )
+        .await
+        .unwrap();
+        let failed_upload = repo.get_next_eh_job_for_upload().await.unwrap().unwrap();
+        let failed_upload_generation = failed_upload.started_at.unwrap();
+        assert!(matches!(
+            repo.record_eh_job_upload_failure(
+                failed_upload.id,
+                failed_upload_generation,
+                "terminal provider failure",
+                0,
+                true,
+            )
+            .await
+            .unwrap(),
+            crate::db::repo::eh_gallery_jobs::EhJobUploadFailureOutcome::Terminal { .. }
+        ));
+
+        let late = repo
+            .enqueue_eh_download(
+                -300,
+                905,
+                "late-demand",
+                "Late demand",
+                true,
+                SOURCE_DIRECT,
+                &variant,
+            )
+            .await
+            .unwrap();
+        assert_eq!(late.job_id, Some(download.id));
+        let after_late_demand = job_for_delivery(&repo, &late).await;
+        assert_eq!(
+            after_late_demand.started_at,
+            Some(failed_upload_generation),
+            "late upload demand must retain the prior generation fence"
+        );
+        assert_eq!(
+            after_late_demand.telegraph_status,
+            crate::db::repo::eh_gallery_jobs::TELEGRAPH_STATUS_PENDING
+        );
+
+        std::fs::remove_file(&zip_path).unwrap();
+        let archive_claim = repo
+            .get_next_eh_delivery_for_publish(true)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(archive_claim.delivery.id, archive.id);
+        let worker = EhPublishWorker::new(
+            Arc::clone(&repo),
+            make_notifier(&tg_server),
+            make_eh_client(&eh_server),
+            None,
+            Arc::new(make_config()),
+        );
+        worker
+            .handle_missing_zip(&archive_claim.delivery, &archive_claim.job)
+            .await
+            .unwrap();
+
+        let reset = job_for_delivery(&repo, &archive).await;
+        assert_eq!(
+            reset.status,
+            crate::db::repo::eh_gallery_jobs::JOB_STATUS_PENDING
+        );
+        assert!(reset.zip_path.is_none());
+        assert_eq!(reset.started_at, Some(failed_upload_generation));
+        assert_eq!(
+            eh_download_queue::Entity::find_by_id(archive.id)
+                .one(repo.db())
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            crate::db::repo::eh_gallery_jobs::DELIVERY_STATUS_WAITING
+        );
+
+        eh_gallery_jobs::Entity::update_many()
+            .col_expr(
+                eh_gallery_jobs::Column::NextRetryAt,
+                Expr::value(None::<chrono::NaiveDateTime>),
+            )
+            .filter(eh_gallery_jobs::Column::Id.eq(download.id))
+            .exec(repo.db())
+            .await
+            .unwrap();
+        let replacement_download = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        let replacement_generation = replacement_download.started_at.unwrap();
+        assert!(replacement_generation > failed_upload_generation);
+        create_test_zip(&zip_path, 1);
+        repo.mark_eh_job_downloaded(
+            replacement_download.id,
+            replacement_generation,
+            10,
+            zip_path.to_str().unwrap(),
+            0,
+        )
+        .await
+        .unwrap();
+        let replacement_upload = repo.get_next_eh_job_for_upload().await.unwrap().unwrap();
+        assert!(
+            replacement_upload.started_at.unwrap() > replacement_generation,
+            "the replacement upload must own a strictly newer generation"
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_missing_zip_state_defers_publishing_delivery_before_error() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        let tg_server = MockServer::start().await;
+        let eh_server = MockServer::start().await;
+        let temp = tempfile::tempdir().unwrap();
+        let zip_path = temp.path().join("malformed.zip");
+        create_test_zip(&zip_path, 1);
+        let (job, deliveries) = seed_downloaded_job_with_deliveries(
+            &repo,
+            906,
+            "malformed",
+            "Malformed",
+            &zip_path,
+            &[(-100, false, "Archive")],
+        )
+        .await;
+        let delivery = deliveries.into_iter().next().unwrap();
+        eh_download_queue::Entity::update_many()
+            .col_expr(
+                eh_download_queue::Column::Status,
+                Expr::value(crate::db::repo::eh_download_queue::STATUS_PUBLISHING),
+            )
+            .filter(eh_download_queue::Column::Id.eq(delivery.id))
+            .exec(repo.db())
+            .await
+            .unwrap();
+        let publishing = eh_download_queue::Entity::find_by_id(delivery.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        let malformed_job = eh_gallery_jobs::Entity::find_by_id(job.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(malformed_job.started_at.is_none());
+        let worker = EhPublishWorker::new(
+            Arc::clone(&repo),
+            make_notifier(&tg_server),
+            make_eh_client(&eh_server),
+            None,
+            Arc::new(make_config()),
+        );
+
+        let error = worker
+            .handle_missing_zip(&publishing, &malformed_job)
+            .await
+            .expect_err("missing generation must still release the delivery first");
+        assert!(error
+            .to_string()
+            .contains("Missing shared EH ZIP reset requires a persisted generation"));
+        let deferred = eh_download_queue::Entity::find_by_id(delivery.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            deferred.status,
+            crate::db::repo::eh_gallery_jobs::DELIVERY_STATUS_WAITING
+        );
+        assert!(deferred.next_retry_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn old_publish_claim_cannot_reset_a_newer_same_path_job_generation() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        let temp = tempfile::tempdir().unwrap();
+        let zip_path = temp.path().join("same-path.zip");
+        create_test_zip(&zip_path, 1);
+        let delivery = repo
+            .enqueue_eh_download(
+                -100,
+                904,
+                "same-path",
+                "Generation fence",
+                false,
+                SOURCE_DIRECT,
+                &EhGalleryVariant::archive("1280x"),
+            )
+            .await
+            .unwrap();
+        let claim = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        repo.mark_eh_job_downloaded(
+            claim.id,
+            claim.started_at.unwrap(),
+            10,
+            zip_path.to_str().unwrap(),
+            0,
+        )
+        .await
+        .unwrap();
+        let job = job_for_delivery(&repo, &delivery).await;
+        let old_generation = job.started_at.unwrap();
+        let new_generation = old_generation + chrono::Duration::seconds(1);
+        eh_gallery_jobs::Entity::update_many()
+            .col_expr(
+                eh_gallery_jobs::Column::StartedAt,
+                Expr::value(Some(new_generation)),
+            )
+            .col_expr(eh_gallery_jobs::Column::RetryCount, Expr::value(7_i32))
+            .filter(eh_gallery_jobs::Column::Id.eq(job.id))
+            .exec(repo.db())
+            .await
+            .unwrap();
+        let before = job_for_delivery(&repo, &delivery).await;
+
+        assert!(
+            !repo
+                .reset_eh_job_for_missing_zip(job.id, old_generation, zip_path.to_str().unwrap(),)
+                .await
+                .unwrap(),
+            "an old publishing claim must not reset a newer generation sharing the same path"
+        );
+
+        let after = job_for_delivery(&repo, &delivery).await;
+        assert_eq!(after.status, before.status);
+        assert_eq!(after.started_at, Some(new_generation));
+        assert_eq!(after.zip_path, before.zip_path);
+        assert_eq!(after.retry_count, before.retry_count);
+        assert_eq!(
+            eh_download_queue::Entity::find_by_id(delivery.id)
+                .one(repo.db())
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            crate::db::repo::eh_gallery_jobs::DELIVERY_STATUS_WAITING
+        );
     }
 
     // ---- GP guard tests ----
@@ -6373,11 +8947,7 @@ mod tests {
 
         worker.tick().await.unwrap();
 
-        let updated = eh_download_queue::Entity::find_by_id(entry.id)
-            .one(repo.db())
-            .await
-            .unwrap()
-            .unwrap();
+        let updated = job_for_delivery(&repo, &entry).await;
         assert_eq!(updated.status, STATUS_FAILED);
         assert_eq!(
             updated.error.as_deref(),
@@ -6390,11 +8960,13 @@ mod tests {
             updated.retry_count, 0,
             "policy reject must not consume retries"
         );
-        assert!(updated.background_download_status.is_none());
-        assert!(updated.background_download_started_at.is_none());
-        assert!(updated.background_download_next_retry_at.is_none());
-        assert!(updated.background_download_error.is_none());
-        assert_eq!(updated.background_download_attempt_count, 0);
+        let delivery = eh_download_queue::Entity::find_by_id(entry.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(delivery.status, STATUS_FAILED);
+        assert!(delivery.error.is_none());
         assert!(gp_attempts(repo.as_ref()).await.is_empty());
     }
 
@@ -6443,11 +9015,7 @@ mod tests {
 
         worker.tick().await.unwrap();
 
-        let updated = eh_download_queue::Entity::find_by_id(entry.id)
-            .one(repo.db())
-            .await
-            .unwrap()
-            .unwrap();
+        let updated = job_for_delivery(&repo, &entry).await;
         assert_eq!(
             updated.status, STATUS_DOWNLOADED,
             "Free download must proceed"
@@ -6500,11 +9068,7 @@ mod tests {
 
         worker.tick().await.unwrap();
 
-        let updated = eh_download_queue::Entity::find_by_id(entry.id)
-            .one(repo.db())
-            .await
-            .unwrap()
-            .unwrap();
+        let updated = job_for_delivery(&repo, &entry).await;
         assert_eq!(
             updated.status, STATUS_DOWNLOADED,
             "GP-cost within limit must proceed"
@@ -6553,15 +9117,13 @@ mod tests {
 
         worker.tick().await.unwrap();
 
-        let updated = eh_download_queue::Entity::find_by_id(entry.id)
-            .one(repo.db())
-            .await
-            .unwrap()
-            .unwrap();
+        let updated = job_for_delivery(&repo, &entry).await;
         assert_eq!(updated.status, STATUS_PENDING);
         assert_eq!(updated.retry_count, 1);
         let attempts = gp_attempts(repo.as_ref()).await;
         assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].job_id, entry.job_id);
+        assert_eq!(attempts[0].queue_id, None);
         assert_eq!(attempts[0].gp_cost, 218);
         let archiver_posts = eh_server
             .received_requests()
@@ -6623,11 +9185,7 @@ mod tests {
 
         worker.tick().await.unwrap();
 
-        let updated = eh_download_queue::Entity::find_by_id(entry.id)
-            .one(repo.db())
-            .await
-            .unwrap()
-            .unwrap();
+        let updated = job_for_delivery(&repo, &entry).await;
         assert_eq!(updated.status, STATUS_PENDING);
         assert_eq!(updated.retry_count, 1);
         assert!(gp_attempts(repo.as_ref()).await.is_empty());
@@ -6698,11 +9256,7 @@ mod tests {
 
         worker.tick().await.unwrap();
 
-        let updated = eh_download_queue::Entity::find_by_id(entry.id)
-            .one(repo.db())
-            .await
-            .unwrap()
-            .unwrap();
+        let updated = job_for_delivery(&repo, &entry).await;
         assert_eq!(
             updated.status, STATUS_PENDING,
             "GP rate limit must defer without POSTing"
@@ -6744,14 +9298,16 @@ mod tests {
             check_and_reserve_archive_cost(
                 repo.as_ref(),
                 &config,
-                first_entry.id,
+                None,
+                Some(first_entry.id),
                 first_entry.gid,
                 &DownloadCost::Gp(218),
             ),
             check_and_reserve_archive_cost(
                 repo.as_ref(),
                 &config,
-                second_entry.id,
+                None,
+                Some(second_entry.id),
                 second_entry.gid,
                 &DownloadCost::Gp(218),
             ),
@@ -6800,7 +9356,8 @@ mod tests {
             let outcome = check_and_reserve_archive_cost(
                 repo.as_ref(),
                 &config,
-                entry.id,
+                None,
+                Some(entry.id),
                 entry.gid,
                 &DownloadCost::Gp(218),
             )
@@ -6840,7 +9397,8 @@ mod tests {
         let result = check_and_reserve_archive_cost(
             repo.as_ref(),
             &config,
-            entry.id,
+            None,
+            Some(entry.id),
             entry.gid,
             &DownloadCost::Gp(218),
         )
@@ -6879,7 +9437,8 @@ mod tests {
         let outcome = check_and_reserve_archive_cost(
             repo.as_ref(),
             &config,
-            entry.id,
+            None,
+            Some(entry.id),
             entry.gid,
             &DownloadCost::Gp(218),
         )
@@ -6922,10 +9481,16 @@ mod tests {
             DownloadCost::Unlocked,
             DownloadCost::Gp(0),
         ] {
-            let outcome =
-                check_and_reserve_archive_cost(repo.as_ref(), &config, entry.id, entry.gid, &cost)
-                    .await
-                    .unwrap();
+            let outcome = check_and_reserve_archive_cost(
+                repo.as_ref(),
+                &config,
+                None,
+                Some(entry.id),
+                entry.gid,
+                &cost,
+            )
+            .await
+            .unwrap();
             assert!(matches!(outcome, ArchiveCostCheck::Proceed));
         }
 
@@ -6954,7 +9519,8 @@ mod tests {
         let outcome = check_and_reserve_archive_cost(
             repo.as_ref(),
             &config,
-            entry.id,
+            None,
+            Some(entry.id),
             entry.gid,
             &DownloadCost::Gp(219),
         )
@@ -6970,7 +9536,8 @@ mod tests {
         let outcome = check_and_reserve_archive_cost(
             repo.as_ref(),
             &config,
-            entry.id,
+            None,
+            Some(entry.id),
             entry.gid,
             &DownloadCost::Gp(1),
         )
@@ -6989,10 +9556,16 @@ mod tests {
             DownloadCost::Unavailable,
             DownloadCost::Insufficient,
         ] {
-            let outcome =
-                check_and_reserve_archive_cost(repo.as_ref(), &config, entry.id, entry.gid, &cost)
-                    .await
-                    .unwrap();
+            let outcome = check_and_reserve_archive_cost(
+                repo.as_ref(),
+                &config,
+                None,
+                Some(entry.id),
+                entry.gid,
+                &cost,
+            )
+            .await
+            .unwrap();
             assert!(matches!(outcome, ArchiveCostCheck::Defer { .. }));
         }
 
@@ -7000,7 +9573,8 @@ mod tests {
         let outcome = check_and_reserve_archive_cost(
             repo.as_ref(),
             &config,
-            entry.id,
+            None,
+            Some(entry.id),
             entry.gid,
             &DownloadCost::Free,
         )
@@ -7079,10 +9653,7 @@ mod tests {
         )
         .await;
 
-        // Schedule for background download (sets background_download_status=pending).
-        repo.schedule_eh_background_download_from(entry.id, STATUS_PENDING, "test setup")
-            .await
-            .unwrap();
+        handoff_job_to_background(&repo, &entry).await;
 
         mock_eh_archiver_page_with_cost(&eh_server, 2284788, "7841d194d4", "8,800 GP", "218 GP")
             .await;
@@ -7108,11 +9679,7 @@ mod tests {
 
         worker.tick().await.unwrap();
 
-        let updated = eh_download_queue::Entity::find_by_id(entry.id)
-            .one(repo.db())
-            .await
-            .unwrap()
-            .unwrap();
+        let updated = job_for_delivery(&repo, &entry).await;
         assert_eq!(updated.status, STATUS_FAILED);
         assert_eq!(
             updated.error.as_deref(),
@@ -7135,6 +9702,7 @@ mod tests {
         let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
         let eh_server = MockServer::start().await;
         let temp = tempfile::tempdir().unwrap();
+        setup_chat(&repo, -100, true).await;
 
         let entry = insert_queue_entry(
             &repo,
@@ -7148,9 +9716,7 @@ mod tests {
             None,
         )
         .await;
-        repo.schedule_eh_background_download_from(entry.id, STATUS_PENDING, "test setup")
-            .await
-            .unwrap();
+        handoff_job_to_background(&repo, &entry).await;
 
         mock_eh_gallery_page(&eh_server, 123456, "abcdef0123").await;
         let download_url = format!("{}/archive/123456/token/0", eh_server.uri());
@@ -7183,11 +9749,7 @@ mod tests {
 
         worker.tick().await.unwrap();
 
-        let updated = eh_download_queue::Entity::find_by_id(entry.id)
-            .one(repo.db())
-            .await
-            .unwrap()
-            .unwrap();
+        let updated = job_for_delivery(&repo, &entry).await;
         assert_eq!(updated.status, STATUS_DOWNLOADED);
         assert_eq!(updated.background_download_status, None);
     }
@@ -7197,6 +9759,7 @@ mod tests {
         let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
         let eh_server = MockServer::start().await;
         let temp = tempfile::tempdir().unwrap();
+        setup_chat(&repo, -100, true).await;
 
         let entry = insert_queue_entry(
             &repo,
@@ -7210,13 +9773,13 @@ mod tests {
             None,
         )
         .await;
-        repo.schedule_eh_background_download_from(entry.id, STATUS_PENDING, "test setup")
-            .await
-            .unwrap();
+        handoff_job_to_background(&repo, &entry).await;
 
-        let eh_cache = temp.path().join("eh_cache");
-        std::fs::create_dir_all(&eh_cache).unwrap();
-        let zip_path = eh_cache.join("123456_abcdef0123.zip");
+        let job = job_for_delivery(&repo, &entry).await;
+        let zip_path = archive_artifacts_for_job(temp.path(), &job)
+            .final_zip()
+            .to_path_buf();
+        std::fs::create_dir_all(zip_path.parent().unwrap()).unwrap();
         let part_path = zip_path.with_extension("zip.part");
         let parts_dir = zip_path.with_extension("zip.parts");
         std::fs::write(&zip_path, b"PK\x03\x04stale").unwrap();
@@ -7244,13 +9807,22 @@ mod tests {
 
         worker.tick().await.unwrap();
 
-        let updated = eh_download_queue::Entity::find_by_id(entry.id)
-            .one(repo.db())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(updated.status, STATUS_FAILED);
+        let updated = job_for_delivery(&repo, &entry).await;
+        assert_eq!(
+            updated.status,
+            crate::db::repo::eh_gallery_jobs::JOB_STATUS_RETIRED
+        );
         assert_eq!(updated.background_download_status, None);
+        assert!(
+            zip_path.exists(),
+            "cleanup ownership is durable before local removal"
+        );
+        assert_eq!(
+            run_eh_job_cleanup_maintenance_once(repo.as_ref(), None, 0, true)
+                .await
+                .unwrap(),
+            Some(EhCleanupFinalizeOutcome::CleanRetired)
+        );
         assert!(!zip_path.exists(), "final ZIP should be cleaned");
         assert!(!part_path.exists(), "partial ZIP should be cleaned");
         assert!(
@@ -7264,6 +9836,7 @@ mod tests {
         let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
         let eh_server = MockServer::start().await;
         let temp = tempfile::tempdir().unwrap();
+        setup_chat(&repo, -100, true).await;
         let entry = insert_queue_entry(
             &repo,
             -100,
@@ -7276,9 +9849,7 @@ mod tests {
             None,
         )
         .await;
-        repo.schedule_eh_background_download_from(entry.id, STATUS_PENDING, "test setup")
-            .await
-            .unwrap();
+        handoff_job_to_background(&repo, &entry).await;
         mock_eh_archiver_page_with_estimated_sizes(
             &eh_server,
             2284789,
@@ -7307,11 +9878,7 @@ mod tests {
 
         worker.tick().await.unwrap();
 
-        let updated = eh_download_queue::Entity::find_by_id(entry.id)
-            .one(repo.db())
-            .await
-            .unwrap()
-            .unwrap();
+        let updated = job_for_delivery(&repo, &entry).await;
         assert_eq!(updated.status, STATUS_PENDING);
         assert_eq!(
             updated.background_download_status.as_deref(),
@@ -7339,6 +9906,7 @@ mod tests {
         let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
         let eh_server = MockServer::start().await;
         let temp_dir = tempfile::tempdir().unwrap();
+        setup_chat(&repo, -100, true).await;
         let entry = insert_queue_entry(
             &repo,
             -100,
@@ -7351,9 +9919,7 @@ mod tests {
             None,
         )
         .await;
-        repo.schedule_eh_background_download_from(entry.id, STATUS_PENDING, "test setup")
-            .await
-            .unwrap();
+        handoff_job_to_background(&repo, &entry).await;
         mock_eh_archiver_page_with_cost_and_estimated_sizes(
             &eh_server,
             2290,
@@ -7385,11 +9951,7 @@ mod tests {
 
         worker.tick().await.unwrap();
 
-        let model = eh_download_queue::Entity::find_by_id(entry.id)
-            .one(repo.db())
-            .await
-            .unwrap()
-            .unwrap();
+        let model = job_for_delivery(&repo, &entry).await;
         assert_eq!(model.status, STATUS_FAILED);
         assert_eq!(
             model.error.as_deref(),
@@ -7410,6 +9972,7 @@ mod tests {
         let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
         let eh_server = MockServer::start().await;
         let temp = tempfile::tempdir().unwrap();
+        setup_chat(&repo, -100, true).await;
         let entry = insert_queue_entry(
             &repo,
             -100,
@@ -7422,9 +9985,7 @@ mod tests {
             None,
         )
         .await;
-        repo.schedule_eh_background_download_from(entry.id, STATUS_PENDING, "test setup")
-            .await
-            .unwrap();
+        handoff_job_to_background(&repo, &entry).await;
         mock_eh_archiver_page_with_cost(&eh_server, 2284788, "7841d194d4", "8,800 GP", "218 GP")
             .await;
         Mock::given(method("POST"))
@@ -7447,11 +10008,7 @@ mod tests {
 
         worker.tick().await.unwrap();
 
-        let updated = eh_download_queue::Entity::find_by_id(entry.id)
-            .one(repo.db())
-            .await
-            .unwrap()
-            .unwrap();
+        let updated = job_for_delivery(&repo, &entry).await;
         assert_eq!(updated.status, STATUS_PENDING);
         assert_eq!(
             updated.background_download_status.as_deref(),
@@ -7474,10 +10031,103 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn two_chats_share_one_background_archive_post_gp_attempt_and_completion() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        let eh_server = MockServer::start().await;
+        let temp = tempfile::tempdir().unwrap();
+        setup_chat(&repo, -100, true).await;
+        setup_chat(&repo, -200, true).await;
+        let variant = EhGalleryVariant::archive("1280x");
+        let first = repo
+            .enqueue_eh_download(
+                -100,
+                2284790,
+                "7841d194d4",
+                "Shared paid background gallery",
+                false,
+                SOURCE_DIRECT,
+                &variant,
+            )
+            .await
+            .unwrap();
+        let second = repo
+            .enqueue_eh_download(
+                -200,
+                2284790,
+                "7841d194d4",
+                "Shared paid background gallery",
+                false,
+                SOURCE_DIRECT,
+                &variant,
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.job_id, second.job_id);
+        handoff_job_to_background(&repo, &first).await;
+
+        mock_eh_archiver_page_with_cost(&eh_server, 2284790, "7841d194d4", "218 GP", "218 GP")
+            .await;
+        let download_url = format!("{}/archive/shared/0", eh_server.uri());
+        mock_eh_archiver_post(&eh_server, &download_url).await;
+        let zip_temp = tempfile::tempdir().unwrap();
+        let fixture_path = zip_temp.path().join("shared-paid.zip");
+        create_test_zip(&fixture_path, 2);
+        let zip_bytes = std::fs::read(&fixture_path).unwrap();
+        mock_eh_archive_download(&eh_server, "/archive/shared/0", zip_bytes.clone()).await;
+
+        let mut config = make_config();
+        config.background_download_enabled = true;
+        config.background_download_concurrency = 2;
+        config.max_archive_size_mb = 0;
+        config.max_archive_gp_cost = 218;
+        let worker = EhBackgroundDownloadWorker::new(
+            Arc::clone(&repo),
+            make_eh_client(&eh_server),
+            Arc::new(config),
+            temp.path().to_path_buf(),
+        );
+
+        worker.tick().await.unwrap();
+
+        let job = job_for_delivery(&repo, &first).await;
+        assert_eq!(job.status, STATUS_DOWNLOADED);
+        let attempts = gp_attempts(repo.as_ref()).await;
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].job_id, Some(job.id));
+        let completions = eh_download_completions::Entity::find()
+            .filter(eh_download_completions::Column::JobId.eq(job.id))
+            .all(repo.db())
+            .await
+            .unwrap();
+        assert_eq!(completions.len(), 1);
+        assert_eq!(completions[0].job_id, Some(job.id));
+        assert_eq!(
+            repo.get_eh_downloaded_bytes_in_window(24).await.unwrap(),
+            completions[0].file_size,
+            "the shared completion must contribute one byte-window entry"
+        );
+        assert_eq!(
+            completions[0].file_size,
+            i64::try_from(zip_bytes.len()).unwrap()
+        );
+        let archiver_posts = eh_server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|request| {
+                request.method.as_str() == "POST" && request.url.path() == "/archiver.php"
+            })
+            .count();
+        assert_eq!(archiver_posts, 1);
+    }
+
+    #[tokio::test]
     async fn test_background_gp_rate_limit_allows_only_one_post() {
         let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
         let eh_server = MockServer::start().await;
         let temp = tempfile::tempdir().unwrap();
+        setup_chat(&repo, -100, true).await;
 
         let first = insert_queue_entry(
             &repo,
@@ -7504,9 +10154,7 @@ mod tests {
         )
         .await;
         for entry in [&first, &second] {
-            repo.schedule_eh_background_download_from(entry.id, STATUS_PENDING, "test setup")
-                .await
-                .unwrap();
+            handoff_job_to_background(&repo, entry).await;
         }
 
         mock_eh_archiver_page_with_cost(&eh_server, 1001, "a1b2c3d4", "218 GP", "218 GP").await;
@@ -7538,28 +10186,20 @@ mod tests {
 
         worker.tick().await.unwrap();
 
-        let first = eh_download_queue::Entity::find_by_id(first.id)
-            .one(repo.db())
-            .await
-            .unwrap()
-            .unwrap();
-        let second = eh_download_queue::Entity::find_by_id(second.id)
-            .one(repo.db())
-            .await
-            .unwrap()
-            .unwrap();
+        let first = job_for_delivery(&repo, &first).await;
+        let second = job_for_delivery(&repo, &second).await;
         assert_eq!(
             [first.status.as_str(), second.status.as_str()]
                 .into_iter()
                 .filter(|status| *status == STATUS_DOWNLOADED)
                 .count(),
             1,
-            "exactly one background entry must download"
+            "exactly one background job must download"
         );
         let deferred = [&first, &second]
             .into_iter()
-            .find(|entry| entry.status == STATUS_PENDING)
-            .expect("one background entry must remain pending");
+            .find(|job| job.status == STATUS_PENDING)
+            .expect("one background job must remain pending");
         assert_eq!(
             deferred.background_download_status.as_deref(),
             Some(BACKGROUND_STATUS_PENDING),
@@ -7614,13 +10254,7 @@ mod tests {
             None,
         )
         .await;
-        repo.schedule_eh_background_download_from(
-            background_entry.id,
-            STATUS_PENDING,
-            "test setup",
-        )
-        .await
-        .unwrap();
+        handoff_job_to_background(&repo, &background_entry).await;
 
         mock_eh_archiver_page_with_cost(&eh_server, 2001, "c1d2e3f4", "218 GP", "218 GP").await;
         mock_eh_archiver_page_with_cost(&eh_server, 2002, "a5b6c7d8", "218 GP", "218 GP").await;
@@ -7663,16 +10297,8 @@ mod tests {
         main_result.unwrap();
         background_result.unwrap();
 
-        let main_entry = eh_download_queue::Entity::find_by_id(main_entry.id)
-            .one(repo.db())
-            .await
-            .unwrap()
-            .unwrap();
-        let background_entry = eh_download_queue::Entity::find_by_id(background_entry.id)
-            .one(repo.db())
-            .await
-            .unwrap()
-            .unwrap();
+        let main_entry = job_for_delivery(&repo, &main_entry).await;
+        let background_entry = job_for_delivery(&repo, &background_entry).await;
         assert_eq!(
             [main_entry.status.as_str(), background_entry.status.as_str()]
                 .into_iter()
@@ -7821,6 +10447,12 @@ mod tests {
         let mut config = make_config();
         config.background_download_enabled = false;
         config.download_resolution = "original".to_string();
+        eh_gallery_jobs::Entity::update_many()
+            .col_expr(eh_gallery_jobs::Column::Resolution, Expr::value("original"))
+            .filter(eh_gallery_jobs::Column::Id.eq(entry.job_id.unwrap()))
+            .exec(repo.db())
+            .await
+            .unwrap();
         // max_archive_gp_cost defaults to 0 -> 8,800 GP must be rejected.
         let worker = EhDownloadWorker::new(
             Arc::clone(&repo),
@@ -7832,11 +10464,7 @@ mod tests {
 
         worker.tick().await.unwrap();
 
-        let updated = eh_download_queue::Entity::find_by_id(entry.id)
-            .one(repo.db())
-            .await
-            .unwrap()
-            .unwrap();
+        let updated = job_for_delivery(&repo, &entry).await;
         assert_eq!(updated.status, STATUS_FAILED);
         assert_eq!(
             updated.error.as_deref(),

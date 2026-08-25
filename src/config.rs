@@ -424,6 +424,11 @@ pub struct EhentaiConfig {
     pub background_download_stale_sec: u64,
     #[serde(default = "default_eh_pushed_cap")]
     pub pushed_cap: usize,
+    /// Maximum concurrent Telegram delivery futures. Bot throttling remains the
+    /// sole Telegram rate-limit authority.
+    #[serde(default = "default_eh_publish_concurrency")]
+    #[allow(dead_code)]
+    pub publish_concurrency: usize,
 }
 
 impl Default for EhentaiConfig {
@@ -457,6 +462,7 @@ impl Default for EhentaiConfig {
             background_download_max_attempts: default_eh_background_download_max_attempts(),
             background_download_stale_sec: default_eh_background_download_stale_sec(),
             pushed_cap: default_eh_pushed_cap(),
+            publish_concurrency: default_eh_publish_concurrency(),
         }
     }
 }
@@ -519,6 +525,13 @@ impl EhentaiConfig {
     /// divide-by-zero and meaningless zero-length windows.
     pub fn gp_rate_window_hours_clamped(&self) -> u64 {
         self.gp_rate_window_hours.max(1)
+    }
+
+    /// Concurrent Telegram delivery futures, bounded to the supported range.
+    /// The `Throttle<Bot>` adaptor remains the Telegram rate-limit authority.
+    #[allow(dead_code)]
+    pub fn publish_concurrency_clamped(&self) -> usize {
+        self.publish_concurrency.clamp(1, 10)
     }
 }
 
@@ -635,6 +648,10 @@ fn default_eh_background_download_stale_sec() -> u64 {
 
 fn default_eh_pushed_cap() -> usize {
     500
+}
+
+fn default_eh_publish_concurrency() -> usize {
+    2
 }
 
 impl Config {
@@ -815,5 +832,28 @@ mod tests {
             .unwrap_err();
 
         assert!(error.to_string().contains("must be at least 1"));
+    }
+
+    #[test]
+    fn publish_concurrency_defaults_to_two_and_clamps_to_supported_range() {
+        assert_eq!(EhentaiConfig::default().publish_concurrency, 2);
+        assert_eq!(EhentaiConfig::default().publish_concurrency_clamped(), 2);
+
+        assert_eq!(
+            EhentaiConfig {
+                publish_concurrency: 0,
+                ..Default::default()
+            }
+            .publish_concurrency_clamped(),
+            1
+        );
+        assert_eq!(
+            EhentaiConfig {
+                publish_concurrency: 42,
+                ..Default::default()
+            }
+            .publish_concurrency_clamped(),
+            10
+        );
     }
 }

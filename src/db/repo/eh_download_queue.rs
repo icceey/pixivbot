@@ -1,40 +1,105 @@
 use super::Repo;
-use crate::db::entities::eh_download_queue;
+use crate::db::entities::{eh_download_queue, eh_gallery_jobs};
+use crate::db::repo::eh_gallery_jobs::{
+    eh_gallery_job_artifact_path, CLEANUP_STATUS_FAILED, CLEANUP_STATUS_NONE,
+    CLEANUP_STATUS_PENDING, CLEANUP_STATUS_RUNNING, JOB_STATUS_DOWNLOADED, JOB_STATUS_DOWNLOADING,
+    JOB_STATUS_PENDING, JOB_STATUS_RETIRED, TELEGRAPH_STATUS_PENDING, TELEGRAPH_STATUS_READY,
+    TELEGRAPH_STATUS_UPLOADING,
+};
 use anyhow::{Context, Result};
 use chrono::{Local, Timelike};
 use eh_client::{ArchiveArtifacts, ImageUploader};
 use sea_orm::prelude::DateTime;
-use sea_orm::sea_query::{Expr, SimpleExpr};
+use sea_orm::sea_query::{Expr, Query, SimpleExpr};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, EntityTrait, Order, PaginatorTrait, QueryFilter, QueryOrder,
-    QueryTrait, Set,
+    QueryTrait, Set, TransactionTrait,
 };
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock, Mutex, Weak};
+use tokio::sync::OwnedMutexGuard;
 use tracing::warn;
 
 use crate::db::entities::subscriptions;
 
-/// Serializes EH publish side effects with subscription-queue cancellation.
+/// Per-chat serialization for EH delivery mutations.
 ///
-/// A database status check alone cannot prevent `/eunsub` from canceling a row
-/// between the final active check and a Telegram send.  Both the cancel path
-/// and the publish-send path take this process-wide lock so their effects have
-/// a single observable order.
-pub static EH_PUBLISH_CANCEL_LOCK: LazyLock<tokio::sync::Mutex<()>> =
-    LazyLock::new(|| tokio::sync::Mutex::new(()));
-
-/// Bundled enqueue request parameters to keep helper signatures manageable
-/// and avoid clippy `too_many_arguments`.
-struct EhEnqueueRequest<'a> {
-    chat_id: i64,
-    gid: i64,
-    token: &'a str,
-    title: &'a str,
-    telegraph: bool,
-    source: &'a str,
-    subscription_id: Option<i32>,
+/// The registry retains only weak references.  A returned guard owns the
+/// mutex while it is held, and removes its idle map entry when it was the last
+/// user, so inactive chats cannot accumulate permanent mutexes.
+#[derive(Default)]
+pub struct EhChatLockRegistry {
+    locks: Mutex<HashMap<i64, Weak<tokio::sync::Mutex<()>>>>,
 }
+
+pub struct EhChatLockGuard<'a> {
+    registry: &'a EhChatLockRegistry,
+    chat_id: i64,
+    mutex: Arc<tokio::sync::Mutex<()>>,
+    guard: Option<OwnedMutexGuard<()>>,
+}
+
+impl EhChatLockRegistry {
+    pub async fn lock_chat(&self, chat_id: i64) -> EhChatLockGuard<'_> {
+        let mutex = {
+            let mut locks = self.locks.lock().expect("EH chat lock map poisoned");
+            locks.retain(|_, mutex| mutex.strong_count() > 0);
+            locks
+                .entry(chat_id)
+                .or_default()
+                .upgrade()
+                .unwrap_or_else(|| {
+                    let mutex = Arc::new(tokio::sync::Mutex::new(()));
+                    locks.insert(chat_id, Arc::downgrade(&mutex));
+                    mutex
+                })
+        };
+        let guard = mutex.clone().lock_owned().await;
+        EhChatLockGuard {
+            registry: self,
+            chat_id,
+            mutex,
+            guard: Some(guard),
+        }
+    }
+
+    pub async fn lock_chats(&self, chat_ids: &[i64]) -> Vec<EhChatLockGuard<'_>> {
+        let mut chat_ids = chat_ids.to_vec();
+        chat_ids.sort_unstable();
+        chat_ids.dedup();
+
+        let mut guards = Vec::with_capacity(chat_ids.len());
+        for chat_id in chat_ids {
+            guards.push(self.lock_chat(chat_id).await);
+        }
+        guards
+    }
+}
+
+impl Drop for EhChatLockGuard<'_> {
+    fn drop(&mut self) {
+        // Release the asynchronous mutex while its map entry still exists, so
+        // a caller that arrives during Drop can only reuse this mutex.
+        drop(self.guard.take());
+
+        let mut locks = self
+            .registry
+            .locks
+            .lock()
+            .expect("EH chat lock map poisoned");
+        // `lock_chat` upgrades/creates entries while holding this same map
+        // mutex.  Checking the matching weak entry and all remaining strong
+        // users together therefore cannot split one chat into two mutexes.
+        let should_remove = locks.get(&self.chat_id).is_some_and(|registered| {
+            registered.ptr_eq(&Arc::downgrade(&self.mutex)) && Arc::strong_count(&self.mutex) == 1
+        });
+        if should_remove {
+            locks.remove(&self.chat_id);
+        }
+    }
+}
+
+pub static EH_CHAT_LOCKS: LazyLock<EhChatLockRegistry> = LazyLock::new(EhChatLockRegistry::default);
 
 /// Status constants for eh_download_queue.
 pub const STATUS_PENDING: &str = "pending";
@@ -49,13 +114,16 @@ pub const STATUS_CANCELED: &str = "canceled";
 pub const BACKGROUND_STATUS_PENDING: &str = "pending";
 pub const BACKGROUND_STATUS_RUNNING: &str = "running";
 pub const TELEGRAPH_REWRITE_STATUS_PENDING: &str = "pending";
+#[allow(dead_code)] // Historical queue-row rewrite state is query-compatible but no longer claimed.
 pub const TELEGRAPH_REWRITE_STATUS_REWRITING: &str = "rewriting";
+#[allow(dead_code)] // Historical queue-row rewrite state is query-compatible but no longer claimed.
 pub const TELEGRAPH_REWRITE_STATUS_FAILED: &str = "failed";
+#[allow(dead_code)]
 const MAIN_DOWNLOAD_RECENT_WINDOW_HOURS: i64 = 2;
 
+#[allow(dead_code)]
 enum ArchivePolicyClaim {
     Main { started_at: DateTime },
-    Background { started_at: DateTime },
 }
 
 /// `started_at` is a row-level claim generation after the first claim. Keeping
@@ -101,8 +169,54 @@ pub struct EhQueueSnapshot {
     pub recent_terminal: Option<EhQueueStatusItem>,
 }
 
-impl From<eh_download_queue::Model> for EhQueueStatusItem {
-    fn from(model: eh_download_queue::Model) -> Self {
+/// A delivery claim paired with the shared-gallery job state that made it
+/// publishable. The worker re-reads both rows under the chat lock before it
+/// sends anything, so this snapshot is only the atomic claim hand-off.
+#[derive(Clone, Debug)]
+pub struct EhDeliveryClaim {
+    pub delivery: eh_download_queue::Model,
+    pub job: eh_gallery_jobs::Model,
+}
+
+fn eh_delivery_is_ready_for_publish(
+    delivery: &eh_download_queue::Model,
+    job: &eh_gallery_jobs::Model,
+    send_archive: bool,
+) -> bool {
+    if job.cleanup_status != CLEANUP_STATUS_NONE {
+        return false;
+    }
+    let archive_required = send_archive && delivery.archive_sent_at.is_none();
+    let telegraph_required = delivery.telegraph && delivery.telegraph_sent_at.is_none();
+    let telegraph_ready =
+        job.telegraph_status == TELEGRAPH_STATUS_READY && job.telegraph_url.is_some();
+
+    // A Telegraph consumer may not be claimed until the shared page is ready.
+    // Archive-only consumers intentionally do not wait for a pending, running,
+    // or terminally failed Telegraph upload.
+    if telegraph_required && !telegraph_ready {
+        return false;
+    }
+
+    let archive_ready = job.status == JOB_STATUS_DOWNLOADED && job.zip_path.is_some();
+    (archive_required && archive_ready)
+        || (telegraph_required && telegraph_ready)
+        || (!archive_required && !telegraph_required)
+}
+
+fn eh_job_cleanup_is_none_filter(job_id: i32) -> SimpleExpr {
+    Expr::exists(
+        Query::select()
+            .expr(Expr::value(1))
+            .from(eh_gallery_jobs::Entity)
+            .and_where(eh_gallery_jobs::Column::Id.eq(job_id))
+            .and_where(eh_gallery_jobs::Column::CleanupStatus.eq(CLEANUP_STATUS_NONE))
+            .to_owned(),
+    )
+}
+
+impl EhQueueStatusItem {
+    fn from_delivery(model: eh_download_queue::Model) -> Self {
         Self {
             gid: model.gid,
             title: model.title,
@@ -110,11 +224,96 @@ impl From<eh_download_queue::Model> for EhQueueStatusItem {
             background_download_status: model.background_download_status,
         }
     }
+
+    /// Project the private shared-job state into the historical, user-facing
+    /// delivery stages. The returned type deliberately contains no job ID,
+    /// artifact path, token, or internal error text.
+    fn from_delivery_and_job(
+        delivery: eh_download_queue::Model,
+        job: Option<eh_gallery_jobs::Model>,
+    ) -> Self {
+        let gid = delivery.gid;
+        let title = delivery.title.clone();
+        let own_status = delivery.status.clone();
+
+        // Delivery state has precedence whenever it represents a concrete
+        // publish or terminal outcome for this chat.
+        if matches!(
+            own_status.as_str(),
+            STATUS_PUBLISHING | STATUS_DONE | STATUS_FAILED | STATUS_CANCELED
+        ) {
+            return Self {
+                gid,
+                title,
+                status: own_status,
+                background_download_status: None,
+            };
+        }
+
+        // Only waiting shared deliveries derive their in-flight stage from the
+        // shared job. Historical unbound active rows retain their own stage.
+        if own_status != STATUS_WAITING {
+            return Self::from_delivery(delivery);
+        }
+        let Some(job) = job else {
+            return Self::from_delivery(delivery);
+        };
+
+        let (status, background_download_status) = if job.status == JOB_STATUS_RETIRED
+            && matches!(
+                job.cleanup_status.as_str(),
+                CLEANUP_STATUS_PENDING | CLEANUP_STATUS_RUNNING | CLEANUP_STATUS_FAILED
+            ) {
+            (STATUS_PENDING, None)
+        } else if matches!(
+            job.background_download_status.as_deref(),
+            Some(BACKGROUND_STATUS_PENDING | BACKGROUND_STATUS_RUNNING)
+        ) {
+            (STATUS_PENDING, job.background_download_status.as_deref())
+        } else if job.status == JOB_STATUS_PENDING {
+            (STATUS_PENDING, None)
+        } else if job.status == JOB_STATUS_DOWNLOADING {
+            (STATUS_DOWNLOADING, None)
+        } else if delivery.telegraph
+            && matches!(
+                job.telegraph_status.as_str(),
+                TELEGRAPH_STATUS_PENDING | TELEGRAPH_STATUS_UPLOADING
+            )
+        {
+            (
+                if job.telegraph_status == TELEGRAPH_STATUS_UPLOADING {
+                    STATUS_UPLOADING
+                } else {
+                    STATUS_DOWNLOADED
+                },
+                None,
+            )
+        } else if job.status == JOB_STATUS_DOWNLOADED {
+            (
+                if delivery.telegraph && job.telegraph_status == TELEGRAPH_STATUS_READY {
+                    STATUS_UPLOADED
+                } else {
+                    STATUS_DOWNLOADED
+                },
+                None,
+            )
+        } else {
+            (STATUS_WAITING, None)
+        };
+
+        Self {
+            gid,
+            title,
+            status: status.to_string(),
+            background_download_status: background_download_status.map(str::to_string),
+        }
+    }
 }
 
 /// Source constants for eh_download_queue.
 pub const SOURCE_SUBSCRIPTION: &str = "subscription";
 pub const SOURCE_DIRECT: &str = "direct";
+pub const STATUS_WAITING: &str = "waiting";
 
 fn parse_subscription_ids(value: Option<&str>) -> BTreeSet<i32> {
     value
@@ -132,7 +331,7 @@ fn format_subscription_ids(ids: &BTreeSet<i32>) -> Option<String> {
     }
 }
 
-fn merge_subscription_ids(current: Option<&str>, new_id: Option<i32>) -> Option<String> {
+pub(crate) fn merge_subscription_ids(current: Option<&str>, new_id: Option<i32>) -> Option<String> {
     let mut ids = parse_subscription_ids(current);
     if let Some(id) = new_id {
         ids.insert(id);
@@ -140,7 +339,7 @@ fn merge_subscription_ids(current: Option<&str>, new_id: Option<i32>) -> Option<
     format_subscription_ids(&ids)
 }
 
-fn merge_telegraph_subscription_ids(
+pub(crate) fn merge_telegraph_subscription_ids(
     current: Option<&str>,
     new_id: Option<i32>,
     telegraph: bool,
@@ -157,7 +356,8 @@ fn merge_telegraph_subscription_ids(
 fn is_active_subscription_queue_status(status: &str) -> bool {
     matches!(
         status,
-        STATUS_PENDING
+        STATUS_WAITING
+            | STATUS_PENDING
             | STATUS_DOWNLOADING
             | STATUS_DOWNLOADED
             | STATUS_UPLOADING
@@ -185,148 +385,14 @@ fn telegraph_subscription_ids_filter(expected: Option<String>) -> sea_orm::sea_q
     }
 }
 
+fn job_id_filter(expected: Option<i32>) -> sea_orm::sea_query::SimpleExpr {
+    match expected {
+        Some(value) => eh_download_queue::Column::JobId.eq(value),
+        None => eh_download_queue::Column::JobId.is_null(),
+    }
+}
+
 impl Repo {
-    /// Recover from a failed insert in `enqueue_eh_download` by re-selecting
-    /// and merging into the existing row.  Extracted as a private helper so
-    /// tests can exercise the fallback logic deterministically without relying
-    /// on fragile concurrency.
-    async fn recover_eh_enqueue_after_insert_error(
-        &self,
-        req: EhEnqueueRequest<'_>,
-        db_err: sea_orm::DbErr,
-    ) -> Result<eh_download_queue::Model> {
-        match eh_download_queue::Entity::find()
-            .filter(eh_download_queue::Column::ChatId.eq(req.chat_id))
-            .filter(eh_download_queue::Column::Gid.eq(req.gid))
-            .one(&self.db)
-            .await
-        {
-            Ok(Some(raced)) => {
-                self.merge_eh_download(
-                    raced,
-                    req.token,
-                    req.title,
-                    req.telegraph,
-                    req.source,
-                    req.subscription_id,
-                )
-                .await
-            }
-            Ok(None) => Err(db_err).context("Failed to enqueue eh download"),
-            Err(select_err) => Err(select_err).context("Failed to re-select after insert conflict"),
-        }
-    }
-
-    /// Enqueue a download request. Returns the created/updated model.
-    ///
-    /// If an entry for the same (chat_id, gid) already exists:
-    /// - If it's `done` or `failed`, reset to `pending` (re-download).
-    /// - Otherwise, return the existing entry (already in queue).
-    pub async fn enqueue_eh_download(
-        &self,
-        chat_id: i64,
-        gid: i64,
-        token: &str,
-        title: &str,
-        telegraph: bool,
-        source: &str,
-    ) -> Result<eh_download_queue::Model> {
-        self.enqueue_eh_download_request(EhEnqueueRequest {
-            chat_id,
-            gid,
-            token,
-            title,
-            telegraph,
-            source,
-            subscription_id: None,
-        })
-        .await
-    }
-
-    /// Enqueue a scheduler-created EH subscription download and remember the
-    /// originating subscription id so unsubscribe can cancel queued work.
-    pub async fn enqueue_eh_subscription_download(
-        &self,
-        chat_id: i64,
-        subscription_id: i32,
-        gid: i64,
-        token: &str,
-        title: &str,
-        telegraph: bool,
-    ) -> Result<eh_download_queue::Model> {
-        self.enqueue_eh_download_request(EhEnqueueRequest {
-            chat_id,
-            gid,
-            token,
-            title,
-            telegraph,
-            source: SOURCE_SUBSCRIPTION,
-            subscription_id: Some(subscription_id),
-        })
-        .await
-    }
-
-    async fn enqueue_eh_download_request(
-        &self,
-        req: EhEnqueueRequest<'_>,
-    ) -> Result<eh_download_queue::Model> {
-        let now = Local::now().naive_local();
-
-        // Check for existing entry
-        let existing = eh_download_queue::Entity::find()
-            .filter(eh_download_queue::Column::ChatId.eq(req.chat_id))
-            .filter(eh_download_queue::Column::Gid.eq(req.gid))
-            .one(&self.db)
-            .await?;
-
-        if let Some(model) = existing {
-            return self
-                .merge_eh_download(
-                    model,
-                    req.token,
-                    req.title,
-                    req.telegraph,
-                    req.source,
-                    req.subscription_id,
-                )
-                .await;
-        }
-
-        // No existing entry — insert new; handle race on unique conflict
-        let entry = eh_download_queue::ActiveModel {
-            chat_id: Set(req.chat_id),
-            gid: Set(req.gid),
-            token: Set(req.token.to_string()),
-            title: Set(req.title.to_string()),
-            telegraph: Set(req.telegraph),
-            source: Set(req.source.to_string()),
-            subscription_ids: Set(req.subscription_id.map(|id| id.to_string())),
-            telegraph_subscription_ids: Set(if req.telegraph {
-                req.subscription_id.map(|id| id.to_string())
-            } else {
-                None
-            }),
-            status: Set(STATUS_PENDING.to_string()),
-            file_size: Set(0),
-            error: Set(None),
-            retry_count: Set(0),
-            created_at: Set(now),
-            started_at: Set(None),
-            completed_at: Set(None),
-            ..Default::default()
-        };
-
-        match entry.insert(&self.db).await {
-            Ok(model) => Ok(model),
-            Err(db_err) => {
-                // Race: another caller may have inserted the same (chat_id, gid).
-                // Re-select and merge instead of failing on unique constraint.
-                self.recover_eh_enqueue_after_insert_error(req, db_err)
-                    .await
-            }
-        }
-    }
-
     /// Merge an existing queue entry with new request parameters.
     ///
     /// - Terminal (`done`/`failed`): reset to `pending` with full transient clear.
@@ -338,6 +404,7 @@ impl Repo {
     /// still in the expected status (and expected telegraph for downloaded rows).
     /// If a concurrent worker changed the row between select and update, re-read and
     /// recompute the merge decision up to 3 attempts.
+    #[cfg_attr(not(test), allow(dead_code))]
     async fn merge_eh_download(
         &self,
         existing: eh_download_queue::Model,
@@ -662,56 +729,6 @@ impl Repo {
         }
     }
 
-    /// Mark a publish as completed successfully (archive and/or Telegraph sent).
-    /// Only allowed when current status is `STATUS_PUBLISHING`.
-    /// Preserves `completed_at` from the download stage if already set;
-    /// sets it to now only if it hasn't been set yet.
-    pub async fn mark_eh_download_done(
-        &self,
-        id: i32,
-        file_size: i64,
-    ) -> Result<eh_download_queue::Model> {
-        let entry = eh_download_queue::Entity::find_by_id(id)
-            .one(&self.db)
-            .await
-            .context("Failed to fetch eh download")?
-            .ok_or_else(|| anyhow::anyhow!("EH download {} not found", id))?;
-
-        let now = Local::now().naive_local();
-        let completed_at = entry.completed_at.unwrap_or(now);
-
-        let result = eh_download_queue::Entity::update_many()
-            .col_expr(eh_download_queue::Column::Status, Expr::value(STATUS_DONE))
-            .col_expr(eh_download_queue::Column::FileSize, Expr::value(file_size))
-            .col_expr(
-                eh_download_queue::Column::CompletedAt,
-                Expr::value(completed_at),
-            )
-            .col_expr(
-                eh_download_queue::Column::Error,
-                Expr::value(None::<String>),
-            )
-            .filter(eh_download_queue::Column::Id.eq(id))
-            .filter(eh_download_queue::Column::Status.eq(STATUS_PUBLISHING))
-            .exec(&self.db)
-            .await
-            .context("Failed to mark eh download as done")?;
-
-        if result.rows_affected != 1 {
-            anyhow::bail!(
-                "Cannot mark EH download {} as done: expected status '{}', but it was changed by another worker",
-                id,
-                STATUS_PUBLISHING
-            );
-        }
-
-        let model = eh_download_queue::Entity::find_by_id(id)
-            .one(&self.db)
-            .await?
-            .context("Entry disappeared after mark done")?;
-        Ok(model)
-    }
-
     /// Mark a download as failed.
     #[allow(dead_code)]
     pub async fn mark_eh_download_failed(
@@ -741,6 +758,7 @@ impl Repo {
     /// Permanently fail a main download after its archive cost violates the
     /// configured policy. The original claim generation prevents a stale worker
     /// from overwriting a newer re-enqueued claim.
+    #[allow(dead_code)]
     pub async fn fail_eh_download_for_archive_policy(
         &self,
         entry: &eh_download_queue::Model,
@@ -753,25 +771,6 @@ impl Repo {
             entry.id,
             error,
             ArchivePolicyClaim::Main { started_at },
-        )
-        .await
-    }
-
-    /// Permanently fail a claimed background download after its archive cost
-    /// violates the configured policy. The original row claim generation preserves
-    /// newer cancellation or re-enqueue decisions.
-    pub async fn fail_eh_background_download_for_archive_policy(
-        &self,
-        entry: &eh_download_queue::Model,
-        error: &str,
-    ) -> Result<eh_download_queue::Model> {
-        let started_at = entry.started_at.context(
-            "Cannot fail EH download for archive policy: missing background claim started_at",
-        )?;
-        self.fail_eh_download_for_archive_policy_claim(
-            entry.id,
-            error,
-            ArchivePolicyClaim::Background { started_at },
         )
         .await
     }
@@ -789,17 +788,6 @@ impl Repo {
                     .add(eh_download_queue::Column::StartedAt.eq(started_at))
                     .into(),
                 "main downloading claim",
-            ),
-            ArchivePolicyClaim::Background { started_at } => (
-                sea_orm::Condition::all()
-                    .add(eh_download_queue::Column::Status.eq(STATUS_PENDING))
-                    .add(
-                        eh_download_queue::Column::BackgroundDownloadStatus
-                            .eq(BACKGROUND_STATUS_RUNNING),
-                    )
-                    .add(eh_download_queue::Column::StartedAt.eq(started_at))
-                    .into(),
-                "background running claim",
             ),
         };
         let now = Local::now().naive_local();
@@ -858,34 +846,13 @@ impl Repo {
             .context("Entry disappeared after archive policy failure")
     }
 
-    /// Get total bytes downloaded in the last `hours` window.
-    /// Uses `completed_at` from the download stage (not overwritten by upload/publish stages).
-    /// Uses SQL aggregate for efficiency.
-    pub async fn get_eh_downloaded_bytes_in_window(&self, hours: u64) -> Result<i64> {
-        let cutoff = Local::now().naive_local() - chrono::Duration::hours(hours as i64);
-
-        let result = eh_download_queue::Entity::find()
-            .filter(eh_download_queue::Column::Status.is_in([
-                STATUS_DOWNLOADED,
-                STATUS_UPLOADING,
-                STATUS_UPLOADED,
-                STATUS_PUBLISHING,
-                STATUS_DONE,
-                STATUS_FAILED,
-            ]))
-            .filter(eh_download_queue::Column::CompletedAt.gte(cutoff))
-            .all(&self.db)
-            .await
-            .context("Failed to fetch eh downloads in window")?;
-
-        Ok(result.iter().map(|e| e.file_size).sum())
-    }
-
     /// Get the current queue status for one chat.
     pub async fn get_eh_queue_snapshot(&self, chat_id: i64) -> Result<EhQueueSnapshot> {
         let active = eh_download_queue::Entity::find()
+            .find_also_related(eh_gallery_jobs::Entity)
             .filter(eh_download_queue::Column::ChatId.eq(chat_id))
             .filter(eh_download_queue::Column::Status.is_in([
+                STATUS_WAITING,
                 STATUS_PENDING,
                 STATUS_DOWNLOADING,
                 STATUS_DOWNLOADED,
@@ -898,7 +865,7 @@ impl Repo {
             .await
             .context("Failed to fetch active EH queue entries")?
             .into_iter()
-            .map(EhQueueStatusItem::from)
+            .map(|(delivery, job)| EhQueueStatusItem::from_delivery_and_job(delivery, job))
             .collect();
 
         let recent_terminal = eh_download_queue::Entity::find()
@@ -912,7 +879,7 @@ impl Repo {
             .one(&self.db)
             .await
             .context("Failed to fetch recent terminal EH queue entry")?
-            .map(EhQueueStatusItem::from);
+            .map(EhQueueStatusItem::from_delivery);
 
         Ok(EhQueueSnapshot {
             active,
@@ -924,18 +891,28 @@ impl Repo {
     #[allow(dead_code)]
     pub async fn count_pending_eh_downloads(&self) -> Result<u64> {
         eh_download_queue::Entity::find()
-            .filter(eh_download_queue::Column::Status.eq(STATUS_PENDING))
+            .filter(eh_download_queue::Column::Status.is_in([STATUS_WAITING, STATUS_PENDING]))
             .count(&self.db)
             .await
             .context("Failed to count pending eh downloads")
     }
 
-    /// Cancel queued/in-flight EH downloads that were created for a subscription
-    /// that has just been removed. Direct downloads and terminal rows are left
-    /// untouched; rows with other active subscription owners keep running.
-    pub async fn cancel_eh_subscription_queue_entries(&self, subscription_id: i32) -> Result<u64> {
-        let _guard = EH_PUBLISH_CANCEL_LOCK.lock().await;
-        self.cancel_eh_subscription_queue_entries_inner(subscription_id)
+    /// Cancel delivery ownership created for a subscription that has just been
+    /// removed. Direct deliveries and other subscription owners are left
+    /// untouched.
+    pub async fn cancel_eh_subscription_queue_entries(
+        &self,
+        subscription_id: i32,
+        send_archive: bool,
+    ) -> Result<u64> {
+        let chat_ids = self
+            .find_eh_subscription_delivery_rows(subscription_id)
+            .await?
+            .into_iter()
+            .map(|row| row.chat_id)
+            .collect::<Vec<_>>();
+        let _guards = EH_CHAT_LOCKS.lock_chats(&chat_ids).await;
+        self.cancel_eh_subscription_queue_entries_under_chat_locks(subscription_id, send_archive)
             .await
     }
 
@@ -946,6 +923,7 @@ impl Repo {
     /// migration introduces owner-aware queue semantics.  Already-canceled
     /// legacy rows are included so startup can repair rows from an older
     /// migration attempt that canceled them without clearing Telegraph state.
+    #[cfg(test)] // Runtime cancellation is shared-job ownership based.
     pub async fn cancel_legacy_eh_subscription_queue_entries(&self) -> Result<u64> {
         let result = eh_download_queue::Entity::update_many()
             .col_expr(
@@ -1004,6 +982,7 @@ impl Repo {
             .filter(eh_download_queue::Column::Source.eq(SOURCE_SUBSCRIPTION))
             .filter(eh_download_queue::Column::SubscriptionIds.is_null())
             .filter(eh_download_queue::Column::Status.is_in([
+                STATUS_WAITING,
                 STATUS_PENDING,
                 STATUS_DOWNLOADING,
                 STATUS_DOWNLOADED,
@@ -1020,27 +999,61 @@ impl Repo {
         Ok(result.rows_affected)
     }
 
-    /// Delete an EH subscription and cancel/prune its queued work in one
-    /// publish/cancel critical section.
+    /// Delete an EH subscription and cancel/prune its deliveries while holding
+    /// that subscription's chat lock.
     pub async fn delete_eh_subscription_and_cancel_queue(
         &self,
         subscription_id: i32,
+        send_archive: bool,
     ) -> Result<()> {
-        let _guard = EH_PUBLISH_CANCEL_LOCK.lock().await;
-        self.delete_subscription(subscription_id).await?;
-        self.cancel_eh_subscription_queue_entries_inner(subscription_id)
-            .await?;
-        Ok(())
+        let subscription = subscriptions::Entity::find_by_id(subscription_id)
+            .one(&self.db)
+            .await
+            .context("Failed to load EH subscription before cancellation")?
+            .context("EH subscription disappeared before cancellation")?;
+        let _guard = EH_CHAT_LOCKS.lock_chat(subscription.chat_id).await;
+        let txn = self
+            .db
+            .begin()
+            .await
+            .context("Failed to begin EH subscription deletion transaction")?;
+        let result: Result<()> = async {
+            let deleted = subscriptions::Entity::delete_by_id(subscription_id)
+                .exec(&txn)
+                .await
+                .context("Failed to delete EH subscription")?;
+            anyhow::ensure!(
+                deleted.rows_affected == 1,
+                "EH subscription disappeared during cancellation"
+            );
+            self.cancel_eh_subscription_queue_entries_in_txn(&txn, subscription_id, send_archive)
+                .await?;
+            Ok(())
+        }
+        .await;
+        match result {
+            Ok(()) => txn
+                .commit()
+                .await
+                .context("Failed to commit EH subscription deletion transaction"),
+            Err(error) => {
+                txn.rollback()
+                    .await
+                    .context("Failed to roll back EH subscription deletion transaction")?;
+                Err(error)
+            }
+        }
     }
 
-    async fn cancel_eh_subscription_queue_entries_inner(
+    async fn find_eh_subscription_delivery_rows(
         &self,
         subscription_id: i32,
-    ) -> Result<u64> {
-        let active_rows = eh_download_queue::Entity::find()
+    ) -> Result<Vec<eh_download_queue::Model>> {
+        let rows = eh_download_queue::Entity::find()
             .filter(eh_download_queue::Column::Source.eq(SOURCE_SUBSCRIPTION))
             .filter(eh_download_queue::Column::SubscriptionIds.is_not_null())
             .filter(eh_download_queue::Column::Status.is_in([
+                STATUS_WAITING,
                 STATUS_PENDING,
                 STATUS_DOWNLOADING,
                 STATUS_DOWNLOADED,
@@ -1054,18 +1067,110 @@ impl Repo {
             .all(&self.db)
             .await
             .context("Failed to cancel eh subscription queue entries")?;
+        Ok(rows
+            .into_iter()
+            .filter(|row| {
+                parse_subscription_ids(row.subscription_ids.as_deref()).contains(&subscription_id)
+            })
+            .collect())
+    }
 
+    async fn find_eh_subscription_delivery_rows_in_txn(
+        &self,
+        txn: &sea_orm::DatabaseTransaction,
+        subscription_id: i32,
+    ) -> Result<Vec<eh_download_queue::Model>> {
+        let rows = eh_download_queue::Entity::find()
+            .filter(eh_download_queue::Column::Source.eq(SOURCE_SUBSCRIPTION))
+            .filter(eh_download_queue::Column::SubscriptionIds.is_not_null())
+            .filter(eh_download_queue::Column::Status.is_in([
+                STATUS_WAITING,
+                STATUS_PENDING,
+                STATUS_DOWNLOADING,
+                STATUS_DOWNLOADED,
+                STATUS_UPLOADING,
+                STATUS_UPLOADED,
+                STATUS_PUBLISHING,
+                STATUS_DONE,
+                STATUS_FAILED,
+                STATUS_CANCELED,
+            ]))
+            .all(txn)
+            .await
+            .context("Failed to select EH subscription deliveries for cancellation")?;
+        Ok(rows
+            .into_iter()
+            .filter(|row| {
+                parse_subscription_ids(row.subscription_ids.as_deref()).contains(&subscription_id)
+            })
+            .collect())
+    }
+
+    async fn cancel_eh_subscription_queue_entries_under_chat_locks(
+        &self,
+        subscription_id: i32,
+        send_archive: bool,
+    ) -> Result<u64> {
+        let txn = self
+            .db
+            .begin()
+            .await
+            .context("Failed to begin EH subscription cancellation transaction")?;
+        let result = self
+            .cancel_eh_subscription_queue_entries_in_txn(&txn, subscription_id, send_archive)
+            .await;
+        match result {
+            Ok(changed) => txn
+                .commit()
+                .await
+                .context("Failed to commit EH subscription cancellation transaction")
+                .map(|()| changed),
+            Err(error) => {
+                txn.rollback()
+                    .await
+                    .context("Failed to roll back EH subscription cancellation transaction")?;
+                Err(error)
+            }
+        }
+    }
+
+    async fn cancel_eh_subscription_queue_entries_in_txn(
+        &self,
+        txn: &sea_orm::DatabaseTransaction,
+        subscription_id: i32,
+        send_archive: bool,
+    ) -> Result<u64> {
+        // Re-query after the caller has acquired every affected chat lock so a
+        // send/cancel operation for the same chat observes one order.
+        let active_rows = self
+            .find_eh_subscription_delivery_rows_in_txn(txn, subscription_id)
+            .await?;
         let mut changed = 0u64;
+        let mut affected_job_ids = BTreeSet::new();
         for row in active_rows {
-            changed += self
-                .remove_subscription_owner_from_eh_row(row, subscription_id)
+            let job_id = row.job_id;
+            let row_changed = self
+                .remove_subscription_owner_from_eh_row_in_txn(txn, row, subscription_id)
+                .await?;
+            changed += row_changed;
+            if row_changed == 1 {
+                if let Some(job_id) = job_id {
+                    affected_job_ids.insert(job_id);
+                }
+            }
+        }
+        for job_id in affected_job_ids {
+            self.recompute_eh_job_telegraph_requirement_in_txn(txn, job_id)
+                .await?;
+            self.evaluate_eh_job_liveness_in_txn(txn, job_id, send_archive)
                 .await?;
         }
         Ok(changed)
     }
 
-    async fn remove_subscription_owner_from_eh_row(
+    async fn remove_subscription_owner_from_eh_row_in_txn(
         &self,
+        txn: &sea_orm::DatabaseTransaction,
         mut row: eh_download_queue::Model,
         subscription_id: i32,
     ) -> Result<u64> {
@@ -1090,13 +1195,6 @@ impl Repo {
             let telegraph_still_required = remaining_telegraph_ids.is_some();
             let new_status = if canceled && is_active_subscription_queue_status(&row.status) {
                 STATUS_CANCELED.to_string()
-            } else if !telegraph_still_required
-                && matches!(
-                    row.status.as_str(),
-                    STATUS_UPLOADING | STATUS_UPLOADED | STATUS_PUBLISHING
-                )
-            {
-                STATUS_DOWNLOADED.to_string()
             } else {
                 row.status.clone()
             };
@@ -1114,151 +1212,16 @@ impl Repo {
                     eh_download_queue::Column::Telegraph,
                     Expr::value(telegraph_still_required),
                 )
-                .col_expr(
-                    eh_download_queue::Column::TelegraphUrl,
-                    Expr::value(if telegraph_still_required {
-                        row.telegraph_url.clone()
-                    } else {
-                        None::<String>
-                    }),
-                )
-                .col_expr(
-                    eh_download_queue::Column::ArchiveSentAt,
-                    Expr::value(if canceled {
-                        None::<DateTime>
-                    } else {
-                        row.archive_sent_at
-                    }),
-                )
-                .col_expr(
-                    eh_download_queue::Column::TelegraphSentAt,
-                    Expr::value(if telegraph_still_required {
-                        row.telegraph_sent_at
-                    } else {
-                        None::<DateTime>
-                    }),
-                )
-                .col_expr(
-                    eh_download_queue::Column::NextRetryAt,
-                    Expr::value(if telegraph_still_required {
-                        row.next_retry_at
-                    } else {
-                        None::<DateTime>
-                    }),
-                )
-                .col_expr(
-                    eh_download_queue::Column::BackgroundDownloadStatus,
-                    Expr::value(if canceled {
-                        None::<String>
-                    } else {
-                        row.background_download_status.clone()
-                    }),
-                )
-                .col_expr(
-                    eh_download_queue::Column::BackgroundDownloadStartedAt,
-                    Expr::value(if canceled {
-                        None::<DateTime>
-                    } else {
-                        row.background_download_started_at
-                    }),
-                )
-                .col_expr(
-                    eh_download_queue::Column::BackgroundDownloadNextRetryAt,
-                    Expr::value(if canceled {
-                        None::<DateTime>
-                    } else {
-                        row.background_download_next_retry_at
-                    }),
-                )
-                .col_expr(
-                    eh_download_queue::Column::BackgroundDownloadAttemptCount,
-                    Expr::value(if canceled {
-                        0
-                    } else {
-                        row.background_download_attempt_count
-                    }),
-                )
-                .col_expr(
-                    eh_download_queue::Column::BackgroundDownloadError,
-                    Expr::value(if canceled {
-                        None::<String>
-                    } else {
-                        row.background_download_error.clone()
-                    }),
-                )
-                .col_expr(
-                    eh_download_queue::Column::TelegraphRewriteData,
-                    Expr::value(if telegraph_still_required {
-                        row.telegraph_rewrite_data.clone()
-                    } else {
-                        None::<String>
-                    }),
-                )
-                .col_expr(
-                    eh_download_queue::Column::TelegraphRewriteStatus,
-                    Expr::value(if telegraph_still_required {
-                        row.telegraph_rewrite_status.clone()
-                    } else {
-                        None::<String>
-                    }),
-                )
-                .col_expr(
-                    eh_download_queue::Column::TelegraphRewriteAfter,
-                    Expr::value(if telegraph_still_required {
-                        row.telegraph_rewrite_after
-                    } else {
-                        None::<DateTime>
-                    }),
-                )
-                .col_expr(
-                    eh_download_queue::Column::TelegraphRewriteStartedAt,
-                    Expr::value(if telegraph_still_required {
-                        row.telegraph_rewrite_started_at
-                    } else {
-                        None::<DateTime>
-                    }),
-                )
-                .col_expr(
-                    eh_download_queue::Column::TelegraphRewriteNextRetryAt,
-                    Expr::value(if telegraph_still_required {
-                        row.telegraph_rewrite_next_retry_at
-                    } else {
-                        None::<DateTime>
-                    }),
-                )
-                .col_expr(
-                    eh_download_queue::Column::TelegraphRewriteRetryCount,
-                    Expr::value(if telegraph_still_required {
-                        row.telegraph_rewrite_retry_count
-                    } else {
-                        0
-                    }),
-                )
-                .col_expr(
-                    eh_download_queue::Column::TelegraphRewriteError,
-                    Expr::value(if telegraph_still_required {
-                        row.telegraph_rewrite_error.clone()
-                    } else {
-                        None::<String>
-                    }),
-                )
-                .col_expr(
-                    eh_download_queue::Column::TelegraphRewrittenAt,
-                    Expr::value(if telegraph_still_required {
-                        row.telegraph_rewritten_at
-                    } else {
-                        None::<DateTime>
-                    }),
-                )
                 .filter(eh_download_queue::Column::Id.eq(row.id))
                 .filter(eh_download_queue::Column::Status.eq(&row.status))
                 .filter(eh_download_queue::Column::Source.eq(SOURCE_SUBSCRIPTION))
+                .filter(job_id_filter(row.job_id))
                 .filter(eh_download_queue::Column::SubscriptionIds.eq(row.subscription_ids.clone()))
                 .filter(eh_download_queue::Column::Telegraph.eq(row.telegraph))
                 .filter(telegraph_subscription_ids_filter(
                     row.telegraph_subscription_ids.clone(),
                 ))
-                .exec(&self.db)
+                .exec(txn)
                 .await
                 .context("Failed to cancel eh subscription queue entry")?;
             if result.rows_affected == 1 {
@@ -1274,7 +1237,7 @@ impl Repo {
             }
 
             match eh_download_queue::Entity::find_by_id(row.id)
-                .one(&self.db)
+                .one(txn)
                 .await?
             {
                 Some(fresh) => row = fresh,
@@ -1286,7 +1249,12 @@ impl Repo {
 
     /// True if a claimed queue row is still active and has not been canceled
     /// after its originating subscription was removed.
-    pub async fn eh_download_is_active(&self, id: i32, expected_status: &str) -> Result<bool> {
+    pub async fn eh_download_is_active(
+        &self,
+        id: i32,
+        expected_status: &str,
+        send_archive: bool,
+    ) -> Result<bool> {
         let row = eh_download_queue::Entity::find()
             .filter(eh_download_queue::Column::Id.eq(id))
             .filter(eh_download_queue::Column::Status.eq(expected_status))
@@ -1299,195 +1267,166 @@ impl Repo {
         if row.source != SOURCE_SUBSCRIPTION {
             return Ok(true);
         }
-        self.eh_download_has_live_owner_or_cancel(row, expected_status)
+        self.eh_download_has_live_owner_or_cancel(row.id, expected_status, send_archive)
             .await
     }
 
     async fn eh_download_has_live_owner_or_cancel(
         &self,
-        mut row: eh_download_queue::Model,
+        id: i32,
         expected_status: &str,
+        send_archive: bool,
     ) -> Result<bool> {
-        const MAX_RETRIES: usize = 3;
-        for attempt in 0..MAX_RETRIES {
-            if row.status != expected_status || row.source != SOURCE_SUBSCRIPTION {
+        let txn = self
+            .db
+            .begin()
+            .await
+            .context("Failed to begin inactive EH download soft-cancel transaction")?;
+        let result: Result<bool> = async {
+            let Some(mut row) = eh_download_queue::Entity::find()
+                .filter(eh_download_queue::Column::Id.eq(id))
+                .filter(eh_download_queue::Column::Status.eq(expected_status))
+                .one(&txn)
+                .await
+                .context("Failed to re-read EH download activity in transaction")?
+            else {
                 return Ok(false);
-            }
-            let ids = parse_subscription_ids(row.subscription_ids.as_deref());
-            let alive = if ids.is_empty() {
-                false
-            } else {
-                subscriptions::Entity::find()
-                    .filter(subscriptions::Column::Id.is_in(ids.iter().copied()))
-                    .count(&self.db)
+            };
+            const MAX_RETRIES: usize = 3;
+            for attempt in 0..MAX_RETRIES {
+                if row.status != expected_status {
+                    return Ok(false);
+                }
+                if row.source != SOURCE_SUBSCRIPTION {
+                    return Ok(true);
+                }
+                let ids = parse_subscription_ids(row.subscription_ids.as_deref());
+                let alive = if ids.is_empty() {
+                    false
+                } else {
+                    subscriptions::Entity::find()
+                        .filter(subscriptions::Column::Id.is_in(ids.iter().copied()))
+                        .count(&txn)
+                        .await
+                        .context("Failed to check EH subscription owners")?
+                        > 0
+                };
+                if alive {
+                    return Ok(true);
+                }
+
+                let result = eh_download_queue::Entity::update_many()
+                    .col_expr(
+                        eh_download_queue::Column::Status,
+                        Expr::value(STATUS_CANCELED),
+                    )
+                    .col_expr(eh_download_queue::Column::Telegraph, Expr::value(false))
+                    .col_expr(
+                        eh_download_queue::Column::SubscriptionIds,
+                        Expr::value(None::<String>),
+                    )
+                    .col_expr(
+                        eh_download_queue::Column::TelegraphSubscriptionIds,
+                        Expr::value(None::<String>),
+                    )
+                    .col_expr(
+                        eh_download_queue::Column::TelegraphUrl,
+                        Expr::value(None::<String>),
+                    )
+                    .col_expr(
+                        eh_download_queue::Column::ArchiveSentAt,
+                        Expr::value(None::<DateTime>),
+                    )
+                    .col_expr(
+                        eh_download_queue::Column::TelegraphSentAt,
+                        Expr::value(None::<DateTime>),
+                    )
+                    .col_expr(
+                        eh_download_queue::Column::TelegraphRewriteData,
+                        Expr::value(None::<String>),
+                    )
+                    .col_expr(
+                        eh_download_queue::Column::TelegraphRewriteStatus,
+                        Expr::value(None::<String>),
+                    )
+                    .col_expr(
+                        eh_download_queue::Column::TelegraphRewriteAfter,
+                        Expr::value(None::<DateTime>),
+                    )
+                    .col_expr(
+                        eh_download_queue::Column::TelegraphRewriteStartedAt,
+                        Expr::value(None::<DateTime>),
+                    )
+                    .col_expr(
+                        eh_download_queue::Column::TelegraphRewriteNextRetryAt,
+                        Expr::value(None::<DateTime>),
+                    )
+                    .col_expr(
+                        eh_download_queue::Column::TelegraphRewriteRetryCount,
+                        Expr::value(0),
+                    )
+                    .col_expr(
+                        eh_download_queue::Column::TelegraphRewriteError,
+                        Expr::value(None::<String>),
+                    )
+                    .col_expr(
+                        eh_download_queue::Column::TelegraphRewrittenAt,
+                        Expr::value(None::<DateTime>),
+                    )
+                    .filter(eh_download_queue::Column::Id.eq(row.id))
+                    .filter(eh_download_queue::Column::Status.eq(&row.status))
+                    .filter(eh_download_queue::Column::Source.eq(SOURCE_SUBSCRIPTION))
+                    .filter(eh_download_queue::Column::Telegraph.eq(row.telegraph))
+                    .filter(subscription_ids_filter(row.subscription_ids.clone()))
+                    .filter(telegraph_subscription_ids_filter(
+                        row.telegraph_subscription_ids.clone(),
+                    ))
+                    .exec(&txn)
                     .await
-                    .context("Failed to check EH subscription owners")?
-                    > 0
-            };
-            if alive {
-                return Ok(true);
-            }
+                    .context("Failed to soft-cancel inactive EH download")?;
+                if result.rows_affected == 1 {
+                    if let Some(job_id) = row.job_id {
+                        self.recompute_eh_job_telegraph_requirement_in_txn(&txn, job_id)
+                            .await?;
+                        self.evaluate_eh_job_liveness_in_txn(&txn, job_id, send_archive)
+                            .await?;
+                    }
+                    return Ok(false);
+                }
 
-            let result = eh_download_queue::Entity::update_many()
-                .col_expr(
-                    eh_download_queue::Column::Status,
-                    Expr::value(STATUS_CANCELED),
-                )
-                .col_expr(eh_download_queue::Column::Telegraph, Expr::value(false))
-                .col_expr(
-                    eh_download_queue::Column::SubscriptionIds,
-                    Expr::value(None::<String>),
-                )
-                .col_expr(
-                    eh_download_queue::Column::TelegraphSubscriptionIds,
-                    Expr::value(None::<String>),
-                )
-                .col_expr(
-                    eh_download_queue::Column::TelegraphUrl,
-                    Expr::value(None::<String>),
-                )
-                .col_expr(
-                    eh_download_queue::Column::ArchiveSentAt,
-                    Expr::value(None::<DateTime>),
-                )
-                .col_expr(
-                    eh_download_queue::Column::TelegraphSentAt,
-                    Expr::value(None::<DateTime>),
-                )
-                .col_expr(
-                    eh_download_queue::Column::TelegraphRewriteData,
-                    Expr::value(None::<String>),
-                )
-                .col_expr(
-                    eh_download_queue::Column::TelegraphRewriteStatus,
-                    Expr::value(None::<String>),
-                )
-                .col_expr(
-                    eh_download_queue::Column::TelegraphRewriteAfter,
-                    Expr::value(None::<DateTime>),
-                )
-                .col_expr(
-                    eh_download_queue::Column::TelegraphRewriteStartedAt,
-                    Expr::value(None::<DateTime>),
-                )
-                .col_expr(
-                    eh_download_queue::Column::TelegraphRewriteNextRetryAt,
-                    Expr::value(None::<DateTime>),
-                )
-                .col_expr(
-                    eh_download_queue::Column::TelegraphRewriteRetryCount,
-                    Expr::value(0),
-                )
-                .col_expr(
-                    eh_download_queue::Column::TelegraphRewriteError,
-                    Expr::value(None::<String>),
-                )
-                .col_expr(
-                    eh_download_queue::Column::TelegraphRewrittenAt,
-                    Expr::value(None::<DateTime>),
-                )
-                .filter(eh_download_queue::Column::Id.eq(row.id))
-                .filter(eh_download_queue::Column::Status.eq(&row.status))
-                .filter(eh_download_queue::Column::Source.eq(SOURCE_SUBSCRIPTION))
-                .filter(eh_download_queue::Column::Telegraph.eq(row.telegraph))
-                .filter(subscription_ids_filter(row.subscription_ids.clone()))
-                .filter(telegraph_subscription_ids_filter(
-                    row.telegraph_subscription_ids.clone(),
-                ))
-                .exec(&self.db)
+                if attempt + 1 == MAX_RETRIES {
+                    anyhow::bail!(
+                        "Failed to soft-cancel inactive EH download {} after {} attempts: row changed too frequently",
+                        row.id,
+                        MAX_RETRIES
+                    );
+                }
+
+                match eh_download_queue::Entity::find_by_id(row.id).one(&txn).await? {
+                    Some(fresh) => row = fresh,
+                    None => return Ok(false),
+                }
+            }
+            Ok(false)
+        }
+        .await;
+        match result {
+            Ok(active) => txn
+                .commit()
                 .await
-                .context("Failed to soft-cancel inactive EH download")?;
-            if result.rows_affected == 1 {
-                return Ok(false);
-            }
-
-            if attempt + 1 == MAX_RETRIES {
-                anyhow::bail!(
-                    "Failed to soft-cancel inactive EH download {} after {} attempts: row changed too frequently",
-                    row.id,
-                    MAX_RETRIES
-                );
-            }
-
-            match eh_download_queue::Entity::find_by_id(row.id)
-                .one(&self.db)
-                .await?
-            {
-                Some(fresh) => row = fresh,
-                None => return Ok(false),
+                .context("Failed to commit inactive EH download soft-cancel transaction")
+                .map(|()| active),
+            Err(error) => {
+                txn.rollback()
+                    .await
+                    .context("Failed to roll back inactive EH download soft-cancel transaction")?;
+                Err(error)
             }
         }
-        Ok(false)
-    }
-
-    /// Reset stale in-flight entries back to their pre-claim status (crash recovery).
-    ///
-    /// Resets ALL three transient statuses:
-    /// - `downloading` → `pending`
-    /// - `uploading`   → `downloaded`
-    /// - `publishing`  → `downloaded` (if telegraph=false) or `uploaded` (if telegraph_url is set)
-    ///
-    /// Should be called once at startup before any worker begins.
-    pub async fn reset_stale_eh_downloads(&self) -> Result<u64> {
-        let mut count = 0u64;
-
-        // downloading → pending
-        let stale_downloading = eh_download_queue::Entity::find()
-            .filter(eh_download_queue::Column::Status.eq(STATUS_DOWNLOADING))
-            .all(&self.db)
-            .await
-            .context("Failed to fetch stale downloading entries")?;
-        for entry in stale_downloading {
-            let mut active: eh_download_queue::ActiveModel = entry.into();
-            active.status = Set(STATUS_PENDING.to_string());
-            active
-                .update(&self.db)
-                .await
-                .context("Failed to reset stale downloading entry")?;
-            count += 1;
-        }
-
-        // uploading → downloaded
-        let stale_uploading = eh_download_queue::Entity::find()
-            .filter(eh_download_queue::Column::Status.eq(STATUS_UPLOADING))
-            .all(&self.db)
-            .await
-            .context("Failed to fetch stale uploading entries")?;
-        for entry in stale_uploading {
-            let mut active: eh_download_queue::ActiveModel = entry.into();
-            active.status = Set(STATUS_DOWNLOADED.to_string());
-            active
-                .update(&self.db)
-                .await
-                .context("Failed to reset stale uploading entry")?;
-            count += 1;
-        }
-
-        // publishing → downloaded (telegraph=false) or uploaded (telegraph_url set)
-        let stale_publishing = eh_download_queue::Entity::find()
-            .filter(eh_download_queue::Column::Status.eq(STATUS_PUBLISHING))
-            .all(&self.db)
-            .await
-            .context("Failed to fetch stale publishing entries")?;
-        for entry in stale_publishing {
-            let target = if entry.telegraph_url.is_some() {
-                STATUS_UPLOADED
-            } else {
-                STATUS_DOWNLOADED
-            };
-            let mut active: eh_download_queue::ActiveModel = entry.into();
-            active.status = Set(target.to_string());
-            active
-                .update(&self.db)
-                .await
-                .context("Failed to reset stale publishing entry")?;
-            count += 1;
-        }
-
-        Ok(count)
     }
 
     /// Reset stale Telegraph rewrite claims back to pending rewrite work.
+    #[allow(dead_code)] // Runtime stale recovery moved to shared eh_gallery_jobs.
     pub async fn reset_stale_eh_telegraph_rewrites(&self, stale_sec: i64) -> Result<u64> {
         let cutoff = Local::now().naive_local() - chrono::Duration::seconds(stale_sec);
         let result = eh_download_queue::Entity::update_many()
@@ -1557,6 +1496,7 @@ impl Repo {
     /// `gp_cost` is compatibility/display metadata for the most recent successful
     /// archive download (0 for free / unlocked). The append-only
     /// `eh_gp_spend_attempts` ledger calculates rolling GP budgets.
+    #[allow(dead_code)]
     pub async fn mark_eh_download_downloaded(
         &self,
         id: i32,
@@ -1701,6 +1641,7 @@ impl Repo {
     /// telegraph_url, archive_sent_at, and telegraph_sent_at so publish
     /// workers do not send stale Telegraph links.
     /// Only updates rows currently in `STATUS_UPLOADING`.
+    #[allow(dead_code)] // Historical per-delivery upload compatibility API; runtime claims jobs.
     pub async fn fallback_eh_upload_to_archive(
         &self,
         id: i32,
@@ -1796,6 +1737,7 @@ impl Repo {
     /// rows without a URL are downgraded to archive-only so they can be downloaded or
     /// published without an upload worker.  Terminal rows have only their Telegraph flag
     /// cleared so a later plain re-enqueue does not OR-merge the stale preference back in.
+    #[allow(dead_code)] // Legacy compatibility API; startup owns only shared job state.
     pub async fn disable_eh_telegraph_for_unuploaded_entries(&self) -> Result<u64> {
         let mut changed = 0u64;
 
@@ -1994,11 +1936,13 @@ impl Repo {
 
     /// Get next entry for the download stage: status=pending, next_retry_at is NULL or <= now.
     /// Uses a conditional UPDATE to atomically claim the entry.
+    #[allow(dead_code)]
     pub async fn get_next_for_download(&self) -> Result<Option<eh_download_queue::Model>> {
         let now = Local::now().naive_local();
         self.get_next_for_download_at(now).await
     }
 
+    #[allow(dead_code)]
     async fn get_next_for_download_at(
         &self,
         now: DateTime,
@@ -2049,6 +1993,7 @@ impl Repo {
         self.claim_main_download_from_snapshot_at(&model, now).await
     }
 
+    #[allow(dead_code)]
     async fn claim_main_download_from_snapshot_at(
         &self,
         model: &eh_download_queue::Model,
@@ -2100,6 +2045,7 @@ impl Repo {
 
     /// Get next entry for the upload stage: status=downloaded, telegraph=true, next_retry_at ok.
     /// Uses a conditional UPDATE to atomically claim the entry.
+    #[allow(dead_code)] // Historical per-delivery upload compatibility API; runtime claims jobs.
     pub async fn get_next_for_upload(&self) -> Result<Option<eh_download_queue::Model>> {
         let now = Local::now().naive_local();
         let entry = eh_download_queue::Entity::find()
@@ -2160,8 +2106,406 @@ impl Repo {
         Ok(updated)
     }
 
-    /// Get next entry for the publish stage: either (downloaded, telegraph=false) or (uploaded).
-    /// Uses a conditional UPDATE to atomically claim the entry.
+    /// Claim the next due shared-gallery delivery that has at least one ready
+    /// publish surface. Legacy rows without a `job_id` are deliberately never
+    /// claimed by this runtime lane.
+    pub async fn get_next_eh_delivery_for_publish(
+        &self,
+        send_archive: bool,
+    ) -> Result<Option<EhDeliveryClaim>> {
+        let now = Local::now().naive_local();
+        let txn = self
+            .db
+            .begin()
+            .await
+            .context("Failed to begin shared EH delivery publish claim transaction")?;
+        let result = async {
+            let candidates = eh_download_queue::Entity::find()
+                .find_also_related(eh_gallery_jobs::Entity)
+                .filter(eh_download_queue::Column::Status.eq(STATUS_WAITING))
+                .filter(eh_download_queue::Column::JobId.is_not_null())
+                .filter(eh_gallery_jobs::Column::CleanupStatus.eq(CLEANUP_STATUS_NONE))
+                .filter(
+                    eh_download_queue::Column::NextRetryAt
+                        .is_null()
+                        .or(eh_download_queue::Column::NextRetryAt.lte(now)),
+                )
+                .order_by(eh_download_queue::Column::CreatedAt, Order::Asc)
+                .order_by(eh_download_queue::Column::Id, Order::Asc)
+                .all(&txn)
+                .await
+                .context("Failed to fetch due shared EH deliveries for publish")?;
+
+            for (delivery, job) in candidates {
+                let Some(job) = job else {
+                    continue;
+                };
+                if !eh_delivery_is_ready_for_publish(&delivery, &job, send_archive) {
+                    continue;
+                }
+
+                let generation = next_claim_generation(now, delivery.started_at)?;
+                let claimed = eh_download_queue::Entity::update_many()
+                    .col_expr(
+                        eh_download_queue::Column::Status,
+                        Expr::value(STATUS_PUBLISHING),
+                    )
+                    .col_expr(
+                        eh_download_queue::Column::StartedAt,
+                        Expr::value(generation),
+                    )
+                    .col_expr(
+                        eh_download_queue::Column::NextRetryAt,
+                        Expr::value(None::<DateTime>),
+                    )
+                    .filter(eh_download_queue::Column::Id.eq(delivery.id))
+                    .filter(eh_download_queue::Column::JobId.eq(job.id))
+                    .filter(eh_download_queue::Column::Status.eq(STATUS_WAITING))
+                    .filter(eh_job_cleanup_is_none_filter(job.id))
+                    .filter(claim_generation_filter(delivery.started_at))
+                    .filter(
+                        eh_download_queue::Column::NextRetryAt
+                            .is_null()
+                            .or(eh_download_queue::Column::NextRetryAt.lte(now)),
+                    )
+                    .exec(&txn)
+                    .await
+                    .context("Failed to atomically claim shared EH delivery for publish")?;
+                if claimed.rows_affected == 0 {
+                    continue;
+                }
+
+                let claimed_delivery = eh_download_queue::Entity::find()
+                    .filter(eh_download_queue::Column::Id.eq(delivery.id))
+                    .filter(eh_download_queue::Column::JobId.eq(job.id))
+                    .filter(eh_download_queue::Column::Status.eq(STATUS_PUBLISHING))
+                    .filter(eh_download_queue::Column::StartedAt.eq(generation))
+                    .one(&txn)
+                    .await
+                    .context("Failed to reread shared EH delivery publish claim")?
+                    .context("Shared EH delivery changed before publish claim readback")?;
+                let claimed_job = eh_gallery_jobs::Entity::find_by_id(job.id)
+                    .filter(eh_gallery_jobs::Column::CleanupStatus.eq(CLEANUP_STATUS_NONE))
+                    .one(&txn)
+                    .await
+                    .context("Failed to reread shared EH job for delivery claim")?
+                    .context("Shared EH job changed before delivery claim readback")?;
+                return Ok(Some(EhDeliveryClaim {
+                    delivery: claimed_delivery,
+                    job: claimed_job,
+                }));
+            }
+
+            Ok(None)
+        }
+        .await;
+
+        match result {
+            Ok(Some(claim)) => {
+                txn.commit()
+                    .await
+                    .context("Failed to commit shared EH delivery publish claim transaction")?;
+                Ok(Some(claim))
+            }
+            Ok(None) => {
+                txn.rollback().await.context(
+                    "Failed to roll back empty shared EH delivery publish claim transaction",
+                )?;
+                Ok(None)
+            }
+            Err(error) => {
+                txn.rollback()
+                    .await
+                    .context("Failed to roll back shared EH delivery publish claim transaction")?;
+                Err(error)
+            }
+        }
+    }
+
+    /// Re-read a currently publishing delivery with its shared job. Publish
+    /// workers call this after acquiring the keyed chat lock so cancellation,
+    /// marker progress, and job readiness are observed as one fresh snapshot.
+    pub async fn get_eh_delivery_publish_claim(
+        &self,
+        delivery_id: i32,
+    ) -> Result<Option<EhDeliveryClaim>> {
+        let Some((delivery, job)) = eh_download_queue::Entity::find()
+            .find_also_related(eh_gallery_jobs::Entity)
+            .filter(eh_download_queue::Column::Id.eq(delivery_id))
+            .filter(eh_download_queue::Column::Status.eq(STATUS_PUBLISHING))
+            .one(&self.db)
+            .await
+            .context("Failed to reread shared EH publishing delivery")?
+        else {
+            return Ok(None);
+        };
+        let Some(job) = job else {
+            return Ok(None);
+        };
+        if job.cleanup_status != CLEANUP_STATUS_NONE {
+            eh_download_queue::Entity::update_many()
+                .col_expr(
+                    eh_download_queue::Column::Status,
+                    Expr::value(STATUS_WAITING),
+                )
+                .col_expr(
+                    eh_download_queue::Column::NextRetryAt,
+                    Expr::value(None::<DateTime>),
+                )
+                .filter(eh_download_queue::Column::Id.eq(delivery.id))
+                .filter(eh_download_queue::Column::JobId.eq(job.id))
+                .filter(eh_download_queue::Column::Status.eq(STATUS_PUBLISHING))
+                .exec(&self.db)
+                .await
+                .context("Failed to release dirty shared EH publishing delivery")?;
+            return Ok(None);
+        }
+        Ok(Some(EhDeliveryClaim { delivery, job }))
+    }
+
+    /// Check whether a claimed delivery still has a live owner. Subscription
+    /// ownership uses the existing cancellation-safe check; direct deliveries
+    /// remain active while their expected claim status survives.
+    pub async fn eh_delivery_is_active(
+        &self,
+        delivery_id: i32,
+        expected_status: &str,
+        send_archive: bool,
+    ) -> Result<bool> {
+        self.eh_download_is_active(delivery_id, expected_status, send_archive)
+            .await
+    }
+
+    /// Release a claimed delivery without burning a retry. A positive delay is
+    /// required so a tick that is refilling workers cannot reclaim it forever.
+    pub async fn defer_eh_delivery_publish(&self, delivery_id: i32, delay_secs: i64) -> Result<()> {
+        let retry_at = Local::now().naive_local() + chrono::Duration::seconds(delay_secs.max(1));
+        let result = eh_download_queue::Entity::update_many()
+            .col_expr(
+                eh_download_queue::Column::Status,
+                Expr::value(STATUS_WAITING),
+            )
+            .col_expr(
+                eh_download_queue::Column::NextRetryAt,
+                Expr::value(Some(retry_at)),
+            )
+            .filter(eh_download_queue::Column::Id.eq(delivery_id))
+            .filter(eh_download_queue::Column::Status.eq(STATUS_PUBLISHING))
+            .exec(&self.db)
+            .await
+            .context("Failed to defer shared EH delivery publish")?;
+        if result.rows_affected != 1 {
+            anyhow::bail!(
+                "Cannot defer shared EH delivery {}: publishing claim changed",
+                delivery_id
+            );
+        }
+        Ok(())
+    }
+
+    /// Retry only the failed chat delivery. Shared download/upload/page state
+    /// remains on its job and is intentionally untouched.
+    pub async fn schedule_eh_delivery_retry(
+        &self,
+        delivery_id: i32,
+        error: &str,
+        max_retry_count: u8,
+        send_archive: bool,
+    ) -> Result<(eh_download_queue::Model, bool)> {
+        let txn = self
+            .db
+            .begin()
+            .await
+            .context("Failed to begin shared EH delivery retry transaction")?;
+        let result: Result<(eh_download_queue::Model, bool)> = async {
+            let delivery = eh_download_queue::Entity::find_by_id(delivery_id)
+                .one(&txn)
+                .await
+                .context("Failed to fetch shared EH delivery for retry")?
+                .context("Shared EH delivery disappeared before retry")?;
+            let retry_count = delivery
+                .retry_count
+                .checked_add(1)
+                .context("Shared EH delivery retry count overflow")?;
+            let terminal = retry_count > i32::from(max_retry_count);
+            let now = Local::now().naive_local();
+            let mut update = eh_download_queue::Entity::update_many()
+                .col_expr(
+                    eh_download_queue::Column::Status,
+                    Expr::value(if terminal {
+                        STATUS_FAILED
+                    } else {
+                        STATUS_WAITING
+                    }),
+                )
+                .col_expr(
+                    eh_download_queue::Column::Error,
+                    Expr::value(Some(error.to_string())),
+                )
+                .col_expr(
+                    eh_download_queue::Column::RetryCount,
+                    Expr::value(retry_count),
+                )
+                .filter(eh_download_queue::Column::Id.eq(delivery_id))
+                .filter(eh_download_queue::Column::Status.eq(STATUS_PUBLISHING))
+                .filter(job_id_filter(delivery.job_id));
+            if terminal {
+                update = update
+                    .col_expr(
+                        eh_download_queue::Column::CompletedAt,
+                        Expr::value(Some(now)),
+                    )
+                    .col_expr(
+                        eh_download_queue::Column::NextRetryAt,
+                        Expr::value(None::<DateTime>),
+                    );
+            } else {
+                let retry_at = now
+                    .checked_add_signed(chrono::Duration::seconds(Self::backoff_delay_secs(
+                        retry_count,
+                    )))
+                    .context("Shared EH delivery retry deadline overflow")?;
+                update = update.col_expr(
+                    eh_download_queue::Column::NextRetryAt,
+                    Expr::value(Some(retry_at)),
+                );
+            }
+            let result = update
+                .exec(&txn)
+                .await
+                .context("Failed to schedule shared EH delivery retry")?;
+            if result.rows_affected != 1 {
+                anyhow::bail!(
+                    "Cannot retry shared EH delivery {}: publishing claim changed",
+                    delivery_id
+                );
+            }
+            if terminal {
+                if let Some(job_id) = delivery.job_id {
+                    self.recompute_eh_job_telegraph_requirement_in_txn(&txn, job_id)
+                        .await?;
+                    self.evaluate_eh_job_liveness_in_txn(&txn, job_id, send_archive)
+                        .await?;
+                }
+            }
+            let updated = eh_download_queue::Entity::find_by_id(delivery_id)
+                .one(&txn)
+                .await
+                .context("Failed to reread shared EH delivery after retry")?
+                .context("Shared EH delivery disappeared after retry")?;
+            Ok((updated, terminal))
+        }
+        .await;
+        match result {
+            Ok(outcome) => txn
+                .commit()
+                .await
+                .context("Failed to commit shared EH delivery retry transaction")
+                .map(|()| outcome),
+            Err(error) => {
+                txn.rollback()
+                    .await
+                    .context("Failed to roll back shared EH delivery retry transaction")?;
+                Err(error)
+            }
+        }
+    }
+
+    /// Persist the archive marker for one delivery immediately after Telegram
+    /// accepts its document. The marker is deliberately delivery-local.
+    pub async fn mark_eh_archive_delivery_sent(&self, delivery_id: i32) -> Result<()> {
+        let result = eh_download_queue::Entity::update_many()
+            .col_expr(
+                eh_download_queue::Column::ArchiveSentAt,
+                Expr::value(Some(Local::now().naive_local())),
+            )
+            .filter(eh_download_queue::Column::Id.eq(delivery_id))
+            .filter(eh_download_queue::Column::Status.eq(STATUS_PUBLISHING))
+            .filter(eh_download_queue::Column::ArchiveSentAt.is_null())
+            .exec(&self.db)
+            .await
+            .context("Failed to mark shared EH archive delivery sent")?;
+        if result.rows_affected != 1 {
+            anyhow::bail!(
+                "Cannot mark archive sent for shared EH delivery {}: publishing claim changed",
+                delivery_id
+            );
+        }
+        Ok(())
+    }
+
+    /// Finish only this delivery after all of its enabled/requested surfaces
+    /// have durable sent markers.
+    pub async fn mark_eh_delivery_done(
+        &self,
+        delivery_id: i32,
+        expected_job_id: i32,
+        send_archive: bool,
+    ) -> Result<eh_download_queue::Model> {
+        let txn = self
+            .db
+            .begin()
+            .await
+            .context("Failed to begin shared EH delivery completion transaction")?;
+        let result: Result<eh_download_queue::Model> = async {
+            let updated = eh_download_queue::Entity::update_many()
+                .col_expr(eh_download_queue::Column::Status, Expr::value(STATUS_DONE))
+                .col_expr(
+                    eh_download_queue::Column::CompletedAt,
+                    Expr::value(Some(Local::now().naive_local())),
+                )
+                .col_expr(
+                    eh_download_queue::Column::NextRetryAt,
+                    Expr::value(None::<DateTime>),
+                )
+                .col_expr(
+                    eh_download_queue::Column::Error,
+                    Expr::value(None::<String>),
+                )
+                .filter(eh_download_queue::Column::Id.eq(delivery_id))
+                .filter(eh_download_queue::Column::JobId.eq(expected_job_id))
+                .filter(eh_download_queue::Column::Status.eq(STATUS_PUBLISHING))
+                .exec(&txn)
+                .await
+                .context("Failed to mark shared EH delivery done")?;
+            if updated.rows_affected != 1 {
+                anyhow::bail!(
+                    "Cannot complete shared EH delivery {}: publishing claim changed",
+                    delivery_id
+                );
+            }
+            self.recompute_eh_job_telegraph_requirement_in_txn(&txn, expected_job_id)
+                .await?;
+            self.evaluate_eh_job_liveness_in_txn(&txn, expected_job_id, send_archive)
+                .await?;
+            eh_download_queue::Entity::find_by_id(delivery_id)
+                .one(&txn)
+                .await
+                .context("Failed to reread completed shared EH delivery")?
+                .filter(|delivery| delivery.job_id == Some(expected_job_id))
+                .context("Shared EH delivery disappeared or changed jobs after completion")
+        }
+        .await;
+        match result {
+            Ok(delivery) => txn
+                .commit()
+                .await
+                .context("Failed to commit shared EH delivery completion transaction")
+                .map(|()| delivery),
+            Err(error) => {
+                txn.rollback()
+                    .await
+                    .context("Failed to roll back shared EH delivery completion transaction")?;
+                Err(error)
+            }
+        }
+    }
+
+    /// Get next entry for the legacy per-row publish stage: either
+    /// (downloaded, telegraph=false) or (uploaded). Runtime workers use
+    /// `get_next_eh_delivery_for_publish` instead.
+    #[cfg(test)]
+    #[allow(dead_code)] // Retained for legacy-row compatibility tests.
     pub async fn get_next_for_publish(&self) -> Result<Option<eh_download_queue::Model>> {
         let now = Local::now().naive_local();
         let entry = eh_download_queue::Entity::find()
@@ -2241,6 +2585,7 @@ impl Repo {
 
     /// Mark the archive ZIP as sent (publish stage progress marker).
     /// Only updates rows currently in `STATUS_PUBLISHING`.
+    #[cfg(test)]
     pub async fn mark_eh_archive_sent(&self, id: i32) -> Result<()> {
         let result = eh_download_queue::Entity::update_many()
             .col_expr(
@@ -2356,6 +2701,7 @@ impl Repo {
     }
 
     /// Schedule stored Telegraph rewrite data after the link has been sent.
+    #[allow(dead_code)] // Runtime scheduling moved to shared eh_gallery_jobs.
     pub async fn schedule_eh_telegraph_rewrite_after_send(
         &self,
         id: i32,
@@ -2406,6 +2752,7 @@ impl Repo {
     }
 
     /// Claim the next due Telegraph rewrite job.
+    #[allow(dead_code)] // Retained only for historical queue-row compatibility queries.
     pub async fn get_next_for_telegraph_rewrite(&self) -> Result<Option<eh_download_queue::Model>> {
         let now = Local::now().naive_local();
         let entry = eh_download_queue::Entity::find()
@@ -2480,6 +2827,7 @@ impl Repo {
     }
 
     /// Mark a claimed Telegraph rewrite as complete and clear rewrite payload.
+    #[allow(dead_code)] // Runtime completion moved to shared eh_gallery_jobs.
     pub async fn mark_eh_telegraph_rewritten(&self, id: i32) -> Result<()> {
         let now = Local::now().naive_local();
         let result = eh_download_queue::Entity::update_many()
@@ -2536,6 +2884,7 @@ impl Repo {
     }
 
     /// Retry a claimed Telegraph rewrite with backoff, or stop retrying after `max_retry_count`.
+    #[allow(dead_code)] // Runtime retry state moved to shared eh_gallery_jobs.
     pub async fn schedule_eh_telegraph_rewrite_retry(
         &self,
         id: i32,
@@ -2642,6 +2991,7 @@ impl Repo {
     /// - target `STATUS_PENDING`: current must be `STATUS_DOWNLOADING`.
     /// - target `STATUS_DOWNLOADED`: current must be `STATUS_UPLOADING` or `STATUS_PUBLISHING`.
     /// - target `STATUS_UPLOADED`: current must be `STATUS_PUBLISHING`.
+    #[cfg(test)]
     pub async fn defer_eh_download(
         &self,
         id: i32,
@@ -2688,6 +3038,7 @@ impl Repo {
     /// This intentionally accepts only `STATUS_UPLOADING`: publish-stage rows
     /// have different completion and retry semantics and must not be released
     /// through the upload fallback path.
+    #[allow(dead_code)] // Historical per-delivery upload compatibility API; runtime claims jobs.
     pub async fn defer_eh_upload_after_abort_failure(
         &self,
         id: i32,
@@ -2723,6 +3074,7 @@ impl Repo {
     /// Only a claimed publish row may use this path. The target is selected
     /// from whether Telegraph upload succeeded, so sent markers remain intact
     /// and the next publish claim only completes local cleanup.
+    #[cfg(test)]
     pub async fn defer_eh_publish_after_abort_failure(
         &self,
         id: i32,
@@ -2946,6 +3298,7 @@ impl Repo {
         Ok((model, false))
     }
 
+    #[allow(dead_code)] // Legacy delivery lane retained for historical rows; workers use job claims.
     pub async fn schedule_eh_background_download_from(
         &self,
         id: i32,
@@ -3020,6 +3373,7 @@ impl Repo {
     /// Requires `status = STATUS_PENDING` and
     /// `background_download_status = BACKGROUND_STATUS_RUNNING` (i.e. the
     /// background worker currently owns the entry). Returns the updated model.
+    #[allow(dead_code)] // Legacy delivery lane retained for historical rows; workers use job claims.
     pub async fn defer_eh_background_download(
         &self,
         id: i32,
@@ -3069,6 +3423,7 @@ impl Repo {
         Ok(model)
     }
 
+    #[allow(dead_code)] // Legacy delivery lane retained for historical rows; workers use job claims.
     pub async fn reset_stale_background_downloads(&self, stale_sec: u64) -> Result<u64> {
         let cutoff = Local::now().naive_local() - chrono::Duration::seconds(stale_sec as i64);
         let result = eh_download_queue::Entity::update_many()
@@ -3095,6 +3450,7 @@ impl Repo {
         Ok(result.rows_affected)
     }
 
+    #[allow(dead_code)] // Legacy delivery lane retained for historical rows; workers use job claims.
     pub async fn release_background_downloads_to_main_queue(&self) -> Result<u64> {
         let result = eh_download_queue::Entity::update_many()
             .col_expr(
@@ -3125,6 +3481,7 @@ impl Repo {
         Ok(result.rows_affected)
     }
 
+    #[allow(dead_code)] // Called only by the retained legacy delivery transitions below.
     async fn clear_background_download_if_inactive(&self, id: i32) -> Result<()> {
         let Some(row) = eh_download_queue::Entity::find_by_id(id)
             .one(&self.db)
@@ -3167,6 +3524,7 @@ impl Repo {
         Ok(())
     }
 
+    #[allow(dead_code)] // Legacy delivery lane retained for historical rows; workers use job claims.
     pub async fn get_next_for_background_download(
         &self,
     ) -> Result<Option<eh_download_queue::Model>> {
@@ -3174,6 +3532,7 @@ impl Repo {
         self.get_next_for_background_download_at(now).await
     }
 
+    #[allow(dead_code)] // Called only by the retained legacy delivery transitions above.
     async fn get_next_for_background_download_at(
         &self,
         now: DateTime,
@@ -3244,6 +3603,7 @@ impl Repo {
         Ok(updated)
     }
 
+    #[allow(dead_code)] // Legacy delivery lane retained for historical rows; workers use job claims.
     pub async fn mark_eh_background_download_downloaded(
         &self,
         id: i32,
@@ -3251,7 +3611,21 @@ impl Repo {
         zip_path: &str,
         gp_cost: i64,
     ) -> Result<eh_download_queue::Model> {
+        anyhow::ensure!(
+            file_size >= 0,
+            "EH background download file size must be non-negative"
+        );
         let now = Local::now().naive_local();
+        let txn = self
+            .db
+            .begin()
+            .await
+            .context("Failed to begin background EH completion transaction")?;
+        let claimed = eh_download_queue::Entity::find_by_id(id)
+            .one(&txn)
+            .await
+            .context("Failed to fetch claimed background EH download")?
+            .context("Background EH download disappeared before completion")?;
         let result = eh_download_queue::Entity::update_many()
             .col_expr(
                 eh_download_queue::Column::Status,
@@ -3297,22 +3671,48 @@ impl Repo {
             .filter(
                 eh_download_queue::Column::BackgroundDownloadStatus.eq(BACKGROUND_STATUS_RUNNING),
             )
-            .exec(&self.db)
+            .exec(&txn)
             .await
             .context("Failed to mark background EH download as downloaded")?;
 
         if result.rows_affected != 1 {
+            txn.rollback().await?;
             self.clear_background_download_if_inactive(id).await?;
             anyhow::bail!("Cannot mark background EH download {} as downloaded", id);
         }
 
         let model = eh_download_queue::Entity::find_by_id(id)
-            .one(&self.db)
+            .one(&txn)
             .await?
             .context("Entry disappeared after mark background downloaded")?;
+        if let Some(job_id) = claimed.job_id {
+            crate::db::repo::eh_download_completions::append_eh_download_completion_in_txn(
+                &txn,
+                job_id,
+                claimed.gid,
+                file_size,
+                now,
+            )
+            .await?;
+        } else {
+            crate::db::entities::eh_download_completions::ActiveModel {
+                job_id: Set(None),
+                gid: Set(claimed.gid),
+                file_size: Set(file_size),
+                created_at: Set(now),
+                ..Default::default()
+            }
+            .insert(&txn)
+            .await
+            .context("Failed to append legacy background EH download completion")?;
+        }
+        txn.commit()
+            .await
+            .context("Failed to commit background EH completion transaction")?;
         Ok(model)
     }
 
+    #[allow(dead_code)] // Legacy delivery lane retained for historical rows; workers use job claims.
     pub async fn schedule_eh_background_download_retry(
         &self,
         id: i32,
@@ -3407,8 +3807,12 @@ impl Repo {
         Ok((model, permanent))
     }
 
-    /// Delete ZIP/partial ZIP files in the cache dir that have no corresponding
-    /// active or retryable queue entry.
+    /// Delete cache artifact families which have no persisted shared-job owner.
+    ///
+    /// Delivery compatibility columns are deliberately excluded from the
+    /// keep-set: only a shared job owns its deterministic artifact family.
+    /// Families carrying remote multipart state are Abort-gated before every
+    /// local deletion and remain intact when that gate cannot be satisfied.
     pub async fn cleanup_eh_cache_orphans(
         &self,
         cache_dir: &std::path::Path,
@@ -3418,21 +3822,29 @@ impl Repo {
             return Ok(());
         }
 
-        let active_final_identities: HashSet<std::path::PathBuf> =
-            eh_download_queue::Entity::find()
-                .filter(eh_download_queue::Column::Status.is_in([
-                    STATUS_PENDING,
-                    STATUS_DOWNLOADING,
-                    STATUS_DOWNLOADED,
-                    STATUS_UPLOADING,
-                    STATUS_UPLOADED,
-                    STATUS_PUBLISHING,
-                ]))
-                .all(&self.db)
-                .await?
-                .into_iter()
-                .flat_map(|entry| expected_eh_cache_zip_paths(cache_dir, entry))
-                .collect();
+        let mut owned_final_zips: HashSet<std::path::PathBuf> = HashSet::new();
+        let job_artifacts = eh_gallery_jobs::Entity::find()
+            .filter(
+                eh_gallery_jobs::Column::Status
+                    .ne(crate::db::repo::eh_gallery_jobs::JOB_STATUS_RETIRED)
+                    .or(eh_gallery_jobs::Column::CleanupStatus
+                        .ne(crate::db::repo::eh_gallery_jobs::CLEANUP_STATUS_NONE)),
+            )
+            .all(&self.db)
+            .await
+            .context("Failed to fetch shared EH jobs for cache cleanup")?;
+        for job in job_artifacts {
+            if let Some(zip_path) = job.zip_path.as_deref() {
+                owned_final_zips.insert(std::path::PathBuf::from(zip_path));
+            }
+            if matches!(
+                job.status.as_str(),
+                crate::db::repo::eh_gallery_jobs::JOB_STATUS_PENDING
+                    | crate::db::repo::eh_gallery_jobs::JOB_STATUS_DOWNLOADING
+            ) {
+                owned_final_zips.insert(eh_gallery_job_artifact_path(cache_dir, &job));
+            }
+        }
 
         let mut artifact_families: HashMap<std::path::PathBuf, ArchiveArtifacts> = HashMap::new();
         for entry in std::fs::read_dir(cache_dir).context("Failed to read eh_cache dir")? {
@@ -3447,7 +3859,7 @@ impl Repo {
         }
 
         for (final_zip, artifacts) in artifact_families {
-            let result = if !active_final_identities.contains(&final_zip) {
+            let result = if !owned_final_zips.contains(&final_zip) {
                 if artifacts.uploads_dir().exists() {
                     let Some(uploader) = abort_uploader else {
                         warn!(
@@ -3467,8 +3879,6 @@ impl Repo {
                     }
                 }
                 artifacts.remove_all().await
-            } else if final_zip.exists() {
-                artifacts.remove_multipart_state().await
             } else {
                 continue;
             };
@@ -3481,26 +3891,19 @@ impl Repo {
     }
 }
 
-fn expected_eh_cache_zip_paths(
-    cache_dir: &std::path::Path,
-    entry: eh_download_queue::Model,
-) -> Vec<std::path::PathBuf> {
-    let mut paths = Vec::new();
-    if let Some(zip_path) = entry.zip_path {
-        paths.push(std::path::PathBuf::from(zip_path));
-    }
-    if matches!(entry.status.as_str(), STATUS_PENDING | STATUS_DOWNLOADING) {
-        paths.push(cache_dir.join(format!("{}_{}.zip", entry.gid, entry.token)));
-    }
-    paths
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::entities::eh_download_completions;
     use crate::db::entities::eh_download_queue::{Column, Entity};
+    use crate::db::entities::{eh_gallery_jobs, subscriptions};
+    use crate::db::repo::eh_gallery_jobs::{
+        EhGalleryVariant, CLEANUP_STATUS_FAILED, CLEANUP_STATUS_PENDING, JOB_STATUS_DOWNLOADED,
+        JOB_STATUS_DOWNLOADING, JOB_STATUS_PENDING, JOB_STATUS_RETIRED,
+    };
     use crate::db::repo::tests_helpers;
-    use chrono::{Duration, NaiveDate, Utc};
+    use crate::db::types::{TagFilter, TaskType};
+    use chrono::{Duration, NaiveDate};
     use sea_orm::{sea_query::Expr, ConnectionTrait, DbBackend, Statement};
 
     #[derive(Default)]
@@ -3534,24 +3937,518 @@ mod tests {
         }
     }
 
-    async fn set_download_claim_fields(
+    async fn job_for_delivery(
         repo: &Repo,
-        id: i32,
-        created_at: DateTime,
-        next_retry_at: Option<DateTime>,
-        background_download_status: Option<&str>,
-    ) {
-        Entity::update_many()
-            .col_expr(Column::CreatedAt, Expr::value(created_at))
-            .col_expr(Column::NextRetryAt, Expr::value(next_retry_at))
-            .col_expr(
-                Column::BackgroundDownloadStatus,
-                Expr::value(background_download_status.map(str::to_owned)),
+        delivery: &eh_download_queue::Model,
+    ) -> eh_gallery_jobs::Model {
+        eh_gallery_jobs::Entity::find_by_id(delivery.job_id.unwrap())
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    async fn seed_publishing_archive_delivery(
+        repo: &Repo,
+        gid: i64,
+    ) -> (eh_download_queue::Model, eh_gallery_jobs::Model) {
+        let delivery = repo
+            .enqueue_eh_download(
+                -100,
+                gid,
+                "terminal-transition",
+                "Terminal transition",
+                false,
+                SOURCE_DIRECT,
+                &EhGalleryVariant::archive("1280x"),
             )
-            .filter(Column::Id.eq(id))
-            .exec(&repo.db)
             .await
             .unwrap();
+        let download = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        repo.mark_eh_job_downloaded(
+            download.id,
+            download.started_at.unwrap(),
+            1,
+            "/tmp/terminal-transition.zip",
+            0,
+        )
+        .await
+        .unwrap();
+        let claim = repo
+            .get_next_eh_delivery_for_publish(true)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(claim.delivery.id, delivery.id);
+        (claim.delivery, claim.job)
+    }
+
+    async fn set_eh_job_claim_fields(
+        repo: &Repo,
+        job_id: i32,
+        created_at: DateTime,
+        next_retry_at: Option<DateTime>,
+    ) {
+        eh_gallery_jobs::Entity::update_many()
+            .col_expr(eh_gallery_jobs::Column::CreatedAt, Expr::value(created_at))
+            .col_expr(
+                eh_gallery_jobs::Column::NextRetryAt,
+                Expr::value(next_retry_at),
+            )
+            .filter(eh_gallery_jobs::Column::Id.eq(job_id))
+            .exec(repo.db())
+            .await
+            .unwrap();
+    }
+
+    async fn completion_count_for_job(repo: &Repo, job_id: i32) -> u64 {
+        eh_download_completions::Entity::find()
+            .filter(eh_download_completions::Column::JobId.eq(job_id))
+            .count(repo.db())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn chat_locks_serialize_same_chat_but_not_different_chats() {
+        let first = EH_CHAT_LOCKS.lock_chat(-100).await;
+        let blocked_same = tokio::spawn(async { EH_CHAT_LOCKS.lock_chat(-100).await });
+        let free_other = tokio::spawn(async { EH_CHAT_LOCKS.lock_chat(-200).await });
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), free_other)
+                .await
+                .is_ok()
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), blocked_same)
+                .await
+                .is_err()
+        );
+        drop(first);
+
+        let guards = EH_CHAT_LOCKS.lock_chats(&[-1, -3, -2, -1]).await;
+        assert_eq!(guards.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn chat_lock_drop_with_queued_waiter_never_splits_and_cleans_idle_key() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        let registry = Arc::new(EhChatLockRegistry::default());
+        let first = registry.lock_chat(-100).await;
+        let active = Arc::new(AtomicUsize::new(0));
+        let second_acquired = Arc::new(tokio::sync::Notify::new());
+        let release_second = Arc::new(tokio::sync::Notify::new());
+        let third_acquired = Arc::new(tokio::sync::Notify::new());
+
+        let second_registry = Arc::clone(&registry);
+        let second_active = Arc::clone(&active);
+        let second_acquired_signal = Arc::clone(&second_acquired);
+        let second_release = Arc::clone(&release_second);
+        let second = tokio::spawn(async move {
+            let _guard = second_registry.lock_chat(-100).await;
+            assert_eq!(second_active.fetch_add(1, Ordering::SeqCst), 0);
+            second_acquired_signal.notify_one();
+            second_release.notified().await;
+            assert_eq!(second_active.fetch_sub(1, Ordering::SeqCst), 1);
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let waiter_is_queued = registry
+                    .locks
+                    .lock()
+                    .unwrap()
+                    .get(&-100)
+                    .is_some_and(|mutex| mutex.strong_count() >= 3);
+                if waiter_is_queued {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("second caller should queue on the first mutex");
+
+        drop(first);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            second_acquired.notified(),
+        )
+        .await
+        .expect("queued caller should acquire after the current guard drops");
+
+        let third_registry = Arc::clone(&registry);
+        let third_active = Arc::clone(&active);
+        let third_acquired_signal = Arc::clone(&third_acquired);
+        let third = tokio::spawn(async move {
+            let _guard = third_registry.lock_chat(-100).await;
+            assert_eq!(third_active.fetch_add(1, Ordering::SeqCst), 0);
+            third_acquired_signal.notify_one();
+            assert_eq!(third_active.fetch_sub(1, Ordering::SeqCst), 1);
+        });
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                third_acquired.notified(),
+            )
+            .await
+            .is_err(),
+            "a third caller must wait for the queued caller's same-chat critical section"
+        );
+
+        release_second.notify_one();
+        second.await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), third_acquired.notified())
+            .await
+            .expect("third caller should acquire after the second caller releases");
+        third.await.unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if registry.locks.lock().unwrap().is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("idle chat lock should be removed from the registry");
+    }
+
+    #[tokio::test]
+    async fn cancel_one_shared_delivery_keeps_sibling_job_and_artifact_live() {
+        let repo = tests_helpers::setup_test_db().await.unwrap();
+        let variant = EhGalleryVariant::archive("1280x");
+        let canceled = repo
+            .enqueue_eh_subscription_download(-100, 123, 700, "tok", "Title", true, &variant)
+            .await
+            .unwrap();
+        let sibling = repo
+            .enqueue_eh_subscription_download(-200, 456, 700, "tok", "Title", false, &variant)
+            .await
+            .unwrap();
+        assert_eq!(canceled.job_id, sibling.job_id);
+
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let job = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        repo.mark_eh_job_downloaded(
+            job.id,
+            job.started_at.unwrap(),
+            1,
+            temp.path().to_str().unwrap(),
+            0,
+        )
+        .await
+        .unwrap();
+
+        repo.cancel_eh_subscription_queue_entries(123, true)
+            .await
+            .unwrap();
+
+        let canceled = Entity::find_by_id(canceled.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        let sibling = Entity::find_by_id(sibling.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        let job = eh_gallery_jobs::Entity::find_by_id(job.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(canceled.status, STATUS_CANCELED);
+        assert_eq!(sibling.status, STATUS_WAITING);
+        assert_ne!(job.status, JOB_STATUS_RETIRED);
+        assert_eq!(job.telegraph_required, sibling.telegraph);
+        assert!(temp.path().exists(), "liveness must not delete the ZIP");
+    }
+
+    #[tokio::test]
+    async fn cancellation_before_and_after_upload_claim_obeys_aggregate_boundary() {
+        let repo = tests_helpers::setup_test_db().await.unwrap();
+        let variant = EhGalleryVariant::archive("1280x");
+
+        let before = repo
+            .enqueue_eh_subscription_download(-100, 123, 701, "before", "Before", true, &variant)
+            .await
+            .unwrap();
+        let before_job = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        repo.mark_eh_job_downloaded(
+            before_job.id,
+            before_job.started_at.unwrap(),
+            1,
+            "/tmp/before.zip",
+            0,
+        )
+        .await
+        .unwrap();
+        repo.cancel_eh_subscription_queue_entries(123, true)
+            .await
+            .unwrap();
+        let before_job = eh_gallery_jobs::Entity::find_by_id(before.job_id.unwrap())
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            before_job.telegraph_status,
+            crate::db::repo::eh_gallery_jobs::TELEGRAPH_STATUS_NOT_REQUIRED
+        );
+
+        let after = repo
+            .enqueue_eh_subscription_download(-200, 456, 702, "after", "After", true, &variant)
+            .await
+            .unwrap();
+        let after_job = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        repo.mark_eh_job_downloaded(
+            after_job.id,
+            after_job.started_at.unwrap(),
+            1,
+            "/tmp/after.zip",
+            0,
+        )
+        .await
+        .unwrap();
+        eh_gallery_jobs::Entity::update_many()
+            .col_expr(
+                eh_gallery_jobs::Column::TelegraphStatus,
+                Expr::value(crate::db::repo::eh_gallery_jobs::TELEGRAPH_STATUS_UPLOADING),
+            )
+            .filter(eh_gallery_jobs::Column::Id.eq(after.job_id.unwrap()))
+            .exec(repo.db())
+            .await
+            .unwrap();
+        repo.cancel_eh_subscription_queue_entries(456, true)
+            .await
+            .unwrap();
+        let after_job = eh_gallery_jobs::Entity::find_by_id(after.job_id.unwrap())
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after_job.telegraph_status,
+            crate::db::repo::eh_gallery_jobs::TELEGRAPH_STATUS_UPLOADING
+        );
+    }
+
+    #[tokio::test]
+    async fn liveness_keeps_pending_rewrite_payload_without_scheduling_archive_cleanup() {
+        let repo = tests_helpers::setup_test_db().await.unwrap();
+        let delivery = repo
+            .enqueue_eh_subscription_download(
+                -100,
+                123,
+                703,
+                "rewrite",
+                "Rewrite",
+                false,
+                &EhGalleryVariant::archive("1280x"),
+            )
+            .await
+            .unwrap();
+        let job = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        repo.mark_eh_job_downloaded(job.id, job.started_at.unwrap(), 1, "/tmp/rewrite.zip", 0)
+            .await
+            .unwrap();
+        Entity::update_many()
+            .col_expr(Column::Status, Expr::value(STATUS_CANCELED))
+            .filter(Column::Id.eq(delivery.id))
+            .exec(repo.db())
+            .await
+            .unwrap();
+        eh_gallery_jobs::Entity::update_many()
+            .col_expr(
+                eh_gallery_jobs::Column::TelegraphRewriteData,
+                Expr::value(Some("payload".to_string())),
+            )
+            .col_expr(
+                eh_gallery_jobs::Column::TelegraphRewriteStatus,
+                Expr::value(Some(
+                    crate::db::repo::eh_gallery_jobs::TELEGRAPH_REWRITE_STATUS_PENDING.to_string(),
+                )),
+            )
+            .filter(eh_gallery_jobs::Column::Id.eq(job.id))
+            .exec(repo.db())
+            .await
+            .unwrap();
+
+        let decision = repo.evaluate_eh_job_liveness(job.id, true).await.unwrap();
+        let job = eh_gallery_jobs::Entity::find_by_id(job.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!decision.retire);
+        assert!(!decision.remove_archive_family);
+        assert!(decision.preserve_rewrite_payload);
+        assert_ne!(job.status, JOB_STATUS_RETIRED);
+        assert_eq!(job.cleanup_status, "none");
+        assert_eq!(job.telegraph_rewrite_data.as_deref(), Some("payload"));
+        assert_eq!(
+            job.telegraph_rewrite_status.as_deref(),
+            Some(crate::db::repo::eh_gallery_jobs::TELEGRAPH_REWRITE_STATUS_PENDING)
+        );
+        assert_eq!(job.zip_path.as_deref(), Some("/tmp/rewrite.zip"));
+    }
+
+    #[tokio::test]
+    async fn cancellation_rolls_back_owner_and_subscription_when_job_update_fails() {
+        let repo = tests_helpers::setup_test_db().await.unwrap();
+        let now = Local::now().naive_local();
+        repo.upsert_chat(-100, "private".to_string(), None, true, Default::default())
+            .await
+            .unwrap();
+        let task = crate::db::entities::tasks::ActiveModel {
+            r#type: Set(crate::db::types::TaskType::Ehentai),
+            value: Set("eh:transactional-cancel".to_string()),
+            author_name: Set(None),
+            next_poll_at: Set(now),
+            last_polled_at: Set(None),
+            ..Default::default()
+        }
+        .insert(repo.db())
+        .await
+        .unwrap();
+        let subscription = crate::db::entities::subscriptions::ActiveModel {
+            chat_id: Set(-100),
+            task_id: Set(task.id),
+            created_at: Set(now),
+            ..Default::default()
+        }
+        .insert(repo.db())
+        .await
+        .unwrap();
+        let delivery = repo
+            .enqueue_eh_subscription_download(
+                -100,
+                subscription.id,
+                704,
+                "transactional",
+                "Transactional",
+                true,
+                &EhGalleryVariant::archive("1280x"),
+            )
+            .await
+            .unwrap();
+        let job_before = eh_gallery_jobs::Entity::find_by_id(delivery.job_id.unwrap())
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+
+        repo.db()
+            .execute_unprepared(
+                "CREATE TRIGGER fail_eh_gallery_job_update \
+                 BEFORE UPDATE OF telegraph_required ON eh_gallery_jobs \
+                 BEGIN SELECT RAISE(ABORT, 'forced job update failure'); END",
+            )
+            .await
+            .unwrap();
+
+        assert!(repo
+            .cancel_eh_subscription_queue_entries(subscription.id, true)
+            .await
+            .is_err());
+        let after_standalone_failure = Entity::find_by_id(delivery.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        let job_after_standalone_failure = eh_gallery_jobs::Entity::find_by_id(job_before.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after_standalone_failure.subscription_ids,
+            delivery.subscription_ids
+        );
+        assert_eq!(after_standalone_failure.status, STATUS_WAITING);
+        assert_eq!(
+            job_after_standalone_failure.telegraph_required,
+            job_before.telegraph_required
+        );
+        assert_eq!(job_after_standalone_failure.status, job_before.status);
+        assert_eq!(
+            job_after_standalone_failure.cleanup_status,
+            job_before.cleanup_status
+        );
+        repo.db()
+            .execute_unprepared("DROP TRIGGER fail_eh_gallery_job_update")
+            .await
+            .unwrap();
+        repo.db()
+            .execute_unprepared(
+                "CREATE TRIGGER fail_eh_gallery_job_liveness \
+                 BEFORE UPDATE OF status ON eh_gallery_jobs \
+                 WHEN NEW.status = 'retired' \
+                 BEGIN SELECT RAISE(ABORT, 'forced liveness update failure'); END",
+            )
+            .await
+            .unwrap();
+
+        assert!(repo
+            .delete_eh_subscription_and_cancel_queue(subscription.id, true)
+            .await
+            .is_err());
+        assert!(repo.subscription_exists(subscription.id).await.unwrap());
+        let after_delete_failure = Entity::find_by_id(delivery.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after_delete_failure.subscription_ids,
+            delivery.subscription_ids
+        );
+        assert_eq!(after_delete_failure.status, STATUS_WAITING);
+        let job_after_delete_failure = eh_gallery_jobs::Entity::find_by_id(job_before.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            job_after_delete_failure.telegraph_required,
+            job_before.telegraph_required
+        );
+        assert_eq!(job_after_delete_failure.status, job_before.status);
+        assert_eq!(
+            job_after_delete_failure.cleanup_status,
+            job_before.cleanup_status
+        );
+
+        repo.db()
+            .execute_unprepared("DROP TRIGGER fail_eh_gallery_job_liveness")
+            .await
+            .unwrap();
+        repo.delete_eh_subscription_and_cancel_queue(subscription.id, true)
+            .await
+            .unwrap();
+        assert!(!repo.subscription_exists(subscription.id).await.unwrap());
+        let canceled = Entity::find_by_id(delivery.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        let retired = eh_gallery_jobs::Entity::find_by_id(job_before.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(canceled.status, STATUS_CANCELED);
+        assert_eq!(canceled.subscription_ids, None);
+        assert!(!retired.telegraph_required);
+        assert_eq!(retired.status, JOB_STATUS_RETIRED);
     }
 
     #[test]
@@ -3583,7 +4480,15 @@ mod tests {
     async fn test_subscription_enqueue_records_origin_subscription() {
         let repo = tests_helpers::setup_test_db().await.unwrap();
         let model = repo
-            .enqueue_eh_subscription_download(-100, 123, 40, "tok", "Title", false)
+            .enqueue_eh_subscription_download(
+                -100,
+                123,
+                40,
+                "tok",
+                "Title",
+                false,
+                &EhGalleryVariant::archive("1280x"),
+            )
             .await
             .unwrap();
 
@@ -3591,7 +4496,15 @@ mod tests {
         assert_eq!(model.subscription_ids.as_deref(), Some("123"));
 
         let direct = repo
-            .enqueue_eh_download(-100, 41, "tok", "Title", false, SOURCE_DIRECT)
+            .enqueue_eh_download(
+                -100,
+                41,
+                "tok",
+                "Title",
+                false,
+                SOURCE_DIRECT,
+                &EhGalleryVariant::archive("1280x"),
+            )
             .await
             .unwrap();
         assert_eq!(direct.subscription_ids, None);
@@ -3601,19 +4514,51 @@ mod tests {
     async fn test_cancel_subscription_queue_entries_cancels_only_active_subscription_rows() {
         let repo = tests_helpers::setup_test_db().await.unwrap();
         let sub_row = repo
-            .enqueue_eh_subscription_download(-100, 123, 40, "tok", "Title", false)
+            .enqueue_eh_subscription_download(
+                -100,
+                123,
+                40,
+                "tok",
+                "Title",
+                false,
+                &EhGalleryVariant::archive("1280x"),
+            )
             .await
             .unwrap();
         let other_sub_row = repo
-            .enqueue_eh_subscription_download(-100, 456, 41, "tok", "Title", false)
+            .enqueue_eh_subscription_download(
+                -100,
+                456,
+                41,
+                "tok",
+                "Title",
+                false,
+                &EhGalleryVariant::archive("1280x"),
+            )
             .await
             .unwrap();
         let direct_row = repo
-            .enqueue_eh_download(-100, 42, "tok", "Title", false, SOURCE_DIRECT)
+            .enqueue_eh_download(
+                -100,
+                42,
+                "tok",
+                "Title",
+                false,
+                SOURCE_DIRECT,
+                &EhGalleryVariant::archive("1280x"),
+            )
             .await
             .unwrap();
         let done_row = repo
-            .enqueue_eh_subscription_download(-100, 123, 43, "tok", "Title", false)
+            .enqueue_eh_subscription_download(
+                -100,
+                123,
+                43,
+                "tok",
+                "Title",
+                false,
+                &EhGalleryVariant::archive("1280x"),
+            )
             .await
             .unwrap();
         Entity::update_many()
@@ -3624,7 +4569,7 @@ mod tests {
             .unwrap();
 
         let changed = repo
-            .cancel_eh_subscription_queue_entries(123)
+            .cancel_eh_subscription_queue_entries(123, true)
             .await
             .unwrap();
         assert_eq!(changed, 2);
@@ -3658,18 +4603,34 @@ mod tests {
     async fn test_cancel_subscription_queue_entries_keeps_other_subscription_owners() {
         let repo = tests_helpers::setup_test_db().await.unwrap();
         let row = repo
-            .enqueue_eh_subscription_download(-100, 123, 44, "tok", "Title", false)
+            .enqueue_eh_subscription_download(
+                -100,
+                123,
+                44,
+                "tok",
+                "Title",
+                false,
+                &EhGalleryVariant::archive("1280x"),
+            )
             .await
             .unwrap();
         let merged = repo
-            .enqueue_eh_subscription_download(-100, 456, 44, "tok2", "Title 2", false)
+            .enqueue_eh_subscription_download(
+                -100,
+                456,
+                44,
+                "tok2",
+                "Title 2",
+                false,
+                &EhGalleryVariant::archive("1280x"),
+            )
             .await
             .unwrap();
         assert_eq!(merged.id, row.id);
         assert_eq!(merged.subscription_ids.as_deref(), Some("123,456"));
 
         let changed = repo
-            .cancel_eh_subscription_queue_entries(123)
+            .cancel_eh_subscription_queue_entries(123, true)
             .await
             .unwrap();
         assert_eq!(changed, 1);
@@ -3678,11 +4639,11 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(remaining.status, STATUS_PENDING);
+        assert_eq!(remaining.status, STATUS_WAITING);
         assert_eq!(remaining.subscription_ids.as_deref(), Some("456"));
 
         let changed = repo
-            .cancel_eh_subscription_queue_entries(456)
+            .cancel_eh_subscription_queue_entries(456, true)
             .await
             .unwrap();
         assert_eq!(changed, 1);
@@ -3699,11 +4660,27 @@ mod tests {
     async fn test_cancel_subscription_queue_entries_removes_stale_telegraph_requirement() {
         let repo = tests_helpers::setup_test_db().await.unwrap();
         let telegraph_owner = repo
-            .enqueue_eh_subscription_download(-100, 123, 52, "tok", "Title", true)
+            .enqueue_eh_subscription_download(
+                -100,
+                123,
+                52,
+                "tok",
+                "Title",
+                true,
+                &EhGalleryVariant::archive("1280x"),
+            )
             .await
             .unwrap();
         let merged = repo
-            .enqueue_eh_subscription_download(-100, 456, 52, "tok2", "Title 2", false)
+            .enqueue_eh_subscription_download(
+                -100,
+                456,
+                52,
+                "tok2",
+                "Title 2",
+                false,
+                &EhGalleryVariant::archive("1280x"),
+            )
             .await
             .unwrap();
         assert_eq!(merged.id, telegraph_owner.id);
@@ -3723,7 +4700,7 @@ mod tests {
             .unwrap();
 
         let changed = repo
-            .cancel_eh_subscription_queue_entries(123)
+            .cancel_eh_subscription_queue_entries(123, true)
             .await
             .unwrap();
         assert_eq!(changed, 1);
@@ -3732,21 +4709,40 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(row.status, STATUS_PENDING);
+        assert_eq!(row.status, STATUS_WAITING);
         assert_eq!(row.subscription_ids.as_deref(), Some("456"));
         assert_eq!(row.telegraph_subscription_ids, None);
         assert!(!row.telegraph);
-        assert!(row.next_retry_at.is_none());
+        assert!(
+            row.next_retry_at.is_some(),
+            "owner removal must not erase delivery retry state"
+        );
     }
 
     #[tokio::test]
     async fn test_cancel_subscription_queue_entries_preserves_concurrent_telegraph_upgrade() {
         let repo = tests_helpers::setup_test_db().await.unwrap();
-        repo.enqueue_eh_subscription_download(-100, 123, 54, "tok", "Title", false)
-            .await
-            .unwrap();
+        repo.enqueue_eh_subscription_download(
+            -100,
+            123,
+            54,
+            "tok",
+            "Title",
+            false,
+            &EhGalleryVariant::archive("1280x"),
+        )
+        .await
+        .unwrap();
         let stale = repo
-            .enqueue_eh_subscription_download(-100, 456, 54, "tok2", "Title 2", false)
+            .enqueue_eh_subscription_download(
+                -100,
+                456,
+                54,
+                "tok2",
+                "Title 2",
+                false,
+                &EhGalleryVariant::archive("1280x"),
+            )
             .await
             .unwrap();
         assert_eq!(stale.subscription_ids.as_deref(), Some("123,456"));
@@ -3764,10 +4760,12 @@ mod tests {
             .unwrap();
 
         let row_id = stale.id;
+        let txn = repo.db.begin().await.unwrap();
         let changed = repo
-            .remove_subscription_owner_from_eh_row(stale, 123)
+            .remove_subscription_owner_from_eh_row_in_txn(&txn, stale, 123)
             .await
             .unwrap();
+        txn.commit().await.unwrap();
         assert_eq!(changed, 1);
         let row = Entity::find_by_id(row_id)
             .one(&repo.db)
@@ -3783,7 +4781,15 @@ mod tests {
     async fn test_cancel_subscription_queue_entries_scrubs_terminal_telegraph_owner() {
         let repo = tests_helpers::setup_test_db().await.unwrap();
         let row = repo
-            .enqueue_eh_subscription_download(-100, 123, 53, "tok", "Title", true)
+            .enqueue_eh_subscription_download(
+                -100,
+                123,
+                53,
+                "tok",
+                "Title",
+                true,
+                &EhGalleryVariant::archive("1280x"),
+            )
             .await
             .unwrap();
         Entity::update_many()
@@ -3798,7 +4804,7 @@ mod tests {
             .unwrap();
 
         let changed = repo
-            .cancel_eh_subscription_queue_entries(123)
+            .cancel_eh_subscription_queue_entries(123, true)
             .await
             .unwrap();
         assert_eq!(changed, 1);
@@ -3811,13 +4817,25 @@ mod tests {
         assert_eq!(scrubbed.subscription_ids, None);
         assert_eq!(scrubbed.telegraph_subscription_ids, None);
         assert!(!scrubbed.telegraph);
-        assert!(scrubbed.telegraph_url.is_none());
+        assert_eq!(
+            scrubbed.telegraph_url.as_deref(),
+            Some("https://telegra.ph/old"),
+            "owner removal must not erase delivery state owned by later job migration tasks"
+        );
 
         let reenqueued = repo
-            .enqueue_eh_download(-100, 53, "new", "New", false, SOURCE_DIRECT)
+            .enqueue_eh_download(
+                -100,
+                53,
+                "new",
+                "New",
+                false,
+                SOURCE_DIRECT,
+                &EhGalleryVariant::archive("1280x"),
+            )
             .await
             .unwrap();
-        assert_eq!(reenqueued.status, STATUS_PENDING);
+        assert_eq!(reenqueued.status, STATUS_WAITING);
         assert!(!reenqueued.telegraph);
     }
 
@@ -3825,7 +4843,15 @@ mod tests {
     async fn test_merge_preserves_concurrent_subscription_owner_updates() {
         let repo = tests_helpers::setup_test_db().await.unwrap();
         let row = repo
-            .enqueue_eh_subscription_download(-100, 123, 45, "tok", "Title", false)
+            .enqueue_eh_subscription_download(
+                -100,
+                123,
+                45,
+                "tok",
+                "Title",
+                false,
+                &EhGalleryVariant::archive("1280x"),
+            )
             .await
             .unwrap();
 
@@ -3913,7 +4939,7 @@ mod tests {
 
         let row_id = row.id;
         let active = repo
-            .eh_download_has_live_owner_or_cancel(row, STATUS_PUBLISHING)
+            .eh_download_has_live_owner_or_cancel(row.id, STATUS_PUBLISHING, true)
             .await
             .unwrap();
         assert!(active, "fresh live owner should prevent soft cancel");
@@ -3952,7 +4978,7 @@ mod tests {
         let row_id = row.id;
 
         let active = repo
-            .eh_download_has_live_owner_or_cancel(row, STATUS_PUBLISHING)
+            .eh_download_has_live_owner_or_cancel(row.id, STATUS_PUBLISHING, true)
             .await
             .unwrap();
         assert!(!active, "missing owner should make row inactive");
@@ -4094,78 +5120,197 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_reenqueue_during_downloading_blocks_stale_download_completion() {
+    async fn test_reenqueue_during_downloading_settles_unbound_completion_for_cleanup() {
         let repo = tests_helpers::setup_test_db().await.unwrap();
-        let model = repo
-            .enqueue_eh_download(-100, 40, "tok", "Title", false, SOURCE_SUBSCRIPTION)
+        let delivery = repo
+            .enqueue_eh_download(
+                -100,
+                40,
+                "tok",
+                "Title",
+                false,
+                SOURCE_SUBSCRIPTION,
+                &EhGalleryVariant::archive("1280x"),
+            )
             .await
             .unwrap();
 
-        // Claim for download (status -> downloading)
-        let claimed = repo.get_next_for_download().await.unwrap().unwrap();
-        assert_eq!(claimed.id, model.id);
-        assert_eq!(claimed.status, STATUS_DOWNLOADING);
+        let claimed = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        let claimed_started_at = claimed.started_at.unwrap();
+        assert_eq!(claimed.id, delivery.job_id.unwrap());
+        assert_eq!(claimed.status, JOB_STATUS_DOWNLOADING);
 
-        // Re-enqueue with source upgrade causes full reset (status -> pending)
-        let reset = repo
-            .enqueue_eh_download(-100, 40, "new", "New", false, SOURCE_DIRECT)
+        // The updated token creates the next canonical job generation and
+        // rebinds the delivery away from the claimed job.
+        let rebound = repo
+            .enqueue_eh_download(
+                -100,
+                40,
+                "new",
+                "New",
+                false,
+                SOURCE_DIRECT,
+                &EhGalleryVariant::archive("1280x"),
+            )
             .await
             .unwrap();
-        assert_eq!(reset.id, model.id);
-        assert_eq!(reset.status, STATUS_PENDING);
+        assert_eq!(rebound.id, delivery.id);
+        assert_eq!(rebound.status, STATUS_WAITING);
+        let replacement_job = job_for_delivery(&repo, &rebound).await;
+        assert_ne!(replacement_job.id, claimed.id);
+        assert_eq!(replacement_job.status, JOB_STATUS_PENDING);
 
-        // Stale worker tries to mark the old claimed row as downloaded — must fail
-        let err = repo
-            .mark_eh_download_downloaded(claimed.id, 9999, "/tmp/40.zip", 0)
-            .await;
-        assert!(
-            err.is_err(),
-            "stale downloaded completion should be blocked"
+        // The claimed worker may finish after its last consumer rebounded. Its
+        // real completion is retained for the owned family and scheduled for
+        // cleanup; it must never alter the replacement job.
+        let settled = repo
+            .mark_eh_job_downloaded(claimed.id, claimed_started_at, 9999, "/tmp/40.zip", 0)
+            .await
+            .unwrap();
+        assert_eq!(settled.status, JOB_STATUS_RETIRED);
+        assert_eq!(settled.cleanup_status, CLEANUP_STATUS_PENDING);
+        assert_eq!(completion_count_for_job(&repo, claimed.id).await, 1);
+        assert_eq!(
+            job_for_delivery(&repo, &rebound).await.status,
+            JOB_STATUS_PENDING
         );
-
-        // Verify final state is still pending, not overwritten
-        let final_row = Entity::find_by_id(model.id)
-            .one(&repo.db)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(final_row.status, STATUS_PENDING);
-        assert_ne!(final_row.file_size, 9999);
     }
 
     #[tokio::test]
-    async fn test_publish_claim_requires_telegraph_false_for_downloaded() {
+    async fn test_publish_claim_waits_for_required_telegraph_readiness() {
         let repo = tests_helpers::setup_test_db().await.unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let zip_path = temp.path().join("45.zip");
+        std::fs::write(&zip_path, b"zip").unwrap();
         let model = repo
-            .enqueue_eh_download(-100, 45, "tok", "Title", false, SOURCE_DIRECT)
+            .enqueue_eh_download(
+                -100,
+                45,
+                "tok",
+                "Title",
+                false,
+                SOURCE_DIRECT,
+                &EhGalleryVariant::archive("1280x"),
+            )
             .await
             .unwrap();
 
-        // Download stage: claim -> downloading -> downloaded
-        let claimed = repo.get_next_for_download().await.unwrap().unwrap();
-        assert_eq!(claimed.id, model.id);
-        repo.mark_eh_download_downloaded(model.id, 5000, "/tmp/45.zip", 0)
-            .await
-            .unwrap();
+        let claimed = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        assert_eq!(claimed.id, model.job_id.unwrap());
+        repo.mark_eh_job_downloaded(
+            claimed.id,
+            claimed.started_at.unwrap(),
+            3,
+            zip_path.to_str().unwrap(),
+            0,
+        )
+        .await
+        .unwrap();
 
-        // Row is now downloaded, telegraph=false — publish should claim it
-        let pub_claimed = repo.get_next_for_publish().await.unwrap().unwrap();
-        assert_eq!(pub_claimed.id, model.id);
-        assert_eq!(pub_claimed.status, STATUS_PUBLISHING);
-        // Reset back to downloaded for the next check
+        let publish_claim = repo
+            .get_next_eh_delivery_for_publish(true)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(publish_claim.delivery.id, model.id);
+        repo.defer_eh_delivery_publish(model.id, 1).await.unwrap();
+
+        // A delivery that now needs Telegraph is not claimable until the shared
+        // Telegraph page is ready, even though its archive remains downloaded.
         Entity::update_many()
-            .col_expr(Column::Status, Expr::value(STATUS_DOWNLOADED))
+            .col_expr(Column::Status, Expr::value(STATUS_WAITING))
             .col_expr(Column::Telegraph, Expr::value(true))
+            .col_expr(Column::NextRetryAt, Expr::value(None::<DateTime>))
             .filter(Column::Id.eq(model.id))
             .exec(&repo.db)
             .await
             .unwrap();
+        eh_gallery_jobs::Entity::update_many()
+            .col_expr(
+                eh_gallery_jobs::Column::TelegraphRequired,
+                Expr::value(true),
+            )
+            .col_expr(
+                eh_gallery_jobs::Column::TelegraphStatus,
+                Expr::value(crate::db::repo::eh_gallery_jobs::TELEGRAPH_STATUS_PENDING),
+            )
+            .filter(eh_gallery_jobs::Column::Id.eq(model.job_id.unwrap()))
+            .exec(repo.db())
+            .await
+            .unwrap();
 
-        // Now row is downloaded, telegraph=true — publish should NOT claim it
-        let none = repo.get_next_for_publish().await.unwrap();
+        let none = repo.get_next_eh_delivery_for_publish(true).await.unwrap();
         assert!(
             none.is_none(),
-            "publish should not claim downloaded row with telegraph=true"
+            "publish must not claim a Telegraph delivery before its shared page is ready"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dirty_cleanup_job_cannot_be_claimed_or_reread_for_publish() {
+        let repo = tests_helpers::setup_test_db().await.unwrap();
+        let delivery = repo
+            .enqueue_eh_download(
+                -100,
+                46,
+                "tok",
+                "Title",
+                true,
+                SOURCE_DIRECT,
+                &EhGalleryVariant::archive("1280x"),
+            )
+            .await
+            .unwrap();
+        let download = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        repo.mark_eh_job_downloaded(
+            download.id,
+            download.started_at.unwrap(),
+            3,
+            "dirty-cleanup.zip",
+            0,
+        )
+        .await
+        .unwrap();
+        let upload = repo.get_next_eh_job_for_upload().await.unwrap().unwrap();
+        repo.mark_eh_job_telegraph_ready(
+            upload.id,
+            upload.started_at.unwrap(),
+            "https://telegra.ph/ready",
+            Some("payload"),
+            false,
+        )
+        .await
+        .unwrap();
+        eh_gallery_jobs::Entity::update_many()
+            .col_expr(
+                eh_gallery_jobs::Column::CleanupStatus,
+                Expr::value(CLEANUP_STATUS_PENDING),
+            )
+            .filter(eh_gallery_jobs::Column::Id.eq(download.id))
+            .exec(repo.db())
+            .await
+            .unwrap();
+
+        assert!(
+            repo.get_next_eh_delivery_for_publish(false)
+                .await
+                .unwrap()
+                .is_none(),
+            "dirty cleanup must block publish claims even with a ready Telegraph URL"
+        );
+
+        Entity::update_many()
+            .col_expr(Column::Status, Expr::value(STATUS_PUBLISHING))
+            .filter(Column::Id.eq(delivery.id))
+            .exec(repo.db())
+            .await
+            .unwrap();
+        assert!(
+            repo.get_eh_delivery_publish_claim(delivery.id)
+                .await
+                .unwrap()
+                .is_none(),
+            "dirty cleanup must also reject a claimed delivery reread"
         );
     }
 
@@ -4173,7 +5318,15 @@ mod tests {
     async fn test_marker_methods_require_publishing_status() {
         let repo = tests_helpers::setup_test_db().await.unwrap();
         let model = repo
-            .enqueue_eh_download(-100, 50, "tok", "Title", false, SOURCE_DIRECT)
+            .enqueue_eh_download(
+                -100,
+                50,
+                "tok",
+                "Title",
+                false,
+                SOURCE_DIRECT,
+                &EhGalleryVariant::archive("1280x"),
+            )
             .await
             .unwrap();
 
@@ -4208,7 +5361,15 @@ mod tests {
     async fn test_defer_rejects_invalid_status_transition() {
         let repo = tests_helpers::setup_test_db().await.unwrap();
         let model = repo
-            .enqueue_eh_download(-100, 55, "tok", "Title", false, SOURCE_DIRECT)
+            .enqueue_eh_download(
+                -100,
+                55,
+                "tok",
+                "Title",
+                false,
+                SOURCE_DIRECT,
+                &EhGalleryVariant::archive("1280x"),
+            )
             .await
             .unwrap();
 
@@ -4237,7 +5398,15 @@ mod tests {
     async fn test_defer_eh_upload_after_abort_failure_only_accepts_uploading() {
         let repo = tests_helpers::setup_test_db().await.unwrap();
         let uploading = repo
-            .enqueue_eh_download(-100, 56, "uploading", "Title", true, SOURCE_DIRECT)
+            .enqueue_eh_download(
+                -100,
+                56,
+                "uploading",
+                "Title",
+                true,
+                SOURCE_DIRECT,
+                &EhGalleryVariant::archive("1280x"),
+            )
             .await
             .unwrap();
         Entity::update_many()
@@ -4260,7 +5429,15 @@ mod tests {
         assert!(uploading.next_retry_at.is_some());
 
         let publishing = repo
-            .enqueue_eh_download(-100, 57, "publishing", "Title", false, SOURCE_DIRECT)
+            .enqueue_eh_download(
+                -100,
+                57,
+                "publishing",
+                "Title",
+                false,
+                SOURCE_DIRECT,
+                &EhGalleryVariant::archive("1280x"),
+            )
             .await
             .unwrap();
         Entity::update_many()
@@ -4287,7 +5464,15 @@ mod tests {
     async fn test_defer_eh_publish_after_abort_failure_only_accepts_publishing_targets() {
         let repo = tests_helpers::setup_test_db().await.unwrap();
         let downloaded = repo
-            .enqueue_eh_download(-100, 58, "downloaded", "Title", false, SOURCE_DIRECT)
+            .enqueue_eh_download(
+                -100,
+                58,
+                "downloaded",
+                "Title",
+                false,
+                SOURCE_DIRECT,
+                &EhGalleryVariant::archive("1280x"),
+            )
             .await
             .unwrap();
         Entity::update_many()
@@ -4315,7 +5500,15 @@ mod tests {
         assert!(downloaded.next_retry_at.is_some());
 
         let uploaded = repo
-            .enqueue_eh_download(-100, 59, "uploaded", "Title", true, SOURCE_DIRECT)
+            .enqueue_eh_download(
+                -100,
+                59,
+                "uploaded",
+                "Title",
+                true,
+                SOURCE_DIRECT,
+                &EhGalleryVariant::archive("1280x"),
+            )
             .await
             .unwrap();
         Entity::update_many()
@@ -4336,7 +5529,15 @@ mod tests {
         assert_eq!(uploaded.retry_count, 0);
 
         let uploading = repo
-            .enqueue_eh_download(-100, 60, "uploading", "Title", false, SOURCE_DIRECT)
+            .enqueue_eh_download(
+                -100,
+                60,
+                "uploading",
+                "Title",
+                false,
+                SOURCE_DIRECT,
+                &EhGalleryVariant::archive("1280x"),
+            )
             .await
             .unwrap();
         Entity::update_many()
@@ -4368,11 +5569,27 @@ mod tests {
     async fn test_enqueue_merges_telegraph_and_direct_source() {
         let repo = tests_helpers::setup_test_db().await.unwrap();
         let first = repo
-            .enqueue_eh_download(-100, 10, "old", "Old", false, SOURCE_SUBSCRIPTION)
+            .enqueue_eh_download(
+                -100,
+                10,
+                "old",
+                "Old",
+                false,
+                SOURCE_SUBSCRIPTION,
+                &EhGalleryVariant::archive("1280x"),
+            )
             .await
             .unwrap();
         let merged = repo
-            .enqueue_eh_download(-100, 10, "new", "New", true, SOURCE_DIRECT)
+            .enqueue_eh_download(
+                -100,
+                10,
+                "new",
+                "New",
+                true,
+                SOURCE_DIRECT,
+                &EhGalleryVariant::archive("1280x"),
+            )
             .await
             .unwrap();
 
@@ -4394,15 +5611,32 @@ mod tests {
             (5, STATUS_DONE, 500),
             (6, STATUS_FAILED, 600),
         ] {
-            let model = repo
-                .enqueue_eh_download(-100, gid, "tok", "Title", false, SOURCE_DIRECT)
+            let delivery = repo
+                .enqueue_eh_download(
+                    -100,
+                    gid,
+                    "tok",
+                    "Title",
+                    false,
+                    SOURCE_DIRECT,
+                    &EhGalleryVariant::archive("1280x"),
+                )
                 .await
                 .unwrap();
+            let job = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+            assert_eq!(job.id, delivery.job_id.unwrap());
+            repo.mark_eh_job_downloaded(
+                job.id,
+                job.started_at.unwrap(),
+                size,
+                &format!("/tmp/{gid}.zip"),
+                0,
+            )
+            .await
+            .unwrap();
             Entity::update_many()
                 .col_expr(Column::Status, Expr::value(status))
-                .col_expr(Column::FileSize, Expr::value(size))
-                .col_expr(Column::CompletedAt, Expr::value(Utc::now().naive_utc()))
-                .filter(Column::Id.eq(model.id))
+                .filter(Column::Id.eq(delivery.id))
                 .exec(&repo.db)
                 .await
                 .unwrap();
@@ -4448,14 +5682,28 @@ mod tests {
         std::fs::write(&unrelated, b"keep").unwrap();
 
         let model = repo
-            .enqueue_eh_download(-100, 77, "tok", "Title", false, SOURCE_DIRECT)
+            .enqueue_eh_download(
+                -100,
+                77,
+                "tok",
+                "Title",
+                false,
+                SOURCE_DIRECT,
+                &EhGalleryVariant::archive("1280x"),
+            )
             .await
             .unwrap();
-        let claimed = repo.get_next_for_download().await.unwrap().unwrap();
-        assert_eq!(claimed.id, model.id);
-        repo.mark_eh_download_downloaded(model.id, 5000, active_zip.to_str().unwrap(), 0)
-            .await
-            .unwrap();
+        let claimed = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        assert_eq!(claimed.id, model.job_id.unwrap());
+        repo.mark_eh_job_downloaded(
+            claimed.id,
+            claimed.started_at.unwrap(),
+            5000,
+            active_zip.to_str().unwrap(),
+            0,
+        )
+        .await
+        .unwrap();
 
         let uploader = RecordingAbortUploader::default();
         repo.cleanup_eh_cache_orphans(cache_dir, Some(&uploader))
@@ -4483,12 +5731,12 @@ mod tests {
         );
         assert!(active_zip.exists(), "active final ZIP should be kept");
         assert!(
-            !active_part.exists(),
-            "active final ZIP should discard stale assembly scratch"
+            active_part.exists(),
+            "a persisted shared-job owner keeps its entire artifact family"
         );
         assert!(
-            !active_parts.exists(),
-            "active final ZIP should discard stale multipart state"
+            active_parts.exists(),
+            "a persisted shared-job owner keeps its assembly state"
         );
         assert!(
             active_uploads.join("archive.json").exists()
@@ -4508,15 +5756,24 @@ mod tests {
         let cache_dir = temp.path();
 
         let model = repo
-            .enqueue_eh_download(-100, 88, "tok", "Title", false, SOURCE_DIRECT)
+            .enqueue_eh_download(
+                -100,
+                88,
+                "tok",
+                "Title",
+                false,
+                SOURCE_DIRECT,
+                &EhGalleryVariant::archive("1280x"),
+            )
             .await
             .unwrap();
-        let claimed = repo.get_next_for_download().await.unwrap().unwrap();
-        assert_eq!(claimed.id, model.id);
+        let claimed = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        assert_eq!(claimed.id, model.job_id.unwrap());
 
-        let part = cache_dir.join("88_tok.zip.part");
-        let parts_dir = cache_dir.join("88_tok.zip.parts");
-        let uploads_dir = cache_dir.join("88_tok.zip.uploads");
+        let artifacts = ArchiveArtifacts::new(eh_gallery_job_artifact_path(cache_dir, &claimed));
+        let part = artifacts.assembly_scratch().to_path_buf();
+        let parts_dir = artifacts.parts_dir().to_path_buf();
+        let uploads_dir = artifacts.uploads_dir().to_path_buf();
         std::fs::write(&part, b"partial").unwrap();
         std::fs::create_dir_all(parts_dir.join("nested")).unwrap();
         std::fs::write(parts_dir.join("manifest.json"), b"manifest").unwrap();
@@ -4525,8 +5782,8 @@ mod tests {
         std::fs::write(uploads_dir.join("archive.json"), b"archive").unwrap();
         std::fs::write(uploads_dir.join("nested").join("image-0.json"), b"image").unwrap();
 
-        let reset = repo.reset_stale_eh_downloads().await.unwrap();
-        assert_eq!(reset, 1);
+        let reset = repo.reset_stale_eh_shared_work(60, 60).await.unwrap();
+        assert_eq!(reset.downloads, 1);
         let uploader = RecordingAbortUploader::default();
         repo.cleanup_eh_cache_orphans(cache_dir, Some(&uploader))
             .await
@@ -4549,32 +5806,41 @@ mod tests {
             "pending retry upload state should be kept for resumable upload"
         );
 
+        let retry = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        std::fs::write(artifacts.final_zip(), b"zip").unwrap();
+        repo.mark_eh_job_downloaded(
+            retry.id,
+            retry.started_at.unwrap(),
+            3,
+            &artifacts.final_zip().to_string_lossy(),
+            0,
+        )
+        .await
+        .unwrap();
         Entity::update_many()
             .col_expr(Column::Status, Expr::value(STATUS_CANCELED))
             .filter(Column::Id.eq(model.id))
             .exec(&repo.db)
             .await
             .unwrap();
+        repo.evaluate_eh_job_liveness(model.job_id.unwrap(), true)
+            .await
+            .unwrap();
 
         repo.cleanup_eh_cache_orphans(cache_dir, Some(&uploader))
             .await
             .unwrap();
-        assert_eq!(
-            *uploader.aborts.lock().unwrap(),
-            vec![(uploads_dir.clone(), true)],
-            "canceled state must be aborted before terminal deletion"
+        assert!(
+            part.exists(),
+            "dirty retired job state belongs to its durable cleanup generation"
         );
         assert!(
-            !part.exists(),
-            "canceled queue partial should be removed as orphan"
+            parts_dir.exists(),
+            "orphan cleanup must not race durable cleanup ownership"
         );
         assert!(
-            !parts_dir.exists(),
-            "canceled queue multipart state should be removed recursively"
-        );
-        assert!(
-            !uploads_dir.exists(),
-            "canceled queue upload state should be removed recursively"
+            uploads_dir.exists(),
+            "durable cleanup performs the required Abort before local removal"
         );
     }
 
@@ -4659,129 +5925,206 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_publish_markers_survive_stale_reset_and_clear_on_terminal_reset() {
+    async fn orphan_cleanup_uses_active_job_paths_and_never_crosses_variants() {
+        let repo = tests_helpers::setup_test_db().await.unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let cache_dir = temp.path();
+        let first = repo
+            .enqueue_eh_download(
+                -100,
+                89,
+                "variants",
+                "First",
+                false,
+                SOURCE_DIRECT,
+                &EhGalleryVariant::archive("1280x"),
+            )
+            .await
+            .unwrap();
+        let second = repo
+            .enqueue_eh_download(
+                -200,
+                89,
+                "variants",
+                "Second",
+                false,
+                SOURCE_DIRECT,
+                &EhGalleryVariant::archive("original"),
+            )
+            .await
+            .unwrap();
+        let first_job = job_for_delivery(&repo, &first).await;
+        let second_job = job_for_delivery(&repo, &second).await;
+        let first_artifacts =
+            ArchiveArtifacts::new(eh_gallery_job_artifact_path(cache_dir, &first_job));
+        let second_artifacts =
+            ArchiveArtifacts::new(eh_gallery_job_artifact_path(cache_dir, &second_job));
+        assert_ne!(first_artifacts.final_zip(), second_artifacts.final_zip());
+        for artifacts in [&first_artifacts, &second_artifacts] {
+            std::fs::write(artifacts.final_zip(), b"zip").unwrap();
+            std::fs::create_dir_all(artifacts.uploads_dir()).unwrap();
+            std::fs::write(artifacts.uploads_dir().join("archive.json"), b"state").unwrap();
+        }
+        let orphan = ArchiveArtifacts::new(cache_dir.join("orphan.zip"));
+        std::fs::write(orphan.final_zip(), b"zip").unwrap();
+        std::fs::create_dir_all(orphan.uploads_dir()).unwrap();
+        std::fs::write(orphan.uploads_dir().join("archive.json"), b"state").unwrap();
+        let uploader = RecordingAbortUploader::default();
+
+        repo.cleanup_eh_cache_orphans(cache_dir, Some(&uploader))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            *uploader.aborts.lock().unwrap(),
+            vec![(orphan.uploads_dir().to_path_buf(), true)]
+        );
+        for artifacts in [&first_artifacts, &second_artifacts] {
+            assert!(artifacts.final_zip().exists());
+            assert!(artifacts.uploads_dir().join("archive.json").exists());
+        }
+        assert!(!orphan.final_zip().exists());
+        assert!(!orphan.uploads_dir().exists());
+    }
+
+    #[tokio::test]
+    async fn test_publish_markers_survive_delivery_retry_and_marker_safe_reenqueue() {
         let repo = tests_helpers::setup_test_db().await.unwrap();
         let model = repo
-            .enqueue_eh_download(-100, 20, "tok", "Title", false, SOURCE_DIRECT)
+            .enqueue_eh_download(
+                -100,
+                20,
+                "tok",
+                "Title",
+                true,
+                SOURCE_DIRECT,
+                &EhGalleryVariant::archive("1280x"),
+            )
             .await
             .unwrap();
 
-        // Move to publishing via the normal pipeline so CAS guards pass.
-        // download: claim -> downloading -> downloaded
-        let claimed = repo.get_next_for_download().await.unwrap().unwrap();
-        assert_eq!(claimed.id, model.id);
-        repo.mark_eh_download_downloaded(model.id, 5000, "/tmp/20.zip", 0)
-            .await
-            .unwrap();
-
-        // Simulate upload: set telegraph_url so publish claims from uploaded branch
-        Entity::update_many()
+        let claimed = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        repo.mark_eh_job_downloaded(
+            claimed.id,
+            claimed.started_at.unwrap(),
+            5000,
+            "/tmp/20.zip",
+            0,
+        )
+        .await
+        .unwrap();
+        eh_gallery_jobs::Entity::update_many()
             .col_expr(
-                Column::TelegraphUrl,
+                eh_gallery_jobs::Column::TelegraphUrl,
                 Expr::value(Some("https://telegra.ph/20".to_string())),
             )
-            .col_expr(Column::Status, Expr::value(STATUS_UPLOADED))
-            .filter(Column::Id.eq(model.id))
-            .exec(&repo.db)
+            .col_expr(
+                eh_gallery_jobs::Column::TelegraphStatus,
+                Expr::value(crate::db::repo::eh_gallery_jobs::TELEGRAPH_STATUS_READY),
+            )
+            .col_expr(
+                eh_gallery_jobs::Column::TelegraphRequired,
+                Expr::value(true),
+            )
+            .filter(eh_gallery_jobs::Column::Id.eq(model.job_id.unwrap()))
+            .exec(repo.db())
             .await
             .unwrap();
 
-        // Claim for publish -> publishing
-        let pub_claimed = repo.get_next_for_publish().await.unwrap().unwrap();
-        assert_eq!(pub_claimed.id, model.id);
-        assert_eq!(pub_claimed.status, STATUS_PUBLISHING);
-
-        // Mark archive and telegraph sent while publishing
-        repo.mark_eh_archive_sent(model.id).await.unwrap();
-        repo.mark_eh_telegraph_sent(model.id).await.unwrap();
-
-        // Defer back to publishing (simulates stale worker)
-        repo.defer_eh_download(model.id, STATUS_UPLOADED, 60)
-            .await
-            .unwrap();
-        // Move back to publishing manually for reset
-        Entity::update_many()
-            .col_expr(Column::Status, Expr::value(STATUS_PUBLISHING))
-            .filter(Column::Id.eq(model.id))
-            .exec(&repo.db)
-            .await
-            .unwrap();
-
-        repo.reset_stale_eh_downloads().await.unwrap();
-        let preserved = Entity::find_by_id(model.id)
-            .one(&repo.db)
+        let claim = repo
+            .get_next_eh_delivery_for_publish(true)
             .await
             .unwrap()
             .unwrap();
-        // Both markers survive stale reset (publishing with telegraph_url -> uploaded)
+        assert_eq!(claim.delivery.id, model.id);
+        repo.mark_eh_archive_delivery_sent(model.id).await.unwrap();
+        repo.mark_eh_telegraph_delivery_sent(model.id, claim.job.id, None)
+            .await
+            .unwrap();
+
+        repo.schedule_eh_delivery_retry(model.id, "telegram failed", 3, true)
+            .await
+            .unwrap();
+        let preserved = Entity::find_by_id(model.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
         assert!(preserved.archive_sent_at.is_some());
         assert!(preserved.telegraph_sent_at.is_some());
 
-        // Terminal reset clears both markers
-        repo.mark_eh_download_failed(model.id, "failed")
+        let rebound = repo
+            .enqueue_eh_download(
+                -100,
+                20,
+                "new",
+                "New",
+                false,
+                SOURCE_DIRECT,
+                &EhGalleryVariant::archive("1280x"),
+            )
             .await
             .unwrap();
-        let reset = repo
-            .enqueue_eh_download(-100, 20, "new", "New", false, SOURCE_DIRECT)
-            .await
-            .unwrap();
-        assert!(reset.archive_sent_at.is_none());
-        assert!(reset.telegraph_sent_at.is_none());
+        assert_eq!(rebound.job_id, model.job_id);
+        assert!(rebound.archive_sent_at.is_some());
+        assert!(rebound.telegraph_sent_at.is_some());
     }
 
     #[tokio::test]
     async fn test_defer_does_not_increment_retry_count() {
         let repo = tests_helpers::setup_test_db().await.unwrap();
-        let model = repo
-            .enqueue_eh_download(-100, 30, "tok", "Title", false, SOURCE_DIRECT)
+        let delivery = repo
+            .enqueue_eh_download(
+                -100,
+                30,
+                "tok",
+                "Title",
+                false,
+                SOURCE_DIRECT,
+                &EhGalleryVariant::archive("1280x"),
+            )
             .await
             .unwrap();
-        // Claim to downloading so defer-to-pending passes the CAS guard.
-        let claimed = repo.get_next_for_download().await.unwrap().unwrap();
-        assert_eq!(claimed.id, model.id);
-        assert_eq!(claimed.status, STATUS_DOWNLOADING);
+        let claimed = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        assert_eq!(claimed.id, delivery.job_id.unwrap());
+        assert_eq!(claimed.status, JOB_STATUS_DOWNLOADING);
 
-        repo.defer_eh_download(model.id, STATUS_PENDING, 60)
-            .await
-            .unwrap();
-        let deferred = Entity::find_by_id(model.id)
-            .one(&repo.db)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(deferred.status, STATUS_PENDING);
+        repo.defer_eh_job_download(claimed.id, 60).await.unwrap();
+        let deferred = job_for_delivery(&repo, &delivery).await;
+        assert_eq!(deferred.status, JOB_STATUS_PENDING);
         assert_eq!(deferred.retry_count, 0);
         assert!(deferred.next_retry_at.is_some());
+        assert_eq!(delivery.status, STATUS_WAITING);
     }
 
     #[tokio::test]
     async fn test_deferred_item_not_claimable_before_delay_expires() {
         let repo = tests_helpers::setup_test_db().await.unwrap();
-        let model = repo
-            .enqueue_eh_download(-100, 35, "tok", "Title", false, SOURCE_DIRECT)
+        let delivery = repo
+            .enqueue_eh_download(
+                -100,
+                35,
+                "tok",
+                "Title",
+                false,
+                SOURCE_DIRECT,
+                &EhGalleryVariant::archive("1280x"),
+            )
             .await
             .unwrap();
-        // Claim to downloading so defer-to-pending passes the CAS guard.
-        let claimed = repo.get_next_for_download().await.unwrap().unwrap();
-        assert_eq!(claimed.id, model.id);
+        let claimed = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        assert_eq!(claimed.id, delivery.job_id.unwrap());
 
         // Defer with a long delay — the item should not be picked up
-        repo.defer_eh_download(model.id, STATUS_PENDING, 3600)
-            .await
-            .unwrap();
+        repo.defer_eh_job_download(claimed.id, 3600).await.unwrap();
 
-        // get_next_for_download filters on next_retry_at <= now, so should return None
-        let next = repo.get_next_for_download().await.unwrap();
+        let next = repo.get_next_eh_job_for_download().await.unwrap();
         assert!(
             next.is_none(),
             "deferred item should not be claimable before delay expires"
         );
 
-        let reloaded = Entity::find_by_id(model.id)
-            .one(&repo.db)
-            .await
-            .unwrap()
-            .unwrap();
+        let reloaded = job_for_delivery(&repo, &delivery).await;
         assert_eq!(reloaded.retry_count, 0);
         assert!(reloaded.next_retry_at.is_some());
     }
@@ -4790,18 +6133,34 @@ mod tests {
     async fn test_background_owned_item_is_excluded_from_main_download_queue() {
         let repo = tests_helpers::setup_test_db().await.unwrap();
         let slow = repo
-            .enqueue_eh_download(-100, 40, "slow", "Slow", false, SOURCE_DIRECT)
+            .enqueue_eh_download(
+                -100,
+                40,
+                "slow",
+                "Slow",
+                false,
+                SOURCE_DIRECT,
+                &EhGalleryVariant::archive("1280x"),
+            )
             .await
             .unwrap();
         let fast = repo
-            .enqueue_eh_download(-100, 41, "fast", "Fast", false, SOURCE_DIRECT)
+            .enqueue_eh_download(
+                -100,
+                41,
+                "fast",
+                "Fast",
+                false,
+                SOURCE_DIRECT,
+                &EhGalleryVariant::archive("1280x"),
+            )
             .await
             .unwrap();
 
-        let claimed = repo.get_next_for_download().await.unwrap().unwrap();
-        assert_eq!(claimed.id, slow.id);
+        let claimed = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        assert_eq!(claimed.id, slow.job_id.unwrap());
         let background = repo
-            .schedule_eh_background_download_from(claimed.id, STATUS_DOWNLOADING, "too slow")
+            .schedule_eh_job_background_download(claimed.id, JOB_STATUS_DOWNLOADING, "too slow")
             .await
             .unwrap();
         assert_eq!(background.status, STATUS_PENDING);
@@ -4810,183 +6169,196 @@ mod tests {
             Some(BACKGROUND_STATUS_PENDING)
         );
 
-        let next = repo.get_next_for_download().await.unwrap().unwrap();
-        assert_eq!(next.id, fast.id);
+        let next = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        assert_eq!(next.id, fast.job_id.unwrap());
     }
 
     #[tokio::test]
     async fn test_main_download_claim_prioritizes_recent_fifo_then_old_lifo() {
         let repo = tests_helpers::setup_test_db().await.unwrap();
-        let anchor = NaiveDate::from_ymd_opt(2026, 7, 22)
-            .unwrap()
-            .and_hms_opt(12, 0, 0)
-            .unwrap();
+        let anchor = chrono::Local::now().naive_local();
 
         let recent_first = repo
-            .enqueue_eh_download(-100, 100, "tok", "Recent first", false, SOURCE_DIRECT)
+            .enqueue_eh_download(
+                -100,
+                100,
+                "tok",
+                "Recent first",
+                false,
+                SOURCE_DIRECT,
+                &EhGalleryVariant::archive("1280x"),
+            )
             .await
             .unwrap();
         let recent_second = repo
-            .enqueue_eh_download(-100, 101, "tok", "Recent second", false, SOURCE_DIRECT)
+            .enqueue_eh_download(
+                -100,
+                101,
+                "tok",
+                "Recent second",
+                false,
+                SOURCE_DIRECT,
+                &EhGalleryVariant::archive("1280x"),
+            )
             .await
             .unwrap();
         let recent_newer = repo
-            .enqueue_eh_download(-100, 102, "tok", "Recent newer", false, SOURCE_DIRECT)
+            .enqueue_eh_download(
+                -100,
+                102,
+                "tok",
+                "Recent newer",
+                false,
+                SOURCE_DIRECT,
+                &EhGalleryVariant::archive("1280x"),
+            )
             .await
             .unwrap();
         let cutoff_first = repo
-            .enqueue_eh_download(-100, 200, "tok", "Cutoff first", false, SOURCE_DIRECT)
+            .enqueue_eh_download(
+                -100,
+                200,
+                "tok",
+                "Cutoff first",
+                false,
+                SOURCE_DIRECT,
+                &EhGalleryVariant::archive("1280x"),
+            )
             .await
             .unwrap();
         let cutoff_second = repo
-            .enqueue_eh_download(-100, 201, "tok", "Cutoff second", false, SOURCE_DIRECT)
+            .enqueue_eh_download(
+                -100,
+                201,
+                "tok",
+                "Cutoff second",
+                false,
+                SOURCE_DIRECT,
+                &EhGalleryVariant::archive("1280x"),
+            )
             .await
             .unwrap();
         let old = repo
-            .enqueue_eh_download(-100, 300, "tok", "Old", false, SOURCE_DIRECT)
+            .enqueue_eh_download(
+                -100,
+                300,
+                "tok",
+                "Old",
+                false,
+                SOURCE_DIRECT,
+                &EhGalleryVariant::archive("1280x"),
+            )
             .await
             .unwrap();
         let future_retry = repo
-            .enqueue_eh_download(-100, 400, "tok", "Future retry", false, SOURCE_DIRECT)
+            .enqueue_eh_download(
+                -100,
+                400,
+                "tok",
+                "Future retry",
+                false,
+                SOURCE_DIRECT,
+                &EhGalleryVariant::archive("1280x"),
+            )
             .await
             .unwrap();
-        let background_old = repo
-            .enqueue_eh_download(-100, 500, "tok", "Background old", false, SOURCE_DIRECT)
-            .await
-            .unwrap();
-        let background_recent = repo
-            .enqueue_eh_download(-100, 501, "tok", "Background recent", false, SOURCE_DIRECT)
-            .await
-            .unwrap();
+        let recent_first_job = job_for_delivery(&repo, &recent_first).await;
+        let recent_second_job = job_for_delivery(&repo, &recent_second).await;
+        let recent_newer_job = job_for_delivery(&repo, &recent_newer).await;
+        let cutoff_first_job = job_for_delivery(&repo, &cutoff_first).await;
+        let cutoff_second_job = job_for_delivery(&repo, &cutoff_second).await;
+        let old_job = job_for_delivery(&repo, &old).await;
+        let future_retry_job = job_for_delivery(&repo, &future_retry).await;
 
-        set_download_claim_fields(
+        set_eh_job_claim_fields(
             &repo,
-            recent_first.id,
+            recent_first_job.id,
             anchor - Duration::minutes(90),
-            None,
             None,
         )
         .await;
-        set_download_claim_fields(
+        set_eh_job_claim_fields(
             &repo,
-            recent_second.id,
+            recent_second_job.id,
             anchor - Duration::minutes(90),
-            None,
             None,
         )
         .await;
-        set_download_claim_fields(
+        set_eh_job_claim_fields(
             &repo,
-            recent_newer.id,
+            recent_newer_job.id,
             anchor - Duration::minutes(30),
             None,
-            None,
         )
         .await;
-        set_download_claim_fields(
+        set_eh_job_claim_fields(
             &repo,
-            cutoff_first.id,
+            cutoff_first_job.id,
             anchor - Duration::hours(2),
             None,
-            None,
         )
         .await;
-        set_download_claim_fields(
+        set_eh_job_claim_fields(
             &repo,
-            cutoff_second.id,
+            cutoff_second_job.id,
             anchor - Duration::hours(2),
             None,
-            None,
         )
         .await;
-        set_download_claim_fields(&repo, old.id, anchor - Duration::hours(3), None, None).await;
-        set_download_claim_fields(
+        set_eh_job_claim_fields(&repo, old_job.id, anchor - Duration::hours(3), None).await;
+        set_eh_job_claim_fields(
             &repo,
-            future_retry.id,
+            future_retry_job.id,
             anchor - Duration::hours(4),
             Some(anchor + Duration::minutes(1)),
-            None,
-        )
-        .await;
-        set_download_claim_fields(
-            &repo,
-            background_old.id,
-            anchor - Duration::hours(3),
-            None,
-            Some(BACKGROUND_STATUS_PENDING),
-        )
-        .await;
-        set_download_claim_fields(
-            &repo,
-            background_recent.id,
-            anchor - Duration::hours(1),
-            None,
-            Some(BACKGROUND_STATUS_PENDING),
         )
         .await;
 
-        assert!(recent_first.id < recent_second.id);
-        assert!(cutoff_first.id < cutoff_second.id);
+        assert!(recent_first_job.id < recent_second_job.id);
+        assert!(cutoff_first_job.id < cutoff_second_job.id);
         for expected_gid in [100, 101, 102, 201, 200, 300] {
-            let claimed = repo
-                .get_next_for_download_at(anchor)
-                .await
-                .unwrap()
-                .unwrap();
+            let claimed = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
             assert_eq!(claimed.gid, expected_gid);
-            assert_eq!(claimed.status, STATUS_DOWNLOADING);
+            assert_eq!(claimed.status, JOB_STATUS_DOWNLOADING);
         }
 
-        assert!(repo
-            .get_next_for_download_at(anchor)
-            .await
-            .unwrap()
-            .is_none());
-        let deferred = Entity::find_by_id(future_retry.id)
-            .one(&repo.db)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(deferred.status, STATUS_PENDING);
+        assert!(repo.get_next_eh_job_for_download().await.unwrap().is_none());
+        let deferred = job_for_delivery(&repo, &future_retry).await;
+        assert_eq!(deferred.status, JOB_STATUS_PENDING);
         assert_eq!(deferred.next_retry_at, Some(anchor + Duration::minutes(1)));
-
-        let first_background = repo
-            .get_next_for_background_download()
-            .await
-            .unwrap()
-            .unwrap();
-        let second_background = repo
-            .get_next_for_background_download()
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(first_background.gid, background_old.gid);
-        assert_eq!(second_background.gid, background_recent.gid);
     }
 
     #[tokio::test]
     async fn test_background_download_lifecycle_success_retry_and_stale_reset() {
         let repo = tests_helpers::setup_test_db().await.unwrap();
         let model = repo
-            .enqueue_eh_download(-100, 45, "tok", "Title", false, SOURCE_DIRECT)
+            .enqueue_eh_download(
+                -100,
+                45,
+                "tok",
+                "Title",
+                false,
+                SOURCE_DIRECT,
+                &EhGalleryVariant::archive("1280x"),
+            )
             .await
             .unwrap();
 
-        let claimed = repo.get_next_for_download().await.unwrap().unwrap();
-        assert_eq!(claimed.id, model.id);
+        let claimed = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        assert_eq!(claimed.id, model.job_id.unwrap());
         let main_generation = claimed.started_at;
         let handed_off = repo
-            .schedule_eh_background_download_from(claimed.id, STATUS_DOWNLOADING, "slow")
+            .schedule_eh_job_background_download(claimed.id, JOB_STATUS_DOWNLOADING, "slow")
             .await
             .unwrap();
         assert_eq!(handed_off.started_at, main_generation);
 
         let bg_claim = repo
-            .get_next_for_background_download()
+            .get_next_eh_job_for_background_download()
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(bg_claim.id, model.id);
+        assert_eq!(bg_claim.id, model.job_id.unwrap());
         assert_eq!(
             bg_claim.background_download_status.as_deref(),
             Some(BACKGROUND_STATUS_RUNNING)
@@ -4995,7 +6367,12 @@ mod tests {
         let background_generation = bg_claim.started_at;
 
         let (retry, permanent) = repo
-            .schedule_eh_background_download_retry(bg_claim.id, "still slow", 6)
+            .schedule_eh_job_background_retry(
+                bg_claim.id,
+                bg_claim.started_at.unwrap(),
+                "still slow",
+                6,
+            )
             .await
             .unwrap();
         assert!(!permanent);
@@ -5008,24 +6385,24 @@ mod tests {
         assert!(retry.background_download_next_retry_at.is_some());
         assert_eq!(retry.started_at, background_generation);
 
-        Entity::update_many()
+        eh_gallery_jobs::Entity::update_many()
             .col_expr(
-                Column::BackgroundDownloadStatus,
+                eh_gallery_jobs::Column::BackgroundDownloadStatus,
                 Expr::value(Some(BACKGROUND_STATUS_RUNNING.to_string())),
             )
             .col_expr(
-                Column::BackgroundDownloadStartedAt,
+                eh_gallery_jobs::Column::BackgroundDownloadStartedAt,
                 Expr::value(Some(
                     Local::now().naive_local() - chrono::Duration::seconds(7200),
                 )),
             )
-            .filter(Column::Id.eq(model.id))
+            .filter(eh_gallery_jobs::Column::Id.eq(model.job_id.unwrap()))
             .exec(&repo.db)
             .await
             .unwrap();
-        let reset = repo.reset_stale_background_downloads(3600).await.unwrap();
-        assert_eq!(reset, 1);
-        let reset_row = Entity::find_by_id(model.id)
+        let reset = repo.reset_stale_eh_shared_work(3600, 3600).await.unwrap();
+        assert_eq!(reset.backgrounds, 1);
+        let reset_row = eh_gallery_jobs::Entity::find_by_id(model.job_id.unwrap())
             .one(&repo.db)
             .await
             .unwrap()
@@ -5037,26 +6414,32 @@ mod tests {
         assert!(reset_row.background_download_started_at.is_none());
         assert_eq!(reset_row.started_at, background_generation);
 
-        Entity::update_many()
+        eh_gallery_jobs::Entity::update_many()
             .col_expr(
-                Column::BackgroundDownloadNextRetryAt,
+                eh_gallery_jobs::Column::BackgroundDownloadNextRetryAt,
                 Expr::value(Some(
                     Local::now().naive_local() - chrono::Duration::seconds(1),
                 )),
             )
-            .filter(Column::Id.eq(model.id))
+            .filter(eh_gallery_jobs::Column::Id.eq(model.job_id.unwrap()))
             .exec(&repo.db)
             .await
             .unwrap();
 
         let bg_claim = repo
-            .get_next_for_background_download()
+            .get_next_eh_job_for_background_download()
             .await
             .unwrap()
             .unwrap();
         assert!(bg_claim.started_at > background_generation);
         let done = repo
-            .mark_eh_background_download_downloaded(bg_claim.id, 1234, "/tmp/bg.zip", 0)
+            .mark_eh_job_background_downloaded(
+                bg_claim.id,
+                bg_claim.started_at.unwrap(),
+                1234,
+                "/tmp/bg.zip",
+                0,
+            )
             .await
             .unwrap();
         assert_eq!(done.status, STATUS_DOWNLOADED);
@@ -5071,21 +6454,29 @@ mod tests {
     async fn test_release_background_downloads_to_main_queue_clears_pending_background_state() {
         let repo = tests_helpers::setup_test_db().await.unwrap();
         let model = repo
-            .enqueue_eh_download(-100, 46, "tok", "Title", false, SOURCE_DIRECT)
+            .enqueue_eh_download(
+                -100,
+                46,
+                "tok",
+                "Title",
+                false,
+                SOURCE_DIRECT,
+                &EhGalleryVariant::archive("1280x"),
+            )
             .await
             .unwrap();
 
-        let claimed = repo.get_next_for_download().await.unwrap().unwrap();
-        repo.schedule_eh_background_download_from(claimed.id, STATUS_DOWNLOADING, "slow")
+        let claimed = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        repo.schedule_eh_job_background_download(claimed.id, JOB_STATUS_DOWNLOADING, "slow")
             .await
             .unwrap();
 
         let released = repo
-            .release_background_downloads_to_main_queue()
+            .release_eh_job_background_downloads_to_main_queue()
             .await
             .unwrap();
         assert_eq!(released, 1);
-        let row = Entity::find_by_id(model.id)
+        let row = eh_gallery_jobs::Entity::find_by_id(model.job_id.unwrap())
             .one(&repo.db)
             .await
             .unwrap()
@@ -5094,24 +6485,32 @@ mod tests {
         assert!(row.background_download_status.is_none());
         assert_eq!(row.background_download_attempt_count, 0);
 
-        let next = repo.get_next_for_download().await.unwrap().unwrap();
-        assert_eq!(next.id, model.id);
+        let next = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        assert_eq!(next.id, model.job_id.unwrap());
     }
 
     #[tokio::test]
-    async fn test_cancel_subscription_queue_entries_clears_background_state() {
+    async fn test_cancel_subscription_queue_entries_retires_background_job() {
         let repo = tests_helpers::setup_test_db().await.unwrap();
         let model = repo
-            .enqueue_eh_subscription_download(-100, 123, 47, "tok", "Title", false)
+            .enqueue_eh_subscription_download(
+                -100,
+                123,
+                47,
+                "tok",
+                "Title",
+                false,
+                &EhGalleryVariant::archive("1280x"),
+            )
             .await
             .unwrap();
 
-        let claimed = repo.get_next_for_download().await.unwrap().unwrap();
-        repo.schedule_eh_background_download_from(claimed.id, STATUS_DOWNLOADING, "slow")
+        let claimed = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        repo.schedule_eh_job_background_download(claimed.id, JOB_STATUS_DOWNLOADING, "slow")
             .await
             .unwrap();
 
-        repo.cancel_eh_subscription_queue_entries(123)
+        repo.cancel_eh_subscription_queue_entries(123, true)
             .await
             .unwrap();
         let row = Entity::find_by_id(model.id)
@@ -5120,8 +6519,8 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(row.status, STATUS_CANCELED);
-        assert!(row.background_download_status.is_none());
-        assert_eq!(row.background_download_attempt_count, 0);
+        let job = job_for_delivery(&repo, &model).await;
+        assert_eq!(job.status, JOB_STATUS_RETIRED);
     }
 
     #[tokio::test]
@@ -5132,63 +6531,106 @@ mod tests {
             .and_hms_opt(12, 0, 0)
             .unwrap();
         let model = repo
-            .enqueue_eh_download(-100, 48, "tok", "Title", false, SOURCE_DIRECT)
+            .enqueue_eh_download(
+                -100,
+                48,
+                "tok",
+                "Title",
+                false,
+                SOURCE_DIRECT,
+                &EhGalleryVariant::archive("1280x"),
+            )
             .await
             .unwrap();
-        Entity::update_many()
-            .col_expr(Column::Status, Expr::value(STATUS_FAILED))
-            .col_expr(Column::StartedAt, Expr::value(Some(generation)))
+        eh_gallery_jobs::Entity::update_many()
             .col_expr(
-                Column::BackgroundDownloadStatus,
+                eh_gallery_jobs::Column::Status,
+                Expr::value(crate::db::repo::eh_gallery_jobs::JOB_STATUS_FAILED),
+            )
+            .col_expr(
+                eh_gallery_jobs::Column::StartedAt,
+                Expr::value(Some(generation)),
+            )
+            .col_expr(
+                eh_gallery_jobs::Column::BackgroundDownloadStatus,
                 Expr::value(Some(BACKGROUND_STATUS_PENDING.to_string())),
             )
-            .col_expr(Column::BackgroundDownloadAttemptCount, Expr::value(5))
-            .filter(Column::Id.eq(model.id))
+            .col_expr(
+                eh_gallery_jobs::Column::BackgroundDownloadAttemptCount,
+                Expr::value(5),
+            )
+            .filter(eh_gallery_jobs::Column::Id.eq(model.job_id.unwrap()))
             .exec(&repo.db)
             .await
             .unwrap();
 
         let reenqueued = repo
-            .enqueue_eh_download(-100, 48, "tok2", "Title 2", false, SOURCE_DIRECT)
+            .enqueue_eh_download(
+                -100,
+                48,
+                "tok2",
+                "Title 2",
+                false,
+                SOURCE_DIRECT,
+                &EhGalleryVariant::archive("1280x"),
+            )
             .await
             .unwrap();
-        assert_eq!(reenqueued.status, STATUS_PENDING);
-        assert_eq!(reenqueued.started_at, Some(generation));
-        assert!(reenqueued.background_download_status.is_none());
-        assert_eq!(reenqueued.background_download_attempt_count, 0);
+        assert_eq!(reenqueued.status, STATUS_WAITING);
+        let reactivated_job = job_for_delivery(&repo, &reenqueued).await;
+        assert_eq!(reactivated_job.status, JOB_STATUS_PENDING);
+        assert!(reactivated_job.started_at.is_none());
+        assert!(reactivated_job.background_download_status.is_none());
+        assert_eq!(reactivated_job.background_download_attempt_count, 0);
     }
 
     #[tokio::test]
-    async fn test_background_completion_cleans_canceled_race_state() {
+    async fn test_background_completion_settles_canceled_race_state_for_cleanup() {
         let repo = tests_helpers::setup_test_db().await.unwrap();
         let model = repo
-            .enqueue_eh_download(-100, 49, "tok", "Title", false, SOURCE_DIRECT)
+            .enqueue_eh_download(
+                -100,
+                49,
+                "tok",
+                "Title",
+                false,
+                SOURCE_DIRECT,
+                &EhGalleryVariant::archive("1280x"),
+            )
             .await
             .unwrap();
 
-        let claimed = repo.get_next_for_download().await.unwrap().unwrap();
-        repo.schedule_eh_background_download_from(claimed.id, STATUS_DOWNLOADING, "slow")
+        let claimed = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        repo.schedule_eh_job_background_download(claimed.id, JOB_STATUS_DOWNLOADING, "slow")
             .await
             .unwrap();
         let bg_claim = repo
-            .get_next_for_background_download()
+            .get_next_eh_job_for_background_download()
             .await
             .unwrap()
             .unwrap();
         Entity::update_many()
             .col_expr(Column::Status, Expr::value(STATUS_CANCELED))
-            .filter(Column::Id.eq(bg_claim.id))
+            .filter(Column::Id.eq(model.id))
             .exec(&repo.db)
             .await
             .unwrap();
-
-        let err = repo
-            .mark_eh_background_download_downloaded(bg_claim.id, 10, "/tmp/bg.zip", 0)
+        repo.evaluate_eh_job_liveness(bg_claim.id, true)
             .await
-            .expect_err("canceled row should not be overwritten by background completion");
-        assert!(err
-            .to_string()
-            .contains("Cannot mark background EH download"));
+            .unwrap();
+
+        let settled = repo
+            .mark_eh_job_background_downloaded(
+                bg_claim.id,
+                bg_claim.started_at.unwrap(),
+                10,
+                "/tmp/bg.zip",
+                0,
+            )
+            .await
+            .unwrap();
+        assert_eq!(settled.status, JOB_STATUS_RETIRED);
+        assert_eq!(settled.cleanup_status, CLEANUP_STATUS_PENDING);
 
         let row = Entity::find_by_id(model.id)
             .one(&repo.db)
@@ -5196,30 +6638,45 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(row.status, STATUS_CANCELED);
-        assert!(row.background_download_status.is_none());
-        assert_eq!(row.background_download_attempt_count, 0);
+        assert_eq!(
+            job_for_delivery(&repo, &model).await.status,
+            JOB_STATUS_RETIRED
+        );
     }
 
     #[tokio::test]
     async fn test_background_retry_permanent_failure_clears_background_state() {
         let repo = tests_helpers::setup_test_db().await.unwrap();
         let model = repo
-            .enqueue_eh_download(-100, 50, "tok", "Title", false, SOURCE_DIRECT)
+            .enqueue_eh_download(
+                -100,
+                50,
+                "tok",
+                "Title",
+                false,
+                SOURCE_DIRECT,
+                &EhGalleryVariant::archive("1280x"),
+            )
             .await
             .unwrap();
 
-        let claimed = repo.get_next_for_download().await.unwrap().unwrap();
-        repo.schedule_eh_background_download_from(claimed.id, STATUS_DOWNLOADING, "slow")
+        let claimed = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        repo.schedule_eh_job_background_download(claimed.id, JOB_STATUS_DOWNLOADING, "slow")
             .await
             .unwrap();
         let bg_claim = repo
-            .get_next_for_background_download()
+            .get_next_eh_job_for_background_download()
             .await
             .unwrap()
             .unwrap();
 
         let (failed, permanent) = repo
-            .schedule_eh_background_download_retry(bg_claim.id, "exhausted", 1)
+            .schedule_eh_job_background_retry(
+                bg_claim.id,
+                bg_claim.started_at.unwrap(),
+                "exhausted",
+                1,
+            )
             .await
             .unwrap();
         assert!(permanent);
@@ -5231,12 +6688,18 @@ mod tests {
         assert!(failed.background_download_error.is_none());
         assert_eq!(failed.background_download_attempt_count, 0);
 
-        let row = Entity::find_by_id(model.id)
+        let row = eh_gallery_jobs::Entity::find_by_id(model.job_id.unwrap())
             .one(&repo.db)
             .await
             .unwrap()
             .unwrap();
         assert_eq!(row.background_download_attempt_count, 0);
+        let delivery = Entity::find_by_id(model.id)
+            .one(&repo.db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(delivery.status, STATUS_FAILED);
     }
 
     #[tokio::test]
@@ -5251,53 +6714,491 @@ mod tests {
                 "Test Gallery",
                 false,
                 SOURCE_SUBSCRIPTION,
+                &EhGalleryVariant::archive("1280x"),
             )
             .await
             .unwrap();
 
         assert_eq!(model.chat_id, -100123);
         assert_eq!(model.gid, 123456);
-        assert_eq!(model.status, STATUS_PENDING);
+        assert_eq!(model.status, STATUS_WAITING);
         assert_eq!(model.source, SOURCE_SUBSCRIPTION);
 
-        // get_next_pending should mark it as downloading
-        let next = repo.get_next_pending_eh_download().await.unwrap().unwrap();
-        assert_eq!(next.id, model.id);
-        assert_eq!(next.status, STATUS_DOWNLOADING);
+        let next = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        assert_eq!(next.id, model.job_id.unwrap());
+        assert_eq!(next.status, JOB_STATUS_DOWNLOADING);
         assert!(next.started_at.is_some());
 
-        // No more pending
-        let none = repo.get_next_pending_eh_download().await.unwrap();
+        let none = repo.get_next_eh_job_for_download().await.unwrap();
         assert!(none.is_none());
     }
 
     #[tokio::test]
-    async fn test_mark_done() {
+    async fn test_mark_delivery_done() {
         let repo = tests_helpers::setup_test_db().await.unwrap();
 
         let model = repo
-            .enqueue_eh_download(-100, 1, "tok", "Title", false, SOURCE_DIRECT)
+            .enqueue_eh_download(
+                -100,
+                1,
+                "tok",
+                "Title",
+                false,
+                SOURCE_DIRECT,
+                &EhGalleryVariant::archive("1280x"),
+            )
             .await
             .unwrap();
 
-        // Download stage: claim -> downloading -> downloaded
-        let claimed = repo.get_next_for_download().await.unwrap().unwrap();
-        assert_eq!(claimed.id, model.id);
-        repo.mark_eh_download_downloaded(model.id, 50000, "/tmp/1.zip", 0)
+        let claimed = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        assert_eq!(claimed.id, model.job_id.unwrap());
+        repo.mark_eh_job_downloaded(
+            claimed.id,
+            claimed.started_at.unwrap(),
+            50000,
+            "/tmp/1.zip",
+            0,
+        )
+        .await
+        .unwrap();
+
+        let publish_claim = repo
+            .get_next_eh_delivery_for_publish(true)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(publish_claim.delivery.id, model.id);
+        repo.mark_eh_archive_delivery_sent(model.id).await.unwrap();
+        let done = repo
+            .mark_eh_delivery_done(model.id, model.job_id.unwrap(), true)
             .await
             .unwrap();
-
-        // Publish stage: claim -> publishing -> done
-        let pub_claimed = repo.get_next_for_publish().await.unwrap().unwrap();
-        assert_eq!(pub_claimed.id, model.id);
-        assert_eq!(pub_claimed.status, STATUS_PUBLISHING);
-
-        let done = repo.mark_eh_download_done(model.id, 50000).await.unwrap();
 
         assert_eq!(done.status, STATUS_DONE);
-        assert_eq!(done.file_size, 50000);
         assert!(done.completed_at.is_some());
         assert!(done.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn delivery_done_rolls_back_when_liveness_settlement_fails() {
+        use crate::db::repo::eh_gallery_jobs::EH_JOB_LIVENESS_UPDATE_FAILURE;
+        use std::sync::{atomic::AtomicBool, Arc};
+
+        let repo = tests_helpers::setup_test_db().await.unwrap();
+        let (delivery, job) = seed_publishing_archive_delivery(&repo, 901).await;
+        repo.mark_eh_archive_delivery_sent(delivery.id)
+            .await
+            .unwrap();
+
+        let error = EH_JOB_LIVENESS_UPDATE_FAILURE
+            .scope(
+                Arc::new(AtomicBool::new(true)),
+                repo.mark_eh_delivery_done(delivery.id, job.id, true),
+            )
+            .await
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("injected shared EH job liveness update failure"));
+
+        let rolled_back_delivery = Entity::find_by_id(delivery.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        let rolled_back_job = eh_gallery_jobs::Entity::find_by_id(job.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(rolled_back_delivery.status, STATUS_PUBLISHING);
+        assert_eq!(rolled_back_job.status, JOB_STATUS_DOWNLOADED);
+        assert_eq!(rolled_back_job.cleanup_status, CLEANUP_STATUS_NONE);
+
+        let done = repo
+            .mark_eh_delivery_done(delivery.id, job.id, true)
+            .await
+            .unwrap();
+        let settled_job = eh_gallery_jobs::Entity::find_by_id(job.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(done.status, STATUS_DONE);
+        assert_eq!(settled_job.status, JOB_STATUS_RETIRED);
+        assert_eq!(settled_job.cleanup_status, CLEANUP_STATUS_PENDING);
+    }
+
+    #[tokio::test]
+    async fn terminal_delivery_retry_rolls_back_with_liveness_settlement() {
+        use crate::db::repo::eh_gallery_jobs::EH_JOB_LIVENESS_UPDATE_FAILURE;
+        use std::sync::{atomic::AtomicBool, Arc};
+
+        let repo = tests_helpers::setup_test_db().await.unwrap();
+        let (delivery, job) = seed_publishing_archive_delivery(&repo, 902).await;
+
+        let error = EH_JOB_LIVENESS_UPDATE_FAILURE
+            .scope(
+                Arc::new(AtomicBool::new(true)),
+                repo.schedule_eh_delivery_retry(delivery.id, "telegram failed", 0, true),
+            )
+            .await
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("injected shared EH job liveness update failure"));
+
+        let rolled_back_delivery = Entity::find_by_id(delivery.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        let rolled_back_job = eh_gallery_jobs::Entity::find_by_id(job.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(rolled_back_delivery.status, STATUS_PUBLISHING);
+        assert_eq!(rolled_back_delivery.retry_count, 0);
+        assert!(rolled_back_delivery.error.is_none());
+        assert_eq!(rolled_back_job.cleanup_status, CLEANUP_STATUS_NONE);
+
+        let (failed, terminal) = repo
+            .schedule_eh_delivery_retry(delivery.id, "telegram failed", 0, true)
+            .await
+            .unwrap();
+        let settled_job = eh_gallery_jobs::Entity::find_by_id(job.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(terminal);
+        assert_eq!(failed.status, STATUS_FAILED);
+        assert_eq!(settled_job.status, JOB_STATUS_RETIRED);
+        assert_eq!(settled_job.cleanup_status, CLEANUP_STATUS_PENDING);
+    }
+
+    #[tokio::test]
+    async fn implicit_dead_subscription_cancel_preserves_pending_rewrite_without_cleanup_claim() {
+        use crate::db::repo::eh_gallery_jobs::{
+            TELEGRAPH_REWRITE_STATUS_PENDING, TELEGRAPH_STATUS_NOT_REQUIRED,
+        };
+
+        let repo = tests_helpers::setup_test_db().await.unwrap();
+        repo.upsert_chat(-100, "private".to_string(), None, true, Default::default())
+            .await
+            .unwrap();
+        let task = repo
+            .get_or_create_task(TaskType::Ehentai, "eh:atomic-cancel".to_string(), None)
+            .await
+            .unwrap();
+        let subscription = repo
+            .upsert_eh_subscription(-100, task.id, TagFilter::default(), None)
+            .await
+            .unwrap();
+        let delivery = repo
+            .enqueue_eh_subscription_download(
+                -100,
+                subscription.id,
+                903,
+                "atomic-cancel",
+                "Atomic cancel",
+                true,
+                &EhGalleryVariant::archive("1280x"),
+            )
+            .await
+            .unwrap();
+        let download = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        repo.mark_eh_job_downloaded(
+            download.id,
+            download.started_at.unwrap(),
+            1,
+            "/tmp/atomic-cancel.zip",
+            0,
+        )
+        .await
+        .unwrap();
+        eh_gallery_jobs::Entity::update_many()
+            .col_expr(
+                eh_gallery_jobs::Column::TelegraphRewriteData,
+                Expr::value(Some("{\"pages\":[]}".to_string())),
+            )
+            .col_expr(
+                eh_gallery_jobs::Column::TelegraphRewriteStatus,
+                Expr::value(Some(TELEGRAPH_REWRITE_STATUS_PENDING.to_string())),
+            )
+            .filter(eh_gallery_jobs::Column::Id.eq(download.id))
+            .exec(repo.db())
+            .await
+            .unwrap();
+        subscriptions::Entity::delete_by_id(subscription.id)
+            .exec(repo.db())
+            .await
+            .unwrap();
+
+        assert!(!repo
+            .eh_download_is_active(delivery.id, STATUS_WAITING, true)
+            .await
+            .unwrap());
+        let canceled = Entity::find_by_id(delivery.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        let settled_job = eh_gallery_jobs::Entity::find_by_id(download.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(canceled.status, STATUS_CANCELED);
+        assert!(!canceled.telegraph);
+        assert!(canceled.subscription_ids.is_none());
+        assert!(!settled_job.telegraph_required);
+        assert_eq!(settled_job.telegraph_status, TELEGRAPH_STATUS_NOT_REQUIRED);
+        assert_eq!(
+            settled_job.telegraph_rewrite_status.as_deref(),
+            Some(TELEGRAPH_REWRITE_STATUS_PENDING)
+        );
+        assert!(settled_job.telegraph_rewrite_data.is_some());
+        assert_eq!(settled_job.cleanup_status, CLEANUP_STATUS_NONE);
+    }
+
+    #[tokio::test]
+    async fn startup_reconciliation_repairs_consumerless_crash_state_idempotently() {
+        let repo = tests_helpers::setup_test_db().await.unwrap();
+        let (delivery, job) = seed_publishing_archive_delivery(&repo, 904).await;
+        Entity::update_many()
+            .col_expr(Column::Status, Expr::value(STATUS_DONE))
+            .filter(Column::Id.eq(delivery.id))
+            .exec(repo.db())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            repo.reconcile_eh_shared_job_liveness(true).await.unwrap(),
+            1
+        );
+        let first = eh_gallery_jobs::Entity::find_by_id(job.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.status, JOB_STATUS_RETIRED);
+        assert_eq!(first.cleanup_status, CLEANUP_STATUS_PENDING);
+
+        assert_eq!(
+            repo.reconcile_eh_shared_job_liveness(true).await.unwrap(),
+            1
+        );
+        let second = eh_gallery_jobs::Entity::find_by_id(job.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(second, first);
+    }
+
+    #[tokio::test]
+    async fn startup_reconciliation_preserves_active_claims_and_dirty_cleanup_generation() {
+        use crate::db::repo::eh_gallery_jobs::{
+            CLEANUP_STATUS_RUNNING, TELEGRAPH_REWRITE_STATUS_REWRITING, TELEGRAPH_STATUS_UPLOADING,
+        };
+
+        let repo = tests_helpers::setup_test_db().await.unwrap();
+
+        let (_active_delivery, active_delivery_job) =
+            seed_publishing_archive_delivery(&repo, 905).await;
+
+        let active_download = repo
+            .enqueue_eh_download(
+                -200,
+                906,
+                "active-download",
+                "Active download",
+                false,
+                SOURCE_DIRECT,
+                &EhGalleryVariant::archive("1280x"),
+            )
+            .await
+            .unwrap();
+        let active_download_job = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        assert_eq!(active_download.job_id, Some(active_download_job.id));
+
+        let active_upload = repo
+            .enqueue_eh_download(
+                -300,
+                907,
+                "active-upload",
+                "Active upload",
+                true,
+                SOURCE_DIRECT,
+                &EhGalleryVariant::archive("1280x"),
+            )
+            .await
+            .unwrap();
+        let upload_download = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        assert_eq!(active_upload.job_id, Some(upload_download.id));
+        repo.mark_eh_job_downloaded(
+            upload_download.id,
+            upload_download.started_at.unwrap(),
+            1,
+            "/tmp/active-upload.zip",
+            0,
+        )
+        .await
+        .unwrap();
+        let active_upload_job = repo.get_next_eh_job_for_upload().await.unwrap().unwrap();
+        assert_eq!(
+            active_upload_job.telegraph_status,
+            TELEGRAPH_STATUS_UPLOADING
+        );
+
+        let active_rewrite = repo
+            .enqueue_eh_download(
+                -400,
+                908,
+                "active-rewrite",
+                "Active rewrite",
+                false,
+                SOURCE_DIRECT,
+                &EhGalleryVariant::archive("1280x"),
+            )
+            .await
+            .unwrap();
+        let active_rewrite_job_id = active_rewrite.job_id.unwrap();
+        let rewrite_started_at = chrono::Local::now().naive_local();
+        eh_gallery_jobs::Entity::update_many()
+            .col_expr(
+                eh_gallery_jobs::Column::Status,
+                Expr::value(JOB_STATUS_DOWNLOADED),
+            )
+            .col_expr(
+                eh_gallery_jobs::Column::TelegraphRewriteData,
+                Expr::value(Some("{\"pages\":[]}".to_string())),
+            )
+            .col_expr(
+                eh_gallery_jobs::Column::TelegraphRewriteStatus,
+                Expr::value(Some(TELEGRAPH_REWRITE_STATUS_REWRITING.to_string())),
+            )
+            .col_expr(
+                eh_gallery_jobs::Column::TelegraphRewriteStartedAt,
+                Expr::value(Some(rewrite_started_at)),
+            )
+            .filter(eh_gallery_jobs::Column::Id.eq(active_rewrite_job_id))
+            .exec(repo.db())
+            .await
+            .unwrap();
+
+        let dirty_cleanup = repo
+            .enqueue_eh_download(
+                -500,
+                909,
+                "dirty-cleanup",
+                "Dirty cleanup",
+                false,
+                SOURCE_DIRECT,
+                &EhGalleryVariant::archive("1280x"),
+            )
+            .await
+            .unwrap();
+        let dirty_download = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        assert_eq!(dirty_cleanup.job_id, Some(dirty_download.id));
+        repo.mark_eh_job_downloaded(
+            dirty_download.id,
+            dirty_download.started_at.unwrap(),
+            1,
+            "/tmp/dirty-cleanup.zip",
+            0,
+        )
+        .await
+        .unwrap();
+        Entity::update_many()
+            .col_expr(Column::Status, Expr::value(STATUS_DONE))
+            .filter(Column::Id.eq(dirty_cleanup.id))
+            .exec(repo.db())
+            .await
+            .unwrap();
+        let cleanup_started_at = chrono::Local::now().naive_local();
+        eh_gallery_jobs::Entity::update_many()
+            .col_expr(
+                eh_gallery_jobs::Column::CleanupStatus,
+                Expr::value(CLEANUP_STATUS_RUNNING),
+            )
+            .col_expr(
+                eh_gallery_jobs::Column::CleanupStartedAt,
+                Expr::value(Some(cleanup_started_at)),
+            )
+            .filter(eh_gallery_jobs::Column::Id.eq(dirty_download.id))
+            .exec(repo.db())
+            .await
+            .unwrap();
+
+        let active_delivery_before = eh_gallery_jobs::Entity::find_by_id(active_delivery_job.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        let active_download_before = eh_gallery_jobs::Entity::find_by_id(active_download_job.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        let active_upload_before = eh_gallery_jobs::Entity::find_by_id(active_upload_job.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        let active_rewrite_before = eh_gallery_jobs::Entity::find_by_id(active_rewrite_job_id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            repo.reconcile_eh_shared_job_liveness(true).await.unwrap(),
+            5
+        );
+
+        assert_eq!(
+            eh_gallery_jobs::Entity::find_by_id(active_delivery_job.id)
+                .one(repo.db())
+                .await
+                .unwrap()
+                .unwrap(),
+            active_delivery_before
+        );
+        assert_eq!(
+            eh_gallery_jobs::Entity::find_by_id(active_download_job.id)
+                .one(repo.db())
+                .await
+                .unwrap()
+                .unwrap(),
+            active_download_before
+        );
+        assert_eq!(
+            eh_gallery_jobs::Entity::find_by_id(active_upload_job.id)
+                .one(repo.db())
+                .await
+                .unwrap()
+                .unwrap(),
+            active_upload_before
+        );
+        assert_eq!(
+            eh_gallery_jobs::Entity::find_by_id(active_rewrite_job_id)
+                .one(repo.db())
+                .await
+                .unwrap()
+                .unwrap(),
+            active_rewrite_before
+        );
+        let dirty_after = eh_gallery_jobs::Entity::find_by_id(dirty_download.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(dirty_after.cleanup_status, CLEANUP_STATUS_RUNNING);
+        assert_eq!(dirty_after.cleanup_started_at, Some(cleanup_started_at));
+        assert_eq!(dirty_after.background_download_status.as_deref(), None);
     }
 
     #[tokio::test]
@@ -5305,7 +7206,15 @@ mod tests {
         let repo = tests_helpers::setup_test_db().await.unwrap();
 
         let model = repo
-            .enqueue_eh_download(-100, 1, "tok", "Title", false, SOURCE_DIRECT)
+            .enqueue_eh_download(
+                -100,
+                1,
+                "tok",
+                "Title",
+                false,
+                SOURCE_DIRECT,
+                &EhGalleryVariant::archive("1280x"),
+            )
             .await
             .unwrap();
 
@@ -5325,32 +7234,48 @@ mod tests {
     async fn test_downloaded_bytes_in_window() {
         let repo = tests_helpers::setup_test_db().await.unwrap();
 
-        // Enqueue and complete two downloads through the full pipeline
-        let m1 = repo
-            .enqueue_eh_download(-100, 1, "tok1", "T1", false, SOURCE_DIRECT)
+        // Each successful job generation appends one immutable completion row.
+        let first_delivery = repo
+            .enqueue_eh_download(
+                -100,
+                1,
+                "tok1",
+                "T1",
+                false,
+                SOURCE_DIRECT,
+                &EhGalleryVariant::archive("1280x"),
+            )
             .await
             .unwrap();
-        let c1 = repo.get_next_for_download().await.unwrap().unwrap();
-        assert_eq!(c1.id, m1.id);
-        repo.mark_eh_download_downloaded(m1.id, 10000, "/tmp/1.zip", 0)
+        let first = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        assert_eq!(first.id, first_delivery.job_id.unwrap());
+        repo.mark_eh_job_downloaded(first.id, first.started_at.unwrap(), 10000, "/tmp/1.zip", 0)
             .await
             .unwrap();
-        let p1 = repo.get_next_for_publish().await.unwrap().unwrap();
-        assert_eq!(p1.id, m1.id);
-        repo.mark_eh_download_done(m1.id, 10000).await.unwrap();
 
-        let m2 = repo
-            .enqueue_eh_download(-100, 2, "tok2", "T2", false, SOURCE_DIRECT)
+        let second_delivery = repo
+            .enqueue_eh_download(
+                -100,
+                2,
+                "tok2",
+                "T2",
+                false,
+                SOURCE_DIRECT,
+                &EhGalleryVariant::archive("1280x"),
+            )
             .await
             .unwrap();
-        let c2 = repo.get_next_for_download().await.unwrap().unwrap();
-        assert_eq!(c2.id, m2.id);
-        repo.mark_eh_download_downloaded(m2.id, 20000, "/tmp/2.zip", 0)
-            .await
-            .unwrap();
-        let p2 = repo.get_next_for_publish().await.unwrap().unwrap();
-        assert_eq!(p2.id, m2.id);
-        repo.mark_eh_download_done(m2.id, 20000).await.unwrap();
+        let second = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        assert_eq!(second.id, second_delivery.job_id.unwrap());
+        repo.mark_eh_job_downloaded(
+            second.id,
+            second.started_at.unwrap(),
+            20000,
+            "/tmp/2.zip",
+            0,
+        )
+        .await
+        .unwrap();
 
         let bytes = repo.get_eh_downloaded_bytes_in_window(24).await.unwrap();
         assert_eq!(bytes, 30000);
@@ -5360,65 +7285,71 @@ mod tests {
     async fn test_reset_stale_downloads() {
         let repo = tests_helpers::setup_test_db().await.unwrap();
 
-        let m = repo
-            .enqueue_eh_download(-100, 1, "tok", "T", false, SOURCE_DIRECT)
+        let delivery = repo
+            .enqueue_eh_download(
+                -100,
+                1,
+                "tok",
+                "T",
+                false,
+                SOURCE_DIRECT,
+                &EhGalleryVariant::archive("1280x"),
+            )
             .await
             .unwrap();
-        let first_claim = repo.get_next_pending_eh_download().await.unwrap().unwrap(); // marks as downloading
+        let first_claim = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
 
-        // Simulate crash: entry is stuck in "downloading"
-        let reset_count = repo.reset_stale_eh_downloads().await.unwrap();
-        assert_eq!(reset_count, 1);
-        let reset = Entity::find_by_id(m.id)
-            .one(&repo.db)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(reset.status, STATUS_PENDING);
+        let reset_count = repo.reset_stale_eh_shared_work(3600, 3600).await.unwrap();
+        assert_eq!(reset_count.downloads, 1);
+        let reset = job_for_delivery(&repo, &delivery).await;
+        assert_eq!(reset.status, JOB_STATUS_PENDING);
         assert_eq!(reset.started_at, first_claim.started_at);
 
-        // Should be pending again
-        let next = repo.get_next_pending_eh_download().await.unwrap().unwrap();
-        assert_eq!(next.id, m.id);
-        assert_eq!(next.status, STATUS_DOWNLOADING); // got_next marks it downloading again
+        let next = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        assert_eq!(next.id, delivery.job_id.unwrap());
+        assert_eq!(next.status, JOB_STATUS_DOWNLOADING);
         assert!(next.started_at > first_claim.started_at);
     }
 
     #[tokio::test]
     async fn test_main_claim_generation_survives_retry_handoff_and_completion() {
         let repo = tests_helpers::setup_test_db().await.unwrap();
-        let claim_now = NaiveDate::from_ymd_opt(2026, 7, 22)
-            .unwrap()
-            .and_hms_opt(12, 0, 0)
-            .unwrap();
         let entry = repo
-            .enqueue_eh_download(-100, 69, "tok", "Title", false, SOURCE_DIRECT)
+            .enqueue_eh_download(
+                -100,
+                69,
+                "tok",
+                "Title",
+                false,
+                SOURCE_DIRECT,
+                &EhGalleryVariant::archive("1280x"),
+            )
             .await
             .unwrap();
 
-        let first_claim = repo
-            .get_next_for_download_at(claim_now)
-            .await
-            .unwrap()
-            .unwrap();
+        let first_claim = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
         let (retry, permanent) = repo
-            .schedule_eh_retry_from(entry.id, STATUS_DOWNLOADING, STATUS_PENDING, "temporary", 5)
+            .schedule_eh_job_download_retry(
+                first_claim.id,
+                first_claim.started_at.unwrap(),
+                "temporary",
+                5,
+            )
             .await
             .unwrap();
         assert!(!permanent);
         assert_eq!(retry.started_at, first_claim.started_at);
 
-        Entity::update_many()
-            .col_expr(Column::NextRetryAt, Expr::value(None::<DateTime>))
-            .filter(Column::Id.eq(entry.id))
+        eh_gallery_jobs::Entity::update_many()
+            .col_expr(
+                eh_gallery_jobs::Column::NextRetryAt,
+                Expr::value(None::<DateTime>),
+            )
+            .filter(eh_gallery_jobs::Column::Id.eq(entry.job_id.unwrap()))
             .exec(&repo.db)
             .await
             .unwrap();
-        let second_claim = repo
-            .get_next_for_download_at(claim_now)
-            .await
-            .unwrap()
-            .unwrap();
+        let second_claim = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
         assert_eq!(
             second_claim.started_at,
             first_claim
@@ -5427,28 +7358,28 @@ mod tests {
         );
 
         let handed_off = repo
-            .schedule_eh_background_download_from(entry.id, STATUS_DOWNLOADING, "slow")
+            .schedule_eh_job_background_download(
+                entry.job_id.unwrap(),
+                JOB_STATUS_DOWNLOADING,
+                "slow",
+            )
             .await
             .unwrap();
         assert_eq!(handed_off.started_at, second_claim.started_at);
         assert_eq!(
-            repo.release_background_downloads_to_main_queue()
+            repo.release_eh_job_background_downloads_to_main_queue()
                 .await
                 .unwrap(),
             1
         );
-        let released = Entity::find_by_id(entry.id)
+        let released = eh_gallery_jobs::Entity::find_by_id(entry.job_id.unwrap())
             .one(&repo.db)
             .await
             .unwrap()
             .unwrap();
         assert_eq!(released.started_at, second_claim.started_at);
 
-        let third_claim = repo
-            .get_next_for_download_at(claim_now)
-            .await
-            .unwrap()
-            .unwrap();
+        let third_claim = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
         assert_eq!(
             third_claim.started_at,
             second_claim
@@ -5456,27 +7387,44 @@ mod tests {
                 .map(|generation| generation + Duration::seconds(1))
         );
         let downloaded = repo
-            .mark_eh_download_downloaded(entry.id, 1024, "/tmp/69.zip", 0)
+            .mark_eh_job_downloaded(
+                entry.job_id.unwrap(),
+                third_claim.started_at.unwrap(),
+                1024,
+                "/tmp/69.zip",
+                0,
+            )
             .await
             .unwrap();
         assert_eq!(downloaded.started_at, third_claim.started_at);
-
-        let publishing = repo.get_next_for_publish().await.unwrap().unwrap();
-        assert!(publishing.started_at > downloaded.started_at);
-        let done = repo.mark_eh_download_done(entry.id, 1024).await.unwrap();
-        assert_eq!(done.started_at, publishing.started_at);
     }
 
     #[tokio::test]
     async fn test_count_pending() {
         let repo = tests_helpers::setup_test_db().await.unwrap();
 
-        repo.enqueue_eh_download(-100, 1, "tok1", "T1", false, SOURCE_DIRECT)
-            .await
-            .unwrap();
-        repo.enqueue_eh_download(-100, 2, "tok2", "T2", false, SOURCE_DIRECT)
-            .await
-            .unwrap();
+        repo.enqueue_eh_download(
+            -100,
+            1,
+            "tok1",
+            "T1",
+            false,
+            SOURCE_DIRECT,
+            &EhGalleryVariant::archive("1280x"),
+        )
+        .await
+        .unwrap();
+        repo.enqueue_eh_download(
+            -100,
+            2,
+            "tok2",
+            "T2",
+            false,
+            SOURCE_DIRECT,
+            &EhGalleryVariant::archive("1280x"),
+        )
+        .await
+        .unwrap();
 
         let count = repo.count_pending_eh_downloads().await.unwrap();
         assert_eq!(count, 2);
@@ -5486,110 +7434,162 @@ mod tests {
     async fn test_queue_schema_has_publish_marker_columns() {
         let repo = tests_helpers::setup_test_db().await.unwrap();
         let entry = repo
-            .enqueue_eh_download(-100, 42, "tok", "Title", false, SOURCE_DIRECT)
+            .enqueue_eh_download(
+                -100,
+                42,
+                "tok",
+                "Title",
+                false,
+                SOURCE_DIRECT,
+                &EhGalleryVariant::archive("1280x"),
+            )
             .await
             .unwrap();
         assert!(entry.archive_sent_at.is_none());
         assert!(entry.telegraph_sent_at.is_none());
     }
 
-    /// Permanent retry must not overwrite a row that was re-enqueued between
-    /// the initial select and the CAS update.
+    /// Permanent retry settles the unbound claimed job without changing the
+    /// replacement delivery that was re-enqueued after the claim.
     #[tokio::test]
-    async fn test_schedule_permanent_retry_does_not_fail_reenqueued_row() {
+    async fn test_schedule_permanent_retry_settles_unbound_job_without_failing_replacement() {
         let repo = tests_helpers::setup_test_db().await.unwrap();
-        let model = repo
-            .enqueue_eh_download(-100, 60, "tok", "Title", false, SOURCE_SUBSCRIPTION)
+        let delivery = repo
+            .enqueue_eh_download(
+                -100,
+                60,
+                "tok",
+                "Title",
+                false,
+                SOURCE_SUBSCRIPTION,
+                &EhGalleryVariant::archive("1280x"),
+            )
             .await
             .unwrap();
 
-        // Claim for download (status -> downloading)
-        let claimed = repo.get_next_for_download().await.unwrap().unwrap();
-        assert_eq!(claimed.id, model.id);
-        assert_eq!(claimed.status, STATUS_DOWNLOADING);
+        let claimed = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        let claimed_started_at = claimed.started_at.unwrap();
+        assert_eq!(claimed.id, delivery.job_id.unwrap());
+        assert_eq!(claimed.status, JOB_STATUS_DOWNLOADING);
 
-        // Re-enqueue with source upgrade (subscription -> direct) triggers full
-        // reset to pending, simulating a re-enqueue that changes the row's status.
+        // A changed token rebinds the delivery to a fresh pending canonical job.
         let reenq = repo
-            .enqueue_eh_download(-100, 60, "new", "New", false, SOURCE_DIRECT)
+            .enqueue_eh_download(
+                -100,
+                60,
+                "new",
+                "New",
+                false,
+                SOURCE_DIRECT,
+                &EhGalleryVariant::archive("1280x"),
+            )
             .await
             .unwrap();
-        assert_eq!(reenq.id, model.id);
-        assert_eq!(reenq.status, STATUS_PENDING);
+        assert_eq!(reenq.id, delivery.id);
+        assert_eq!(reenq.status, STATUS_WAITING);
+        let rebound_job = job_for_delivery(&repo, &reenq).await;
+        assert_ne!(rebound_job.id, claimed.id);
+        assert_eq!(rebound_job.status, JOB_STATUS_PENDING);
 
-        // A stale worker (still holding the old "downloading" snapshot) tries to
-        // permanently fail the row — must be rejected because current status is
-        // no longer "downloading".
-        let err = repo
-            .schedule_eh_retry(claimed.id, STATUS_PENDING, "stale error", 0)
-            .await;
-        assert!(
-            err.is_err(),
-            "permanent retry with stale snapshot must be rejected"
+        let (failed, permanent) = repo
+            .schedule_eh_job_download_retry(claimed.id, claimed_started_at, "stale error", 0)
+            .await
+            .unwrap();
+        assert!(permanent);
+        assert_eq!(failed.id, claimed.id);
+        assert_eq!(
+            failed.status,
+            crate::db::repo::eh_gallery_jobs::JOB_STATUS_FAILED
         );
 
-        // Verify the row is still pending, not overwritten as failed
-        let row = Entity::find_by_id(model.id)
-            .one(&repo.db)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(row.status, STATUS_PENDING);
-        assert_ne!(row.status, STATUS_FAILED);
+        assert_eq!(
+            job_for_delivery(&repo, &reenq).await.status,
+            JOB_STATUS_PENDING
+        );
+        assert_eq!(completion_count_for_job(&repo, claimed.id).await, 0);
     }
 
-    /// A policy decision made by a main worker must not overwrite a row that
-    /// was re-enqueued after that worker claimed it.
+    /// A policy decision made by a main worker settles its unbound claimed job
+    /// without overwriting the replacement delivery's job.
     #[tokio::test]
-    async fn test_main_archive_policy_failure_does_not_fail_reenqueued_row() {
+    async fn test_main_archive_policy_failure_settles_unbound_job_without_failing_replacement() {
         let repo = tests_helpers::setup_test_db().await.unwrap();
-        let model = repo
-            .enqueue_eh_download(-100, 62, "tok", "Title", false, SOURCE_SUBSCRIPTION)
+        let delivery = repo
+            .enqueue_eh_download(
+                -100,
+                62,
+                "tok",
+                "Title",
+                false,
+                SOURCE_SUBSCRIPTION,
+                &EhGalleryVariant::archive("1280x"),
+            )
             .await
             .unwrap();
 
-        let claimed = repo.get_next_for_download().await.unwrap().unwrap();
-        assert_eq!(claimed.id, model.id);
-        assert_eq!(claimed.status, STATUS_DOWNLOADING);
+        let claimed = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        assert_eq!(claimed.id, delivery.job_id.unwrap());
+        assert_eq!(claimed.status, JOB_STATUS_DOWNLOADING);
 
         let reenqueued = repo
-            .enqueue_eh_download(-100, 62, "new", "New", false, SOURCE_DIRECT)
+            .enqueue_eh_download(
+                -100,
+                62,
+                "new",
+                "New",
+                false,
+                SOURCE_DIRECT,
+                &EhGalleryVariant::archive("1280x"),
+            )
             .await
             .unwrap();
-        assert_eq!(reenqueued.id, model.id);
-        assert_eq!(reenqueued.status, STATUS_PENDING);
+        assert_eq!(reenqueued.id, delivery.id);
+        assert_eq!(reenqueued.status, STATUS_WAITING);
+        let rebound_job = job_for_delivery(&repo, &reenqueued).await;
+        assert_ne!(rebound_job.id, claimed.id);
+        assert_eq!(rebound_job.status, JOB_STATUS_PENDING);
 
-        let err = repo
-            .fail_eh_download_for_archive_policy(&claimed, "policy reject")
+        let failed = repo
+            .fail_eh_job_for_archive_policy(&claimed, "policy reject")
             .await
-            .expect_err("stale policy decision must not fail a re-enqueued row");
-        assert!(err.to_string().contains("archive policy"));
-
-        let row = Entity::find_by_id(model.id)
-            .one(&repo.db)
-            .await
-            .unwrap()
             .unwrap();
-        assert_eq!(row.status, STATUS_PENDING);
-        assert_ne!(row.status, STATUS_FAILED);
+        assert_eq!(failed.id, claimed.id);
+        assert_eq!(
+            failed.status,
+            crate::db::repo::eh_gallery_jobs::JOB_STATUS_FAILED
+        );
+
+        assert_eq!(
+            job_for_delivery(&repo, &reenqueued).await.status,
+            JOB_STATUS_PENDING
+        );
+        assert_eq!(completion_count_for_job(&repo, claimed.id).await, 0);
     }
 
-    /// A policy decision made by a background worker must not overwrite a row
-    /// canceled after its running claim.
+    /// A policy decision made by a background worker settles its claim after
+    /// cancellation without changing the canceled delivery.
     #[tokio::test]
-    async fn test_background_archive_policy_failure_does_not_fail_canceled_row() {
+    async fn test_background_archive_policy_failure_settles_canceled_claim() {
         let repo = tests_helpers::setup_test_db().await.unwrap();
         let model = repo
-            .enqueue_eh_subscription_download(-100, 123, 63, "tok", "Title", false)
+            .enqueue_eh_subscription_download(
+                -100,
+                123,
+                63,
+                "tok",
+                "Title",
+                false,
+                &EhGalleryVariant::archive("1280x"),
+            )
             .await
             .unwrap();
 
-        let claimed = repo.get_next_for_download().await.unwrap().unwrap();
-        repo.schedule_eh_background_download_from(claimed.id, STATUS_DOWNLOADING, "slow")
+        let claimed = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        repo.schedule_eh_job_background_download(claimed.id, JOB_STATUS_DOWNLOADING, "slow")
             .await
             .unwrap();
         let background_claim = repo
-            .get_next_for_background_download()
+            .get_next_eh_job_for_background_download()
             .await
             .unwrap()
             .unwrap();
@@ -5598,15 +7598,19 @@ mod tests {
             Some(BACKGROUND_STATUS_RUNNING)
         );
 
-        repo.cancel_eh_subscription_queue_entries(123)
+        repo.cancel_eh_subscription_queue_entries(123, true)
             .await
             .unwrap();
 
-        let err = repo
-            .fail_eh_background_download_for_archive_policy(&background_claim, "policy reject")
+        let failed = repo
+            .fail_eh_job_background_download_for_archive_policy(&background_claim, "policy reject")
             .await
-            .expect_err("stale policy decision must not fail a canceled row");
-        assert!(err.to_string().contains("archive policy"));
+            .unwrap();
+        assert_eq!(failed.id, background_claim.id);
+        assert_eq!(
+            failed.status,
+            crate::db::repo::eh_gallery_jobs::JOB_STATUS_FAILED
+        );
 
         let row = Entity::find_by_id(model.id)
             .one(&repo.db)
@@ -5621,25 +7625,34 @@ mod tests {
     async fn test_archive_policy_failure_rejects_missing_claim_timestamp() {
         let repo = tests_helpers::setup_test_db().await.unwrap();
         let entry = repo
-            .enqueue_eh_download(-100, 66, "tok", "Title", false, SOURCE_DIRECT)
+            .enqueue_eh_download(
+                -100,
+                66,
+                "tok",
+                "Title",
+                false,
+                SOURCE_DIRECT,
+                &EhGalleryVariant::archive("1280x"),
+            )
             .await
             .unwrap();
 
+        let job = job_for_delivery(&repo, &entry).await;
         let main_err = repo
-            .fail_eh_download_for_archive_policy(&entry, "policy reject")
+            .fail_eh_job_for_archive_policy(&job, "policy reject")
             .await
             .expect_err("main policy failure requires a claim timestamp");
         assert!(main_err
             .to_string()
-            .contains("missing main claim started_at"));
+            .contains("missing download claim started_at"));
 
         let background_err = repo
-            .fail_eh_background_download_for_archive_policy(&entry, "policy reject")
+            .fail_eh_job_background_download_for_archive_policy(&job, "policy reject")
             .await
             .expect_err("background policy failure requires a claim timestamp");
         assert!(background_err
             .to_string()
-            .contains("missing background claim started_at"));
+            .contains("missing claim started_at"));
     }
 
     /// A main policy transition must be bound to the original worker claim, not
@@ -5647,35 +7660,27 @@ mod tests {
     #[tokio::test]
     async fn test_main_archive_policy_aba_does_not_fail_reclaimed_row() {
         let repo = tests_helpers::setup_test_db().await.unwrap();
-        let claim_now = NaiveDate::from_ymd_opt(2026, 7, 22)
-            .unwrap()
-            .and_hms_opt(12, 0, 0)
-            .unwrap();
-        let model = repo
-            .enqueue_eh_download(-100, 64, "tok", "Title", false, SOURCE_SUBSCRIPTION)
+        let delivery = repo
+            .enqueue_eh_download(
+                -100,
+                64,
+                "tok",
+                "Title",
+                false,
+                SOURCE_SUBSCRIPTION,
+                &EhGalleryVariant::archive("1280x"),
+            )
             .await
             .unwrap();
 
-        let first_claim = repo
-            .get_next_for_download_at(claim_now)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(first_claim.status, STATUS_DOWNLOADING);
+        let first_claim = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        assert_eq!(first_claim.id, delivery.job_id.unwrap());
+        assert_eq!(first_claim.status, JOB_STATUS_DOWNLOADING);
         assert!(first_claim.started_at.is_some());
 
-        let reenqueued = repo
-            .enqueue_eh_download(-100, 64, "new", "New", false, SOURCE_DIRECT)
-            .await
-            .unwrap();
-        assert_eq!(reenqueued.status, STATUS_PENDING);
-        assert_eq!(reenqueued.started_at, first_claim.started_at);
-        let second_claim = repo
-            .get_next_for_download_at(claim_now)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(second_claim.status, STATUS_DOWNLOADING);
+        repo.defer_eh_job_download(first_claim.id, 0).await.unwrap();
+        let second_claim = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        assert_eq!(second_claim.status, JOB_STATUS_DOWNLOADING);
         assert_eq!(
             second_claim.started_at,
             first_claim
@@ -5684,42 +7689,49 @@ mod tests {
         );
 
         let err = repo
-            .fail_eh_download_for_archive_policy(&first_claim, "policy reject")
+            .fail_eh_job_for_archive_policy(&first_claim, "policy reject")
             .await
             .expect_err("stale main claim must not fail the newer claim");
-        assert!(err.to_string().contains("archive policy"));
+        assert!(err.to_string().contains("claim changed concurrently"));
 
-        let row = Entity::find_by_id(model.id)
-            .one(&repo.db)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(row.status, STATUS_DOWNLOADING);
-        assert_eq!(row.started_at, second_claim.started_at);
-        assert_ne!(row.status, STATUS_FAILED);
+        let job = job_for_delivery(&repo, &delivery).await;
+        assert_eq!(job.status, JOB_STATUS_DOWNLOADING);
+        assert_eq!(job.started_at, second_claim.started_at);
+        assert_ne!(
+            job.status,
+            crate::db::repo::eh_gallery_jobs::JOB_STATUS_FAILED
+        );
+        assert_eq!(completion_count_for_job(&repo, job.id).await, 0);
     }
 
-    /// A background policy transition must be bound to the original running
-    /// claim, even after cancellation and a second background handoff/claim.
+    /// A background policy transition settles its original unbound job without
+    /// changing the distinct job claimed after cancellation and re-enqueue.
     #[tokio::test]
-    async fn test_background_archive_policy_aba_does_not_fail_reclaimed_row() {
+    async fn test_background_archive_policy_settles_unbound_job_without_failing_reclaimed_row() {
         let repo = tests_helpers::setup_test_db().await.unwrap();
-        let claim_now = Local::now().naive_local() + Duration::minutes(1);
-        let model = repo
-            .enqueue_eh_subscription_download(-100, 124, 65, "tok", "Title", false)
+        let _model = repo
+            .enqueue_eh_subscription_download(
+                -100,
+                124,
+                65,
+                "tok",
+                "Title",
+                false,
+                &EhGalleryVariant::archive("1280x"),
+            )
             .await
             .unwrap();
 
-        let first_main_claim = repo
-            .get_next_for_download_at(claim_now)
-            .await
-            .unwrap()
-            .unwrap();
-        repo.schedule_eh_background_download_from(first_main_claim.id, STATUS_DOWNLOADING, "slow")
-            .await
-            .unwrap();
+        let first_main_claim = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        repo.schedule_eh_job_background_download(
+            first_main_claim.id,
+            JOB_STATUS_DOWNLOADING,
+            "slow",
+        )
+        .await
+        .unwrap();
         let first_background_claim = repo
-            .get_next_for_background_download_at(claim_now)
+            .get_next_eh_job_for_background_download()
             .await
             .unwrap()
             .unwrap();
@@ -5732,25 +7744,35 @@ mod tests {
             .is_some());
         assert!(first_background_claim.started_at.is_some());
 
-        repo.cancel_eh_subscription_queue_entries(124)
+        repo.cancel_eh_subscription_queue_entries(124, true)
             .await
             .unwrap();
         let reenqueued = repo
-            .enqueue_eh_download(-100, 65, "new", "New", false, SOURCE_DIRECT)
+            .enqueue_eh_download(
+                -100,
+                65,
+                "new",
+                "New",
+                false,
+                SOURCE_DIRECT,
+                &EhGalleryVariant::archive("1280x"),
+            )
             .await
             .unwrap();
-        assert_eq!(reenqueued.status, STATUS_PENDING);
-        assert_eq!(reenqueued.started_at, first_background_claim.started_at);
-        let second_main_claim = repo
-            .get_next_for_download_at(claim_now)
-            .await
-            .unwrap()
-            .unwrap();
-        repo.schedule_eh_background_download_from(second_main_claim.id, STATUS_DOWNLOADING, "slow")
-            .await
-            .unwrap();
+        assert_eq!(reenqueued.status, STATUS_WAITING);
+        let replacement_job = job_for_delivery(&repo, &reenqueued).await;
+        assert_ne!(replacement_job.id, first_background_claim.id);
+        let second_main_claim = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        assert_eq!(second_main_claim.id, replacement_job.id);
+        repo.schedule_eh_job_background_download(
+            second_main_claim.id,
+            JOB_STATUS_DOWNLOADING,
+            "slow",
+        )
+        .await
+        .unwrap();
         let second_background_claim = repo
-            .get_next_for_background_download_at(claim_now)
+            .get_next_eh_job_for_background_download()
             .await
             .unwrap()
             .unwrap();
@@ -5760,31 +7782,21 @@ mod tests {
                 .as_deref(),
             Some(BACKGROUND_STATUS_RUNNING)
         );
-        assert_eq!(
-            first_background_claim.background_download_started_at,
-            second_background_claim.background_download_started_at
-        );
-        assert_eq!(
-            second_background_claim.started_at,
-            first_background_claim
-                .started_at
-                .map(|generation| generation + Duration::seconds(2))
-        );
 
-        let err = repo
-            .fail_eh_background_download_for_archive_policy(
+        let failed = repo
+            .fail_eh_job_background_download_for_archive_policy(
                 &first_background_claim,
                 "policy reject",
             )
             .await
-            .expect_err("stale background claim must not fail the newer claim");
-        assert!(err.to_string().contains("archive policy"));
-
-        let row = Entity::find_by_id(model.id)
-            .one(&repo.db)
-            .await
-            .unwrap()
             .unwrap();
+        assert_eq!(failed.id, first_background_claim.id);
+        assert_eq!(
+            failed.status,
+            crate::db::repo::eh_gallery_jobs::JOB_STATUS_FAILED
+        );
+
+        let row = job_for_delivery(&repo, &reenqueued).await;
         assert_eq!(row.status, STATUS_PENDING);
         assert_eq!(
             row.background_download_status.as_deref(),
@@ -5799,203 +7811,199 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_main_download_claim_rejects_stale_previous_generation() {
-        let repo = tests_helpers::setup_test_db().await.unwrap();
-        let claim_now = NaiveDate::from_ymd_opt(2026, 7, 22)
-            .unwrap()
-            .and_hms_opt(12, 0, 0)
-            .unwrap();
-        let entry = repo
-            .enqueue_eh_download(-100, 67, "tok", "Title", false, SOURCE_SUBSCRIPTION)
-            .await
-            .unwrap();
-        let stale_snapshot = Entity::find_by_id(entry.id)
-            .one(&repo.db)
-            .await
-            .unwrap()
-            .unwrap();
-
-        let first_claim = repo
-            .get_next_for_download_at(claim_now)
-            .await
-            .unwrap()
-            .unwrap();
-        repo.enqueue_eh_download(-100, 67, "new", "New", false, SOURCE_DIRECT)
-            .await
-            .unwrap();
-        let second_claim = repo
-            .get_next_for_download_at(claim_now)
-            .await
-            .unwrap()
-            .unwrap();
-        Entity::update_many()
-            .col_expr(Column::Status, Expr::value(STATUS_PENDING))
-            .filter(Column::Id.eq(entry.id))
-            .filter(Column::Status.eq(STATUS_DOWNLOADING))
-            .exec(&repo.db)
-            .await
-            .unwrap();
-
-        assert_eq!(
-            repo.claim_main_download_from_snapshot_at(&stale_snapshot, claim_now)
-                .await
-                .unwrap(),
-            None,
-            "the stale selector must not claim after a later generation is released"
-        );
-        let row = Entity::find_by_id(entry.id)
-            .one(&repo.db)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(row.status, STATUS_PENDING);
-        assert_eq!(
-            second_claim.started_at,
-            first_claim
-                .started_at
-                .map(|generation| generation + Duration::seconds(1))
-        );
-        assert_eq!(row.started_at, second_claim.started_at);
-    }
-
-    #[tokio::test]
     async fn test_main_download_claim_refetch_detects_lost_claim() {
         let repo = tests_helpers::setup_test_db().await.unwrap();
-        let claim_now = NaiveDate::from_ymd_opt(2026, 7, 22)
-            .unwrap()
-            .and_hms_opt(12, 0, 0)
-            .unwrap();
-        let entry = repo
-            .enqueue_eh_download(-100, 68, "tok", "Title", false, SOURCE_DIRECT)
+        let delivery = repo
+            .enqueue_eh_download(
+                -100,
+                68,
+                "tok",
+                "Title",
+                false,
+                SOURCE_DIRECT,
+                &EhGalleryVariant::archive("1280x"),
+            )
             .await
             .unwrap();
         repo.db
             .execute(Statement::from_string(
                 DbBackend::Sqlite,
-                "CREATE TRIGGER release_eh_main_claim AFTER UPDATE OF status ON eh_download_queue \
+                "CREATE TRIGGER release_eh_job_claim AFTER UPDATE OF status ON eh_gallery_jobs \
                  WHEN NEW.status = 'downloading' BEGIN \
-                     UPDATE eh_download_queue SET status = 'pending' WHERE id = NEW.id; \
-                 END;",
+                      UPDATE eh_gallery_jobs SET status = 'pending' WHERE id = NEW.id; \
+                  END;",
             ))
             .await
             .unwrap();
 
         assert!(
-            repo.get_next_for_download_at(claim_now)
-                .await
-                .unwrap()
-                .is_none(),
+            repo.get_next_eh_job_for_download().await.unwrap().is_none(),
             "a claim lost before refetch must not be returned to its original worker"
         );
-        let row = Entity::find_by_id(entry.id)
-            .one(&repo.db)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(row.status, STATUS_PENDING);
-        assert_eq!(row.started_at, Some(claim_now));
+        let job = job_for_delivery(&repo, &delivery).await;
+        assert_eq!(job.status, JOB_STATUS_PENDING);
+        assert!(job.started_at.is_some());
     }
 
     #[tokio::test]
     async fn test_stale_upload_retry_does_not_overwrite_publishing_row() {
         let repo = tests_helpers::setup_test_db().await.unwrap();
-        let model = repo
-            .enqueue_eh_download(-100, 61, "tok", "Title", true, SOURCE_DIRECT)
+        let delivery = repo
+            .enqueue_eh_download(
+                -100,
+                61,
+                "tok",
+                "Title",
+                true,
+                SOURCE_DIRECT,
+                &EhGalleryVariant::archive("1280x"),
+            )
             .await
             .unwrap();
 
-        let download_claim = repo.get_next_for_download().await.unwrap().unwrap();
-        assert_eq!(download_claim.status, STATUS_DOWNLOADING);
-        repo.mark_eh_download_downloaded(model.id, 5000, "/tmp/61.zip", 0)
-            .await
-            .unwrap();
+        let download_claim = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        assert_eq!(download_claim.id, delivery.job_id.unwrap());
+        assert_eq!(download_claim.status, JOB_STATUS_DOWNLOADING);
+        repo.mark_eh_job_downloaded(
+            download_claim.id,
+            download_claim.started_at.unwrap(),
+            5000,
+            "/tmp/61.zip",
+            0,
+        )
+        .await
+        .unwrap();
 
-        let upload_claim = repo.get_next_for_upload().await.unwrap().unwrap();
-        assert_eq!(upload_claim.status, STATUS_UPLOADING);
-        repo.mark_eh_download_uploaded(model.id, "https://telegra.ph/61")
-            .await
-            .unwrap();
+        let upload_claim = repo.get_next_eh_job_for_upload().await.unwrap().unwrap();
+        assert_eq!(upload_claim.id, delivery.job_id.unwrap());
+        let upload_started_at = upload_claim.started_at.unwrap();
+        repo.mark_eh_job_telegraph_ready(
+            upload_claim.id,
+            upload_started_at,
+            "https://telegra.ph/61",
+            None,
+            true,
+        )
+        .await
+        .unwrap();
 
-        let publish_claim = repo.get_next_for_publish().await.unwrap().unwrap();
-        assert_eq!(publish_claim.status, STATUS_PUBLISHING);
+        let publish_claim = repo
+            .get_next_eh_delivery_for_publish(true)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(publish_claim.delivery.id, delivery.id);
+        assert_eq!(publish_claim.delivery.status, STATUS_PUBLISHING);
 
         let stale_upload_retry = repo
-            .schedule_eh_retry_from(
+            .record_eh_job_upload_failure(
                 upload_claim.id,
-                STATUS_UPLOADING,
-                STATUS_DOWNLOADED,
+                upload_started_at,
                 "stale upload failure",
                 3,
+                true,
             )
-            .await;
+            .await
+            .unwrap();
         assert!(
-            stale_upload_retry.is_err(),
-            "stale upload retry must not move a publishing row back to downloaded"
+            matches!(
+                stale_upload_retry,
+                crate::db::repo::eh_gallery_jobs::EhJobUploadFailureOutcome::Stale
+            ),
+            "stale shared upload retry must not affect a delivery that is already publishing"
         );
 
-        let row = Entity::find_by_id(model.id)
+        let row = Entity::find_by_id(delivery.id)
             .one(&repo.db)
             .await
             .unwrap()
             .unwrap();
         assert_eq!(row.status, STATUS_PUBLISHING);
         assert_eq!(row.retry_count, 0);
+        assert_eq!(
+            job_for_delivery(&repo, &delivery).await.telegraph_status,
+            crate::db::repo::eh_gallery_jobs::TELEGRAPH_STATUS_READY
+        );
     }
 
-    /// When merge runs on a row that was claimed by a publish worker between
-    /// select and update, the CAS guard detects the status change, re-reads,
-    /// and correctly decides to reset (telegraph was upgraded while the row is
-    /// in a post-download state where telegraph matters).
     #[tokio::test]
-    async fn test_merge_rechecks_after_publish_claim_race() {
+    async fn test_enqueue_preserves_a_markerless_crashed_publishing_claim() {
         let repo = tests_helpers::setup_test_db().await.unwrap();
         let model = repo
-            .enqueue_eh_subscription_download(-100, 123, 65, "tok", "Title", false)
+            .enqueue_eh_subscription_download(
+                -100,
+                123,
+                65,
+                "tok",
+                "Title",
+                false,
+                &EhGalleryVariant::archive("1280x"),
+            )
             .await
             .unwrap();
 
-        // Download: claim -> downloading -> downloaded (telegraph=false)
-        let claimed = repo.get_next_for_download().await.unwrap().unwrap();
-        assert_eq!(claimed.id, model.id);
-        repo.mark_eh_download_downloaded(model.id, 5000, "/tmp/65.zip", 0)
+        let claimed = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        assert_eq!(claimed.id, model.job_id.unwrap());
+        repo.mark_eh_job_downloaded(
+            claimed.id,
+            claimed.started_at.unwrap(),
+            5000,
+            "/tmp/65.zip",
+            0,
+        )
+        .await
+        .unwrap();
+
+        let publish_claim = repo
+            .get_next_eh_delivery_for_publish(true)
             .await
+            .unwrap()
             .unwrap();
+        assert_eq!(publish_claim.delivery.id, model.id);
 
-        // Row is now downloaded, telegraph=false — publish worker claims it
-        let pub_claimed = repo.get_next_for_publish().await.unwrap().unwrap();
-        assert_eq!(pub_claimed.id, model.id);
-        assert_eq!(pub_claimed.status, STATUS_PUBLISHING);
-
-        // Now enqueue with telegraph=true.  The merge sees the row is
-        // `publishing` and telegraph was upgraded → resets to pending so the
-        // new telegraph requirement is not lost.
+        // A new token creates a different shared job, but a crash-residual
+        // publishing claim must remain bound to its original wave for startup
+        // recovery. Enqueue may merge ownership, never replace the claim.
         let merged = repo
-            .enqueue_eh_subscription_download(-100, 456, 65, "newtok", "NewTitle", true)
+            .enqueue_eh_subscription_download(
+                -100,
+                456,
+                65,
+                "newtok",
+                "NewTitle",
+                true,
+                &EhGalleryVariant::archive("1280x"),
+            )
             .await
             .unwrap();
 
-        // Merge correctly detected the telegraph upgrade on a publishing row
-        // and reset to pending so the download pipeline will re-process with
-        // telegraph=true.
         assert_eq!(merged.id, model.id);
-        assert_eq!(merged.status, STATUS_PENDING);
-        assert!(merged.telegraph, "reset must preserve telegraph=true");
+        assert_eq!(merged.status, STATUS_PUBLISHING);
+        assert!(
+            merged.telegraph,
+            "owner merge must preserve telegraph demand"
+        );
         assert_eq!(merged.subscription_ids.as_deref(), Some("123,456"));
         assert_eq!(merged.telegraph_subscription_ids.as_deref(), Some("456"));
-        assert_eq!(merged.token, "newtok");
-        assert_eq!(merged.title, "NewTitle");
-
-        // Re-download and verify the pipeline now respects telegraph=true
-        let re_claimed = repo.get_next_for_download().await.unwrap().unwrap();
-        assert_eq!(re_claimed.id, model.id);
-        repo.mark_eh_download_downloaded(model.id, 5000, "/tmp/65b.zip", 0)
+        assert_eq!(merged.token, "tok");
+        assert_eq!(merged.title, "Title");
+        assert_eq!(merged.job_id, model.job_id);
+        let claimed_job = job_for_delivery(&repo, &merged).await;
+        assert_eq!(claimed_job.status, JOB_STATUS_DOWNLOADED);
+        assert!(claimed_job.telegraph_required);
+        assert_eq!(claimed_job.title, "Title");
+        let unbound_requested_job = eh_gallery_jobs::Entity::find()
+            .filter(eh_gallery_jobs::Column::Gid.eq(65_i64))
+            .filter(eh_gallery_jobs::Column::Token.eq("newtok"))
+            .one(repo.db())
             .await
+            .unwrap()
             .unwrap();
-
-        // Upload stage should now claim it (telegraph=true, downloaded)
-        let up_claimed = repo.get_next_for_upload().await.unwrap().unwrap();
-        assert_eq!(up_claimed.id, model.id);
-        assert_eq!(up_claimed.status, STATUS_UPLOADING);
+        assert_eq!(unbound_requested_job.status, JOB_STATUS_RETIRED);
+        assert!(
+            repo.get_next_eh_job_for_download().await.unwrap().is_none(),
+            "a requested job left unbound by a publishing claim must not remain claimable"
+        );
     }
 
     /// When an insert conflicts on (chat_id, gid) unique constraint, the
@@ -6029,7 +8037,15 @@ mod tests {
         // Now enqueue the "real" request — SELECT finds the directly-inserted
         // row and merges via merge_eh_download.
         let merged = repo
-            .enqueue_eh_download(-100, 70, "tok2", "Title2", true, SOURCE_DIRECT)
+            .enqueue_eh_download(
+                -100,
+                70,
+                "tok2",
+                "Title2",
+                true,
+                SOURCE_DIRECT,
+                &EhGalleryVariant::archive("1280x"),
+            )
             .await
             .unwrap();
 
@@ -6062,13 +8078,21 @@ mod tests {
     async fn test_merge_source_guard_preserves_direct_upgrade() {
         let repo = tests_helpers::setup_test_db().await.unwrap();
 
-        // Insert a row with SOURCE_SUBSCRIPTION, status=pending
+        // Insert a row with SOURCE_SUBSCRIPTION, status=waiting.
         let model = repo
-            .enqueue_eh_download(-100, 80, "tok", "Title", false, SOURCE_SUBSCRIPTION)
+            .enqueue_eh_download(
+                -100,
+                80,
+                "tok",
+                "Title",
+                false,
+                SOURCE_SUBSCRIPTION,
+                &EhGalleryVariant::archive("1280x"),
+            )
             .await
             .unwrap();
         assert_eq!(model.source, SOURCE_SUBSCRIPTION);
-        assert_eq!(model.status, STATUS_PENDING);
+        assert_eq!(model.status, STATUS_WAITING);
 
         // Snapshot A: the old subscription row
         let snap_a = Entity::find_by_id(model.id)
@@ -6080,13 +8104,21 @@ mod tests {
 
         // Apply a direct upgrade via enqueue (full reset path)
         let upgraded = repo
-            .enqueue_eh_download(-100, 80, "direct_tok", "Direct Title", false, SOURCE_DIRECT)
+            .enqueue_eh_download(
+                -100,
+                80,
+                "direct_tok",
+                "Direct Title",
+                false,
+                SOURCE_DIRECT,
+                &EhGalleryVariant::archive("1280x"),
+            )
             .await
             .unwrap();
         assert_eq!(upgraded.id, model.id);
         assert_eq!(upgraded.source, SOURCE_DIRECT);
 
-        // Snapshot B: the upgraded row (still pending after reset)
+        // Snapshot B: the upgraded delivery is still waiting.
         let snap_b = Entity::find_by_id(model.id)
             .one(&repo.db)
             .await
@@ -6117,98 +8149,6 @@ mod tests {
         // the CAS retry re-reads the row with the correct source).  The key
         // invariant is that source stays SOURCE_DIRECT.
         assert_eq!(merged.token, "stale_tok");
-    }
-
-    /// Verify that `recover_eh_enqueue_after_insert_error` reselects the
-    /// existing row and merges it when called after a simulated insert error.
-    /// The existing test only exercised the SELECT-found path before the
-    /// insert; this test exercises the fallback branch through the private
-    /// helper directly.
-    #[tokio::test]
-    async fn test_enqueue_insert_error_reselect_merge_fallback() {
-        let repo = tests_helpers::setup_test_db().await.unwrap();
-
-        // Pre-insert a row so the helper's re-select finds it
-        let now = chrono::Local::now().naive_local();
-        let conflict = eh_download_queue::ActiveModel {
-            chat_id: Set(-100i64),
-            gid: Set(71i64),
-            token: Set("other".to_string()),
-            title: Set("Other".to_string()),
-            telegraph: Set(false),
-            source: Set(SOURCE_SUBSCRIPTION.to_string()),
-            status: Set(STATUS_PENDING.to_string()),
-            file_size: Set(0),
-            error: Set(None),
-            retry_count: Set(0),
-            created_at: Set(now),
-            started_at: Set(None),
-            completed_at: Set(None),
-            ..Default::default()
-        };
-        conflict.insert(&repo.db).await.unwrap();
-
-        // Call the private helper with a synthetic DbErr — the error value
-        // is not inspected, only used for logging in production.
-        let synthetic_err = sea_orm::DbErr::Custom("simulated insert conflict".to_string());
-        let recovered = repo
-            .recover_eh_enqueue_after_insert_error(
-                EhEnqueueRequest {
-                    chat_id: -100,
-                    gid: 71,
-                    token: "real_tok",
-                    title: "Real Title",
-                    telegraph: true,
-                    source: SOURCE_DIRECT,
-                    subscription_id: None,
-                },
-                synthetic_err,
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(recovered.chat_id, -100);
-        assert_eq!(recovered.gid, 71);
-        assert_eq!(recovered.token, "real_tok");
-        assert_eq!(recovered.title, "Real Title");
-        assert!(recovered.telegraph, "telegraph should be OR-merged");
-        assert_eq!(recovered.source, SOURCE_DIRECT, "source should be upgraded");
-    }
-
-    /// When re-select after insert conflict returns Ok(None) (row doesn't
-    /// exist at all), the helper must propagate the original insert DbErr
-    /// rather than a generic message.
-    #[tokio::test]
-    async fn test_enqueue_insert_error_reselect_none_preserves_original_error() {
-        let repo = tests_helpers::setup_test_db().await.unwrap();
-
-        // No row exists for (chat_id, gid) — re-select will return Ok(None).
-        let synthetic_err = sea_orm::DbErr::Custom("unique constraint violation".to_string());
-        let err = repo
-            .recover_eh_enqueue_after_insert_error(
-                EhEnqueueRequest {
-                    chat_id: -999,
-                    gid: 999,
-                    token: "tok",
-                    title: "Title",
-                    telegraph: false,
-                    source: SOURCE_DIRECT,
-                    subscription_id: None,
-                },
-                synthetic_err,
-            )
-            .await
-            .unwrap_err();
-
-        let chain = format!("{:#}", err);
-        assert!(
-            chain.contains("unique constraint violation"),
-            "original DbErr should appear in error chain: {chain}"
-        );
-        assert!(
-            chain.contains("Failed to enqueue eh download"),
-            "context message should be present: {chain}"
-        );
     }
 
     /// After fallback, stale Telegraph URL and sent markers must be cleared
@@ -6284,17 +8224,31 @@ mod tests {
     async fn test_disable_telegraph_without_token_downgrades_unuploaded_downloaded_rows() {
         let repo = tests_helpers::setup_test_db().await.unwrap();
         let model = repo
-            .enqueue_eh_download(-100, 91, "tok", "Title", true, SOURCE_DIRECT)
+            .enqueue_eh_download(
+                -100,
+                91,
+                "tok",
+                "Title",
+                true,
+                SOURCE_DIRECT,
+                &EhGalleryVariant::archive("1280x"),
+            )
             .await
             .unwrap();
-        let claimed = repo.get_next_for_download().await.unwrap().unwrap();
-        assert_eq!(claimed.id, model.id);
-        repo.mark_eh_download_downloaded(model.id, 5000, "/tmp/91.zip", 0)
-            .await
-            .unwrap();
+        let claimed = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        assert_eq!(claimed.id, model.job_id.unwrap());
+        repo.mark_eh_job_downloaded(
+            claimed.id,
+            claimed.started_at.unwrap(),
+            5000,
+            "/tmp/91.zip",
+            0,
+        )
+        .await
+        .unwrap();
 
         let changed = repo
-            .disable_eh_telegraph_for_unuploaded_entries()
+            .disable_eh_telegraph_for_unuploaded_jobs()
             .await
             .unwrap();
         assert_eq!(changed, 1);
@@ -6304,36 +8258,62 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(row.status, STATUS_DOWNLOADED);
+        assert_eq!(row.status, STATUS_WAITING);
         assert!(!row.telegraph);
         assert!(row.telegraph_url.is_none());
 
-        assert!(repo.get_next_for_upload().await.unwrap().is_none());
-        let publish = repo.get_next_for_publish().await.unwrap().unwrap();
-        assert_eq!(publish.id, model.id);
-        assert_eq!(publish.status, STATUS_PUBLISHING);
+        let job = eh_gallery_jobs::Entity::find_by_id(model.job_id.unwrap())
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            job.telegraph_status,
+            crate::db::repo::eh_gallery_jobs::TELEGRAPH_STATUS_NOT_REQUIRED
+        );
+        assert!(!job.telegraph_required);
     }
 
     #[tokio::test]
     async fn test_disable_telegraph_without_token_preserves_uploaded_rows_with_url() {
         let repo = tests_helpers::setup_test_db().await.unwrap();
         let model = repo
-            .enqueue_eh_download(-100, 92, "tok", "Title", true, SOURCE_DIRECT)
+            .enqueue_eh_download(
+                -100,
+                92,
+                "tok",
+                "Title",
+                true,
+                SOURCE_DIRECT,
+                &EhGalleryVariant::archive("1280x"),
+            )
             .await
             .unwrap();
-        let claimed = repo.get_next_for_download().await.unwrap().unwrap();
-        assert_eq!(claimed.id, model.id);
-        repo.mark_eh_download_downloaded(model.id, 5000, "/tmp/92.zip", 0)
-            .await
-            .unwrap();
-        let upload = repo.get_next_for_upload().await.unwrap().unwrap();
-        assert_eq!(upload.id, model.id);
-        repo.mark_eh_download_uploaded(model.id, "https://telegra.ph/92")
-            .await
-            .unwrap();
+        let claimed = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        assert_eq!(claimed.id, model.job_id.unwrap());
+        repo.mark_eh_job_downloaded(
+            claimed.id,
+            claimed.started_at.unwrap(),
+            5000,
+            "/tmp/92.zip",
+            0,
+        )
+        .await
+        .unwrap();
+        let upload = repo.get_next_eh_job_for_upload().await.unwrap().unwrap();
+        assert_eq!(upload.id, model.job_id.unwrap());
+        repo.mark_eh_job_telegraph_ready(
+            upload.id,
+            upload.started_at.unwrap(),
+            "https://telegra.ph/92",
+            None,
+            true,
+        )
+        .await
+        .unwrap();
 
         let changed = repo
-            .disable_eh_telegraph_for_unuploaded_entries()
+            .disable_eh_telegraph_for_unuploaded_jobs()
             .await
             .unwrap();
         assert_eq!(changed, 0);
@@ -6344,15 +8324,30 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(row.telegraph);
-        assert_eq!(row.status, STATUS_UPLOADED);
-        assert_eq!(row.telegraph_url.as_deref(), Some("https://telegra.ph/92"));
+        assert_eq!(row.status, STATUS_WAITING);
+        assert!(row.telegraph_url.is_none());
+        let job = eh_gallery_jobs::Entity::find_by_id(model.job_id.unwrap())
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.telegraph_status, TELEGRAPH_STATUS_READY);
+        assert_eq!(job.telegraph_url.as_deref(), Some("https://telegra.ph/92"));
     }
 
     #[tokio::test]
     async fn test_disable_telegraph_without_token_clears_terminal_stale_flag() {
         let repo = tests_helpers::setup_test_db().await.unwrap();
         let model = repo
-            .enqueue_eh_download(-100, 93, "tok", "Title", true, SOURCE_DIRECT)
+            .enqueue_eh_download(
+                -100,
+                93,
+                "tok",
+                "Title",
+                true,
+                SOURCE_DIRECT,
+                &EhGalleryVariant::archive("1280x"),
+            )
             .await
             .unwrap();
         Entity::update_many()
@@ -6363,7 +8358,15 @@ mod tests {
             .await
             .unwrap();
         let canceled_model = repo
-            .enqueue_eh_download(-100, 94, "tok", "Title", true, SOURCE_DIRECT)
+            .enqueue_eh_download(
+                -100,
+                94,
+                "tok",
+                "Title",
+                true,
+                SOURCE_DIRECT,
+                &EhGalleryVariant::archive("1280x"),
+            )
             .await
             .unwrap();
         Entity::update_many()
@@ -6373,7 +8376,15 @@ mod tests {
             .await
             .unwrap();
         let done_with_url = repo
-            .enqueue_eh_download(-100, 95, "tok", "Title", true, SOURCE_DIRECT)
+            .enqueue_eh_download(
+                -100,
+                95,
+                "tok",
+                "Title",
+                true,
+                SOURCE_DIRECT,
+                &EhGalleryVariant::archive("1280x"),
+            )
             .await
             .unwrap();
         Entity::update_many()
@@ -6388,10 +8399,10 @@ mod tests {
             .unwrap();
 
         let changed = repo
-            .disable_eh_telegraph_for_unuploaded_entries()
+            .disable_eh_telegraph_for_unuploaded_jobs()
             .await
             .unwrap();
-        assert_eq!(changed, 3);
+        assert_eq!(changed, 0);
 
         let row = Entity::find_by_id(model.id)
             .one(&repo.db)
@@ -6399,217 +8410,269 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(row.status, STATUS_FAILED);
-        assert!(!row.telegraph);
+        assert!(
+            row.telegraph,
+            "terminal delivery history is not startup work"
+        );
         let canceled = Entity::find_by_id(canceled_model.id)
             .one(&repo.db)
             .await
             .unwrap()
             .unwrap();
         assert_eq!(canceled.status, STATUS_CANCELED);
-        assert!(!canceled.telegraph);
+        assert!(canceled.telegraph);
         let done = Entity::find_by_id(done_with_url.id)
             .one(&repo.db)
             .await
             .unwrap()
             .unwrap();
         assert_eq!(done.status, STATUS_DONE);
-        assert!(!done.telegraph);
+        assert!(done.telegraph);
         assert_eq!(
             done.telegraph_url.as_deref(),
             Some("https://telegra.ph/old")
         );
-
-        let reenqueued = repo
-            .enqueue_eh_download(-100, 93, "new", "New", false, SOURCE_DIRECT)
-            .await
-            .unwrap();
-        assert_eq!(reenqueued.status, STATUS_PENDING);
-        assert!(!reenqueued.telegraph);
-        let reenqueued_done_url = repo
-            .enqueue_eh_download(-100, 95, "new", "New", false, SOURCE_DIRECT)
-            .await
-            .unwrap();
-        assert_eq!(reenqueued_done_url.status, STATUS_PENDING);
-        assert!(!reenqueued_done_url.telegraph);
     }
 
     #[tokio::test]
-    async fn test_telegraph_rewrite_lifecycle_schedule_retry_stale_and_success() {
-        let repo = tests_helpers::setup_test_db().await.unwrap();
-        let model = repo
-            .enqueue_eh_download(-100, 96, "tok", "Title", true, SOURCE_DIRECT)
-            .await
-            .unwrap();
+    async fn shared_enqueue_is_atomic_across_job_and_delivery_unique_constraints() {
+        let repo = std::sync::Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        let variant = EhGalleryVariant::archive("980x");
 
-        let claimed = repo.get_next_for_download().await.unwrap().unwrap();
-        assert_eq!(claimed.id, model.id);
-        repo.mark_eh_download_downloaded(model.id, 5000, "/tmp/96.zip", 0)
-            .await
-            .unwrap();
-
-        let upload = repo.get_next_for_upload().await.unwrap().unwrap();
-        assert_eq!(upload.status, STATUS_UPLOADING);
-        let uploaded = repo
-            .mark_eh_download_uploaded_with_rewrite(
-                model.id,
-                "https://telegra.ph/96",
-                Some("{\"pages\":[]}"),
-            )
-            .await
-            .unwrap();
-        assert_eq!(uploaded.status, STATUS_UPLOADED);
-        assert_eq!(
-            uploaded.telegraph_rewrite_data.as_deref(),
-            Some("{\"pages\":[]}")
+        let (first, second, same_chat_upgrade) = tokio::join!(
+            repo.enqueue_eh_download(
+                -100,
+                700,
+                "token",
+                "Gallery",
+                false,
+                SOURCE_DIRECT,
+                &variant,
+            ),
+            repo.enqueue_eh_download(
+                -200,
+                700,
+                "token",
+                "Gallery",
+                false,
+                SOURCE_DIRECT,
+                &variant,
+            ),
+            repo.enqueue_eh_download(-100, 700, "token", "Gallery", true, SOURCE_DIRECT, &variant,),
         );
-        assert!(uploaded.telegraph_rewrite_status.is_none());
+        let first = first.unwrap();
+        let second = second.unwrap();
+        let same_chat_upgrade = same_chat_upgrade.unwrap();
 
-        let publishing = repo.get_next_for_publish().await.unwrap().unwrap();
-        assert_eq!(publishing.status, STATUS_PUBLISHING);
-        repo.mark_eh_telegraph_sent_and_schedule_rewrite(model.id, Some(0))
-            .await
-            .unwrap();
-        let scheduled = Entity::find_by_id(model.id)
-            .one(&repo.db)
-            .await
-            .unwrap()
-            .unwrap();
-        let first_rewrite_after = scheduled.telegraph_rewrite_after;
-        repo.schedule_eh_telegraph_rewrite_after_send(model.id, 3600)
-            .await
-            .unwrap();
-        let still_scheduled = Entity::find_by_id(model.id)
-            .one(&repo.db)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(still_scheduled.telegraph_rewrite_after, first_rewrite_after);
-
-        let rewrite = repo
-            .get_next_for_telegraph_rewrite()
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(rewrite.id, model.id);
+        assert_eq!(first.job_id, second.job_id);
+        assert_eq!(first.id, same_chat_upgrade.id);
+        assert!(same_chat_upgrade.telegraph);
         assert_eq!(
-            rewrite.telegraph_rewrite_status.as_deref(),
-            Some(TELEGRAPH_REWRITE_STATUS_REWRITING)
+            eh_gallery_jobs::Entity::find()
+                .filter(eh_gallery_jobs::Column::Gid.eq(700))
+                .count(repo.db())
+                .await
+                .unwrap(),
+            1
         );
-        assert!(rewrite.telegraph_rewrite_started_at.is_some());
-
-        let permanent = repo
-            .schedule_eh_telegraph_rewrite_retry(model.id, "gateway not ready", 3)
-            .await
-            .unwrap();
-        assert!(!permanent);
-        let retry = Entity::find_by_id(model.id)
-            .one(&repo.db)
-            .await
-            .unwrap()
-            .unwrap();
         assert_eq!(
-            retry.telegraph_rewrite_status.as_deref(),
-            Some(TELEGRAPH_REWRITE_STATUS_PENDING)
+            Entity::find()
+                .filter(Column::Gid.eq(700))
+                .count(repo.db())
+                .await
+                .unwrap(),
+            2
         );
-        assert_eq!(retry.telegraph_rewrite_retry_count, 1);
-        assert!(retry.telegraph_rewrite_next_retry_at.is_some());
-
-        Entity::update_many()
-            .col_expr(
-                Column::TelegraphRewriteStatus,
-                Expr::value(Some(TELEGRAPH_REWRITE_STATUS_REWRITING.to_string())),
-            )
-            .col_expr(
-                Column::TelegraphRewriteStartedAt,
-                Expr::value(Some(
-                    Local::now().naive_local() - chrono::Duration::seconds(7200),
-                )),
-            )
-            .filter(Column::Id.eq(model.id))
-            .exec(&repo.db)
-            .await
-            .unwrap();
-        let reset = repo.reset_stale_eh_telegraph_rewrites(3600).await.unwrap();
-        assert_eq!(reset, 1);
-
-        Entity::update_many()
-            .col_expr(
-                Column::TelegraphRewriteNextRetryAt,
-                Expr::value(None::<DateTime>),
-            )
-            .filter(Column::Id.eq(model.id))
-            .exec(&repo.db)
-            .await
-            .unwrap();
-        let rewrite = repo
-            .get_next_for_telegraph_rewrite()
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(rewrite.id, model.id);
-        repo.mark_eh_telegraph_rewritten(model.id).await.unwrap();
-
-        let done = Entity::find_by_id(model.id)
-            .one(&repo.db)
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(done.telegraph_rewrite_data.is_none());
-        assert!(done.telegraph_rewrite_status.is_none());
-        assert_eq!(done.telegraph_rewrite_retry_count, 0);
-        assert!(done.telegraph_rewritten_at.is_some());
     }
 
     #[tokio::test]
-    async fn test_telegraph_rewrite_retry_exhaustion_marks_failed() {
+    async fn enqueue_isolates_variants_and_rebinds_direct_upgrade_before_markers() {
         let repo = tests_helpers::setup_test_db().await.unwrap();
-        let model = repo
-            .enqueue_eh_download(-100, 97, "tok", "Title", true, SOURCE_DIRECT)
+        let subscription = repo
+            .enqueue_eh_subscription_download(
+                -100,
+                12,
+                701,
+                "token",
+                "Subscription title",
+                false,
+                &EhGalleryVariant::archive("980x"),
+            )
             .await
             .unwrap();
+        let subscription_job_id = subscription.job_id.unwrap();
 
-        let claimed = repo.get_next_for_download().await.unwrap().unwrap();
-        repo.mark_eh_download_downloaded(claimed.id, 5000, "/tmp/97.zip", 0)
+        let direct = repo
+            .enqueue_eh_download(
+                -100,
+                701,
+                "token",
+                "Direct title",
+                false,
+                SOURCE_DIRECT,
+                &EhGalleryVariant::archive("original"),
+            )
             .await
             .unwrap();
-        repo.get_next_for_upload().await.unwrap().unwrap();
-        repo.mark_eh_download_uploaded_with_rewrite(
-            model.id,
-            "https://telegra.ph/97",
-            Some("{\"pages\":[]}"),
-        )
-        .await
-        .unwrap();
-        repo.get_next_for_publish().await.unwrap().unwrap();
-        repo.mark_eh_telegraph_sent_and_schedule_rewrite(model.id, Some(0))
-            .await
-            .unwrap();
-        repo.get_next_for_telegraph_rewrite()
-            .await
-            .unwrap()
-            .unwrap();
-
-        let permanent = repo
-            .schedule_eh_telegraph_rewrite_retry(model.id, "edit denied", 0)
-            .await
-            .unwrap();
-        assert!(permanent);
-
-        let failed = Entity::find_by_id(model.id)
-            .one(&repo.db)
-            .await
-            .unwrap()
-            .unwrap();
+        let direct_job_id = direct.job_id.unwrap();
+        assert_ne!(direct_job_id, subscription_job_id);
+        assert_eq!(direct.source, SOURCE_DIRECT);
         assert_eq!(
-            failed.telegraph_rewrite_status.as_deref(),
-            Some(TELEGRAPH_REWRITE_STATUS_FAILED)
+            eh_gallery_jobs::Entity::find_by_id(subscription_job_id)
+                .one(repo.db())
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            JOB_STATUS_RETIRED
         );
-        assert_eq!(failed.telegraph_rewrite_retry_count, 1);
-        assert!(failed.telegraph_rewrite_next_retry_at.is_none());
-        assert!(repo
-            .get_next_for_telegraph_rewrite()
+
+        Entity::update_many()
+            .col_expr(
+                Column::ArchiveSentAt,
+                Expr::value(Some(Local::now().naive_local())),
+            )
+            .filter(Column::Id.eq(direct.id))
+            .exec(repo.db())
+            .await
+            .unwrap();
+        let marker_bound = repo
+            .enqueue_eh_download(
+                -100,
+                701,
+                "token",
+                "Later title",
+                false,
+                SOURCE_DIRECT,
+                &EhGalleryVariant::archive("780x"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(marker_bound.job_id, Some(direct_job_id));
+
+        let orphan = eh_gallery_jobs::Entity::find()
+            .filter(eh_gallery_jobs::Column::Gid.eq(701))
+            .filter(eh_gallery_jobs::Column::Resolution.eq("780x"))
+            .one(repo.db())
             .await
             .unwrap()
-            .is_none());
+            .unwrap();
+        assert_eq!(orphan.status, JOB_STATUS_RETIRED);
+    }
+
+    #[tokio::test]
+    async fn enqueue_binds_dirty_retired_job_without_reactivating_or_clearing_artifacts() {
+        let repo = tests_helpers::setup_test_db().await.unwrap();
+        let variant = EhGalleryVariant::archive("980x");
+        let initial = repo
+            .enqueue_eh_download(
+                -100,
+                702,
+                "token",
+                "Initial title",
+                false,
+                SOURCE_DIRECT,
+                &variant,
+            )
+            .await
+            .unwrap();
+        let job_id = initial.job_id.unwrap();
+        Entity::update_many()
+            .col_expr(Column::JobId, Expr::value(None::<i32>))
+            .col_expr(Column::Status, Expr::value(STATUS_CANCELED))
+            .filter(Column::Id.eq(initial.id))
+            .exec(repo.db())
+            .await
+            .unwrap();
+        eh_gallery_jobs::Entity::update_many()
+            .col_expr(
+                eh_gallery_jobs::Column::Status,
+                Expr::value(JOB_STATUS_RETIRED),
+            )
+            .col_expr(
+                eh_gallery_jobs::Column::CleanupStatus,
+                Expr::value(CLEANUP_STATUS_FAILED),
+            )
+            .col_expr(
+                eh_gallery_jobs::Column::ZipPath,
+                Expr::value(Some("cache/702.zip".to_string())),
+            )
+            .col_expr(
+                eh_gallery_jobs::Column::CleanupError,
+                Expr::value(Some("disk unavailable".to_string())),
+            )
+            .filter(eh_gallery_jobs::Column::Id.eq(job_id))
+            .exec(repo.db())
+            .await
+            .unwrap();
+
+        let bound = repo
+            .enqueue_eh_download(
+                -200,
+                702,
+                "token",
+                "Later title",
+                false,
+                SOURCE_DIRECT,
+                &variant,
+            )
+            .await
+            .unwrap();
+        assert_eq!(bound.job_id, Some(job_id));
+        let job = eh_gallery_jobs::Entity::find_by_id(job_id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.status, JOB_STATUS_RETIRED);
+        assert_eq!(job.cleanup_status, CLEANUP_STATUS_FAILED);
+        assert_eq!(job.zip_path.as_deref(), Some("cache/702.zip"));
+        assert_eq!(job.cleanup_error.as_deref(), Some("disk unavailable"));
+    }
+
+    #[tokio::test]
+    async fn publish_claim_readback_failure_rolls_back_the_delivery_cas() {
+        let repo = tests_helpers::setup_test_db().await.unwrap();
+        let delivery = repo
+            .enqueue_eh_download(
+                -100,
+                703,
+                "token",
+                "Claim rollback",
+                false,
+                SOURCE_DIRECT,
+                &EhGalleryVariant::archive("980x"),
+            )
+            .await
+            .unwrap();
+        repo.db
+            .execute(Statement::from_string(
+                DbBackend::Sqlite,
+                format!(
+                    "CREATE TRIGGER delete_claimed_delivery AFTER UPDATE OF status ON eh_download_queue \
+                     WHEN NEW.id = {} AND NEW.status = 'publishing' BEGIN \
+                         DELETE FROM eh_download_queue WHERE id = NEW.id; \
+                     END;",
+                    delivery.id
+                ),
+            ))
+            .await
+            .unwrap();
+
+        let error = repo
+            .get_next_eh_delivery_for_publish(false)
+            .await
+            .expect_err("a missing readback must fail the claim transaction");
+        assert!(error
+            .to_string()
+            .contains("Shared EH delivery changed before publish claim readback"));
+
+        let delivery = Entity::find_by_id(delivery.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .expect("the failed readback must not leave a deleted or publishing delivery");
+        assert_eq!(delivery.status, STATUS_WAITING);
+        assert!(delivery.started_at.is_none());
     }
 }
