@@ -512,7 +512,11 @@ impl EhBackgroundDownloadWorker {
         let concurrency = self.config.background_download_concurrency.max(1);
         let mut tasks = JoinSet::new();
         for _ in 0..concurrency {
-            let Some(job) = self.repo.get_next_eh_job_for_background_download().await? else {
+            let Some(job) = self
+                .repo
+                .get_next_eh_job_for_background_download_with_policy(self.config.send_archive)
+                .await?
+            else {
                 break;
             };
             let worker = Self::new(
@@ -1398,7 +1402,10 @@ impl EhDownloadWorker {
             return Ok(());
         }
 
-        let job = self.repo.get_next_eh_job_for_download().await?;
+        let job = self
+            .repo
+            .get_next_eh_job_for_download_with_policy(self.config.send_archive)
+            .await?;
         let Some(job) = job else {
             return Ok(());
         };

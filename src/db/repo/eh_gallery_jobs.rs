@@ -869,14 +869,25 @@ impl Repo {
 impl Repo {
     /// Claim the next normal shared-gallery download job. Recent work remains
     /// FIFO while older work remains LIFO, matching the pre-sharing queue lane.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub async fn get_next_eh_job_for_download(&self) -> Result<Option<eh_gallery_jobs::Model>> {
-        self.get_next_eh_job_for_download_at(Local::now().naive_local())
+        self.get_next_eh_job_for_download_with_policy(true).await
+    }
+
+    /// Claim the next normal shared-gallery download job with the configured
+    /// archive publish policy applied to every bound delivery.
+    pub async fn get_next_eh_job_for_download_with_policy(
+        &self,
+        send_archive: bool,
+    ) -> Result<Option<eh_gallery_jobs::Model>> {
+        self.get_next_eh_job_for_download_at(Local::now().naive_local(), send_archive)
             .await
     }
 
     async fn get_next_eh_job_for_download_at(
         &self,
         now: DateTime,
+        send_archive: bool,
     ) -> Result<Option<eh_gallery_jobs::Model>> {
         let cutoff = now - chrono::Duration::hours(MAIN_DOWNLOAD_RECENT_WINDOW_HOURS);
         let is_recent = Expr::col(eh_gallery_jobs::Column::CreatedAt).gt(cutoff);
@@ -902,6 +913,9 @@ impl Repo {
             .filter(eh_gallery_jobs::Column::Status.eq(JOB_STATUS_PENDING))
             .filter(eh_gallery_jobs::Column::CleanupStatus.eq(CLEANUP_STATUS_NONE))
             .filter(eh_gallery_jobs::Column::BackgroundDownloadStatus.is_null())
+            .filter(eh_job_has_configured_source_work_candidate_filter(
+                send_archive,
+            ))
             .filter(
                 eh_gallery_jobs::Column::NextRetryAt
                     .is_null()
@@ -921,13 +935,15 @@ impl Repo {
             return Ok(None);
         };
 
-        self.claim_eh_job_download_from_snapshot_at(&job, now).await
+        self.claim_eh_job_download_from_snapshot_at(&job, now, send_archive)
+            .await
     }
 
     async fn claim_eh_job_download_from_snapshot_at(
         &self,
         job: &eh_gallery_jobs::Model,
         now: DateTime,
+        send_archive: bool,
     ) -> Result<Option<eh_gallery_jobs::Model>> {
         let generation = next_job_claim_generation(now, job.started_at)?;
         let result = eh_gallery_jobs::Entity::update_many()
@@ -944,6 +960,10 @@ impl Repo {
             .filter(eh_gallery_jobs::Column::Status.eq(JOB_STATUS_PENDING))
             .filter(eh_gallery_jobs::Column::CleanupStatus.eq(CLEANUP_STATUS_NONE))
             .filter(eh_gallery_jobs::Column::BackgroundDownloadStatus.is_null())
+            .filter(eh_job_has_configured_source_work_filter(
+                job.id,
+                send_archive,
+            ))
             .filter(job_claim_generation_filter(job.started_at))
             .filter(
                 sea_orm::Condition::any()
@@ -1030,7 +1050,6 @@ impl Repo {
         query = query
             .filter(eh_gallery_jobs::Column::Status.ne(JOB_STATUS_DOWNLOADING))
             .filter(eh_gallery_jobs::Column::TelegraphStatus.ne(TELEGRAPH_STATUS_UPLOADING))
-            .filter(no_active_eh_telegraph_rewrite_filter())
             .filter(
                 eh_gallery_jobs::Column::BackgroundDownloadStatus
                     .is_null()
@@ -1074,7 +1093,6 @@ impl Repo {
             .filter(cleanup_claim_generation_filter(job.cleanup_started_at))
             .filter(eh_gallery_jobs::Column::Status.ne(JOB_STATUS_DOWNLOADING))
             .filter(eh_gallery_jobs::Column::TelegraphStatus.ne(TELEGRAPH_STATUS_UPLOADING))
-            .filter(no_active_eh_telegraph_rewrite_filter())
             .filter(
                 eh_gallery_jobs::Column::BackgroundDownloadStatus
                     .is_null()
@@ -2376,16 +2394,28 @@ impl Repo {
 
     /// Claim the next background-owned shared-gallery job. Its ordering matches
     /// the normal lane: recent jobs are FIFO and older jobs are LIFO.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub async fn get_next_eh_job_for_background_download(
         &self,
     ) -> Result<Option<eh_gallery_jobs::Model>> {
-        self.get_next_eh_job_for_background_download_at(Local::now().naive_local())
+        self.get_next_eh_job_for_background_download_with_policy(true)
+            .await
+    }
+
+    /// Claim the next background-owned shared-gallery download job with the
+    /// configured archive publish policy applied to every bound delivery.
+    pub async fn get_next_eh_job_for_background_download_with_policy(
+        &self,
+        send_archive: bool,
+    ) -> Result<Option<eh_gallery_jobs::Model>> {
+        self.get_next_eh_job_for_background_download_at(Local::now().naive_local(), send_archive)
             .await
     }
 
     async fn get_next_eh_job_for_background_download_at(
         &self,
         now: DateTime,
+        send_archive: bool,
     ) -> Result<Option<eh_gallery_jobs::Model>> {
         let cutoff = now - chrono::Duration::hours(MAIN_DOWNLOAD_RECENT_WINDOW_HOURS);
         let is_recent = Expr::col(eh_gallery_jobs::Column::CreatedAt).gt(cutoff);
@@ -2411,6 +2441,9 @@ impl Repo {
             .filter(eh_gallery_jobs::Column::Status.eq(JOB_STATUS_PENDING))
             .filter(eh_gallery_jobs::Column::CleanupStatus.eq(CLEANUP_STATUS_NONE))
             .filter(eh_gallery_jobs::Column::BackgroundDownloadStatus.eq(BACKGROUND_STATUS_PENDING))
+            .filter(eh_job_has_configured_source_work_candidate_filter(
+                send_archive,
+            ))
             .filter(
                 eh_gallery_jobs::Column::BackgroundDownloadNextRetryAt
                     .is_null()
@@ -2430,7 +2463,7 @@ impl Repo {
             return Ok(None);
         };
 
-        self.claim_eh_job_background_download_from_snapshot_at(&job, now)
+        self.claim_eh_job_background_download_from_snapshot_at(&job, now, send_archive)
             .await
     }
 
@@ -2438,6 +2471,7 @@ impl Repo {
         &self,
         job: &eh_gallery_jobs::Model,
         now: DateTime,
+        send_archive: bool,
     ) -> Result<Option<eh_gallery_jobs::Model>> {
         let generation = next_job_claim_generation(now, job.started_at)?;
         let lease_started_at = next_job_claim_generation(now, None)?;
@@ -2455,6 +2489,10 @@ impl Repo {
             .filter(eh_gallery_jobs::Column::Status.eq(JOB_STATUS_PENDING))
             .filter(eh_gallery_jobs::Column::CleanupStatus.eq(CLEANUP_STATUS_NONE))
             .filter(eh_gallery_jobs::Column::BackgroundDownloadStatus.eq(BACKGROUND_STATUS_PENDING))
+            .filter(eh_job_has_configured_source_work_filter(
+                job.id,
+                send_archive,
+            ))
             .filter(job_claim_generation_filter(job.started_at))
             .filter(
                 sea_orm::Condition::any()
@@ -3039,7 +3077,6 @@ impl Repo {
             let remove_archive_family = job.zip_path.is_some()
                 && !archive_still_needed
                 && !has_active_delivery
-                && !rewrite_in_progress
                 && !upload_still_needs_zip
                 && !download_in_flight;
             let retire = !has_active_delivery
@@ -3326,11 +3363,22 @@ impl Repo {
         }
         let background_claimed = job.status == JOB_STATUS_PENDING
             && job.background_download_status.as_deref() == Some(BACKGROUND_STATUS_RUNNING);
+        let status: SimpleExpr = Expr::case(
+            sea_orm::Condition::any()
+                .add(
+                    eh_gallery_jobs::Column::TelegraphRewriteStatus
+                        .eq(TELEGRAPH_REWRITE_STATUS_PENDING),
+                )
+                .add(
+                    eh_gallery_jobs::Column::TelegraphRewriteStatus
+                        .eq(TELEGRAPH_REWRITE_STATUS_REWRITING),
+                ),
+            Expr::value(JOB_STATUS_DOWNLOADED),
+        )
+        .finally(Expr::value(JOB_STATUS_RETIRED))
+        .into();
         let mut update = eh_gallery_jobs::Entity::update_many()
-            .col_expr(
-                eh_gallery_jobs::Column::Status,
-                Expr::value(JOB_STATUS_RETIRED),
-            )
+            .col_expr(eh_gallery_jobs::Column::Status, status)
             .col_expr(
                 eh_gallery_jobs::Column::NextRetryAt,
                 Expr::value(None::<DateTime>),
@@ -3523,11 +3571,9 @@ pub(crate) async fn retire_consumerless_eh_job_in_txn(
         });
     }
 
-    let rewrite_in_progress = preserve_rewrite_payload;
     let upload_still_needs_zip = job.telegraph_status == TELEGRAPH_STATUS_UPLOADING
         || (job.telegraph_status == TELEGRAPH_STATUS_PENDING && job.telegraph_required);
-    let remove_archive_family =
-        job.zip_path.is_some() && !rewrite_in_progress && !upload_still_needs_zip;
+    let remove_archive_family = job.zip_path.is_some() && !upload_still_needs_zip;
     let cleanup_is_dirty = matches!(
         job.cleanup_status.as_str(),
         CLEANUP_STATUS_PENDING | CLEANUP_STATUS_RUNNING | CLEANUP_STATUS_FAILED
@@ -3537,6 +3583,7 @@ pub(crate) async fn retire_consumerless_eh_job_in_txn(
     } else {
         &job.cleanup_status
     };
+    let rewrite_in_progress = preserve_rewrite_payload;
     let retire = !rewrite_in_progress;
     let status = if retire {
         JOB_STATUS_RETIRED
@@ -3619,20 +3666,52 @@ fn no_active_eh_delivery_filter(job_id: i32) -> SimpleExpr {
     .not()
 }
 
-fn no_active_eh_telegraph_rewrite_filter() -> sea_orm::Condition {
-    sea_orm::Condition::any()
-        .add(eh_gallery_jobs::Column::TelegraphRewriteStatus.is_null())
-        .add(
-            sea_orm::Condition::all()
-                .add(
-                    eh_gallery_jobs::Column::TelegraphRewriteStatus
-                        .ne(TELEGRAPH_REWRITE_STATUS_PENDING),
-                )
-                .add(
-                    eh_gallery_jobs::Column::TelegraphRewriteStatus
-                        .ne(TELEGRAPH_REWRITE_STATUS_REWRITING),
-                ),
-        )
+fn eh_job_has_configured_source_work_filter(job_id: i32, send_archive: bool) -> SimpleExpr {
+    Expr::exists(
+        Query::select()
+            .expr(Expr::value(1))
+            .from(eh_download_queue::Entity)
+            .and_where(eh_download_queue::Column::JobId.eq(job_id))
+            .and_where(eh_active_delivery_status_filter())
+            .and_where(eh_configured_source_surface_filter(send_archive))
+            .to_owned(),
+    )
+}
+
+fn eh_job_has_configured_source_work_candidate_filter(send_archive: bool) -> SimpleExpr {
+    eh_gallery_jobs::Column::Id.in_subquery(
+        Query::select()
+            .column(eh_download_queue::Column::JobId)
+            .from(eh_download_queue::Entity)
+            .and_where(eh_active_delivery_status_filter())
+            .and_where(eh_configured_source_surface_filter(send_archive))
+            .to_owned(),
+    )
+}
+
+fn eh_active_delivery_status_filter() -> SimpleExpr {
+    eh_download_queue::Column::Status.is_in([
+        DELIVERY_STATUS_WAITING,
+        "pending",
+        "downloading",
+        "downloaded",
+        "uploading",
+        "uploaded",
+        DELIVERY_STATUS_PUBLISHING,
+    ])
+}
+
+fn eh_configured_source_surface_filter(send_archive: bool) -> SimpleExpr {
+    let mut source_surface = sea_orm::Condition::any();
+    if send_archive {
+        source_surface = source_surface.add(eh_download_queue::Column::ArchiveSentAt.is_null());
+    }
+    source_surface = source_surface.add(
+        sea_orm::Condition::all()
+            .add(eh_download_queue::Column::Telegraph.eq(true))
+            .add(eh_download_queue::Column::TelegraphSentAt.is_null()),
+    );
+    source_surface.into()
 }
 
 fn cleanup_pending_when_zip_owned_expr() -> SimpleExpr {
@@ -3976,6 +4055,102 @@ mod tests {
             .unwrap()
             .unwrap();
         (job, delivery)
+    }
+
+    async fn set_active_telegraph_rewrite(
+        repo: &Repo,
+        job_id: i32,
+        rewrite_status: &str,
+    ) -> eh_gallery_jobs::Model {
+        let now = Local::now().naive_local();
+        let rewrite_after = now + chrono::Duration::seconds(10);
+        let retry_at = now + chrono::Duration::seconds(20);
+        eh_gallery_jobs::Entity::update_many()
+            .col_expr(
+                eh_gallery_jobs::Column::TelegraphStatus,
+                Expr::value(TELEGRAPH_STATUS_READY),
+            )
+            .col_expr(
+                eh_gallery_jobs::Column::TelegraphUrl,
+                Expr::value(Some("https://telegra.ph/rewrite".to_string())),
+            )
+            .col_expr(
+                eh_gallery_jobs::Column::TelegraphRewriteData,
+                Expr::value(Some("{\"pages\":[]}".to_string())),
+            )
+            .col_expr(
+                eh_gallery_jobs::Column::TelegraphRewriteStatus,
+                Expr::value(Some(rewrite_status.to_string())),
+            )
+            .col_expr(
+                eh_gallery_jobs::Column::TelegraphRewriteAfter,
+                Expr::value(Some(rewrite_after)),
+            )
+            .col_expr(
+                eh_gallery_jobs::Column::TelegraphRewriteStartedAt,
+                Expr::value(Some(now)),
+            )
+            .col_expr(
+                eh_gallery_jobs::Column::TelegraphRewriteNextRetryAt,
+                Expr::value(Some(retry_at)),
+            )
+            .col_expr(
+                eh_gallery_jobs::Column::TelegraphRewriteRetryCount,
+                Expr::value(2_i32),
+            )
+            .col_expr(
+                eh_gallery_jobs::Column::TelegraphRewriteError,
+                Expr::value(Some("temporary rewrite error".to_string())),
+            )
+            .filter(eh_gallery_jobs::Column::Id.eq(job_id))
+            .exec(repo.db())
+            .await
+            .unwrap();
+        eh_gallery_jobs::Entity::find_by_id(job_id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    fn assert_telegraph_rewrite_state_preserved(
+        expected: &eh_gallery_jobs::Model,
+        actual: &eh_gallery_jobs::Model,
+    ) {
+        assert_eq!(actual.telegraph_status, expected.telegraph_status);
+        assert_eq!(actual.telegraph_url, expected.telegraph_url);
+        assert_eq!(
+            actual.telegraph_rewrite_data,
+            expected.telegraph_rewrite_data
+        );
+        assert_eq!(
+            actual.telegraph_rewrite_status,
+            expected.telegraph_rewrite_status
+        );
+        assert_eq!(
+            actual.telegraph_rewrite_after,
+            expected.telegraph_rewrite_after
+        );
+        assert_eq!(
+            actual.telegraph_rewrite_started_at,
+            expected.telegraph_rewrite_started_at
+        );
+        assert_eq!(
+            actual.telegraph_rewrite_next_retry_at,
+            expected.telegraph_rewrite_next_retry_at
+        );
+        assert_eq!(
+            actual.telegraph_rewrite_retry_count,
+            expected.telegraph_rewrite_retry_count
+        );
+        assert_eq!(
+            actual.telegraph_rewrite_error,
+            expected.telegraph_rewrite_error
+        );
+        assert_eq!(
+            actual.telegraph_rewritten_at,
+            expected.telegraph_rewritten_at
+        );
     }
 
     #[tokio::test]
@@ -4598,13 +4773,339 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pending_or_rewriting_telegraph_work_blocks_cleanup_until_terminal() {
+    async fn no_configured_publish_surface_is_never_claimed_for_source_download() {
         let repo = tests_helpers::setup_test_db().await.unwrap();
+        let variant = EhGalleryVariant::archive("1280x");
+        let no_surface = repo
+            .enqueue_eh_download(
+                -100,
+                7214,
+                "token",
+                "No surface",
+                false,
+                SOURCE_DIRECT,
+                &variant,
+            )
+            .await
+            .unwrap();
+        let normal_surface = repo
+            .enqueue_eh_download(
+                -200,
+                7215,
+                "token",
+                "Telegraph surface",
+                true,
+                SOURCE_DIRECT,
+                &variant,
+            )
+            .await
+            .unwrap();
+
+        let normal = repo
+            .get_next_eh_job_for_download_with_policy(false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(normal.id, normal_surface.job_id.unwrap());
+        let unclaimed = eh_gallery_jobs::Entity::find_by_id(no_surface.job_id.unwrap())
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(unclaimed.status, JOB_STATUS_PENDING);
+        assert!(unclaimed.started_at.is_none());
+
+        assert!(repo
+            .get_next_eh_delivery_for_publish(false)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            eh_download_queue::Entity::find_by_id(no_surface.id)
+                .one(repo.db())
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            DELIVERY_STATUS_FAILED
+        );
+
+        let background_no_surface = repo
+            .enqueue_eh_download(
+                -300,
+                7216,
+                "token",
+                "Background no surface",
+                false,
+                SOURCE_DIRECT,
+                &variant,
+            )
+            .await
+            .unwrap();
+        let background_surface = repo
+            .enqueue_eh_download(
+                -400,
+                7217,
+                "token",
+                "Background Telegraph surface",
+                true,
+                SOURCE_DIRECT,
+                &variant,
+            )
+            .await
+            .unwrap();
+        repo.schedule_eh_job_background_download(
+            background_no_surface.job_id.unwrap(),
+            JOB_STATUS_PENDING,
+            "handoff",
+        )
+        .await
+        .unwrap();
+        repo.schedule_eh_job_background_download(
+            background_surface.job_id.unwrap(),
+            JOB_STATUS_PENDING,
+            "handoff",
+        )
+        .await
+        .unwrap();
+
+        let background = repo
+            .get_next_eh_job_for_background_download_with_policy(false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(background.id, background_surface.job_id.unwrap());
+        assert_eq!(
+            background.background_download_status.as_deref(),
+            Some(BACKGROUND_STATUS_RUNNING)
+        );
+        let background_unclaimed =
+            eh_gallery_jobs::Entity::find_by_id(background_no_surface.job_id.unwrap())
+                .one(repo.db())
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            background_unclaimed.background_download_status.as_deref(),
+            Some(BACKGROUND_STATUS_PENDING)
+        );
+        assert!(background_unclaimed
+            .background_download_started_at
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn active_telegraph_rewrite_releases_zip_without_retiring() {
+        let repo = tests_helpers::setup_test_db().await.unwrap();
+        let variant = EhGalleryVariant::archive("1280x");
         let (job, delivery) = seed_rewrite_ready_job(&repo, 7214).await;
         eh_gallery_jobs::Entity::update_many()
             .col_expr(
                 eh_gallery_jobs::Column::ZipPath,
                 Expr::value(Some("rewrite-pending.zip".to_string())),
+            )
+            .col_expr(eh_gallery_jobs::Column::FileSize, Expr::value(123_i64))
+            .col_expr(eh_gallery_jobs::Column::GpCost, Expr::value(4_i64))
+            .filter(eh_gallery_jobs::Column::Id.eq(job.id))
+            .exec(repo.db())
+            .await
+            .unwrap();
+        repo.mark_eh_archive_sent(delivery.id).await.unwrap();
+        repo.mark_eh_telegraph_delivery_sent(delivery.id, job.id, Some(0))
+            .await
+            .unwrap();
+        eh_download_queue::Entity::update_many()
+            .col_expr(
+                eh_download_queue::Column::Status,
+                Expr::value(DELIVERY_STATUS_DONE),
+            )
+            .filter(eh_download_queue::Column::Id.eq(delivery.id))
+            .exec(repo.db())
+            .await
+            .unwrap();
+
+        repo.evaluate_eh_job_liveness(job.id, true).await.unwrap();
+        let pending = eh_gallery_jobs::Entity::find_by_id(job.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(pending.cleanup_status, CLEANUP_STATUS_PENDING);
+        assert_eq!(pending.zip_path.as_deref(), Some("rewrite-pending.zip"));
+        assert_eq!(
+            pending.telegraph_rewrite_status.as_deref(),
+            Some(TELEGRAPH_REWRITE_STATUS_PENDING)
+        );
+        assert_eq!(
+            pending.telegraph_rewrite_data.as_deref(),
+            Some("{\"pages\":[]}")
+        );
+
+        let rewrite = repo
+            .get_next_eh_job_for_telegraph_rewrite()
+            .await
+            .unwrap()
+            .unwrap();
+        let rewrite_generation = rewrite.telegraph_rewrite_started_at.unwrap();
+        let rewrite_after = rewrite.telegraph_rewrite_after;
+        let cleanup = repo.get_next_eh_job_for_cleanup().await.unwrap().unwrap();
+        assert_eq!(cleanup.id, job.id);
+        assert_eq!(
+            repo.finalize_eh_job_cleanup(job.id, cleanup.cleanup_started_at.unwrap(), true)
+                .await
+                .unwrap(),
+            Some(EhCleanupFinalizeOutcome::RetainedForRewrite)
+        );
+        let cleaned = eh_gallery_jobs::Entity::find_by_id(job.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(cleaned.status, JOB_STATUS_DOWNLOADED);
+        assert_eq!(cleaned.cleanup_status, CLEANUP_STATUS_NONE);
+        assert!(cleaned.zip_path.is_none());
+        assert_eq!(cleaned.file_size, 0);
+        assert_eq!(cleaned.gp_cost, 0);
+        assert_eq!(
+            cleaned.telegraph_rewrite_status.as_deref(),
+            Some(TELEGRAPH_REWRITE_STATUS_REWRITING)
+        );
+        assert_eq!(
+            cleaned.telegraph_rewrite_data.as_deref(),
+            Some("{\"pages\":[]}")
+        );
+        assert_eq!(cleaned.telegraph_rewrite_after, rewrite_after);
+        assert_eq!(
+            cleaned.telegraph_rewrite_started_at,
+            Some(rewrite_generation)
+        );
+        eh_gallery_jobs::Entity::update_many()
+            .col_expr(
+                eh_gallery_jobs::Column::Error,
+                Expr::value(Some("stale download error".to_string())),
+            )
+            .col_expr(eh_gallery_jobs::Column::RetryCount, Expr::value(3_i32))
+            .col_expr(
+                eh_gallery_jobs::Column::NextRetryAt,
+                Expr::value(Some(Local::now().naive_local())),
+            )
+            .col_expr(
+                eh_gallery_jobs::Column::CompletedAt,
+                Expr::value(Some(Local::now().naive_local())),
+            )
+            .filter(eh_gallery_jobs::Column::Id.eq(job.id))
+            .exec(repo.db())
+            .await
+            .unwrap();
+        let cleaned = eh_gallery_jobs::Entity::find_by_id(job.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+
+        let late_archive = repo
+            .enqueue_eh_download(
+                -200,
+                7214,
+                "token",
+                "Gallery",
+                false,
+                SOURCE_DIRECT,
+                &variant,
+            )
+            .await
+            .unwrap();
+        assert_eq!(late_archive.job_id, Some(job.id));
+        assert!(repo
+            .get_next_eh_delivery_for_publish(true)
+            .await
+            .unwrap()
+            .is_none());
+        let recovered = eh_gallery_jobs::Entity::find_by_id(job.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.status, JOB_STATUS_PENDING);
+        assert_eq!(recovered.cleanup_status, CLEANUP_STATUS_NONE);
+        assert!(recovered.zip_path.is_none());
+        assert_eq!(recovered.started_at, cleaned.started_at);
+        assert!(recovered.error.is_none());
+        assert_eq!(recovered.retry_count, 0);
+        assert!(recovered.next_retry_at.is_none());
+        assert!(recovered.completed_at.is_none());
+        assert!(recovered.background_download_status.is_none());
+        assert_telegraph_rewrite_state_preserved(&cleaned, &recovered);
+        assert_eq!(
+            repo.get_next_eh_job_for_download_with_policy(true)
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            job.id
+        );
+
+        assert!(!repo
+            .schedule_eh_job_telegraph_rewrite_retry(
+                job.id,
+                rewrite_generation,
+                "temporary rewrite failure",
+                1,
+            )
+            .await
+            .unwrap());
+        eh_gallery_jobs::Entity::update_many()
+            .col_expr(
+                eh_gallery_jobs::Column::TelegraphRewriteNextRetryAt,
+                Expr::value(None::<DateTime>),
+            )
+            .filter(eh_gallery_jobs::Column::Id.eq(job.id))
+            .exec(repo.db())
+            .await
+            .unwrap();
+        let retry = repo
+            .get_next_eh_job_for_telegraph_rewrite()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            retry.telegraph_rewrite_data.as_deref(),
+            Some("{\"pages\":[]}")
+        );
+        assert!(retry.telegraph_rewrite_started_at.unwrap() > rewrite_generation);
+        assert!(repo
+            .schedule_eh_job_telegraph_rewrite_retry(
+                job.id,
+                retry.telegraph_rewrite_started_at.unwrap(),
+                "terminal rewrite failure",
+                0,
+            )
+            .await
+            .unwrap());
+        let terminal = eh_gallery_jobs::Entity::find_by_id(job.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            terminal.telegraph_rewrite_status.as_deref(),
+            Some(TELEGRAPH_REWRITE_STATUS_FAILED)
+        );
+        assert_eq!(
+            terminal.telegraph_rewrite_data.as_deref(),
+            Some("{\"pages\":[]}")
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_rewrite_before_archive_recovery_does_not_strand_delivery() {
+        let repo = tests_helpers::setup_test_db().await.unwrap();
+        let variant = EhGalleryVariant::archive("1280x");
+        let (job, delivery) = seed_rewrite_ready_job(&repo, 7220).await;
+        eh_gallery_jobs::Entity::update_many()
+            .col_expr(
+                eh_gallery_jobs::Column::ZipPath,
+                Expr::value(Some("terminal-rewrite.zip".to_string())),
             )
             .filter(eh_gallery_jobs::Column::Id.eq(job.id))
             .exec(repo.db())
@@ -4625,24 +5126,32 @@ mod tests {
             .unwrap();
 
         repo.evaluate_eh_job_liveness(job.id, true).await.unwrap();
-        assert_eq!(
-            eh_gallery_jobs::Entity::find_by_id(job.id)
-                .one(repo.db())
-                .await
-                .unwrap()
-                .unwrap()
-                .cleanup_status,
-            CLEANUP_STATUS_NONE
-        );
-        assert!(repo.get_next_eh_job_for_cleanup().await.unwrap().is_none());
-
         let rewrite = repo
             .get_next_eh_job_for_telegraph_rewrite()
             .await
             .unwrap()
             .unwrap();
-        repo.evaluate_eh_job_liveness(job.id, true).await.unwrap();
-        assert!(repo.get_next_eh_job_for_cleanup().await.unwrap().is_none());
+        let cleanup = repo.get_next_eh_job_for_cleanup().await.unwrap().unwrap();
+        assert_eq!(
+            repo.finalize_eh_job_cleanup(job.id, cleanup.cleanup_started_at.unwrap(), true)
+                .await
+                .unwrap(),
+            Some(EhCleanupFinalizeOutcome::RetainedForRewrite)
+        );
+
+        let late_archive = repo
+            .enqueue_eh_download(
+                -200,
+                7220,
+                "token",
+                "Gallery",
+                false,
+                SOURCE_DIRECT,
+                &variant,
+            )
+            .await
+            .unwrap();
+        assert_eq!(late_archive.job_id, Some(job.id));
         assert!(repo
             .schedule_eh_job_telegraph_rewrite_retry(
                 job.id,
@@ -4652,16 +5161,205 @@ mod tests {
             )
             .await
             .unwrap());
-
         repo.evaluate_eh_job_liveness(job.id, true).await.unwrap();
+        let terminal = eh_gallery_jobs::Entity::find_by_id(job.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(terminal.status, JOB_STATUS_DOWNLOADED);
         assert_eq!(
-            repo.get_next_eh_job_for_cleanup()
+            terminal.telegraph_rewrite_status.as_deref(),
+            Some(TELEGRAPH_REWRITE_STATUS_FAILED)
+        );
+        assert_eq!(
+            eh_download_queue::Entity::find_by_id(late_archive.id)
+                .one(repo.db())
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            DELIVERY_STATUS_WAITING
+        );
+
+        assert!(repo
+            .get_next_eh_delivery_for_publish(true)
+            .await
+            .unwrap()
+            .is_none());
+        let recovered = eh_gallery_jobs::Entity::find_by_id(job.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.status, JOB_STATUS_PENDING);
+        assert_eq!(recovered.started_at, terminal.started_at);
+        assert_telegraph_rewrite_state_preserved(&terminal, &recovered);
+        assert_eq!(
+            repo.get_next_eh_job_for_download_with_policy(true)
                 .await
                 .unwrap()
                 .unwrap()
                 .id,
             job.id
         );
+    }
+
+    #[tokio::test]
+    async fn normal_lost_claim_releases_active_rewrite_without_retiring() {
+        let repo = tests_helpers::setup_test_db().await.unwrap();
+        let variant = EhGalleryVariant::archive("1280x");
+        let delivery = repo
+            .enqueue_eh_download(
+                -100,
+                7218,
+                "token",
+                "Gallery",
+                false,
+                SOURCE_DIRECT,
+                &variant,
+            )
+            .await
+            .unwrap();
+        let claim = repo
+            .get_next_eh_job_for_download_with_policy(true)
+            .await
+            .unwrap()
+            .unwrap();
+        let rewrite =
+            set_active_telegraph_rewrite(&repo, claim.id, TELEGRAPH_REWRITE_STATUS_PENDING).await;
+        eh_download_queue::Entity::update_many()
+            .col_expr(
+                eh_download_queue::Column::Status,
+                Expr::value(DELIVERY_STATUS_CANCELED),
+            )
+            .filter(eh_download_queue::Column::Id.eq(delivery.id))
+            .exec(repo.db())
+            .await
+            .unwrap();
+
+        assert!(repo
+            .retire_eh_job_without_active_deliveries(&claim)
+            .await
+            .unwrap());
+        let released = eh_gallery_jobs::Entity::find_by_id(claim.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(released.status, JOB_STATUS_DOWNLOADED);
+        assert_eq!(released.cleanup_status, CLEANUP_STATUS_NONE);
+        assert_eq!(released.started_at, rewrite.started_at);
+        assert_telegraph_rewrite_state_preserved(&rewrite, &released);
+
+        let late = repo
+            .enqueue_eh_download(
+                -200,
+                7218,
+                "token",
+                "Gallery",
+                false,
+                SOURCE_DIRECT,
+                &variant,
+            )
+            .await
+            .unwrap();
+        assert_eq!(late.job_id, Some(claim.id));
+        let after_enqueue = eh_gallery_jobs::Entity::find_by_id(claim.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after_enqueue.status, JOB_STATUS_DOWNLOADED);
+        assert_telegraph_rewrite_state_preserved(&rewrite, &after_enqueue);
+        assert!(!repo
+            .retire_eh_job_without_active_deliveries(&claim)
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn background_lost_claim_releases_active_rewrite_without_retiring() {
+        let repo = tests_helpers::setup_test_db().await.unwrap();
+        let variant = EhGalleryVariant::archive("1280x");
+        let delivery = repo
+            .enqueue_eh_download(
+                -100,
+                7219,
+                "token",
+                "Gallery",
+                false,
+                SOURCE_DIRECT,
+                &variant,
+            )
+            .await
+            .unwrap();
+        let normal = repo
+            .get_next_eh_job_for_download_with_policy(true)
+            .await
+            .unwrap()
+            .unwrap();
+        repo.schedule_eh_job_background_download(normal.id, &normal.status, "test handoff")
+            .await
+            .unwrap();
+        let claim = repo
+            .get_next_eh_job_for_background_download_with_policy(true)
+            .await
+            .unwrap()
+            .unwrap();
+        let rewrite =
+            set_active_telegraph_rewrite(&repo, claim.id, TELEGRAPH_REWRITE_STATUS_REWRITING).await;
+        eh_download_queue::Entity::update_many()
+            .col_expr(
+                eh_download_queue::Column::Status,
+                Expr::value(DELIVERY_STATUS_CANCELED),
+            )
+            .filter(eh_download_queue::Column::Id.eq(delivery.id))
+            .exec(repo.db())
+            .await
+            .unwrap();
+
+        assert!(repo
+            .retire_eh_job_without_active_deliveries(&claim)
+            .await
+            .unwrap());
+        let released = eh_gallery_jobs::Entity::find_by_id(claim.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(released.status, JOB_STATUS_DOWNLOADED);
+        assert!(released.background_download_status.is_none());
+        assert!(released.background_download_started_at.is_none());
+        assert!(released.background_download_next_retry_at.is_none());
+        assert_eq!(released.background_download_attempt_count, 0);
+        assert!(released.background_download_error.is_none());
+        assert_telegraph_rewrite_state_preserved(&rewrite, &released);
+
+        let late = repo
+            .enqueue_eh_download(
+                -200,
+                7219,
+                "token",
+                "Gallery",
+                false,
+                SOURCE_DIRECT,
+                &variant,
+            )
+            .await
+            .unwrap();
+        assert_eq!(late.job_id, Some(claim.id));
+        let after_enqueue = eh_gallery_jobs::Entity::find_by_id(claim.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after_enqueue.status, JOB_STATUS_DOWNLOADED);
+        assert_telegraph_rewrite_state_preserved(&rewrite, &after_enqueue);
+        assert!(!repo
+            .retire_eh_job_without_active_deliveries(&claim)
+            .await
+            .unwrap());
     }
 
     #[tokio::test]
@@ -5566,6 +6264,7 @@ mod tests {
             repo.claim_eh_job_download_from_snapshot_at(
                 &stale_snapshot,
                 Local::now().naive_local(),
+                true,
             )
             .await
             .unwrap(),

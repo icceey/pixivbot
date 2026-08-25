@@ -12,8 +12,8 @@ use eh_client::{ArchiveArtifacts, ImageUploader};
 use sea_orm::prelude::DateTime;
 use sea_orm::sea_query::{Expr, Query, SimpleExpr};
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, EntityTrait, Order, PaginatorTrait, QueryFilter, QueryOrder,
-    QueryTrait, Set, TransactionTrait,
+    ActiveModelTrait, ColumnTrait, DatabaseTransaction, EntityTrait, Order, PaginatorTrait,
+    QueryFilter, QueryOrder, QueryTrait, Set, TransactionTrait,
 };
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, LazyLock, Mutex, Weak};
@@ -154,6 +154,25 @@ fn claim_generation_filter(previous: Option<DateTime>) -> sea_orm::Condition {
             sea_orm::Condition::all().add(eh_download_queue::Column::StartedAt.eq(generation))
         }
         None => sea_orm::Condition::all().add(eh_download_queue::Column::StartedAt.is_null()),
+    }
+}
+
+fn eh_job_claim_generation_filter(previous: Option<DateTime>) -> sea_orm::Condition {
+    match previous {
+        Some(generation) => {
+            sea_orm::Condition::all().add(eh_gallery_jobs::Column::StartedAt.eq(generation))
+        }
+        None => sea_orm::Condition::all().add(eh_gallery_jobs::Column::StartedAt.is_null()),
+    }
+}
+
+fn optional_eh_delivery_datetime_filter(
+    column: eh_download_queue::Column,
+    value: Option<DateTime>,
+) -> SimpleExpr {
+    match value {
+        Some(value) => column.eq(value),
+        None => column.is_null(),
     }
 }
 
@@ -2122,6 +2141,95 @@ impl Repo {
         Ok(updated)
     }
 
+    /// Reopen a cleaned rewrite-retained job only when this waiting delivery
+    /// still needs its archive. The source claim is intentionally deferred to
+    /// the policy-aware download selector after this transaction commits.
+    async fn recover_eh_job_for_missing_archive_in_txn(
+        &self,
+        txn: &DatabaseTransaction,
+        delivery: &eh_download_queue::Model,
+        job: &eh_gallery_jobs::Model,
+        send_archive: bool,
+    ) -> Result<bool> {
+        if !send_archive
+            || delivery.archive_sent_at.is_some()
+            || job.status != JOB_STATUS_DOWNLOADED
+            || job.zip_path.is_some()
+            || job.cleanup_status != CLEANUP_STATUS_NONE
+            || job.background_download_status.is_some()
+            || job.telegraph_status == TELEGRAPH_STATUS_UPLOADING
+        {
+            return Ok(false);
+        }
+
+        let delivery_still_waiting_for_archive = Expr::exists(
+            Query::select()
+                .expr(Expr::value(1))
+                .from(eh_download_queue::Entity)
+                .and_where(eh_download_queue::Column::Id.eq(delivery.id))
+                .and_where(eh_download_queue::Column::JobId.eq(job.id))
+                .and_where(eh_download_queue::Column::Status.eq(STATUS_WAITING))
+                .and_where(eh_download_queue::Column::ArchiveSentAt.is_null())
+                .and_where(optional_eh_delivery_datetime_filter(
+                    eh_download_queue::Column::StartedAt,
+                    delivery.started_at,
+                ))
+                .and_where(optional_eh_delivery_datetime_filter(
+                    eh_download_queue::Column::NextRetryAt,
+                    delivery.next_retry_at,
+                ))
+                .to_owned(),
+        );
+        let recovered = eh_gallery_jobs::Entity::update_many()
+            .col_expr(
+                eh_gallery_jobs::Column::Status,
+                Expr::value(JOB_STATUS_PENDING),
+            )
+            .col_expr(eh_gallery_jobs::Column::Error, Expr::value(None::<String>))
+            .col_expr(eh_gallery_jobs::Column::RetryCount, Expr::value(0_i32))
+            .col_expr(
+                eh_gallery_jobs::Column::NextRetryAt,
+                Expr::value(None::<DateTime>),
+            )
+            .col_expr(
+                eh_gallery_jobs::Column::CompletedAt,
+                Expr::value(None::<DateTime>),
+            )
+            .col_expr(
+                eh_gallery_jobs::Column::BackgroundDownloadStatus,
+                Expr::value(None::<String>),
+            )
+            .col_expr(
+                eh_gallery_jobs::Column::BackgroundDownloadStartedAt,
+                Expr::value(None::<DateTime>),
+            )
+            .col_expr(
+                eh_gallery_jobs::Column::BackgroundDownloadNextRetryAt,
+                Expr::value(None::<DateTime>),
+            )
+            .col_expr(
+                eh_gallery_jobs::Column::BackgroundDownloadAttemptCount,
+                Expr::value(0_i32),
+            )
+            .col_expr(
+                eh_gallery_jobs::Column::BackgroundDownloadError,
+                Expr::value(None::<String>),
+            )
+            .filter(eh_gallery_jobs::Column::Id.eq(job.id))
+            .filter(eh_gallery_jobs::Column::Status.eq(JOB_STATUS_DOWNLOADED))
+            .filter(eh_gallery_jobs::Column::ZipPath.is_null())
+            .filter(eh_gallery_jobs::Column::CleanupStatus.eq(CLEANUP_STATUS_NONE))
+            .filter(eh_gallery_jobs::Column::BackgroundDownloadStatus.is_null())
+            .filter(eh_gallery_jobs::Column::TelegraphStatus.eq(&job.telegraph_status))
+            .filter(eh_gallery_jobs::Column::TelegraphRequired.eq(job.telegraph_required))
+            .filter(eh_job_claim_generation_filter(job.started_at))
+            .filter(delivery_still_waiting_for_archive)
+            .exec(txn)
+            .await
+            .context("Failed to recover shared EH job with a missing archive")?;
+        Ok(recovered.rows_affected == 1)
+    }
+
     /// Claim the next due shared-gallery delivery that has at least one ready
     /// publish surface. Legacy rows without a `job_id` are deliberately never
     /// claimed by this runtime lane.
@@ -2152,7 +2260,7 @@ impl Repo {
                 .await
                 .context("Failed to fetch due shared EH deliveries for publish")?;
 
-            let mut settled_no_surface_delivery = false;
+            let mut committed_state_transition = false;
             for (delivery, job) in candidates {
                 let Some(job) = job else {
                     continue;
@@ -2198,8 +2306,15 @@ impl Repo {
                             .await?;
                         self.evaluate_eh_job_liveness_in_txn(&txn, job.id, send_archive)
                             .await?;
-                        settled_no_surface_delivery = true;
+                        committed_state_transition = true;
                     }
+                    continue;
+                }
+                if self
+                    .recover_eh_job_for_missing_archive_in_txn(&txn, &delivery, &job, send_archive)
+                    .await?
+                {
+                    committed_state_transition = true;
                     continue;
                 }
                 if !eh_delivery_is_ready_for_publish(&delivery, &job, send_archive) {
@@ -2257,11 +2372,11 @@ impl Repo {
                         delivery: claimed_delivery,
                         job: claimed_job,
                     }),
-                    settled_no_surface_delivery,
+                    committed_state_transition,
                 ));
             }
 
-            Ok((None, settled_no_surface_delivery))
+            Ok((None, committed_state_transition))
         }
         .await;
 
@@ -2275,7 +2390,7 @@ impl Repo {
             Ok((None, true)) => txn
                 .commit()
                 .await
-                .context("Failed to commit shared EH no-surface delivery settlement transaction")
+                .context("Failed to commit shared EH delivery state transition transaction")
                 .map(|()| None),
             Ok((None, false)) => {
                 txn.rollback().await.context(
@@ -4312,7 +4427,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn liveness_keeps_pending_rewrite_payload_without_scheduling_archive_cleanup() {
+    async fn liveness_schedules_cleanup_while_preserving_pending_rewrite_payload() {
         let repo = tests_helpers::setup_test_db().await.unwrap();
         let delivery = repo
             .enqueue_eh_subscription_download(
@@ -4359,10 +4474,10 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(!decision.retire);
-        assert!(!decision.remove_archive_family);
+        assert!(decision.remove_archive_family);
         assert!(decision.preserve_rewrite_payload);
         assert_ne!(job.status, JOB_STATUS_RETIRED);
-        assert_eq!(job.cleanup_status, "none");
+        assert_eq!(job.cleanup_status, CLEANUP_STATUS_PENDING);
         assert_eq!(job.telegraph_rewrite_data.as_deref(), Some("payload"));
         assert_eq!(
             job.telegraph_rewrite_status.as_deref(),
@@ -7047,7 +7162,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn implicit_dead_subscription_cancel_preserves_pending_rewrite_without_cleanup_claim() {
+    async fn implicit_dead_subscription_cancel_schedules_cleanup_without_retiring_rewrite() {
         use crate::db::repo::eh_gallery_jobs::{
             TELEGRAPH_REWRITE_STATUS_PENDING, TELEGRAPH_STATUS_NOT_REQUIRED,
         };
@@ -7128,7 +7243,12 @@ mod tests {
             Some(TELEGRAPH_REWRITE_STATUS_PENDING)
         );
         assert!(settled_job.telegraph_rewrite_data.is_some());
-        assert_eq!(settled_job.cleanup_status, CLEANUP_STATUS_NONE);
+        assert_ne!(settled_job.status, JOB_STATUS_RETIRED);
+        assert_eq!(settled_job.cleanup_status, CLEANUP_STATUS_PENDING);
+        assert_eq!(
+            settled_job.zip_path.as_deref(),
+            Some("/tmp/atomic-cancel.zip")
+        );
     }
 
     #[tokio::test]
