@@ -136,6 +136,10 @@ pub enum EhCleanupFinalizeOutcome {
     /// A delivery arrived while the retired generation was being cleaned; it
     /// now owns a fresh pending download generation.
     ReactivatedPending,
+    /// Active deliveries arrived during cleanup but require neither an archive
+    /// nor a new Telegraph page, so the shared reusable result remains ready
+    /// for publishing without another source claim.
+    FinalizedWithoutSourceWork,
     /// No consumer remains and all rewrite work is terminal.
     CleanRetired,
     /// The archive family was removed, but delayed Telegraph rewrite state is
@@ -1166,7 +1170,7 @@ impl Repo {
         &self,
         job_id: i32,
         expected_cleanup_started_at: DateTime,
-        _send_archive: bool,
+        send_archive: bool,
     ) -> Result<Option<EhCleanupFinalizeOutcome>> {
         let txn = self
             .db
@@ -1201,6 +1205,18 @@ impl Repo {
             );
             let has_usable_ready_telegraph =
                 job.telegraph_status == TELEGRAPH_STATUS_READY && job.telegraph_url.is_some();
+            let archive_source_required = send_archive
+                && deliveries.iter().any(|delivery| {
+                    is_active_delivery_status(&delivery.status)
+                        && delivery.archive_sent_at.is_none()
+                });
+            let telegraph_source_required = !has_usable_ready_telegraph
+                && deliveries.iter().any(|delivery| {
+                    is_active_delivery_status(&delivery.status)
+                        && delivery.telegraph
+                        && delivery.telegraph_sent_at.is_none()
+                });
+            let source_work_required = archive_source_required || telegraph_source_required;
             let mut update = eh_gallery_jobs::Entity::update_many()
                 .col_expr(
                     eh_gallery_jobs::Column::CleanupStatus,
@@ -1224,11 +1240,12 @@ impl Repo {
                 .filter(eh_gallery_jobs::Column::CleanupStatus.eq(CLEANUP_STATUS_RUNNING))
                 .filter(eh_gallery_jobs::Column::CleanupStartedAt.eq(expected_cleanup_started_at));
 
-            let outcome = if has_active_delivery {
+            let outcome = if has_active_delivery && source_work_required {
                 // A delivery bound after this consumerless cleanup generation
-                // was claimed. The ZIP is already gone, so make its archive
-                // work claimable again without disturbing a ready Telegraph
-                // result or any rewrite lease that may have appeared meanwhile.
+                // was claimed and still needs source work. The ZIP is already
+                // gone, so make that work claimable again without disturbing a
+                // ready Telegraph result or any rewrite lease that may have
+                // appeared meanwhile.
                 update = update
                     .col_expr(
                         eh_gallery_jobs::Column::Status,
@@ -1309,6 +1326,49 @@ impl Repo {
                         );
                 }
                 EhCleanupFinalizeOutcome::ReactivatedPending
+            } else if has_active_delivery {
+                // The archive is disabled and each active Telegraph delivery
+                // can reuse the ready page, or no configured publish surface
+                // remains. Finalize cleanup without making a source selector
+                // claim this job; the publish transaction handles no-surface
+                // deliveries as its existing terminal transition.
+                update = update
+                    .col_expr(
+                        eh_gallery_jobs::Column::Status,
+                        Expr::value(JOB_STATUS_DOWNLOADED),
+                    )
+                    .col_expr(eh_gallery_jobs::Column::Error, Expr::value(None::<String>))
+                    .col_expr(eh_gallery_jobs::Column::RetryCount, Expr::value(0_i32))
+                    .col_expr(
+                        eh_gallery_jobs::Column::NextRetryAt,
+                        Expr::value(None::<DateTime>),
+                    )
+                    .col_expr(
+                        eh_gallery_jobs::Column::CompletedAt,
+                        Expr::value(None::<DateTime>),
+                    )
+                    .col_expr(
+                        eh_gallery_jobs::Column::BackgroundDownloadStatus,
+                        Expr::value(None::<String>),
+                    )
+                    .col_expr(
+                        eh_gallery_jobs::Column::BackgroundDownloadStartedAt,
+                        Expr::value(None::<DateTime>),
+                    )
+                    .col_expr(
+                        eh_gallery_jobs::Column::BackgroundDownloadNextRetryAt,
+                        Expr::value(None::<DateTime>),
+                    )
+                    .col_expr(
+                        eh_gallery_jobs::Column::BackgroundDownloadAttemptCount,
+                        Expr::value(0_i32),
+                    )
+                    .col_expr(
+                        eh_gallery_jobs::Column::BackgroundDownloadError,
+                        Expr::value(None::<String>),
+                    )
+                    .filter(no_active_eh_delivery_filter(job_id).not());
+                EhCleanupFinalizeOutcome::FinalizedWithoutSourceWork
             } else if rewrite_in_progress {
                 update = update.filter(no_active_eh_delivery_filter(job_id));
                 EhCleanupFinalizeOutcome::RetainedForRewrite
@@ -4665,6 +4725,113 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ready_telegraph_delivery_during_cleanup_reuses_page_without_redownload() {
+        let repo = tests_helpers::setup_test_db().await.unwrap();
+        let variant = EhGalleryVariant::archive("1280x");
+        let first = repo
+            .enqueue_eh_download(
+                -100,
+                7212,
+                "token",
+                "Gallery",
+                true,
+                SOURCE_DIRECT,
+                &variant,
+            )
+            .await
+            .unwrap();
+        let download = repo
+            .get_next_eh_job_for_download_with_policy(false)
+            .await
+            .unwrap()
+            .unwrap();
+        repo.mark_eh_job_downloaded(
+            download.id,
+            download.started_at.unwrap(),
+            123,
+            "ready-cleanup.zip",
+            0,
+        )
+        .await
+        .unwrap();
+        let upload = repo.get_next_eh_job_for_upload().await.unwrap().unwrap();
+        repo.mark_eh_job_telegraph_ready(
+            upload.id,
+            upload.started_at.unwrap(),
+            "https://telegra.ph/ready-cleanup",
+            Some("{\"pages\":[]}"),
+            false,
+        )
+        .await
+        .unwrap();
+        let expected_rewrite =
+            set_active_telegraph_rewrite(&repo, download.id, TELEGRAPH_REWRITE_STATUS_PENDING)
+                .await;
+        eh_download_queue::Entity::update_many()
+            .col_expr(
+                eh_download_queue::Column::Status,
+                Expr::value(DELIVERY_STATUS_CANCELED),
+            )
+            .filter(eh_download_queue::Column::Id.eq(first.id))
+            .exec(repo.db())
+            .await
+            .unwrap();
+        repo.evaluate_eh_job_liveness(download.id, false)
+            .await
+            .unwrap();
+        let cleanup = repo.get_next_eh_job_for_cleanup().await.unwrap().unwrap();
+        let cleanup_generation = cleanup.cleanup_started_at.unwrap();
+
+        let late = repo
+            .enqueue_eh_download(
+                -200,
+                7212,
+                "token",
+                "Gallery",
+                true,
+                SOURCE_DIRECT,
+                &variant,
+            )
+            .await
+            .unwrap();
+        assert_eq!(late.job_id, Some(download.id));
+
+        assert_eq!(
+            repo.finalize_eh_job_cleanup(download.id, cleanup_generation, false)
+                .await
+                .unwrap(),
+            Some(EhCleanupFinalizeOutcome::FinalizedWithoutSourceWork)
+        );
+        let settled = eh_gallery_jobs::Entity::find_by_id(download.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(settled.cleanup_status, CLEANUP_STATUS_NONE);
+        assert!(settled.zip_path.is_none());
+        assert_eq!(settled.status, JOB_STATUS_DOWNLOADED);
+        assert_telegraph_rewrite_state_preserved(&expected_rewrite, &settled);
+
+        let publish = repo
+            .get_next_eh_delivery_for_publish(false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(publish.delivery.id, late.id);
+        assert_eq!(publish.job.telegraph_url, expected_rewrite.telegraph_url);
+        assert!(repo
+            .get_next_eh_job_for_download_with_policy(false)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(repo
+            .get_next_eh_job_for_background_download_with_policy(false)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
     async fn claimed_cleanup_reactivates_archive_work_without_clearing_ready_telegraph_state() {
         let repo = tests_helpers::setup_test_db().await.unwrap();
         let variant = EhGalleryVariant::archive("1280x");
@@ -4887,7 +5054,7 @@ mod tests {
             .is_none());
 
         assert_eq!(
-            repo.finalize_eh_job_cleanup(download.id, cleanup_generation, true)
+            repo.finalize_eh_job_cleanup(download.id, cleanup_generation, false)
                 .await
                 .unwrap(),
             Some(EhCleanupFinalizeOutcome::ReactivatedPending)
@@ -4909,7 +5076,11 @@ mod tests {
         assert_eq!(reactivated.retry_count, 0);
         assert!(reactivated.next_retry_at.is_none());
 
-        let redownload = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        let redownload = repo
+            .get_next_eh_job_for_download_with_policy(false)
+            .await
+            .unwrap()
+            .unwrap();
         repo.mark_eh_job_downloaded(
             redownload.id,
             redownload.started_at.unwrap(),
