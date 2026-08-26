@@ -2191,6 +2191,10 @@ impl Repo {
                 transition = transition
                     .col_expr(eh_download_queue::Column::Telegraph, Expr::value(false))
                     .col_expr(
+                        eh_download_queue::Column::TelegraphSubscriptionIds,
+                        Expr::value(None::<String>),
+                    )
+                    .col_expr(
                         eh_download_queue::Column::Status,
                         Expr::value(if delivery.archive_sent_at.is_some() {
                             DELIVERY_STATUS_DONE
@@ -4550,6 +4554,81 @@ mod tests {
             .await
             .unwrap(),
             EhJobUploadFailureOutcome::Stale
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_upload_archive_fallback_retires_subscription_telegraph_owners() {
+        let repo = tests_helpers::setup_test_db().await.unwrap();
+        let variant = EhGalleryVariant::archive("1280x");
+        let first = repo
+            .enqueue_eh_subscription_download(-100, 101, 725, "token", "Gallery", true, &variant)
+            .await
+            .unwrap();
+        let download = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        repo.mark_eh_job_downloaded(
+            download.id,
+            download.started_at.unwrap(),
+            123,
+            "subscription-fallback.zip",
+            0,
+        )
+        .await
+        .unwrap();
+        let upload = repo.get_next_eh_job_for_upload().await.unwrap().unwrap();
+        let EhJobUploadFailureOutcome::Terminal { .. } = repo
+            .record_eh_job_upload_failure(
+                upload.id,
+                upload.started_at.unwrap(),
+                "terminal provider failure",
+                0,
+                true,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected a terminal shared upload failure");
+        };
+
+        let fallback = eh_download_queue::Entity::find_by_id(first.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(fallback.status, DELIVERY_STATUS_WAITING);
+        assert!(!fallback.telegraph);
+        assert!(fallback.telegraph_subscription_ids.is_none());
+        assert_eq!(fallback.subscription_ids.as_deref(), Some("101"));
+        let failed = eh_gallery_jobs::Entity::find_by_id(upload.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!failed.telegraph_required);
+
+        let merged = repo
+            .enqueue_eh_subscription_download(-100, 202, 725, "token", "Gallery", false, &variant)
+            .await
+            .unwrap();
+        assert_eq!(merged.id, first.id);
+        assert!(!merged.telegraph);
+        assert!(merged.telegraph_subscription_ids.is_none());
+        assert_eq!(merged.subscription_ids.as_deref(), Some("101,202"));
+        let after_merge = eh_gallery_jobs::Entity::find_by_id(upload.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!after_merge.telegraph_required);
+        assert!(repo.get_next_eh_job_for_upload().await.unwrap().is_none());
+        assert_eq!(
+            repo.get_next_eh_delivery_for_publish(true)
+                .await
+                .unwrap()
+                .unwrap()
+                .delivery
+                .id,
+            first.id
         );
     }
 
