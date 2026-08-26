@@ -1907,6 +1907,23 @@ impl EhUploadWorker {
                 EhJobUploadFailureOutcome::Stale => return Err(error),
                 EhJobUploadFailureOutcome::Terminal { job: _, deliveries } => {
                     for delivery in deliveries {
+                        match get_chat_if_should_notify(&self.repo, delivery.chat_id).await {
+                            Ok(Some(_)) => {}
+                            Ok(None) => {
+                                info!(
+                                    "Skipping terminal EH Telegraph failure notification for delivery {} in non-notifiable chat {}",
+                                    delivery.delivery_id, delivery.chat_id
+                                );
+                                continue;
+                            }
+                            Err(eligibility_error) => {
+                                error!(
+                                    "Failed to check notification eligibility for terminal EH Telegraph failure delivery {} in chat {}: {:#}",
+                                    delivery.delivery_id, delivery.chat_id, eligibility_error
+                                );
+                                continue;
+                            }
+                        }
                         let title = teloxide::utils::markdown::escape(&delivery.title);
                         let message = format!("⚠️ Telegraph 上传失败，请稍后重试\n\n📦 {}", title);
                         if let Err(notify_error) = self
@@ -6236,6 +6253,7 @@ mod tests {
 
     struct AlwaysFailUploader {
         message: String,
+        calls: std::sync::atomic::AtomicUsize,
     }
 
     #[async_trait::async_trait]
@@ -6244,6 +6262,7 @@ mod tests {
             &self,
             _images: &[ImageUploadInput<'_>],
         ) -> eh_client::Result<Vec<String>> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Err(eh_client::Error::Other(self.message.clone()))
         }
     }
@@ -6786,6 +6805,7 @@ mod tests {
             make_telegraph_client(&tg_server),
             Arc::new(AlwaysFailUploader {
                 message: "sqlite secret; /private/path; multipart upload id=abc".to_string(),
+                calls: std::sync::atomic::AtomicUsize::new(0),
             }),
             None,
             Arc::new(config),
@@ -6866,6 +6886,104 @@ mod tests {
             .unwrap();
         assert_eq!(fallback_claim.delivery.id, deliveries[0].id);
         assert!(!fallback_claim.delivery.telegraph);
+    }
+
+    #[tokio::test]
+    async fn terminal_upload_failure_skips_disabled_shared_destination_notification() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        let tg_server = MockServer::start().await;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let zip_path = temp_dir.path().join("terminal-shared-gallery.zip");
+        create_test_zip(&zip_path, 1);
+        setup_chat(&repo, -100, true).await;
+        setup_chat(&repo, -200, false).await;
+        let (job, deliveries) = seed_downloaded_job_with_deliveries(
+            &repo,
+            712,
+            "token",
+            "Shared Gallery",
+            &zip_path,
+            &[(-100, true, "Enabled"), (-200, true, "Disabled")],
+        )
+        .await;
+        let response = serde_json::json!({
+            "ok": true,
+            "result": {
+                "message_id": 43,
+                "date": 1700000000,
+                "chat": {"id": -100, "type": "private"}
+            }
+        });
+        Mock::given(method("POST"))
+            .and(path("/botfake_token/SendMessage"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(response))
+            .mount(&tg_server)
+            .await;
+        let uploader = Arc::new(AlwaysFailUploader {
+            message: "terminal provider failure".to_string(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let mut config = make_config();
+        config.max_retry_count = 0;
+        let worker = EhUploadWorker::new(
+            Arc::clone(&repo),
+            make_notifier(&tg_server),
+            make_telegraph_client(&tg_server),
+            uploader.clone(),
+            None,
+            Arc::new(config),
+        );
+
+        worker.tick().await.unwrap();
+        worker.tick().await.unwrap();
+
+        assert_eq!(
+            uploader.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the enabled Telegraph delivery must authorize provider work"
+        );
+        let requests = tg_server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|request| request.url.path() == "/botfake_token/SendMessage")
+            .map(|request| serde_json::from_slice::<serde_json::Value>(&request.body).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            requests
+                .iter()
+                .map(|body| body["chat_id"].as_i64().unwrap())
+                .collect::<Vec<_>>(),
+            vec![-100],
+            "terminal notification must skip the disabled sibling and remain exact-once"
+        );
+        assert_eq!(
+            requests[0]["text"].as_str(),
+            Some("⚠️ Telegraph 上传失败，请稍后重试\n\n📦 Enabled")
+        );
+        for delivery in deliveries {
+            let delivery = eh_download_queue::Entity::find_by_id(delivery.id)
+                .one(repo.db())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                delivery.status,
+                crate::db::repo::eh_gallery_jobs::DELIVERY_STATUS_WAITING
+            );
+            assert!(!delivery.telegraph);
+            assert_eq!(delivery.error, None);
+        }
+        let failed_job = eh_gallery_jobs::Entity::find_by_id(job.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            failed_job.telegraph_status,
+            crate::db::repo::eh_gallery_jobs::TELEGRAPH_STATUS_FAILED
+        );
     }
 
     #[tokio::test]
