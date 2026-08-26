@@ -6405,6 +6405,7 @@ mod tests {
             .await;
         let mut config = make_config();
         config.max_retry_count = 0;
+        assert!(config.send_archive);
         let worker = EhUploadWorker::new(
             Arc::clone(&repo),
             make_notifier(&tg_server),
@@ -6461,10 +6462,19 @@ mod tests {
             crate::db::repo::eh_gallery_jobs::TELEGRAPH_STATUS_FAILED
         );
         assert!(failed_job.error.unwrap().contains("sqlite secret"));
-        for (delivery, expected_status) in deliveries.iter().zip([
-            crate::db::repo::eh_gallery_jobs::DELIVERY_STATUS_FAILED,
-            crate::db::repo::eh_gallery_jobs::DELIVERY_STATUS_FAILED,
-            crate::db::repo::eh_gallery_jobs::DELIVERY_STATUS_WAITING,
+        for (delivery, (expected_status, expected_telegraph)) in deliveries.iter().zip([
+            (
+                crate::db::repo::eh_gallery_jobs::DELIVERY_STATUS_WAITING,
+                false,
+            ),
+            (
+                crate::db::repo::eh_gallery_jobs::DELIVERY_STATUS_WAITING,
+                false,
+            ),
+            (
+                crate::db::repo::eh_gallery_jobs::DELIVERY_STATUS_WAITING,
+                false,
+            ),
         ]) {
             let delivery = eh_download_queue::Entity::find_by_id(delivery.id)
                 .one(repo.db())
@@ -6472,8 +6482,16 @@ mod tests {
                 .unwrap()
                 .unwrap();
             assert_eq!(delivery.status, expected_status);
+            assert_eq!(delivery.telegraph, expected_telegraph);
             assert_eq!(delivery.error, None);
         }
+        let fallback_claim = repo
+            .get_next_eh_delivery_for_publish(true)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(fallback_claim.delivery.id, deliveries[0].id);
+        assert!(!fallback_claim.delivery.telegraph);
     }
 
     #[tokio::test]
@@ -7670,7 +7688,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_upload_terminal_failure_removes_upload_state_but_keeps_zip_for_archive_mode() {
+    async fn test_upload_terminal_failure_keeps_archive_fallback_and_upload_state() {
         let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
         setup_chat(&repo, -100, true).await;
         let tg_server = MockServer::start().await;
@@ -7713,10 +7731,20 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(model.status, STATUS_FAILED);
-        assert!(model.telegraph);
+        assert_eq!(
+            model.status,
+            crate::db::repo::eh_gallery_jobs::DELIVERY_STATUS_WAITING
+        );
+        assert!(!model.telegraph);
         assert_eq!(model.error, None);
+        assert!(model.started_at.is_none());
+        assert!(model.completed_at.is_none());
+        assert!(model.next_retry_at.is_none());
         let job = job_for_delivery(&repo, &entry).await;
+        assert_eq!(
+            job.status,
+            crate::db::repo::eh_gallery_jobs::JOB_STATUS_DOWNLOADED
+        );
         assert_eq!(
             job.telegraph_status,
             crate::db::repo::eh_gallery_jobs::TELEGRAPH_STATUS_FAILED
@@ -7725,33 +7753,24 @@ mod tests {
         assert!(job.next_retry_at.is_none());
         assert_eq!(
             job.cleanup_status,
-            crate::db::repo::eh_gallery_jobs::CLEANUP_STATUS_PENDING
+            crate::db::repo::eh_gallery_jobs::CLEANUP_STATUS_NONE
         );
-        assert!(
-            zip_path.exists(),
-            "liveness schedules rather than deleting the retired archive family"
-        );
-        assert!(
-            artifacts.uploads_dir().exists(),
-            "maintenance owns the Abort and local removal"
-        );
+        assert!(zip_path.exists());
+        assert!(artifacts.uploads_dir().exists());
         assert!(artifacts.assembly_scratch().exists());
         assert!(artifacts.parts_dir().exists());
-        assert_eq!(
-            run_eh_job_cleanup_maintenance_once(repo.as_ref(), Some(uploader.as_ref()), 1, true)
-                .await
-                .unwrap(),
-            Some(EhCleanupFinalizeOutcome::CleanRetired)
-        );
-        assert!(!zip_path.exists());
-        assert!(!artifacts.uploads_dir().exists());
-        assert!(!artifacts.assembly_scratch().exists());
-        assert!(!artifacts.parts_dir().exists());
-        assert_terminal_cleanup_precedes_local_removal(&uploader, &artifacts);
+        let fallback_claim = repo
+            .get_next_eh_delivery_for_publish(true)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(fallback_claim.delivery.id, entry.id);
+        assert!(!fallback_claim.delivery.telegraph);
+        assert!(uploader.cleanup_calls.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
-    async fn test_upload_terminal_failure_preserves_family_when_abort_fails() {
+    async fn test_upload_terminal_failure_defers_abort_until_archive_fallback_finishes() {
         let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
         setup_chat(&repo, -100, true).await;
         let tg_server = MockServer::start().await;
@@ -7798,12 +7817,9 @@ mod tests {
             .unwrap();
         assert_eq!(
             model.status,
-            crate::db::repo::eh_gallery_jobs::DELIVERY_STATUS_FAILED
+            crate::db::repo::eh_gallery_jobs::DELIVERY_STATUS_WAITING
         );
-        assert!(
-            model.telegraph,
-            "Abort failure must not enter archive fallback"
-        );
+        assert!(!model.telegraph);
         let job = job_for_delivery(&repo, &entry).await;
         assert_eq!(job.retry_count, 1);
         assert_eq!(
@@ -7812,33 +7828,21 @@ mod tests {
         );
         assert_eq!(
             job.cleanup_status,
-            crate::db::repo::eh_gallery_jobs::CLEANUP_STATUS_PENDING
+            crate::db::repo::eh_gallery_jobs::CLEANUP_STATUS_NONE
         );
-        assert!(run_eh_job_cleanup_maintenance_once(
-            repo.as_ref(),
-            Some(uploader.as_ref()),
-            1,
-            true
-        )
-        .await
-        .is_err());
-        let failed_cleanup = job_for_delivery(&repo, &entry).await;
-        assert_eq!(
-            failed_cleanup.cleanup_status,
-            crate::db::repo::eh_gallery_jobs::CLEANUP_STATUS_FAILED
-        );
-        assert!(zip_path.exists(), "Abort failure must retain the final ZIP");
+        assert!(zip_path.exists());
         assert!(artifacts.uploads_dir().exists());
         assert!(artifacts.uploads_dir().join("archive.json").exists());
-        assert_terminal_cleanup_precedes_local_removal(&uploader, &artifacts);
+        assert!(uploader.cleanup_calls.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
-    async fn test_upload_terminal_failure_without_abort_uploader_preserves_job_family() {
+    async fn test_upload_terminal_failure_without_abort_uploader_preserves_archive_fallback() {
         let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
         let tg_server = MockServer::start().await;
         let mut config = make_config();
         config.max_retry_count = 0;
+        assert!(config.send_archive);
         let temp_dir = tempfile::tempdir().unwrap();
         let zip_path = temp_dir.path().join("505-no-abort-uploader.zip");
         create_test_zip(&zip_path, 2);
@@ -7866,14 +7870,10 @@ mod tests {
         );
 
         worker.tick().await.unwrap();
-        let error = run_eh_job_cleanup_maintenance_once(repo.as_ref(), None, 1, true)
-            .await
-            .expect_err("missing Abort uploader must fail closed during maintenance");
-        assert!(error.to_string().contains("no Abort uploader configured"));
         let job = job_for_delivery(&repo, &entry).await;
         assert_eq!(
             job.status,
-            crate::db::repo::eh_gallery_jobs::JOB_STATUS_RETIRED
+            crate::db::repo::eh_gallery_jobs::JOB_STATUS_DOWNLOADED
         );
         assert_eq!(
             job.telegraph_status,
@@ -7882,7 +7882,7 @@ mod tests {
         assert_eq!(job.retry_count, 1);
         assert_eq!(
             job.cleanup_status,
-            crate::db::repo::eh_gallery_jobs::CLEANUP_STATUS_FAILED
+            crate::db::repo::eh_gallery_jobs::CLEANUP_STATUS_NONE
         );
         let delivery = eh_download_queue::Entity::find_by_id(entry.id)
             .one(repo.db())
@@ -7891,8 +7891,9 @@ mod tests {
             .unwrap();
         assert_eq!(
             delivery.status,
-            crate::db::repo::eh_gallery_jobs::DELIVERY_STATUS_FAILED
+            crate::db::repo::eh_gallery_jobs::DELIVERY_STATUS_WAITING
         );
+        assert!(!delivery.telegraph);
         assert!(artifacts.final_zip().exists());
         assert!(artifacts.assembly_scratch().exists());
         assert!(artifacts.parts_dir().exists());
@@ -8204,7 +8205,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_upload_permanent_failure_without_zip_does_not_fallback() {
+    async fn test_upload_permanent_failure_with_missing_zip_enters_archive_fallback() {
         let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
         setup_chat(&repo, -100, true).await;
         let tg_server = MockServer::start().await;
@@ -8241,8 +8242,13 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        // Missing ZIP file reaches the shared terminal failure path.
-        assert_eq!(model.status, STATUS_FAILED);
+        // The terminal upload failure preserves the DB-visible archive surface;
+        // the publish worker owns filesystem validation and missing-ZIP recovery.
+        assert_eq!(
+            model.status,
+            crate::db::repo::eh_gallery_jobs::DELIVERY_STATUS_WAITING
+        );
+        assert!(!model.telegraph);
         assert_eq!(model.error, None, "provider errors stay on the shared job");
         assert!(job_for_delivery(&repo, &entry).await.error.is_some());
     }

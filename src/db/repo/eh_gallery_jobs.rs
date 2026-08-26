@@ -2019,24 +2019,68 @@ impl Repo {
         let now = Local::now().naive_local();
         let mut deliveries = Vec::with_capacity(candidates.len());
         for delivery in candidates {
-            let transitioned = eh_download_queue::Entity::update_many()
-                .col_expr(
-                    eh_download_queue::Column::Status,
-                    Expr::value(DELIVERY_STATUS_FAILED),
-                )
-                .col_expr(eh_download_queue::Column::CompletedAt, Expr::value(now))
-                .col_expr(
-                    eh_download_queue::Column::NextRetryAt,
-                    Expr::value(None::<DateTime>),
-                )
+            let mut transition = eh_download_queue::Entity::update_many()
                 .filter(eh_download_queue::Column::Id.eq(delivery.id))
                 .filter(eh_download_queue::Column::JobId.eq(job_id))
                 .filter(eh_download_queue::Column::Telegraph.eq(true))
                 .filter(eh_download_queue::Column::TelegraphSentAt.is_null())
-                .filter(eh_download_queue::Column::Status.eq(&delivery.status))
+                .filter(eh_download_queue::Column::Status.eq(&delivery.status));
+            if send_archive {
+                transition = transition
+                    .col_expr(eh_download_queue::Column::Telegraph, Expr::value(false))
+                    .col_expr(
+                        eh_download_queue::Column::Status,
+                        Expr::value(if delivery.archive_sent_at.is_some() {
+                            DELIVERY_STATUS_DONE
+                        } else {
+                            DELIVERY_STATUS_WAITING
+                        }),
+                    )
+                    .col_expr(
+                        eh_download_queue::Column::NextRetryAt,
+                        Expr::value(None::<DateTime>),
+                    );
+                if delivery.archive_sent_at.is_some() {
+                    transition = transition.col_expr(
+                        eh_download_queue::Column::CompletedAt,
+                        Expr::value(Some(now)),
+                    );
+                } else {
+                    transition = transition
+                        .col_expr(
+                            eh_download_queue::Column::StartedAt,
+                            Expr::value(None::<DateTime>),
+                        )
+                        .col_expr(
+                            eh_download_queue::Column::CompletedAt,
+                            Expr::value(None::<DateTime>),
+                        );
+                }
+            } else {
+                transition = transition
+                    .col_expr(
+                        eh_download_queue::Column::Status,
+                        Expr::value(DELIVERY_STATUS_FAILED),
+                    )
+                    .col_expr(
+                        eh_download_queue::Column::CompletedAt,
+                        Expr::value(Some(now)),
+                    )
+                    .col_expr(
+                        eh_download_queue::Column::NextRetryAt,
+                        Expr::value(None::<DateTime>),
+                    );
+            }
+            let transitioned = transition
+                .filter(optional_datetime_filter(
+                    eh_download_queue::Column::ArchiveSentAt,
+                    delivery.archive_sent_at,
+                ))
                 .exec(&txn)
                 .await
-                .context("Failed to fail one Telegraph delivery after terminal upload failure")?;
+                .context(
+                    "Failed to transition one Telegraph delivery after terminal upload failure",
+                )?;
             if transitioned.rows_affected == 1 {
                 deliveries.push(EhFailedTelegraphDelivery {
                     delivery_id: delivery.id,
@@ -4154,7 +4198,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn late_telegraph_consumer_reuses_download_and_terminal_upload_failure_is_scoped() {
+    async fn late_telegraph_consumer_reuses_download_and_terminal_upload_failure_falls_back_to_archive(
+    ) {
         let repo = tests_helpers::setup_test_db().await.unwrap();
         let variant = EhGalleryVariant::archive("1280x");
         let archive_only = repo
@@ -4240,9 +4285,36 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(archive_only.status, DELIVERY_STATUS_WAITING);
-        assert_eq!(late.status, DELIVERY_STATUS_FAILED);
+        assert!(!archive_only.telegraph);
+        assert_eq!(late.status, DELIVERY_STATUS_WAITING);
+        assert!(!late.telegraph);
         assert_eq!(archive_only.error, None);
         assert_eq!(late.error, None);
+        assert!(late.archive_sent_at.is_none());
+        assert!(late.telegraph_sent_at.is_none());
+        assert!(late.started_at.is_none());
+        assert!(late.completed_at.is_none());
+        assert!(late.next_retry_at.is_none());
+
+        let archive_only_claim = repo
+            .get_next_eh_delivery_for_publish(true)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(archive_only_claim.delivery.id, archive_only.id);
+        repo.mark_eh_archive_delivery_sent(archive_only.id)
+            .await
+            .unwrap();
+        repo.mark_eh_delivery_done(archive_only.id, claimed_upload.id, true)
+            .await
+            .unwrap();
+        let late_claim = repo
+            .get_next_eh_delivery_for_publish(true)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(late_claim.delivery.id, late.id);
+        assert!(!late_claim.delivery.telegraph);
 
         assert_eq!(
             repo.record_eh_job_upload_failure(
@@ -4256,6 +4328,86 @@ mod tests {
             .unwrap(),
             EhJobUploadFailureOutcome::Stale
         );
+    }
+
+    #[tokio::test]
+    async fn terminal_upload_failure_completes_mixed_delivery_after_archive_was_sent() {
+        let repo = tests_helpers::setup_test_db().await.unwrap();
+        let variant = EhGalleryVariant::archive("1280x");
+        let delivery = repo
+            .enqueue_eh_download(-100, 701, "token", "Gallery", true, SOURCE_DIRECT, &variant)
+            .await
+            .unwrap();
+        let download = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        repo.mark_eh_job_downloaded(
+            download.id,
+            download.started_at.unwrap(),
+            123,
+            "shared.zip",
+            0,
+        )
+        .await
+        .unwrap();
+        let upload = repo.get_next_eh_job_for_upload().await.unwrap().unwrap();
+        let archive_sent_at = Local::now().naive_local();
+        eh_download_queue::Entity::update_many()
+            .col_expr(
+                eh_download_queue::Column::Status,
+                Expr::value(DELIVERY_STATUS_PUBLISHING),
+            )
+            .col_expr(
+                eh_download_queue::Column::StartedAt,
+                Expr::value(Some(archive_sent_at)),
+            )
+            .col_expr(
+                eh_download_queue::Column::ArchiveSentAt,
+                Expr::value(Some(archive_sent_at)),
+            )
+            .col_expr(
+                eh_download_queue::Column::NextRetryAt,
+                Expr::value(Some(archive_sent_at + chrono::Duration::minutes(1))),
+            )
+            .filter(eh_download_queue::Column::Id.eq(delivery.id))
+            .exec(repo.db())
+            .await
+            .unwrap();
+
+        let outcome = repo
+            .record_eh_job_upload_failure(
+                upload.id,
+                upload.started_at.unwrap(),
+                "provider secret",
+                0,
+                true,
+            )
+            .await
+            .unwrap();
+        let EhJobUploadFailureOutcome::Terminal { job, deliveries } = outcome else {
+            panic!("expected a terminal shared upload failure");
+        };
+        assert_eq!(
+            deliveries,
+            vec![EhFailedTelegraphDelivery {
+                delivery_id: delivery.id,
+                chat_id: -100,
+                title: "Gallery".to_string(),
+            }]
+        );
+        assert_eq!(job.telegraph_status, TELEGRAPH_STATUS_FAILED);
+        assert_eq!(job.status, JOB_STATUS_RETIRED);
+        assert_eq!(job.cleanup_status, CLEANUP_STATUS_PENDING);
+
+        let completed = eh_download_queue::Entity::find_by_id(delivery.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(completed.status, DELIVERY_STATUS_DONE);
+        assert!(!completed.telegraph);
+        assert_eq!(completed.archive_sent_at, Some(archive_sent_at));
+        assert!(completed.telegraph_sent_at.is_none());
+        assert!(completed.completed_at.is_some());
+        assert!(completed.next_retry_at.is_none());
     }
 
     #[tokio::test]
@@ -4656,7 +4808,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dirty_failed_upload_late_demand_restarts_after_cleanup_and_redownload() {
+    async fn archive_disabled_terminal_upload_failure_remains_failed_and_notifies_once() {
         let repo = tests_helpers::setup_test_db().await.unwrap();
         let variant = EhGalleryVariant::archive("1280x");
         let first = repo
@@ -4688,14 +4840,21 @@ mod tests {
                 upload.started_at.unwrap(),
                 "terminal provider failure",
                 0,
-                true,
+                false,
             )
             .await
             .unwrap();
-        assert!(matches!(
-            terminal,
-            EhJobUploadFailureOutcome::Terminal { .. }
-        ));
+        let EhJobUploadFailureOutcome::Terminal { deliveries, .. } = terminal else {
+            panic!("expected a terminal shared upload failure");
+        };
+        assert_eq!(
+            deliveries,
+            vec![EhFailedTelegraphDelivery {
+                delivery_id: first.id,
+                chat_id: -100,
+                title: "Gallery".to_string(),
+            }]
+        );
         assert_eq!(
             eh_download_queue::Entity::find_by_id(first.id)
                 .one(repo.db())
@@ -5498,15 +5657,13 @@ mod tests {
             outcome,
             EhJobUploadFailureOutcome::Terminal { .. }
         ));
-        assert_eq!(
-            eh_download_queue::Entity::find_by_id(failed_telegraph.id)
-                .one(repo.db())
-                .await
-                .unwrap()
-                .unwrap()
-                .status,
-            DELIVERY_STATUS_FAILED
-        );
+        let archive_fallback = eh_download_queue::Entity::find_by_id(failed_telegraph.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(archive_fallback.status, DELIVERY_STATUS_WAITING);
+        assert!(!archive_fallback.telegraph);
 
         let late = repo
             .enqueue_eh_download(-300, 724, "token", "Gallery", true, SOURCE_DIRECT, &variant)
