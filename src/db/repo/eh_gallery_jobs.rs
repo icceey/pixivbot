@@ -178,6 +178,22 @@ pub enum EhJobUploadFailureOutcome {
     },
 }
 
+/// The durable result of a missing shared-ZIP reset attempted by a publish
+/// worker. Exactly one racing delivery observes `Reset` or `Exhausted`; every
+/// other caller sees `Stale` and must leave the shared state alone.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EhMissingZipResetOutcome {
+    /// The shared job was put back into the pending redownload queue with
+    /// backoff and an incremented retry count.
+    Reset,
+    /// The retry limit was reached: the job failed terminally, its active
+    /// deliveries failed once, and no further download is scheduled.
+    Exhausted,
+    /// The `(downloaded, expected generation, expected path)` CAS did not
+    /// match, so this caller lost the race and changed nothing.
+    Stale,
+}
+
 struct EhEnqueueRequest<'a> {
     chat_id: i64,
     gid: i64,
@@ -3139,42 +3155,89 @@ impl Repo {
     /// persisted ZIP has disappeared. The `(downloaded, expected generation,
     /// expected path)` CAS is the generation boundary: exactly one racing
     /// delivery advances the shared retry count, while all other callers
-    /// observe `false` and leave it alone.
+    /// observe `Stale` and leave it alone.
     ///
     /// Ready Telegraph state and rewrite state deliberately survive. They are
     /// shared work that remains valid even though the archive must be fetched
     /// again for delivery.
+    ///
+    /// Once the incremented retry count exceeds `max_retry_count`, the reset
+    /// becomes terminal in the same transaction: the job fails with a stable
+    /// error, its active deliveries fail once, and no further download is
+    /// scheduled. The persisted ZIP path is kept so durable cleanup still owns
+    /// any leftover `.part/.parts/.uploads` family members.
     pub async fn reset_eh_job_for_missing_zip(
         &self,
         job_id: i32,
         expected_started_at: DateTime,
         expected_zip_path: &str,
-    ) -> Result<bool> {
+        max_retry_count: u8,
+    ) -> Result<EhMissingZipResetOutcome> {
         let txn = self
             .db
             .begin()
             .await
             .context("Failed to begin missing shared EH ZIP reset transaction")?;
-        let result: Result<bool> = async {
+        let result: Result<EhMissingZipResetOutcome> = async {
             let Some(job) = eh_gallery_jobs::Entity::find_by_id(job_id)
                 .one(&txn)
                 .await
                 .context("Failed to fetch shared EH job for missing ZIP reset")?
             else {
-                return Ok(false);
+                return Ok(EhMissingZipResetOutcome::Stale);
             };
             if job.status != JOB_STATUS_DOWNLOADED
                 || job.started_at != Some(expected_started_at)
                 || job.zip_path.as_deref() != Some(expected_zip_path)
                 || job.telegraph_status == TELEGRAPH_STATUS_UPLOADING
             {
-                return Ok(false);
+                return Ok(EhMissingZipResetOutcome::Stale);
             }
             let retry_count = job
                 .retry_count
                 .checked_add(1)
                 .context("Shared EH missing ZIP retry count overflow")?;
             let now = Local::now().naive_local();
+            if retry_count > i32::from(max_retry_count) {
+                let exhausted = eh_gallery_jobs::Entity::update_many()
+                    .col_expr(
+                        eh_gallery_jobs::Column::Status,
+                        Expr::value(JOB_STATUS_FAILED),
+                    )
+                    .col_expr(
+                        eh_gallery_jobs::Column::Error,
+                        Expr::value(Some("cached EH ZIP is missing".to_string())),
+                    )
+                    .col_expr(
+                        eh_gallery_jobs::Column::RetryCount,
+                        Expr::value(retry_count),
+                    )
+                    .col_expr(eh_gallery_jobs::Column::CompletedAt, Expr::value(now))
+                    .col_expr(
+                        eh_gallery_jobs::Column::NextRetryAt,
+                        Expr::value(None::<DateTime>),
+                    )
+                    .col_expr(
+                        eh_gallery_jobs::Column::CleanupStatus,
+                        cleanup_pending_when_zip_owned_expr(),
+                    )
+                    .filter(eh_gallery_jobs::Column::Id.eq(job_id))
+                    .filter(eh_gallery_jobs::Column::Status.eq(JOB_STATUS_DOWNLOADED))
+                    .filter(eh_gallery_jobs::Column::StartedAt.eq(expected_started_at))
+                    .filter(eh_gallery_jobs::Column::ZipPath.eq(expected_zip_path))
+                    .filter(eh_gallery_jobs::Column::TelegraphStatus.ne(TELEGRAPH_STATUS_UPLOADING))
+                    .exec(&txn)
+                    .await
+                    .context("Failed to fail shared EH job after missing ZIP retries")?;
+                if exhausted.rows_affected == 0 {
+                    return Ok(EhMissingZipResetOutcome::Stale);
+                }
+                // Terminal download failures match the ordinary claim-failure
+                // path: active deliveries fail once, without erasing a
+                // successfully sent surface marker.
+                fail_active_eh_job_deliveries_in_txn(&txn, job_id).await?;
+                return Ok(EhMissingZipResetOutcome::Exhausted);
+            }
             let retry_at = now
                 .checked_add_signed(chrono::Duration::seconds(Self::backoff_delay_secs(
                     retry_count,
@@ -3216,7 +3279,7 @@ impl Repo {
                 .await
                 .context("Failed to reset shared EH job for missing ZIP")?;
             if reset.rows_affected == 0 {
-                return Ok(false);
+                return Ok(EhMissingZipResetOutcome::Stale);
             }
 
             // Other archive consumers may already have claimed their delivery.
@@ -3237,7 +3300,7 @@ impl Repo {
                 .exec(&txn)
                 .await
                 .context("Failed to release shared EH archive deliveries after missing ZIP")?;
-            Ok(true)
+            Ok(EhMissingZipResetOutcome::Reset)
         }
         .await;
         match result {
@@ -6200,10 +6263,17 @@ mod tests {
         let upload = repo.get_next_eh_job_for_upload().await.unwrap().unwrap();
         let upload_generation = upload.started_at.unwrap();
 
-        assert!(!repo
-            .reset_eh_job_for_missing_zip(upload.id, upload_generation, "uploading-owned.zip",)
+        assert_eq!(
+            repo.reset_eh_job_for_missing_zip(
+                upload.id,
+                upload_generation,
+                "uploading-owned.zip",
+                3
+            )
             .await
-            .unwrap());
+            .unwrap(),
+            EhMissingZipResetOutcome::Stale
+        );
         let after_rejected_reset = eh_gallery_jobs::Entity::find_by_id(upload.id)
             .one(repo.db())
             .await
@@ -6288,6 +6358,164 @@ mod tests {
                 .unwrap()
                 .id,
             upload.id
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_zip_reset_stops_at_retry_limit_and_fails_deliveries() {
+        let repo = tests_helpers::setup_test_db().await.unwrap();
+        let variant = EhGalleryVariant::archive("1280x");
+        let delivery = repo
+            .enqueue_eh_download(
+                -100,
+                731,
+                "token",
+                "Gallery",
+                false,
+                SOURCE_DIRECT,
+                &variant,
+            )
+            .await
+            .unwrap();
+        let download = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        repo.mark_eh_job_downloaded(
+            download.id,
+            download.started_at.unwrap(),
+            123,
+            "at-limit.zip",
+            0,
+        )
+        .await
+        .unwrap();
+        let generation = download.started_at.unwrap();
+        let second = repo
+            .enqueue_eh_download(
+                -200,
+                731,
+                "token",
+                "Gallery",
+                false,
+                SOURCE_DIRECT,
+                &variant,
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.job_id, Some(download.id));
+
+        // Below the limit: one more shared redownload is still scheduled.
+        eh_gallery_jobs::Entity::update_many()
+            .col_expr(eh_gallery_jobs::Column::RetryCount, Expr::value(2_i32))
+            .filter(eh_gallery_jobs::Column::Id.eq(download.id))
+            .exec(repo.db())
+            .await
+            .unwrap();
+        assert_eq!(
+            repo.reset_eh_job_for_missing_zip(download.id, generation, "at-limit.zip", 3)
+                .await
+                .unwrap(),
+            EhMissingZipResetOutcome::Reset
+        );
+        let reset = eh_gallery_jobs::Entity::find_by_id(download.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reset.status, JOB_STATUS_PENDING);
+        assert_eq!(reset.retry_count, 3);
+        assert!(reset.next_retry_at.is_some());
+        assert!(reset.zip_path.is_none());
+        assert_eq!(
+            eh_download_queue::Entity::find_by_id(delivery.id)
+                .one(repo.db())
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            DELIVERY_STATUS_WAITING
+        );
+
+        // Back to downloaded state at the limit for the terminal scenario.
+        eh_gallery_jobs::Entity::update_many()
+            .col_expr(
+                eh_gallery_jobs::Column::NextRetryAt,
+                Expr::value(None::<DateTime>),
+            )
+            .filter(eh_gallery_jobs::Column::Id.eq(download.id))
+            .exec(repo.db())
+            .await
+            .unwrap();
+        let redownload = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        assert_eq!(redownload.id, download.id);
+        repo.mark_eh_job_downloaded(
+            redownload.id,
+            redownload.started_at.unwrap(),
+            123,
+            "at-limit.zip",
+            0,
+        )
+        .await
+        .unwrap();
+        let at_limit_generation = redownload.started_at.unwrap();
+        eh_gallery_jobs::Entity::update_many()
+            .col_expr(eh_gallery_jobs::Column::RetryCount, Expr::value(3_i32))
+            .filter(eh_gallery_jobs::Column::Id.eq(download.id))
+            .exec(repo.db())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            repo.reset_eh_job_for_missing_zip(download.id, at_limit_generation, "at-limit.zip", 3)
+                .await
+                .unwrap(),
+            EhMissingZipResetOutcome::Exhausted
+        );
+
+        let failed = eh_gallery_jobs::Entity::find_by_id(download.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(failed.status, JOB_STATUS_FAILED);
+        assert_eq!(failed.retry_count, 4);
+        assert_eq!(failed.error.as_deref(), Some("cached EH ZIP is missing"));
+        assert!(failed.next_retry_at.is_none());
+        assert!(failed.completed_at.is_some());
+        assert_eq!(failed.zip_path.as_deref(), Some("at-limit.zip"));
+        assert_eq!(failed.cleanup_status, CLEANUP_STATUS_PENDING);
+
+        for delivery_id in [delivery.id, second.id] {
+            let failed_delivery = eh_download_queue::Entity::find_by_id(delivery_id)
+                .one(repo.db())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(failed_delivery.status, DELIVERY_STATUS_FAILED);
+            assert!(failed_delivery.next_retry_at.is_none());
+        }
+
+        // A repeated reset attempt is stale: the failed generation is gone.
+        assert_eq!(
+            repo.reset_eh_job_for_missing_zip(download.id, at_limit_generation, "at-limit.zip", 3)
+                .await
+                .unwrap(),
+            EhMissingZipResetOutcome::Stale
+        );
+        // Neither the normal nor the background source selector ever claims the
+        // failed job again.
+        assert!(repo.get_next_eh_job_for_download().await.unwrap().is_none());
+        assert!(repo
+            .get_next_eh_job_for_background_download()
+            .await
+            .unwrap()
+            .is_none());
+        // The durable cleanup lane now owns the leftover archive family.
+        assert_eq!(
+            repo.get_next_eh_job_for_cleanup()
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            download.id
         );
     }
 
