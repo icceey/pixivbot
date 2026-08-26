@@ -1795,6 +1795,29 @@ impl EhUploadWorker {
         ensure_job_upload_state_aborted(job, self.abort_uploader.as_deref()).await
     }
 
+    async fn has_notifiable_telegraph_delivery(&self, job_id: i32) -> Result<bool> {
+        let deliveries = self.repo.get_active_eh_job_deliveries(job_id).await?;
+        for delivery in deliveries {
+            if !delivery.telegraph || delivery.telegraph_sent_at.is_some() {
+                continue;
+            }
+            if !self
+                .repo
+                .eh_download_is_active(delivery.id, &delivery.status, self.config.send_archive)
+                .await?
+            {
+                continue;
+            }
+            if get_chat_if_should_notify(&self.repo, delivery.chat_id)
+                .await?
+                .is_some()
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     pub async fn run(self) {
         let poll = self.config.download_poll_interval_sec.max(10);
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(poll));
@@ -1816,6 +1839,56 @@ impl EhUploadWorker {
         let expected_started_at = job
             .started_at
             .context("Claimed shared EH gallery upload is missing started_at")?;
+
+        let defer_delay_secs = self.config.download_poll_interval_sec.max(10);
+        let has_notifiable_delivery = match self.has_notifiable_telegraph_delivery(job.id).await {
+            Ok(has_notifiable_delivery) => has_notifiable_delivery,
+            Err(inspection_error) => {
+                match self
+                    .repo
+                    .defer_eh_job_upload(
+                        job.id,
+                        expected_started_at,
+                        defer_delay_secs as i64,
+                        self.config.send_archive,
+                    )
+                    .await
+                {
+                    Ok(true) => {}
+                    Ok(false) => info!(
+                        "Shared EH gallery upload {} changed before eligibility-inspection defer",
+                        job.id
+                    ),
+                    Err(defer_error) => error!(
+                        "Failed to defer shared EH gallery upload {} after eligibility inspection error: {:#}",
+                        job.id, defer_error
+                    ),
+                }
+                return Err(inspection_error);
+            }
+        };
+        if !has_notifiable_delivery {
+            info!(
+                "Deferring shared EH gallery upload {} because no active Telegraph destination is notifiable",
+                job.id
+            );
+            if !self
+                .repo
+                .defer_eh_job_upload(
+                    job.id,
+                    expected_started_at,
+                    defer_delay_secs as i64,
+                    self.config.send_archive,
+                )
+                .await?
+            {
+                info!(
+                    "Skipping stale shared EH gallery upload {} before provider work",
+                    job.id
+                );
+            }
+            return Ok(());
+        }
 
         if let Err(error) = self.process(&job).await {
             error!("Upload failed for shared EH job {}: {:#}", job.id, error);
@@ -6217,6 +6290,8 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let zip_path = temp_dir.path().join("shared-gallery.zip");
         create_test_zip(&zip_path, 2);
+        setup_chat(&repo, -100, true).await;
+        setup_chat(&repo, -200, true).await;
         let (job, deliveries) = seed_downloaded_job_with_deliveries(
             &repo,
             710,
@@ -6293,6 +6368,137 @@ mod tests {
             assert_eq!(delivery.telegraph_url, None);
             assert_eq!(delivery.telegraph_rewrite_data, None);
         }
+    }
+
+    #[tokio::test]
+    async fn upload_worker_defers_all_disabled_destinations_without_spending_quota_or_starving_next_job(
+    ) {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        let tg_server = MockServer::start().await;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let disabled_zip_path = temp_dir.path().join("disabled-gallery.zip");
+        let enabled_zip_path = temp_dir.path().join("enabled-gallery.zip");
+        create_test_zip(&disabled_zip_path, 1);
+        create_test_zip(&enabled_zip_path, 1);
+        let disabled_artifacts = ArchiveArtifacts::new(&disabled_zip_path);
+        std::fs::create_dir_all(disabled_artifacts.uploads_dir()).unwrap();
+        let disabled_manifest = disabled_artifacts.uploads_dir().join("archive.json");
+        std::fs::write(&disabled_manifest, b"resume state").unwrap();
+
+        setup_chat(&repo, -100, false).await;
+        setup_chat(&repo, -101, true).await;
+        setup_chat(&repo, -200, true).await;
+        let (disabled_job, disabled_deliveries) = seed_downloaded_job_with_deliveries(
+            &repo,
+            711,
+            "disabled",
+            "Disabled Gallery",
+            &disabled_zip_path,
+            &[
+                (-100, true, "Disabled Telegraph"),
+                (-101, false, "Archive Only"),
+            ],
+        )
+        .await;
+        let (enabled_job, _) = seed_downloaded_job_with_deliveries(
+            &repo,
+            712,
+            "enabled",
+            "Enabled Gallery",
+            &enabled_zip_path,
+            &[(-200, true, "Enabled Telegraph")],
+        )
+        .await;
+        let body = serde_json::json!({
+            "ok": true,
+            "result": {"url": "https://telegra.ph/Enabled-Gallery-01-01"}
+        });
+        Mock::given(method("POST"))
+            .and(path("/createPage"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .expect(1)
+            .mount(&tg_server)
+            .await;
+        let uploader = Arc::new(ZipFirstMockUploader::default());
+        let worker = EhUploadWorker::new(
+            Arc::clone(&repo),
+            make_notifier(&tg_server),
+            make_telegraph_client(&tg_server),
+            uploader.clone(),
+            None,
+            Arc::new(make_config()),
+        );
+
+        worker.tick().await.unwrap();
+
+        assert_eq!(
+            uploader.zip_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "disabled Telegraph destinations must not invoke the ZIP uploader"
+        );
+        assert_eq!(
+            uploader
+                .image_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "disabled Telegraph destinations must not invoke the image uploader"
+        );
+        assert_eq!(
+            tg_server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|request| request.url.path() == "/createPage")
+                .count(),
+            0,
+            "disabled Telegraph destinations must not create a Telegraph page"
+        );
+        let deferred = eh_gallery_jobs::Entity::find_by_id(disabled_job.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            deferred.telegraph_status,
+            crate::db::repo::eh_gallery_jobs::TELEGRAPH_STATUS_PENDING
+        );
+        assert!(deferred.next_retry_at.is_some());
+        assert_eq!(deferred.retry_count, disabled_job.retry_count);
+        assert_eq!(deferred.error, disabled_job.error);
+        assert_eq!(deferred.zip_path, disabled_job.zip_path);
+        assert_eq!(deferred.file_size, disabled_job.file_size);
+        assert!(disabled_zip_path.exists());
+        assert_eq!(std::fs::read(&disabled_manifest).unwrap(), b"resume state");
+        for delivery in disabled_deliveries {
+            let delivery = eh_download_queue::Entity::find_by_id(delivery.id)
+                .one(repo.db())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                delivery.status,
+                crate::db::repo::eh_gallery_jobs::DELIVERY_STATUS_WAITING
+            );
+            assert!(delivery.telegraph_sent_at.is_none());
+        }
+
+        worker.tick().await.unwrap();
+
+        assert_eq!(
+            uploader.zip_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the next due, notifiable job must not be starved"
+        );
+        let ready = eh_gallery_jobs::Entity::find_by_id(enabled_job.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            ready.telegraph_status,
+            crate::db::repo::eh_gallery_jobs::TELEGRAPH_STATUS_READY
+        );
     }
 
     #[tokio::test]
@@ -6542,6 +6748,8 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let zip_path = temp_dir.path().join("terminal-shared-gallery.zip");
         create_test_zip(&zip_path, 1);
+        setup_chat(&repo, -100, true).await;
+        setup_chat(&repo, -200, true).await;
         let (job, deliveries) = seed_downloaded_job_with_deliveries(
             &repo,
             711,
@@ -8100,6 +8308,7 @@ mod tests {
         let zip_path = temp_dir.path().join("505-no-abort-uploader.zip");
         create_test_zip(&zip_path, 2);
         let artifacts = seed_archive_artifact_family(&zip_path);
+        setup_chat(&repo, -100, true).await;
         let entry = insert_queue_entry(
             &repo,
             -100,
@@ -8507,7 +8716,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_upload_worker_ignores_per_chat_notification_gate() {
+    async fn test_upload_worker_defers_disabled_destination_without_provider_calls() {
         let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
         setup_chat(&repo, -100, false).await; // disabled
         let tg_server = MockServer::start().await;
@@ -8529,9 +8738,6 @@ mod tests {
         )
         .await;
         let entry = migrate_seeded_delivery_to_waiting(&repo, entry).await;
-        mock_telegraph_upload(&tg_server, 2).await;
-        mock_telegraph_create_page(&tg_server).await;
-
         let worker = EhUploadWorker::new(
             Arc::clone(&repo),
             notifier,
@@ -8542,11 +8748,12 @@ mod tests {
         );
         worker.tick().await.unwrap();
         let job = job_for_delivery(&repo, &entry).await;
+        assert!(tg_server.received_requests().await.unwrap().is_empty());
         assert_eq!(job.retry_count, 0);
-        assert_eq!(job.next_retry_at, None);
+        assert!(job.next_retry_at.is_some());
         assert_eq!(
             job.telegraph_status,
-            crate::db::repo::eh_gallery_jobs::TELEGRAPH_STATUS_READY
+            crate::db::repo::eh_gallery_jobs::TELEGRAPH_STATUS_PENDING
         );
         assert!(zip_path.exists());
     }

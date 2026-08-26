@@ -2267,6 +2267,67 @@ impl Repo {
         Ok(EhJobUploadFailureOutcome::Terminal { job, deliveries })
     }
 
+    /// Release a claimed upload when no active destination can currently
+    /// receive Telegraph. This is deliberately not a provider retry: it keeps
+    /// the upload generation, retry budget, error, and artifact ownership.
+    pub async fn defer_eh_job_upload(
+        &self,
+        job_id: i32,
+        expected_started_at: DateTime,
+        delay_secs: i64,
+        send_archive: bool,
+    ) -> Result<bool> {
+        let retry_at = Local::now()
+            .naive_local()
+            .checked_add_signed(chrono::Duration::seconds(delay_secs.max(1)))
+            .context("Shared EH gallery upload defer deadline overflow")?;
+        let txn = self
+            .db
+            .begin()
+            .await
+            .context("Failed to begin shared EH gallery upload defer transaction")?;
+        let result: Result<bool> = async {
+            let deferred = eh_gallery_jobs::Entity::update_many()
+                .col_expr(
+                    eh_gallery_jobs::Column::TelegraphStatus,
+                    Expr::value(TELEGRAPH_STATUS_PENDING),
+                )
+                .col_expr(
+                    eh_gallery_jobs::Column::NextRetryAt,
+                    Expr::value(Some(retry_at)),
+                )
+                .filter(eh_gallery_jobs::Column::Id.eq(job_id))
+                .filter(eh_gallery_jobs::Column::TelegraphStatus.eq(TELEGRAPH_STATUS_UPLOADING))
+                .filter(eh_gallery_jobs::Column::StartedAt.eq(expected_started_at))
+                .exec(&txn)
+                .await
+                .context("Failed to defer shared EH gallery upload")?;
+            if deferred.rows_affected != 1 {
+                return Ok(false);
+            }
+
+            self.recompute_eh_job_telegraph_requirement_in_txn(&txn, job_id)
+                .await?;
+            self.evaluate_eh_job_liveness_in_txn(&txn, job_id, send_archive)
+                .await?;
+            Ok(true)
+        }
+        .await;
+        match result {
+            Ok(deferred) => txn
+                .commit()
+                .await
+                .context("Failed to commit shared EH gallery upload defer transaction")
+                .map(|()| deferred),
+            Err(error) => {
+                txn.rollback()
+                    .await
+                    .context("Failed to roll back shared EH gallery upload defer transaction")?;
+                Err(error)
+            }
+        }
+    }
+
     /// Recover every shared-work lease at the one startup boundary.  Lease
     /// generations remain persisted so a subsequent claim always advances past
     /// a crashed worker; payloads, paths, and sent markers are deliberately
@@ -4649,6 +4710,80 @@ mod tests {
         assert_eq!(delivery.status, DELIVERY_STATUS_WAITING);
         assert_eq!(delivery.telegraph_url, None);
         assert_eq!(delivery.telegraph_rewrite_data, None);
+    }
+
+    #[tokio::test]
+    async fn upload_defer_is_generation_guarded_and_does_not_consume_retry() {
+        let repo = tests_helpers::setup_test_db().await.unwrap();
+        let variant = EhGalleryVariant::archive("1280x");
+        let delivery = repo
+            .enqueue_eh_download(-100, 72, "token", "Gallery", true, SOURCE_DIRECT, &variant)
+            .await
+            .unwrap();
+        let download = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        repo.mark_eh_job_downloaded(
+            download.id,
+            download.started_at.unwrap(),
+            123,
+            "shared.zip",
+            7,
+        )
+        .await
+        .unwrap();
+
+        let first = repo.get_next_eh_job_for_upload().await.unwrap().unwrap();
+        let first_started_at = first.started_at.unwrap();
+        assert!(repo
+            .defer_eh_job_upload(first.id, first_started_at, 0, true)
+            .await
+            .unwrap());
+        let deferred = eh_gallery_jobs::Entity::find_by_id(first.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(deferred.telegraph_status, TELEGRAPH_STATUS_PENDING);
+        assert_eq!(deferred.started_at, Some(first_started_at));
+        assert_eq!(deferred.retry_count, 0);
+        assert_eq!(deferred.error, None);
+        assert_eq!(deferred.file_size, 123);
+        assert_eq!(deferred.gp_cost, 7);
+        assert_eq!(deferred.zip_path.as_deref(), Some("shared.zip"));
+        assert!(deferred.next_retry_at.is_some());
+
+        eh_gallery_jobs::Entity::update_many()
+            .col_expr(
+                eh_gallery_jobs::Column::NextRetryAt,
+                Expr::value(None::<DateTime>),
+            )
+            .filter(eh_gallery_jobs::Column::Id.eq(first.id))
+            .exec(repo.db())
+            .await
+            .unwrap();
+        let second = repo.get_next_eh_job_for_upload().await.unwrap().unwrap();
+        let second_started_at = second.started_at.unwrap();
+        assert!(second_started_at > first_started_at);
+
+        assert!(!repo
+            .defer_eh_job_upload(first.id, first_started_at, 60, true)
+            .await
+            .unwrap());
+        let after_stale_defer = eh_gallery_jobs::Entity::find_by_id(first.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after_stale_defer.telegraph_status,
+            TELEGRAPH_STATUS_UPLOADING
+        );
+        assert_eq!(after_stale_defer.started_at, Some(second_started_at));
+        assert_eq!(after_stale_defer.retry_count, 0);
+        assert_eq!(after_stale_defer.error, None);
+        assert_eq!(after_stale_defer.file_size, 123);
+        assert_eq!(after_stale_defer.gp_cost, 7);
+        assert_eq!(after_stale_defer.zip_path.as_deref(), Some("shared.zip"));
+        assert_eq!(delivery.job_id, Some(first.id));
     }
 
     #[tokio::test]
