@@ -1381,13 +1381,19 @@ impl EhDownloadWorker {
     }
 
     async fn tick(&self) -> Result<()> {
-        run_eh_job_cleanup_maintenance_once(
+        if let Err(error) = run_eh_job_cleanup_maintenance_once(
             self.repo.as_ref(),
             self.startup_abort_uploader.as_deref(),
             self.config.download_poll_interval_sec as i64,
             self.config.send_archive,
         )
-        .await?;
+        .await
+        {
+            error!(
+                "Shared EH cleanup maintenance failed; continuing normal download selection: {:#}",
+                error
+            );
+        }
 
         // Rate limit check
         let window_hours = i64::try_from(self.config.download_rate_window_hours)
@@ -2936,6 +2942,166 @@ mod tests {
                 .await
                 .unwrap(),
             2
+        );
+    }
+
+    #[tokio::test]
+    async fn download_tick_continues_after_due_cleanup_abort_failure() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        let eh_server = MockServer::start().await;
+        let temp = tempfile::tempdir().unwrap();
+        let dirty_zip = temp.path().join("dirty-cleanup.zip");
+        create_test_zip(&dirty_zip, 1);
+        let artifacts = seed_archive_artifact_family(&dirty_zip);
+        setup_chat(&repo, -100, true).await;
+        setup_chat(&repo, -200, true).await;
+        setup_chat(&repo, -300, true).await;
+
+        let dirty_delivery = repo
+            .enqueue_eh_download(
+                -100,
+                883,
+                "dirty",
+                "Dirty cleanup",
+                false,
+                SOURCE_DIRECT,
+                &EhGalleryVariant::archive("1280x"),
+            )
+            .await
+            .unwrap();
+        let dirty_claim = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        repo.mark_eh_job_downloaded(
+            dirty_claim.id,
+            dirty_claim.started_at.unwrap(),
+            10,
+            &dirty_zip.to_string_lossy(),
+            0,
+        )
+        .await
+        .unwrap();
+        eh_download_queue::Entity::update_many()
+            .col_expr(
+                eh_download_queue::Column::Status,
+                Expr::value(STATUS_CANCELED),
+            )
+            .filter(eh_download_queue::Column::Id.eq(dirty_delivery.id))
+            .exec(repo.db())
+            .await
+            .unwrap();
+        repo.evaluate_eh_job_liveness(dirty_claim.id, true)
+            .await
+            .unwrap();
+
+        let first = repo
+            .enqueue_eh_download(
+                -200,
+                884,
+                "abcd000001",
+                "First valid job",
+                false,
+                SOURCE_DIRECT,
+                &EhGalleryVariant::archive("1280x"),
+            )
+            .await
+            .unwrap();
+        mock_eh_gallery_page(&eh_server, 884, "abcd000001").await;
+        let first_download_url = format!("{}/archive/884/token/0", eh_server.uri());
+        mock_eh_archiver_post(&eh_server, &first_download_url).await;
+        let first_source_zip = temp.path().join("first-source.zip");
+        create_test_zip(&first_source_zip, 1);
+        mock_eh_archive_download(
+            &eh_server,
+            "/archive/884/token/0",
+            std::fs::read(&first_source_zip).unwrap(),
+        )
+        .await;
+
+        let failing_uploader = Arc::new(TerminalCleanupMockUploader {
+            fail_abort: true,
+            ..Default::default()
+        });
+        let mut config = make_config();
+        config.background_download_enabled = false;
+        let worker = EhDownloadWorker::new(
+            Arc::clone(&repo),
+            make_eh_client(&eh_server),
+            Arc::new(config),
+            temp.path().to_path_buf(),
+            Some(failing_uploader.clone()),
+        );
+
+        worker.tick().await.unwrap();
+        let first_job = job_for_delivery(&repo, &first).await;
+        assert_eq!(
+            first_job.status, STATUS_DOWNLOADED,
+            "unrelated job must complete after cleanup failure: {first_job:#?}"
+        );
+
+        let second = repo
+            .enqueue_eh_download(
+                -300,
+                885,
+                "abcd000002",
+                "Second valid job",
+                false,
+                SOURCE_DIRECT,
+                &EhGalleryVariant::archive("1280x"),
+            )
+            .await
+            .unwrap();
+        mock_eh_gallery_page(&eh_server, 885, "abcd000002").await;
+        let second_download_url = format!("{}/archive/885/token/0", eh_server.uri());
+        mock_eh_archiver_post(&eh_server, &second_download_url).await;
+        let second_source_zip = temp.path().join("second-source.zip");
+        create_test_zip(&second_source_zip, 1);
+        mock_eh_archive_download(
+            &eh_server,
+            "/archive/885/token/0",
+            std::fs::read(&second_source_zip).unwrap(),
+        )
+        .await;
+        eh_gallery_jobs::Entity::update_many()
+            .col_expr(
+                eh_gallery_jobs::Column::CleanupNextRetryAt,
+                Expr::value(Some(
+                    Local::now().naive_local() - chrono::Duration::seconds(1),
+                )),
+            )
+            .filter(eh_gallery_jobs::Column::Id.eq(dirty_claim.id))
+            .exec(repo.db())
+            .await
+            .unwrap();
+
+        worker.tick().await.unwrap();
+        assert_eq!(
+            job_for_delivery(&repo, &second).await.status,
+            STATUS_DOWNLOADED
+        );
+
+        let dirty_job = eh_gallery_jobs::Entity::find_by_id(dirty_claim.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            dirty_job.cleanup_status,
+            crate::db::repo::eh_gallery_jobs::CLEANUP_STATUS_FAILED
+        );
+        assert!(dirty_job.cleanup_next_retry_at.is_some());
+        assert!(dirty_job.cleanup_error.is_some());
+        assert_eq!(
+            *failing_uploader.cleanup_calls.lock().unwrap(),
+            vec![
+                (artifacts.uploads_dir().to_path_buf(), true),
+                (artifacts.uploads_dir().to_path_buf(), true),
+            ],
+            "each due cleanup must Abort before preserving local artifacts"
+        );
+        assert!(artifacts.final_zip().exists());
+        assert!(artifacts.uploads_dir().join("archive.json").exists());
+        assert!(
+            repo.get_next_eh_job_for_download().await.unwrap().is_none(),
+            "failed cleanup remains nonclaimable after unrelated jobs progress"
         );
     }
 
@@ -7032,6 +7198,93 @@ mod tests {
             1,
             "the old wave must send exactly once before a new wave can begin"
         );
+    }
+
+    #[tokio::test]
+    async fn markerless_publish_claim_rebinds_to_direct_original_before_chat_lock() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        setup_chat(&repo, -100, true).await;
+        let tg_server = MockServer::start().await;
+        let eh_server = MockServer::start().await;
+        let temp = tempfile::tempdir().unwrap();
+        let zip_path = temp.path().join("old-1280x.zip");
+        create_test_zip(&zip_path, 1);
+        let (old_job, deliveries) = seed_downloaded_job_with_deliveries(
+            &repo,
+            912,
+            "same-token",
+            "Old 1280x wave",
+            &zip_path,
+            &[(-100, false, "Old 1280x wave")],
+        )
+        .await;
+        let old_claim = repo
+            .get_next_eh_delivery_for_publish(true)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(old_claim.delivery.id, deliveries[0].id);
+        assert!(old_claim.delivery.archive_sent_at.is_none());
+        assert!(old_claim.delivery.telegraph_sent_at.is_none());
+
+        let rebound = repo
+            .enqueue_eh_download(
+                -100,
+                912,
+                "same-token",
+                "Requested original",
+                false,
+                SOURCE_DIRECT,
+                &EhGalleryVariant::archive("original"),
+            )
+            .await
+            .unwrap();
+        let requested_job = job_for_delivery(&repo, &rebound).await;
+        assert_eq!(
+            rebound.status,
+            crate::db::repo::eh_gallery_jobs::DELIVERY_STATUS_WAITING
+        );
+        assert_ne!(rebound.job_id, Some(old_job.id));
+        assert_eq!(requested_job.resolution, "original");
+        assert_eq!(rebound.token, "same-token");
+        assert_eq!(rebound.title, "Requested original");
+        assert!(rebound.archive_sent_at.is_none());
+        assert!(rebound.telegraph_sent_at.is_none());
+        assert!(rebound.started_at.is_none());
+        assert!(rebound.completed_at.is_none());
+        assert!(rebound.error.is_none());
+        assert_eq!(rebound.retry_count, 0);
+        assert!(rebound.next_retry_at.is_none());
+
+        let worker = EhPublishWorker::new(
+            Arc::clone(&repo),
+            make_notifier(&tg_server),
+            make_eh_client(&eh_server),
+            None,
+            Arc::new(make_config()),
+        );
+        worker.process_claimed(old_claim).await.unwrap();
+        assert!(
+            tg_server.received_requests().await.unwrap().is_empty(),
+            "the stale publisher must re-read the re-bound delivery and send nothing"
+        );
+        assert_eq!(
+            eh_download_queue::Entity::find_by_id(rebound.id)
+                .one(repo.db())
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            crate::db::repo::eh_gallery_jobs::DELIVERY_STATUS_WAITING
+        );
+
+        let selected = repo
+            .get_next_eh_job_for_download_with_policy(true)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(selected.id, requested_job.id);
+        assert_eq!(selected.resolution, "original");
     }
 
     #[tokio::test]

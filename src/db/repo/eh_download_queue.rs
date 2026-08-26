@@ -8215,7 +8215,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_enqueue_preserves_a_markerless_crashed_publishing_claim() {
+    async fn test_enqueue_preserves_a_same_job_markerless_publishing_claim() {
         let repo = tests_helpers::setup_test_db().await.unwrap();
         let model = repo
             .enqueue_eh_subscription_download(
@@ -8249,17 +8249,16 @@ mod tests {
             .unwrap();
         assert_eq!(publish_claim.delivery.id, model.id);
 
-        // A new token creates a different shared job, but a crash-residual
-        // publishing claim must remain bound to its original wave for startup
-        // recovery. Enqueue may merge ownership, never replace the claim.
+        // A same-job request merges owner demand, but must leave the live
+        // publishing generation and binding untouched.
         let merged = repo
-            .enqueue_eh_subscription_download(
+            .enqueue_eh_download(
                 -100,
-                456,
                 65,
-                "newtok",
+                "tok",
                 "NewTitle",
                 true,
+                SOURCE_DIRECT,
                 &EhGalleryVariant::archive("1280x"),
             )
             .await
@@ -8271,27 +8270,81 @@ mod tests {
             merged.telegraph,
             "owner merge must preserve telegraph demand"
         );
-        assert_eq!(merged.subscription_ids.as_deref(), Some("123,456"));
-        assert_eq!(merged.telegraph_subscription_ids.as_deref(), Some("456"));
+        assert_eq!(merged.source, SOURCE_DIRECT);
+        assert_eq!(merged.subscription_ids, None);
+        assert_eq!(merged.telegraph_subscription_ids, None);
         assert_eq!(merged.token, "tok");
         assert_eq!(merged.title, "Title");
         assert_eq!(merged.job_id, model.job_id);
+        assert_eq!(merged.started_at, publish_claim.delivery.started_at);
+        assert!(merged.archive_sent_at.is_none());
+        assert!(merged.telegraph_sent_at.is_none());
         let claimed_job = job_for_delivery(&repo, &merged).await;
         assert_eq!(claimed_job.status, JOB_STATUS_DOWNLOADED);
         assert!(claimed_job.telegraph_required);
-        assert_eq!(claimed_job.title, "Title");
-        let unbound_requested_job = eh_gallery_jobs::Entity::find()
-            .filter(eh_gallery_jobs::Column::Gid.eq(65_i64))
-            .filter(eh_gallery_jobs::Column::Token.eq("newtok"))
+    }
+
+    #[tokio::test]
+    async fn test_enqueue_preserves_a_marker_bearing_publishing_claim() {
+        let repo = tests_helpers::setup_test_db().await.unwrap();
+        let model = repo
+            .enqueue_eh_download(
+                -100,
+                66,
+                "tok",
+                "Published title",
+                false,
+                SOURCE_DIRECT,
+                &EhGalleryVariant::archive("1280x"),
+            )
+            .await
+            .unwrap();
+        let claimed = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        repo.mark_eh_job_downloaded(
+            claimed.id,
+            claimed.started_at.unwrap(),
+            5000,
+            "/tmp/66.zip",
+            0,
+        )
+        .await
+        .unwrap();
+        let publish_claim = repo
+            .get_next_eh_delivery_for_publish(true)
+            .await
+            .unwrap()
+            .unwrap();
+        repo.mark_eh_archive_delivery_sent(model.id).await.unwrap();
+
+        let merged = repo
+            .enqueue_eh_download(
+                -100,
+                66,
+                "tok",
+                "Requested original",
+                true,
+                SOURCE_DIRECT,
+                &EhGalleryVariant::archive("original"),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(merged.status, STATUS_PUBLISHING);
+        assert_eq!(merged.job_id, model.job_id);
+        assert_eq!(merged.started_at, publish_claim.delivery.started_at);
+        assert!(merged.archive_sent_at.is_some());
+        assert!(merged.telegraph_sent_at.is_none());
+        assert!(merged.telegraph, "owner demand must still merge");
+        assert_eq!(merged.token, "tok");
+        assert_eq!(merged.title, "Published title");
+        let requested_job = eh_gallery_jobs::Entity::find()
+            .filter(eh_gallery_jobs::Column::Gid.eq(66_i64))
+            .filter(eh_gallery_jobs::Column::Resolution.eq("original"))
             .one(repo.db())
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(unbound_requested_job.status, JOB_STATUS_RETIRED);
-        assert!(
-            repo.get_next_eh_job_for_download().await.unwrap().is_none(),
-            "a requested job left unbound by a publishing claim must not remain claimable"
-        );
+        assert_eq!(requested_job.status, JOB_STATUS_RETIRED);
     }
 
     /// When an insert conflicts on (chat_id, gid) unique constraint, the

@@ -538,12 +538,16 @@ impl Repo {
                 merged_telegraph,
             )
         };
+        let marker_bearing =
+            existing.archive_sent_at.is_some() || existing.telegraph_sent_at.is_some();
 
-        if existing.status == DELIVERY_STATUS_PUBLISHING {
-            // A live publisher (or a crash-residual claim for startup
-            // recovery) owns this delivery's binding and local state. Merge
-            // only its owner demand; never replace its job, status, metadata,
-            // sent markers, or generation fields.
+        if existing.status == DELIVERY_STATUS_PUBLISHING
+            && (existing.job_id == Some(requested_job_id) || marker_bearing)
+        {
+            // A publisher already bound to the requested job, or one with a
+            // persisted send marker, owns this delivery's binding and local
+            // state. Merge only owner demand; never replace its job, status,
+            // metadata, sent markers, or generation fields.
             let updated = eh_download_queue::Entity::update_many()
                 .col_expr(
                     eh_download_queue::Column::Telegraph,
@@ -576,6 +580,106 @@ impl Repo {
                 .exec(txn)
                 .await
                 .context("Failed to merge shared EH publishing delivery owner")?;
+            if updated.rows_affected != 1 {
+                anyhow::bail!("Shared EH delivery changed concurrently during enqueue")
+            }
+            return Ok(existing.job_id);
+        }
+
+        if existing.status == DELIVERY_STATUS_PUBLISHING {
+            // `enqueue_eh_download_request` and `process_claimed` share the
+            // keyed chat lock. A markerless publishing claim therefore has not
+            // entered the send critical section yet, so a different requested
+            // job may replace the stale binding.
+            let updated = eh_download_queue::Entity::update_many()
+                .col_expr(
+                    eh_download_queue::Column::JobId,
+                    Expr::value(Some(requested_job_id)),
+                )
+                .col_expr(
+                    eh_download_queue::Column::Token,
+                    Expr::value(req.token.to_string()),
+                )
+                .col_expr(
+                    eh_download_queue::Column::Title,
+                    Expr::value(req.title.to_string()),
+                )
+                .col_expr(
+                    eh_download_queue::Column::Telegraph,
+                    Expr::value(merged_telegraph),
+                )
+                .col_expr(
+                    eh_download_queue::Column::Source,
+                    Expr::value(merged_source.to_string()),
+                )
+                .col_expr(
+                    eh_download_queue::Column::SubscriptionIds,
+                    Expr::value(merged_subscription_ids),
+                )
+                .col_expr(
+                    eh_download_queue::Column::TelegraphSubscriptionIds,
+                    Expr::value(merged_telegraph_subscription_ids),
+                )
+                .col_expr(
+                    eh_download_queue::Column::Status,
+                    Expr::value(DELIVERY_STATUS_WAITING),
+                )
+                .col_expr(eh_download_queue::Column::FileSize, Expr::value(0_i64))
+                .col_expr(eh_download_queue::Column::GpCost, Expr::value(0_i64))
+                .col_expr(
+                    eh_download_queue::Column::Error,
+                    Expr::value(None::<String>),
+                )
+                .col_expr(eh_download_queue::Column::RetryCount, Expr::value(0_i32))
+                .col_expr(
+                    eh_download_queue::Column::StartedAt,
+                    Expr::value(None::<DateTime>),
+                )
+                .col_expr(
+                    eh_download_queue::Column::CompletedAt,
+                    Expr::value(None::<DateTime>),
+                )
+                .col_expr(
+                    eh_download_queue::Column::ZipPath,
+                    Expr::value(None::<String>),
+                )
+                .col_expr(
+                    eh_download_queue::Column::TelegraphUrl,
+                    Expr::value(None::<String>),
+                )
+                .col_expr(
+                    eh_download_queue::Column::NextRetryAt,
+                    Expr::value(None::<DateTime>),
+                )
+                .col_expr(
+                    eh_download_queue::Column::ArchiveSentAt,
+                    Expr::value(None::<DateTime>),
+                )
+                .col_expr(
+                    eh_download_queue::Column::TelegraphSentAt,
+                    Expr::value(None::<DateTime>),
+                )
+                .filter(eh_download_queue::Column::Id.eq(existing.id))
+                .filter(eh_download_queue::Column::Status.eq(DELIVERY_STATUS_PUBLISHING))
+                .filter(optional_i32_filter(
+                    eh_download_queue::Column::JobId,
+                    existing.job_id,
+                ))
+                .filter(eh_download_queue::Column::Telegraph.eq(existing.telegraph))
+                .filter(eh_download_queue::Column::Source.eq(&existing.source))
+                .filter(optional_string_filter(
+                    eh_download_queue::Column::SubscriptionIds,
+                    existing.subscription_ids.as_deref(),
+                ))
+                .filter(optional_string_filter(
+                    eh_download_queue::Column::TelegraphSubscriptionIds,
+                    existing.telegraph_subscription_ids.as_deref(),
+                ))
+                .filter(eh_download_queue::Column::ArchiveSentAt.is_null())
+                .filter(eh_download_queue::Column::TelegraphSentAt.is_null())
+                .exec(txn)
+                .await
+                .context("Failed to rebind markerless shared EH publishing delivery")?;
             if updated.rows_affected != 1 {
                 anyhow::bail!("Shared EH delivery changed concurrently during enqueue")
             }
@@ -720,8 +824,6 @@ impl Repo {
             return Ok(existing.job_id);
         }
 
-        let marker_bearing =
-            existing.archive_sent_at.is_some() || existing.telegraph_sent_at.is_some();
         let target_job_id = if marker_bearing {
             existing.job_id
         } else {
