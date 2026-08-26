@@ -338,7 +338,7 @@ mod tests {
         let jobs = db
             .query_all(Statement::from_string(
                 DbBackend::Sqlite,
-                "SELECT gid, token, download_mode, resolution, title, status, telegraph_required, telegraph_status, created_at FROM eh_gallery_jobs ORDER BY gid, resolution".to_owned(),
+                "SELECT gid, token, download_mode, resolution, title, status, telegraph_required, telegraph_status, created_at, zip_path, file_size, gp_cost, completed_at, telegraph_url, telegraph_rewrite_data, telegraph_rewrite_status, telegraph_rewrite_after, telegraph_rewrite_started_at, telegraph_rewrite_next_retry_at, telegraph_rewrite_retry_count, telegraph_rewrite_error, telegraph_rewritten_at FROM eh_gallery_jobs ORDER BY gid, resolution".to_owned(),
             ))
             .await?;
         assert_eq!(jobs.len(), 3);
@@ -360,10 +360,107 @@ mod tests {
         assert!(jobs[1].try_get::<bool>("", "telegraph_required")?);
         assert_eq!(
             jobs[1].try_get::<String>("", "telegraph_status")?,
-            "pending"
+            "ready",
+            "job with a pre-existing Telegraph page must not re-upload it"
         );
         assert_eq!(jobs[2].try_get::<i64>("", "gid")?, 102);
         assert_eq!(jobs[2].try_get::<String>("", "resolution")?, "subscription");
+
+        // Gallery 101 subscription group: row 2 (`uploading`) carries the most
+        // advanced completed work, so its download result and Telegraph page
+        // must be preserved on the shared job instead of being redownloaded.
+        assert_eq!(
+            jobs[1].try_get::<String>("", "status")?,
+            "downloaded",
+            "subscription job must inherit the most advanced row's download result"
+        );
+        assert_eq!(
+            jobs[1].try_get::<Option<String>>("", "zip_path")?,
+            Some("/old/subscription.zip".to_owned())
+        );
+        assert_eq!(jobs[1].try_get::<i64>("", "file_size")?, 123);
+        assert_eq!(jobs[1].try_get::<i64>("", "gp_cost")?, 456);
+        assert_eq!(
+            jobs[1].try_get::<Option<String>>("", "completed_at")?,
+            Some("2026-08-02 02:00:00".to_owned())
+        );
+        assert_eq!(
+            jobs[1].try_get::<String>("", "telegraph_status")?,
+            "ready",
+            "subscription job must inherit the existing Telegraph page"
+        );
+        assert_eq!(
+            jobs[1].try_get::<Option<String>>("", "telegraph_url")?,
+            Some("https://old.example/subscription".to_owned())
+        );
+        assert_eq!(
+            jobs[1].try_get::<Option<String>>("", "telegraph_rewrite_data")?,
+            Some("rewrite data".to_owned())
+        );
+        assert_eq!(
+            jobs[1].try_get::<Option<String>>("", "telegraph_rewrite_status")?,
+            Some("rewriting".to_owned())
+        );
+        assert_eq!(
+            jobs[1].try_get::<Option<String>>("", "telegraph_rewrite_after")?,
+            Some("2026-08-02 07:00:00".to_owned())
+        );
+        assert_eq!(
+            jobs[1].try_get::<Option<String>>("", "telegraph_rewrite_started_at")?,
+            Some("2026-08-02 08:00:00".to_owned())
+        );
+        assert_eq!(
+            jobs[1].try_get::<Option<String>>("", "telegraph_rewrite_next_retry_at")?,
+            Some("2026-08-02 09:00:00".to_owned())
+        );
+        assert_eq!(
+            jobs[1].try_get::<i64>("", "telegraph_rewrite_retry_count")?,
+            4
+        );
+        assert_eq!(
+            jobs[1].try_get::<Option<String>>("", "telegraph_rewrite_error")?,
+            Some("rewrite error".to_owned())
+        );
+        assert_eq!(
+            jobs[1].try_get::<Option<String>>("", "telegraph_rewritten_at")?,
+            Some("2026-08-02 10:00:00".to_owned())
+        );
+
+        // Gallery 101 direct group: row 3 (`downloaded`) completed its download,
+        // but Telegraph was never demanded unsent for this variant, so the
+        // direct job stays `not_required` with no URL.
+        assert_eq!(
+            jobs[0].try_get::<String>("", "status")?,
+            "downloaded",
+            "direct job must inherit the downloaded row's archive"
+        );
+        assert_eq!(
+            jobs[0].try_get::<Option<String>>("", "zip_path")?,
+            Some("/old/direct.zip".to_owned())
+        );
+        assert_eq!(jobs[0].try_get::<i64>("", "file_size")?, 10);
+        assert_eq!(jobs[0].try_get::<i64>("", "gp_cost")?, 20);
+        assert_eq!(
+            jobs[0].try_get::<Option<String>>("", "completed_at")?,
+            Some("2026-08-03 02:00:00".to_owned())
+        );
+        assert_eq!(
+            jobs[0].try_get::<Option<String>>("", "telegraph_url")?,
+            None,
+            "not_required jobs must not gain a Telegraph URL from siblings"
+        );
+
+        // Gallery 102 subscription group: row 4 (`publishing`) has no zip
+        // artifact, so its shared job stays `pending` with no download fields.
+        assert_eq!(
+            jobs[2].try_get::<String>("", "status")?,
+            "pending",
+            "job without a download-complete row must stay pending"
+        );
+        assert_eq!(jobs[2].try_get::<Option<String>>("", "zip_path")?, None);
+        assert_eq!(jobs[2].try_get::<i64>("", "file_size")?, 0);
+        assert_eq!(jobs[2].try_get::<i64>("", "gp_cost")?, 0);
+        assert_eq!(jobs[2].try_get::<Option<String>>("", "completed_at")?, None);
 
         let active = db
             .query_all(Statement::from_string(
@@ -466,6 +563,139 @@ mod tests {
             terminal.try_get::<Option<String>>("", "error")?,
             Some("terminal error".to_owned())
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn migration_backfills_completed_work_from_most_advanced_active_row() -> Result<()> {
+        let db = new_db().await?;
+        create_legacy_shared_jobs_tables(&db).await?;
+        db.execute_unprepared(
+            "INSERT INTO eh_download_queue (\
+                id, chat_id, gid, token, title, telegraph, source, subscription_ids, \
+                telegraph_subscription_ids, status, file_size, gp_cost, error, retry_count, \
+                created_at, started_at, completed_at, zip_path, telegraph_url, next_retry_at, \
+                archive_sent_at, telegraph_sent_at, background_download_status, \
+                background_download_started_at, background_download_next_retry_at, \
+                background_download_attempt_count, background_download_error, \
+                telegraph_rewrite_data, telegraph_rewrite_status, telegraph_rewrite_after, \
+                telegraph_rewrite_started_at, telegraph_rewrite_next_retry_at, \
+                telegraph_rewrite_retry_count, telegraph_rewrite_error, telegraph_rewritten_at\
+             ) VALUES \
+                (1, 10, 301, 'token-301', 'Earlier pending row', 0, 'subscription', '1', NULL, 'pending', 0, 0, NULL, 0, '2026-08-01 00:00:00', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 0, NULL, NULL, NULL, NULL, NULL, NULL, 0, NULL, NULL), \
+                (2, 20, 301, 'token-301', 'Later downloaded row', 0, 'subscription', '2', NULL, 'downloaded', 500, 70, NULL, 0, '2026-08-02 00:00:00', '2026-08-02 01:00:00', '2026-08-02 02:00:00', '/new/subscription.zip', NULL, NULL, NULL, NULL, NULL, NULL, NULL, 0, NULL, NULL, NULL, NULL, NULL, NULL, 0, NULL, NULL), \
+                (3, 30, 302, 'token-302', 'Uploading row', 1, 'subscription', '3', '3', 'uploading', 80, 0, NULL, 0, '2026-08-03 00:00:00', '2026-08-03 01:00:00', '2026-08-03 02:00:00', '/new/uploading.zip', 'https://new.example/uploading', NULL, NULL, NULL, NULL, NULL, NULL, 0, NULL, 'rw', 'pending', '2026-08-03 03:00:00', NULL, NULL, 0, NULL, NULL)",
+        )
+        .await?;
+
+        migrate_shared_jobs_up(&db).await?;
+
+        let jobs = db
+            .query_all(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT gid, status, zip_path, file_size, gp_cost, completed_at, telegraph_status, telegraph_url, telegraph_rewrite_data, telegraph_rewrite_status, telegraph_rewrite_after, telegraph_rewrite_started_at, telegraph_rewrite_next_retry_at, telegraph_rewrite_retry_count, telegraph_rewrite_error, telegraph_rewritten_at FROM eh_gallery_jobs ORDER BY gid".to_owned(),
+            ))
+            .await?;
+        assert_eq!(jobs.len(), 2);
+
+        // Group 301: the later `downloaded` row wins over the earlier
+        // `pending` row, so its completed archive backfills the shared job.
+        assert_eq!(jobs[0].try_get::<i64>("", "gid")?, 301);
+        assert_eq!(jobs[0].try_get::<String>("", "status")?, "downloaded");
+        assert_eq!(
+            jobs[0].try_get::<Option<String>>("", "zip_path")?,
+            Some("/new/subscription.zip".to_owned())
+        );
+        assert_eq!(jobs[0].try_get::<i64>("", "file_size")?, 500);
+        assert_eq!(jobs[0].try_get::<i64>("", "gp_cost")?, 70);
+        assert_eq!(
+            jobs[0].try_get::<Option<String>>("", "completed_at")?,
+            Some("2026-08-02 02:00:00".to_owned())
+        );
+        assert_eq!(
+            jobs[0].try_get::<String>("", "telegraph_status")?,
+            "not_required",
+            "group without unsent Telegraph demand stays not_required"
+        );
+        assert_eq!(
+            jobs[0].try_get::<Option<String>>("", "telegraph_url")?,
+            None
+        );
+
+        // Group 302: the `uploading` row has a ZIP on disk and a ready
+        // Telegraph page with a resumable pending rewrite, so the shared job
+        // becomes `downloaded` + `ready` and the rewrite stays claimable.
+        assert_eq!(jobs[1].try_get::<i64>("", "gid")?, 302);
+        assert_eq!(jobs[1].try_get::<String>("", "status")?, "downloaded");
+        assert_eq!(
+            jobs[1].try_get::<Option<String>>("", "zip_path")?,
+            Some("/new/uploading.zip".to_owned())
+        );
+        assert_eq!(jobs[1].try_get::<i64>("", "file_size")?, 80);
+        assert_eq!(jobs[1].try_get::<String>("", "telegraph_status")?, "ready");
+        assert_eq!(
+            jobs[1].try_get::<Option<String>>("", "telegraph_url")?,
+            Some("https://new.example/uploading".to_owned())
+        );
+        assert_eq!(
+            jobs[1].try_get::<Option<String>>("", "telegraph_rewrite_data")?,
+            Some("rw".to_owned())
+        );
+        assert_eq!(
+            jobs[1].try_get::<Option<String>>("", "telegraph_rewrite_status")?,
+            Some("pending".to_owned())
+        );
+        assert_eq!(
+            jobs[1].try_get::<Option<String>>("", "telegraph_rewrite_after")?,
+            Some("2026-08-03 03:00:00".to_owned())
+        );
+        assert_eq!(
+            jobs[1].try_get::<Option<String>>("", "telegraph_rewrite_started_at")?,
+            None
+        );
+        assert_eq!(
+            jobs[1].try_get::<Option<String>>("", "telegraph_rewrite_next_retry_at")?,
+            None
+        );
+        assert_eq!(
+            jobs[1].try_get::<i64>("", "telegraph_rewrite_retry_count")?,
+            0
+        );
+        assert_eq!(
+            jobs[1].try_get::<Option<String>>("", "telegraph_rewrite_error")?,
+            None
+        );
+        assert_eq!(
+            jobs[1].try_get::<Option<String>>("", "telegraph_rewritten_at")?,
+            None
+        );
+
+        // Delivery rows are still normalized to `waiting` with cleared fields.
+        let deliveries = db
+            .query_all(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT id, status, zip_path, telegraph_url, file_size, gp_cost, telegraph_rewrite_data, telegraph_rewrite_status FROM eh_download_queue WHERE id IN (1, 2, 3) ORDER BY id".to_owned(),
+            ))
+            .await?;
+        assert_eq!(deliveries.len(), 3);
+        for delivery in &deliveries {
+            assert_eq!(delivery.try_get::<String>("", "status")?, "waiting");
+            assert_eq!(delivery.try_get::<Option<String>>("", "zip_path")?, None);
+            assert_eq!(
+                delivery.try_get::<Option<String>>("", "telegraph_url")?,
+                None
+            );
+            assert_eq!(delivery.try_get::<i64>("", "file_size")?, 0);
+            assert_eq!(delivery.try_get::<i64>("", "gp_cost")?, 0);
+            assert_eq!(
+                delivery.try_get::<Option<String>>("", "telegraph_rewrite_data")?,
+                None
+            );
+            assert_eq!(
+                delivery.try_get::<Option<String>>("", "telegraph_rewrite_status")?,
+                None
+            );
+        }
         Ok(())
     }
 

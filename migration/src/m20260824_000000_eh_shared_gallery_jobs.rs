@@ -409,6 +409,159 @@ async fn create_shared_gallery_job_schema_and_backfill(
               WHERE queue.status IN ('pending', 'downloading', 'downloaded', 'uploading', 'uploaded', 'publishing')",
         )
         .await?;
+    // Preserve already-completed download work: the most advanced active
+    // delivery row (download complete with a persisted ZIP, lowest id for
+    // stability) hands its archive result to the new shared job so the paid
+    // archive POST/GP is never repeated and orphan cleanup keeps seeing the
+    // artifact family as owned. Must run before the compatibility clearing
+    // UPDATE below strips the legacy result columns.
+    manager
+        .get_connection()
+        .execute_unprepared(
+            "UPDATE eh_gallery_jobs AS job \
+                 SET status = 'downloaded', \
+                     zip_path = (\
+                         SELECT winner.zip_path \
+                           FROM eh_download_queue AS winner \
+                          WHERE winner.job_id = job.id \
+                            AND winner.status IN ('downloaded', 'uploading', 'uploaded', 'publishing') \
+                            AND winner.zip_path IS NOT NULL \
+                          ORDER BY winner.id \
+                          LIMIT 1\
+                     ), \
+                     file_size = (\
+                         SELECT winner.file_size \
+                           FROM eh_download_queue AS winner \
+                          WHERE winner.job_id = job.id \
+                            AND winner.status IN ('downloaded', 'uploading', 'uploaded', 'publishing') \
+                            AND winner.zip_path IS NOT NULL \
+                          ORDER BY winner.id \
+                          LIMIT 1\
+                     ), \
+                     gp_cost = (\
+                         SELECT winner.gp_cost \
+                           FROM eh_download_queue AS winner \
+                          WHERE winner.job_id = job.id \
+                            AND winner.status IN ('downloaded', 'uploading', 'uploaded', 'publishing') \
+                            AND winner.zip_path IS NOT NULL \
+                          ORDER BY winner.id \
+                          LIMIT 1\
+                     ), \
+                     completed_at = (\
+                         SELECT winner.completed_at \
+                           FROM eh_download_queue AS winner \
+                          WHERE winner.job_id = job.id \
+                            AND winner.status IN ('downloaded', 'uploading', 'uploaded', 'publishing') \
+                            AND winner.zip_path IS NOT NULL \
+                          ORDER BY winner.id \
+                          LIMIT 1\
+                     ) \
+               WHERE job.status = 'pending' \
+                 AND job.download_mode = 'legacy' \
+                 AND EXISTS (\
+                     SELECT 1 \
+                       FROM eh_download_queue AS winner \
+                      WHERE winner.job_id = job.id \
+                        AND winner.status IN ('downloaded', 'uploading', 'uploaded', 'publishing') \
+                        AND winner.zip_path IS NOT NULL\
+                 )",
+        )
+        .await?;
+    // Preserve already-completed Telegraph work: the earliest active delivery
+    // row carrying a page URL hands the URL and its delayed-rewrite payload to
+    // the shared job so the upload is never repeated. A preserved pending
+    // rewrite (data non-null, rewritten_at null) resumes naturally through the
+    // ordinary rewrite claim; a preserved in-flight `rewriting` claim is
+    // recovered by the stale-rewrite reset. Only jobs with unsent Telegraph
+    // demand (`telegraph_status = 'pending'`) are upgraded; `not_required`
+    // jobs gain nothing from a stored URL.
+    manager
+        .get_connection()
+        .execute_unprepared(
+            "UPDATE eh_gallery_jobs AS job \
+                 SET telegraph_status = 'ready', \
+                     telegraph_url = (\
+                         SELECT winner.telegraph_url \
+                           FROM eh_download_queue AS winner \
+                          WHERE winner.job_id = job.id \
+                            AND winner.telegraph_url IS NOT NULL \
+                          ORDER BY winner.id \
+                          LIMIT 1\
+                     ), \
+                     telegraph_rewrite_data = (\
+                         SELECT winner.telegraph_rewrite_data \
+                           FROM eh_download_queue AS winner \
+                          WHERE winner.job_id = job.id \
+                            AND winner.telegraph_url IS NOT NULL \
+                          ORDER BY winner.id \
+                          LIMIT 1\
+                     ), \
+                     telegraph_rewrite_status = (\
+                         SELECT winner.telegraph_rewrite_status \
+                           FROM eh_download_queue AS winner \
+                          WHERE winner.job_id = job.id \
+                            AND winner.telegraph_url IS NOT NULL \
+                          ORDER BY winner.id \
+                          LIMIT 1\
+                     ), \
+                     telegraph_rewrite_after = (\
+                         SELECT winner.telegraph_rewrite_after \
+                           FROM eh_download_queue AS winner \
+                          WHERE winner.job_id = job.id \
+                            AND winner.telegraph_url IS NOT NULL \
+                          ORDER BY winner.id \
+                          LIMIT 1\
+                     ), \
+                     telegraph_rewrite_started_at = (\
+                         SELECT winner.telegraph_rewrite_started_at \
+                           FROM eh_download_queue AS winner \
+                          WHERE winner.job_id = job.id \
+                            AND winner.telegraph_url IS NOT NULL \
+                          ORDER BY winner.id \
+                          LIMIT 1\
+                     ), \
+                     telegraph_rewrite_next_retry_at = (\
+                         SELECT winner.telegraph_rewrite_next_retry_at \
+                           FROM eh_download_queue AS winner \
+                          WHERE winner.job_id = job.id \
+                            AND winner.telegraph_url IS NOT NULL \
+                          ORDER BY winner.id \
+                          LIMIT 1\
+                     ), \
+                     telegraph_rewrite_retry_count = (\
+                         SELECT winner.telegraph_rewrite_retry_count \
+                           FROM eh_download_queue AS winner \
+                          WHERE winner.job_id = job.id \
+                            AND winner.telegraph_url IS NOT NULL \
+                          ORDER BY winner.id \
+                          LIMIT 1\
+                     ), \
+                     telegraph_rewrite_error = (\
+                         SELECT winner.telegraph_rewrite_error \
+                           FROM eh_download_queue AS winner \
+                          WHERE winner.job_id = job.id \
+                            AND winner.telegraph_url IS NOT NULL \
+                          ORDER BY winner.id \
+                          LIMIT 1\
+                     ), \
+                     telegraph_rewritten_at = (\
+                         SELECT winner.telegraph_rewritten_at \
+                           FROM eh_download_queue AS winner \
+                          WHERE winner.job_id = job.id \
+                            AND winner.telegraph_url IS NOT NULL \
+                          ORDER BY winner.id \
+                          LIMIT 1\
+                     ) \
+               WHERE job.telegraph_status = 'pending' \
+                 AND job.download_mode = 'legacy' \
+                 AND EXISTS (\
+                     SELECT 1 \
+                       FROM eh_download_queue AS winner \
+                      WHERE winner.job_id = job.id \
+                        AND winner.telegraph_url IS NOT NULL\
+                 )",
+        )
+        .await?;
     manager
         .get_connection()
         .execute_unprepared(
