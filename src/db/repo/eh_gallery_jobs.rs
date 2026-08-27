@@ -556,9 +556,14 @@ impl Repo {
         };
         let marker_bearing =
             existing.archive_sent_at.is_some() || existing.telegraph_sent_at.is_some();
+        let direct_marker_bearing_rebind = !terminal
+            && req.source == SOURCE_DIRECT
+            && existing.job_id != Some(requested_job_id)
+            && marker_bearing;
 
         if existing.status == DELIVERY_STATUS_PUBLISHING
-            && (existing.job_id == Some(requested_job_id) || marker_bearing)
+            && (existing.job_id == Some(requested_job_id)
+                || (marker_bearing && !direct_marker_bearing_rebind))
         {
             // A publisher already bound to the requested job, or one with a
             // persisted send marker, owns this delivery's binding and local
@@ -602,7 +607,7 @@ impl Repo {
             return Ok(existing.job_id);
         }
 
-        if existing.status == DELIVERY_STATUS_PUBLISHING {
+        if existing.status == DELIVERY_STATUS_PUBLISHING && !marker_bearing {
             // `enqueue_eh_download_request` and `process_claimed` share the
             // keyed chat lock. A markerless publishing claim therefore has not
             // entered the send critical section yet, so a different requested
@@ -702,10 +707,10 @@ impl Repo {
             return Ok(existing.job_id);
         }
 
-        if terminal {
+        if terminal || direct_marker_bearing_rebind {
             // Keep `created_at` stable: delivery ordering remains attached to
             // the chat/gid record while every wave-local field starts clean.
-            let updated = eh_download_queue::Entity::update_many()
+            let mut update = eh_download_queue::Entity::update_many()
                 .col_expr(
                     eh_download_queue::Column::JobId,
                     Expr::value(Some(requested_job_id)),
@@ -720,19 +725,23 @@ impl Repo {
                 )
                 .col_expr(
                     eh_download_queue::Column::Telegraph,
-                    Expr::value(merged_telegraph),
+                    Expr::value(req.telegraph),
                 )
                 .col_expr(
                     eh_download_queue::Column::Source,
-                    Expr::value(merged_source.to_string()),
+                    Expr::value(req.source.to_string()),
                 )
                 .col_expr(
                     eh_download_queue::Column::SubscriptionIds,
-                    Expr::value(merged_subscription_ids),
+                    Expr::value(req.subscription_id.map(|id| id.to_string())),
                 )
                 .col_expr(
                     eh_download_queue::Column::TelegraphSubscriptionIds,
-                    Expr::value(merged_telegraph_subscription_ids),
+                    Expr::value(if req.telegraph {
+                        req.subscription_id.map(|id| id.to_string())
+                    } else {
+                        None
+                    }),
                 )
                 .col_expr(
                     eh_download_queue::Column::Status,
@@ -830,10 +839,32 @@ impl Repo {
                 .filter(optional_i32_filter(
                     eh_download_queue::Column::JobId,
                     existing.job_id,
-                ))
+                ));
+            if !terminal {
+                update = update
+                    .filter(eh_download_queue::Column::Telegraph.eq(existing.telegraph))
+                    .filter(eh_download_queue::Column::Source.eq(&existing.source))
+                    .filter(optional_string_filter(
+                        eh_download_queue::Column::SubscriptionIds,
+                        existing.subscription_ids.as_deref(),
+                    ))
+                    .filter(optional_string_filter(
+                        eh_download_queue::Column::TelegraphSubscriptionIds,
+                        existing.telegraph_subscription_ids.as_deref(),
+                    ))
+                    .filter(optional_datetime_filter(
+                        eh_download_queue::Column::ArchiveSentAt,
+                        existing.archive_sent_at,
+                    ))
+                    .filter(optional_datetime_filter(
+                        eh_download_queue::Column::TelegraphSentAt,
+                        existing.telegraph_sent_at,
+                    ));
+            }
+            let updated = update
                 .exec(txn)
                 .await
-                .context("Failed to reset terminal shared EH delivery wave")?;
+                .context("Failed to reset shared EH delivery wave")?;
             if updated.rows_affected != 1 {
                 anyhow::bail!("Shared EH delivery changed concurrently during enqueue")
             }

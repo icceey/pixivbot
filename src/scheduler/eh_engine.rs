@@ -8949,6 +8949,184 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn direct_archive_only_variant_after_partial_publish_starts_a_clean_delivery_wave() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        let tg_server = MockServer::start().await;
+        let eh_server = MockServer::start().await;
+        let temp = tempfile::tempdir().unwrap();
+        let zip_path = temp.path().join("partial-publish.zip");
+        create_test_zip(&zip_path, 1);
+        setup_chat(&repo, -100, true).await;
+
+        let initial = repo
+            .enqueue_eh_download(
+                -100,
+                914,
+                "token",
+                "Original 1280x request",
+                true,
+                SOURCE_DIRECT,
+                &EhGalleryVariant::archive("1280x"),
+            )
+            .await
+            .unwrap();
+        let old_download = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        assert_eq!(old_download.id, initial.job_id.unwrap());
+        repo.mark_eh_job_downloaded(
+            old_download.id,
+            old_download.started_at.unwrap(),
+            1,
+            zip_path.to_str().unwrap(),
+            0,
+        )
+        .await
+        .unwrap();
+        let old_upload = repo.get_next_eh_job_for_upload().await.unwrap().unwrap();
+        repo.mark_eh_job_telegraph_ready(
+            old_upload.id,
+            old_upload.started_at.unwrap(),
+            "https://telegra.ph/old-1280",
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+
+        mock_tg_send_document(&tg_server).await;
+        Mock::given(method("POST"))
+            .and(path("/botfake_token/SendMessage"))
+            .respond_with(ResponseTemplate::new(500).set_body_json(serde_json::json!({
+                "ok": false,
+                "description": "mock Telegraph send failure"
+            })))
+            .expect(1)
+            .mount(&tg_server)
+            .await;
+        let initial_worker = EhPublishWorker::new(
+            Arc::clone(&repo),
+            make_notifier(&tg_server),
+            make_eh_client(&eh_server),
+            None,
+            Arc::new(make_config()),
+        );
+        initial_worker.tick().await.unwrap();
+
+        let partial = eh_download_queue::Entity::find_by_id(initial.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            partial.status,
+            crate::db::repo::eh_gallery_jobs::DELIVERY_STATUS_WAITING
+        );
+        assert!(partial.archive_sent_at.is_some());
+        assert!(partial.telegraph_sent_at.is_none());
+        assert!(partial.next_retry_at.is_some());
+
+        let same_job = repo
+            .enqueue_eh_download(
+                -100,
+                914,
+                "token",
+                "Same 1280x request",
+                true,
+                SOURCE_DIRECT,
+                &EhGalleryVariant::archive("1280x"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(same_job.job_id, initial.job_id);
+        assert_eq!(same_job.status, partial.status);
+        assert_eq!(same_job.archive_sent_at, partial.archive_sent_at);
+        assert_eq!(same_job.telegraph_sent_at, partial.telegraph_sent_at);
+        assert_eq!(same_job.next_retry_at, partial.next_retry_at);
+
+        let subscription_merge = repo
+            .enqueue_eh_subscription_download(
+                -100,
+                914,
+                914,
+                "token",
+                "Subscription original request",
+                true,
+                &EhGalleryVariant::archive("original"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(subscription_merge.job_id, initial.job_id);
+        assert_eq!(subscription_merge.archive_sent_at, partial.archive_sent_at);
+        assert_eq!(
+            subscription_merge.telegraph_sent_at,
+            partial.telegraph_sent_at
+        );
+
+        let forced = repo
+            .enqueue_eh_download(
+                -100,
+                914,
+                "token",
+                "Direct original request",
+                false,
+                SOURCE_DIRECT,
+                &EhGalleryVariant::archive("original"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(forced.id, initial.id);
+        assert_eq!(
+            forced.status,
+            crate::db::repo::eh_gallery_jobs::DELIVERY_STATUS_WAITING
+        );
+        assert_ne!(forced.job_id, initial.job_id);
+        assert!(forced.archive_sent_at.is_none());
+        assert!(forced.telegraph_sent_at.is_none());
+        assert_eq!(forced.retry_count, 0);
+        assert!(forced.started_at.is_none());
+        assert!(forced.completed_at.is_none());
+        assert!(forced.next_retry_at.is_none());
+        assert_eq!(forced.source, SOURCE_DIRECT);
+        assert!(!forced.telegraph);
+        assert!(forced.subscription_ids.is_none());
+        assert!(forced.telegraph_subscription_ids.is_none());
+        assert_eq!(
+            job_for_delivery(&repo, &initial).await.status,
+            crate::db::repo::eh_gallery_jobs::JOB_STATUS_RETIRED
+        );
+
+        let new_download = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        assert_eq!(new_download.id, forced.job_id.unwrap());
+        assert_eq!(new_download.resolution, "original");
+        assert!(!new_download.telegraph_required);
+        repo.mark_eh_job_downloaded(
+            new_download.id,
+            new_download.started_at.unwrap(),
+            1,
+            zip_path.to_str().unwrap(),
+            0,
+        )
+        .await
+        .unwrap();
+
+        tg_server.reset().await;
+        mock_tg_send_document(&tg_server).await;
+        let replacement_worker = EhPublishWorker::new(
+            Arc::clone(&repo),
+            make_notifier(&tg_server),
+            make_eh_client(&eh_server),
+            None,
+            Arc::new(make_config()),
+        );
+        replacement_worker.tick().await.unwrap();
+
+        let requests = tg_server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let body = String::from_utf8_lossy(&requests[0].body);
+        assert!(body.contains("Direct original request.zip"));
+        assert!(!body.contains("old-1280"));
+    }
+
+    #[tokio::test]
     async fn publish_worker_claims_at_most_two_deliveries_and_refills() {
         let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
         let tg_server = MockServer::start().await;

@@ -12,8 +12,8 @@ use eh_client::{ArchiveArtifacts, ImageUploader};
 use sea_orm::prelude::DateTime;
 use sea_orm::sea_query::{Expr, Query, SimpleExpr};
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseTransaction, EntityTrait, Order, PaginatorTrait,
-    QueryFilter, QueryOrder, QueryTrait, Set, TransactionTrait,
+    ActiveModelTrait, ColumnTrait, Condition, DatabaseTransaction, EntityTrait, Order,
+    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, QueryTrait, Set, TransactionTrait,
 };
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, LazyLock, Mutex, Weak};
@@ -120,6 +120,7 @@ pub const TELEGRAPH_REWRITE_STATUS_REWRITING: &str = "rewriting";
 pub const TELEGRAPH_REWRITE_STATUS_FAILED: &str = "failed";
 const NO_CONFIGURED_EH_DELIVERY_PUBLISH_SURFACE_ERROR: &str =
     "No configured EH delivery publish surface";
+const PUBLISH_MAINTENANCE_BATCH_SIZE: u64 = 16;
 #[allow(dead_code)]
 const MAIN_DOWNLOAD_RECENT_WINDOW_HOURS: i64 = 2;
 
@@ -199,6 +200,18 @@ pub struct EhDeliveryClaim {
     pub job: eh_gallery_jobs::Model,
 }
 
+#[cfg(test)]
+tokio::task_local! {
+    static EH_PUBLISH_CANDIDATE_INSPECTIONS: std::sync::Arc<std::sync::atomic::AtomicUsize>;
+}
+
+#[cfg(test)]
+fn record_eh_publish_candidate_inspection() {
+    let _ = EH_PUBLISH_CANDIDATE_INSPECTIONS.try_with(|inspections| {
+        inspections.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    });
+}
+
 fn eh_delivery_is_ready_for_publish(
     delivery: &eh_download_queue::Model,
     job: &eh_gallery_jobs::Model,
@@ -229,14 +242,57 @@ fn eh_delivery_is_ready_for_publish(
         || (!archive_required && !telegraph_required && has_requested_surface)
 }
 
-fn eh_delivery_has_no_configured_publish_surface(
-    delivery: &eh_download_queue::Model,
-    send_archive: bool,
-) -> bool {
-    !send_archive
-        && !delivery.telegraph
-        && delivery.archive_sent_at.is_none()
-        && delivery.telegraph_sent_at.is_none()
+/// SQL equivalent of `eh_delivery_is_ready_for_publish`, scoped to delivery
+/// rows joined with their shared jobs. This makes the claim selector read only
+/// a publishable row rather than materializing due-but-blocked deliveries.
+fn eh_delivery_ready_for_publish_filter(send_archive: bool) -> Condition {
+    let telegraph_ready = Condition::all()
+        .add(eh_download_queue::Column::Telegraph.eq(true))
+        .add(eh_download_queue::Column::TelegraphSentAt.is_null())
+        .add(eh_gallery_jobs::Column::TelegraphStatus.eq(TELEGRAPH_STATUS_READY))
+        .add(eh_gallery_jobs::Column::TelegraphUrl.is_not_null());
+
+    let settled_requested_surfaces = if send_archive {
+        Condition::all()
+            .add(eh_download_queue::Column::ArchiveSentAt.is_not_null())
+            .add(
+                Condition::any()
+                    .add(eh_download_queue::Column::Telegraph.eq(false))
+                    .add(eh_download_queue::Column::TelegraphSentAt.is_not_null()),
+            )
+    } else {
+        Condition::all()
+            .add(
+                Condition::any()
+                    .add(eh_download_queue::Column::Telegraph.eq(false))
+                    .add(eh_download_queue::Column::TelegraphSentAt.is_not_null()),
+            )
+            .add(
+                Condition::any()
+                    .add(eh_download_queue::Column::Telegraph.eq(true))
+                    .add(eh_download_queue::Column::ArchiveSentAt.is_not_null())
+                    .add(eh_download_queue::Column::TelegraphSentAt.is_not_null()),
+            )
+    };
+
+    let telegraph_not_required_or_ready = Condition::any()
+        .add(eh_download_queue::Column::Telegraph.eq(false))
+        .add(eh_download_queue::Column::TelegraphSentAt.is_not_null())
+        .add(telegraph_ready.clone());
+    let mut ready = Condition::any()
+        .add(telegraph_ready)
+        .add(settled_requested_surfaces);
+    if send_archive {
+        ready = ready.add(
+            Condition::all()
+                .add(eh_download_queue::Column::ArchiveSentAt.is_null())
+                .add(eh_gallery_jobs::Column::Status.eq(JOB_STATUS_DOWNLOADED))
+                .add(eh_gallery_jobs::Column::ZipPath.is_not_null()),
+        );
+    }
+    Condition::all()
+        .add(telegraph_not_required_or_ready)
+        .add(ready)
 }
 
 fn eh_job_cleanup_is_none_filter(job_id: i32) -> SimpleExpr {
@@ -2244,28 +2300,31 @@ impl Repo {
             .await
             .context("Failed to begin shared EH delivery publish claim transaction")?;
         let result = async {
-            let candidates = eh_download_queue::Entity::find()
-                .find_also_related(eh_gallery_jobs::Entity)
-                .filter(eh_download_queue::Column::Status.eq(STATUS_WAITING))
-                .filter(eh_download_queue::Column::JobId.is_not_null())
-                .filter(eh_gallery_jobs::Column::CleanupStatus.eq(CLEANUP_STATUS_NONE))
-                .filter(
-                    eh_download_queue::Column::NextRetryAt
-                        .is_null()
-                        .or(eh_download_queue::Column::NextRetryAt.lte(now)),
-                )
-                .order_by(eh_download_queue::Column::CreatedAt, Order::Asc)
-                .order_by(eh_download_queue::Column::Id, Order::Asc)
-                .all(&txn)
-                .await
-                .context("Failed to fetch due shared EH deliveries for publish")?;
-
             let mut committed_state_transition = false;
-            for (delivery, job) in candidates {
-                let Some(job) = job else {
-                    continue;
-                };
-                if eh_delivery_has_no_configured_publish_surface(&delivery, send_archive) {
+            if !send_archive {
+                let no_surface_candidates = eh_download_queue::Entity::find()
+                    .find_also_related(eh_gallery_jobs::Entity)
+                    .filter(eh_download_queue::Column::Status.eq(STATUS_WAITING))
+                    .filter(eh_download_queue::Column::JobId.is_not_null())
+                    .filter(eh_download_queue::Column::Telegraph.eq(false))
+                    .filter(eh_download_queue::Column::ArchiveSentAt.is_null())
+                    .filter(eh_download_queue::Column::TelegraphSentAt.is_null())
+                    .filter(eh_gallery_jobs::Column::CleanupStatus.eq(CLEANUP_STATUS_NONE))
+                    .filter(
+                        eh_download_queue::Column::NextRetryAt
+                            .is_null()
+                            .or(eh_download_queue::Column::NextRetryAt.lte(now)),
+                    )
+                    .order_by(eh_download_queue::Column::CreatedAt, Order::Asc)
+                    .order_by(eh_download_queue::Column::Id, Order::Asc)
+                    .limit(PUBLISH_MAINTENANCE_BATCH_SIZE)
+                    .all(&txn)
+                    .await
+                    .context("Failed to fetch surface-less shared EH deliveries for publish")?;
+                for (delivery, job) in no_surface_candidates {
+                    let Some(job) = job else {
+                        continue;
+                    };
                     let failed = eh_download_queue::Entity::update_many()
                         .col_expr(
                             eh_download_queue::Column::Status,
@@ -2308,75 +2367,129 @@ impl Repo {
                             .await?;
                         committed_state_transition = true;
                     }
-                    continue;
                 }
-                if self
-                    .recover_eh_job_for_missing_archive_in_txn(&txn, &delivery, &job, send_archive)
-                    .await?
-                {
-                    committed_state_transition = true;
-                    continue;
-                }
-                if !eh_delivery_is_ready_for_publish(&delivery, &job, send_archive) {
-                    continue;
-                }
+            }
 
-                let generation = next_claim_generation(now, delivery.started_at)?;
-                let claimed = eh_download_queue::Entity::update_many()
-                    .col_expr(
-                        eh_download_queue::Column::Status,
-                        Expr::value(STATUS_PUBLISHING),
-                    )
-                    .col_expr(
-                        eh_download_queue::Column::StartedAt,
-                        Expr::value(generation),
-                    )
-                    .col_expr(
-                        eh_download_queue::Column::NextRetryAt,
-                        Expr::value(None::<DateTime>),
-                    )
-                    .filter(eh_download_queue::Column::Id.eq(delivery.id))
-                    .filter(eh_download_queue::Column::JobId.eq(job.id))
+            if send_archive {
+                let missing_archive_candidates = eh_download_queue::Entity::find()
+                    .find_also_related(eh_gallery_jobs::Entity)
                     .filter(eh_download_queue::Column::Status.eq(STATUS_WAITING))
-                    .filter(eh_job_cleanup_is_none_filter(job.id))
-                    .filter(claim_generation_filter(delivery.started_at))
+                    .filter(eh_download_queue::Column::JobId.is_not_null())
+                    .filter(eh_download_queue::Column::ArchiveSentAt.is_null())
+                    .filter(eh_gallery_jobs::Column::Status.eq(JOB_STATUS_DOWNLOADED))
+                    .filter(eh_gallery_jobs::Column::ZipPath.is_null())
+                    .filter(eh_gallery_jobs::Column::CleanupStatus.eq(CLEANUP_STATUS_NONE))
+                    .filter(eh_gallery_jobs::Column::BackgroundDownloadStatus.is_null())
+                    .filter(eh_gallery_jobs::Column::TelegraphStatus.ne(TELEGRAPH_STATUS_UPLOADING))
                     .filter(
                         eh_download_queue::Column::NextRetryAt
                             .is_null()
                             .or(eh_download_queue::Column::NextRetryAt.lte(now)),
                     )
-                    .exec(&txn)
+                    .order_by(eh_download_queue::Column::CreatedAt, Order::Asc)
+                    .order_by(eh_download_queue::Column::Id, Order::Asc)
+                    .limit(PUBLISH_MAINTENANCE_BATCH_SIZE)
+                    .all(&txn)
                     .await
-                    .context("Failed to atomically claim shared EH delivery for publish")?;
-                if claimed.rows_affected == 0 {
-                    continue;
+                    .context("Failed to fetch missing-archive shared EH deliveries for publish")?;
+                for (delivery, job) in missing_archive_candidates {
+                    let Some(job) = job else {
+                        continue;
+                    };
+                    if self
+                        .recover_eh_job_for_missing_archive_in_txn(
+                            &txn,
+                            &delivery,
+                            &job,
+                            send_archive,
+                        )
+                        .await?
+                    {
+                        committed_state_transition = true;
+                    }
                 }
-
-                let claimed_delivery = eh_download_queue::Entity::find()
-                    .filter(eh_download_queue::Column::Id.eq(delivery.id))
-                    .filter(eh_download_queue::Column::JobId.eq(job.id))
-                    .filter(eh_download_queue::Column::Status.eq(STATUS_PUBLISHING))
-                    .filter(eh_download_queue::Column::StartedAt.eq(generation))
-                    .one(&txn)
-                    .await
-                    .context("Failed to reread shared EH delivery publish claim")?
-                    .context("Shared EH delivery changed before publish claim readback")?;
-                let claimed_job = eh_gallery_jobs::Entity::find_by_id(job.id)
-                    .filter(eh_gallery_jobs::Column::CleanupStatus.eq(CLEANUP_STATUS_NONE))
-                    .one(&txn)
-                    .await
-                    .context("Failed to reread shared EH job for delivery claim")?
-                    .context("Shared EH job changed before delivery claim readback")?;
-                return Ok((
-                    Some(EhDeliveryClaim {
-                        delivery: claimed_delivery,
-                        job: claimed_job,
-                    }),
-                    committed_state_transition,
-                ));
             }
 
-            Ok((None, committed_state_transition))
+            let Some((delivery, Some(job))) = eh_download_queue::Entity::find()
+                .find_also_related(eh_gallery_jobs::Entity)
+                .filter(eh_download_queue::Column::Status.eq(STATUS_WAITING))
+                .filter(eh_download_queue::Column::JobId.is_not_null())
+                .filter(eh_gallery_jobs::Column::CleanupStatus.eq(CLEANUP_STATUS_NONE))
+                .filter(
+                    eh_download_queue::Column::NextRetryAt
+                        .is_null()
+                        .or(eh_download_queue::Column::NextRetryAt.lte(now)),
+                )
+                .filter(eh_delivery_ready_for_publish_filter(send_archive))
+                .order_by(eh_download_queue::Column::CreatedAt, Order::Asc)
+                .order_by(eh_download_queue::Column::Id, Order::Asc)
+                .one(&txn)
+                .await
+                .context("Failed to fetch next ready shared EH delivery for publish")?
+            else {
+                return Ok((None, committed_state_transition));
+            };
+            #[cfg(test)]
+            record_eh_publish_candidate_inspection();
+            debug_assert!(eh_delivery_is_ready_for_publish(
+                &delivery,
+                &job,
+                send_archive
+            ));
+
+            let generation = next_claim_generation(now, delivery.started_at)?;
+            let claimed = eh_download_queue::Entity::update_many()
+                .col_expr(
+                    eh_download_queue::Column::Status,
+                    Expr::value(STATUS_PUBLISHING),
+                )
+                .col_expr(
+                    eh_download_queue::Column::StartedAt,
+                    Expr::value(generation),
+                )
+                .col_expr(
+                    eh_download_queue::Column::NextRetryAt,
+                    Expr::value(None::<DateTime>),
+                )
+                .filter(eh_download_queue::Column::Id.eq(delivery.id))
+                .filter(eh_download_queue::Column::JobId.eq(job.id))
+                .filter(eh_download_queue::Column::Status.eq(STATUS_WAITING))
+                .filter(eh_job_cleanup_is_none_filter(job.id))
+                .filter(claim_generation_filter(delivery.started_at))
+                .filter(
+                    eh_download_queue::Column::NextRetryAt
+                        .is_null()
+                        .or(eh_download_queue::Column::NextRetryAt.lte(now)),
+                )
+                .exec(&txn)
+                .await
+                .context("Failed to atomically claim shared EH delivery for publish")?;
+            if claimed.rows_affected == 0 {
+                return Ok((None, committed_state_transition));
+            }
+
+            let claimed_delivery = eh_download_queue::Entity::find()
+                .filter(eh_download_queue::Column::Id.eq(delivery.id))
+                .filter(eh_download_queue::Column::JobId.eq(job.id))
+                .filter(eh_download_queue::Column::Status.eq(STATUS_PUBLISHING))
+                .filter(eh_download_queue::Column::StartedAt.eq(generation))
+                .one(&txn)
+                .await
+                .context("Failed to reread shared EH delivery publish claim")?
+                .context("Shared EH delivery changed before publish claim readback")?;
+            let claimed_job = eh_gallery_jobs::Entity::find_by_id(job.id)
+                .filter(eh_gallery_jobs::Column::CleanupStatus.eq(CLEANUP_STATUS_NONE))
+                .one(&txn)
+                .await
+                .context("Failed to reread shared EH job for delivery claim")?
+                .context("Shared EH job changed before delivery claim readback")?;
+            Ok((
+                Some(EhDeliveryClaim {
+                    delivery: claimed_delivery,
+                    job: claimed_job,
+                }),
+                committed_state_transition,
+            ))
         }
         .await;
 
@@ -5012,7 +5125,7 @@ mod tests {
             .enqueue_eh_download(
                 -100,
                 53,
-                "new",
+                "tok",
                 "New",
                 false,
                 SOURCE_DIRECT,
@@ -5527,6 +5640,111 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(done.status, STATUS_DONE);
+    }
+
+    #[tokio::test]
+    async fn test_publish_selector_claims_ready_rows_without_inspecting_blocked_backlog() {
+        let repo = tests_helpers::setup_test_db().await.unwrap();
+        for gid in 10_000..10_064 {
+            repo.enqueue_eh_download(
+                -gid,
+                gid,
+                "blocked",
+                "Blocked",
+                true,
+                SOURCE_DIRECT,
+                &EhGalleryVariant::archive("1280x"),
+            )
+            .await
+            .unwrap();
+        }
+
+        let first_ready = repo
+            .enqueue_eh_download(
+                -20_000,
+                20_000,
+                "first-ready",
+                "First ready",
+                false,
+                SOURCE_DIRECT,
+                &EhGalleryVariant::archive("1280x"),
+            )
+            .await
+            .unwrap();
+        eh_gallery_jobs::Entity::update_many()
+            .col_expr(
+                eh_gallery_jobs::Column::Status,
+                Expr::value(JOB_STATUS_DOWNLOADED),
+            )
+            .col_expr(
+                eh_gallery_jobs::Column::ZipPath,
+                Expr::value(Some("/tmp/first-ready.zip".to_string())),
+            )
+            .filter(eh_gallery_jobs::Column::Id.eq(first_ready.job_id.unwrap()))
+            .exec(repo.db())
+            .await
+            .unwrap();
+
+        let second_ready = repo
+            .enqueue_eh_download(
+                -20_001,
+                20_001,
+                "second-ready",
+                "Second ready",
+                false,
+                SOURCE_DIRECT,
+                &EhGalleryVariant::archive("1280x"),
+            )
+            .await
+            .unwrap();
+        eh_gallery_jobs::Entity::update_many()
+            .col_expr(
+                eh_gallery_jobs::Column::Status,
+                Expr::value(JOB_STATUS_DOWNLOADED),
+            )
+            .col_expr(
+                eh_gallery_jobs::Column::ZipPath,
+                Expr::value(Some("/tmp/second-ready.zip".to_string())),
+            )
+            .filter(eh_gallery_jobs::Column::Id.eq(second_ready.job_id.unwrap()))
+            .exec(repo.db())
+            .await
+            .unwrap();
+
+        let first_inspections = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let first_claim = super::EH_PUBLISH_CANDIDATE_INSPECTIONS
+            .scope(
+                first_inspections.clone(),
+                repo.get_next_eh_delivery_for_publish(true),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first_claim.delivery.id, first_ready.id);
+        assert_eq!(
+            first_inspections.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the ready claim must not materialize or inspect the blocked prefix"
+        );
+        repo.defer_eh_delivery_publish(first_claim.delivery.id, 60)
+            .await
+            .unwrap();
+
+        let second_inspections = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let second_claim = super::EH_PUBLISH_CANDIDATE_INSPECTIONS
+            .scope(
+                second_inspections.clone(),
+                repo.get_next_eh_delivery_for_publish(true),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(second_claim.delivery.id, second_ready.id);
+        assert_eq!(
+            second_inspections.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "each refill must read only its selected ready candidate"
+        );
     }
 
     #[tokio::test]
@@ -6340,7 +6558,7 @@ mod tests {
             .enqueue_eh_download(
                 -100,
                 20,
-                "new",
+                "tok",
                 "New",
                 false,
                 SOURCE_DIRECT,
@@ -8285,7 +8503,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_enqueue_preserves_a_marker_bearing_publishing_claim() {
+    async fn test_direct_enqueue_restarts_a_marker_bearing_publishing_delivery_wave() {
         let repo = tests_helpers::setup_test_db().await.unwrap();
         let model = repo
             .enqueue_eh_download(
@@ -8309,7 +8527,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let publish_claim = repo
+        let _publish_claim = repo
             .get_next_eh_delivery_for_publish(true)
             .await
             .unwrap()
@@ -8329,14 +8547,17 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(merged.status, STATUS_PUBLISHING);
-        assert_eq!(merged.job_id, model.job_id);
-        assert_eq!(merged.started_at, publish_claim.delivery.started_at);
-        assert!(merged.archive_sent_at.is_some());
+        assert_eq!(merged.status, STATUS_WAITING);
+        assert_ne!(merged.job_id, model.job_id);
+        assert!(merged.started_at.is_none());
+        assert!(merged.archive_sent_at.is_none());
         assert!(merged.telegraph_sent_at.is_none());
-        assert!(merged.telegraph, "owner demand must still merge");
+        assert!(merged.telegraph);
         assert_eq!(merged.token, "tok");
-        assert_eq!(merged.title, "Published title");
+        assert_eq!(merged.title, "Requested original");
+        assert_eq!(merged.retry_count, 0);
+        assert!(merged.completed_at.is_none());
+        assert!(merged.next_retry_at.is_none());
         let requested_job = eh_gallery_jobs::Entity::find()
             .filter(eh_gallery_jobs::Column::Gid.eq(66_i64))
             .filter(eh_gallery_jobs::Column::Resolution.eq("original"))
@@ -8344,7 +8565,25 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(requested_job.status, JOB_STATUS_RETIRED);
+        assert_eq!(requested_job.id, merged.job_id.unwrap());
+        assert_eq!(requested_job.status, JOB_STATUS_PENDING);
+        assert_eq!(
+            eh_gallery_jobs::Entity::find_by_id(model.job_id.unwrap())
+                .one(repo.db())
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            JOB_STATUS_RETIRED
+        );
+        assert_eq!(
+            repo.get_next_eh_job_for_download()
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            requested_job.id
+        );
     }
 
     /// When an insert conflicts on (chat_id, gid) unique constraint, the
@@ -8886,7 +9125,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn enqueue_isolates_variants_and_rebinds_direct_upgrade_before_markers() {
+    async fn enqueue_isolates_variants_and_rebinds_direct_upgrade_before_and_after_markers() {
         let repo = tests_helpers::setup_test_db().await.unwrap();
         let subscription = repo
             .enqueue_eh_subscription_download(
@@ -8948,16 +9187,28 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(marker_bound.job_id, Some(direct_job_id));
+        assert_ne!(marker_bound.job_id, Some(direct_job_id));
+        assert!(marker_bound.archive_sent_at.is_none());
+        assert!(marker_bound.telegraph_sent_at.is_none());
 
-        let orphan = eh_gallery_jobs::Entity::find()
+        let requested = eh_gallery_jobs::Entity::find()
             .filter(eh_gallery_jobs::Column::Gid.eq(701))
             .filter(eh_gallery_jobs::Column::Resolution.eq("780x"))
             .one(repo.db())
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(orphan.status, JOB_STATUS_RETIRED);
+        assert_eq!(requested.id, marker_bound.job_id.unwrap());
+        assert_eq!(requested.status, JOB_STATUS_PENDING);
+        assert_eq!(
+            eh_gallery_jobs::Entity::find_by_id(direct_job_id)
+                .one(repo.db())
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            JOB_STATUS_RETIRED
+        );
     }
 
     #[tokio::test]
