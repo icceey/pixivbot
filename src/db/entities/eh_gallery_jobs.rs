@@ -10,6 +10,7 @@ pub struct Model {
     pub token: String,
     pub download_mode: String,
     pub resolution: String,
+    pub source_fingerprint: Option<String>,
     pub title: String,
     pub status: String,
     pub telegraph_status: String,

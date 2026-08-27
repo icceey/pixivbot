@@ -413,7 +413,8 @@ impl BotHandler {
             SOURCE_DIRECT,
             self.eh_config.as_ref(),
         );
-        if let Err(e) = self
+        let fingerprint = metadata.source_fingerprint();
+        match self
             .repo
             .enqueue_eh_download(
                 chat_id.0,
@@ -423,12 +424,22 @@ impl BotHandler {
                 telegraph,
                 SOURCE_DIRECT,
                 &variant,
+                Some(&fingerprint),
+                self.eh_config.send_archive,
             )
             .await
         {
-            error!("Failed to enqueue eh download: {:#}", e);
-            let _ = bot.send_message(chat_id, "❌ 加入下载队列失败").await;
-            return Ok(());
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                error!("Direct EH enqueue from /edl returned no delivery");
+                let _ = bot.send_message(chat_id, "❌ 加入下载队列失败").await;
+                return Ok(());
+            }
+            Err(e) => {
+                error!("Failed to enqueue eh download: {:#}", e);
+                let _ = bot.send_message(chat_id, "❌ 加入下载队列失败").await;
+                return Ok(());
+            }
         }
 
         // Delete status message
@@ -547,7 +558,8 @@ impl BotHandler {
             SOURCE_DIRECT,
             self.eh_config.as_ref(),
         );
-        if let Err(e) = self
+        let fingerprint = metadata.source_fingerprint();
+        match self
             .repo
             .enqueue_eh_download(
                 chat_id.0,
@@ -557,12 +569,22 @@ impl BotHandler {
                 true, // always telegraph
                 SOURCE_DIRECT,
                 &variant,
+                Some(&fingerprint),
+                self.eh_config.send_archive,
             )
             .await
         {
-            error!("Failed to enqueue eh download: {:#}", e);
-            let _ = bot.send_message(chat_id, "❌ 加入下载队列失败").await;
-            return Ok(());
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                error!("Direct EH enqueue from /telegraph returned no delivery");
+                let _ = bot.send_message(chat_id, "❌ 加入下载队列失败").await;
+                return Ok(());
+            }
+            Err(e) => {
+                error!("Failed to enqueue eh download: {:#}", e);
+                let _ = bot.send_message(chat_id, "❌ 加入下载队列失败").await;
+                return Ok(());
+            }
         }
 
         // Delete status message

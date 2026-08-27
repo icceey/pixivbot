@@ -5,6 +5,8 @@ mod chats;
 pub mod eh_download_completions;
 pub mod eh_download_queue;
 pub mod eh_gallery_jobs;
+pub mod eh_gallery_push_ledger;
+pub mod eh_gallery_results;
 pub mod eh_gp_spend_attempts;
 mod messages;
 mod stats;
@@ -83,6 +85,7 @@ pub mod tests_helpers {
                 token TEXT NOT NULL,
                 download_mode TEXT NOT NULL,
                 resolution TEXT NOT NULL DEFAULT '',
+                source_fingerprint TEXT,
                 title TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'pending',
                 telegraph_status TEXT NOT NULL DEFAULT 'not_required',
@@ -115,6 +118,43 @@ pub mod tests_helpers {
                 telegraph_rewrite_error TEXT,
                 telegraph_rewritten_at TIMESTAMP,
                 UNIQUE(gid, token, download_mode, resolution)
+            )
+            "#,
+        ))
+        .await?;
+
+        db.execute(Statement::from_string(
+            DbBackend::Sqlite,
+            r#"
+            CREATE TABLE eh_gallery_results (
+                id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                gid INTEGER NOT NULL,
+                token TEXT NOT NULL,
+                download_mode TEXT NOT NULL,
+                resolution TEXT NOT NULL,
+                source_fingerprint TEXT NOT NULL,
+                telegraph_url TEXT NOT NULL,
+                telegraph_rewrite_data TEXT,
+                media_cids TEXT,
+                created_at TIMESTAMP NOT NULL,
+                updated_at TIMESTAMP NOT NULL,
+                UNIQUE(gid, token, download_mode, resolution)
+            )
+            "#,
+        ))
+        .await?;
+
+        db.execute(Statement::from_string(
+            DbBackend::Sqlite,
+            r#"
+            CREATE TABLE eh_gallery_push_ledger (
+                id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                chat_id INTEGER NOT NULL,
+                gid INTEGER NOT NULL,
+                archive_sent_at TIMESTAMP,
+                telegraph_sent_at TIMESTAMP,
+                updated_at TIMESTAMP NOT NULL,
+                UNIQUE(chat_id, gid)
             )
             "#,
         ))

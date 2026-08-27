@@ -98,6 +98,7 @@ mod tests {
     const CREATED_AT_INDEX: &str = "idx_eh_gp_spend_attempts_created_at";
     const MIGRATION_NAME: &str = "m20260719_000000_eh_gp_spend_attempts";
     const SHARED_JOBS_MIGRATION_NAME: &str = "m20260824_000000_eh_shared_gallery_jobs";
+    const REUSE_LEDGER_MIGRATION_NAME: &str = "m20260826_000000_eh_result_reuse_and_push_ledger";
 
     async fn new_db() -> Result<DatabaseConnection> {
         let db = Database::connect("sqlite::memory:").await?;
@@ -141,6 +142,23 @@ mod tests {
 
     async fn migrate_shared_jobs_up(db: &DatabaseConnection) -> Result<()> {
         shared_jobs_target_migration()?
+            .up(&SchemaManager::new(db))
+            .await?;
+        Ok(())
+    }
+
+    fn reuse_ledger_target_migration() -> Result<Box<dyn MigrationTrait>> {
+        Migrator::migrations()
+            .into_iter()
+            .find(|migration| migration.name() == REUSE_LEDGER_MIGRATION_NAME)
+            .ok_or_else(|| {
+                anyhow::anyhow!("migration {REUSE_LEDGER_MIGRATION_NAME} is not registered")
+            })
+    }
+
+    async fn migrate_reuse_ledger_up(db: &DatabaseConnection) -> Result<()> {
+        migrate_shared_jobs_up(db).await?;
+        reuse_ledger_target_migration()?
             .up(&SchemaManager::new(db))
             .await?;
         Ok(())
@@ -270,6 +288,72 @@ mod tests {
 
         assert!(migration_table_exists(&db).await?);
         assert!(migration_created_at_index_exists(&db).await?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn migration_reuse_tables_and_fingerprint_column() -> Result<()> {
+        let db = new_db().await?;
+        create_legacy_shared_jobs_tables(&db).await?;
+        db.execute_unprepared(
+            "INSERT INTO eh_download_queue (chat_id, gid, token, title, source, status) \
+             VALUES (1, 101, 'token-101', 'Legacy gallery', 'subscription', 'pending')",
+        )
+        .await?;
+
+        migrate_reuse_ledger_up(&db).await?;
+
+        assert!(
+            sqlite_master_entry_exists(&db, "table", "eh_gallery_results").await?,
+            "result reuse table must be created"
+        );
+        assert!(
+            sqlite_master_entry_exists(&db, "table", "eh_gallery_push_ledger").await?,
+            "push ledger table must be created"
+        );
+        let migrated_job = db
+            .query_one(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT source_fingerprint FROM eh_gallery_jobs WHERE gid = 101".to_owned(),
+            ))
+            .await?
+            .expect("legacy gallery job must be migrated");
+        assert_eq!(
+            migrated_job.try_get::<Option<String>>("", "source_fingerprint")?,
+            None
+        );
+
+        db.execute_unprepared(
+            "INSERT INTO eh_gallery_results (\
+                gid, token, download_mode, resolution, source_fingerprint, telegraph_url, created_at, updated_at\
+             ) VALUES (101, 'token-101', 'archive', '1280x', 'fingerprint', 'https://telegra.ph/page', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        )
+        .await?;
+        assert!(
+            db.execute_unprepared(
+                "INSERT INTO eh_gallery_results (\
+                    gid, token, download_mode, resolution, source_fingerprint, telegraph_url, created_at, updated_at\
+                 ) VALUES (101, 'token-101', 'archive', '1280x', 'fingerprint', 'https://telegra.ph/page', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+            )
+            .await
+            .is_err(),
+            "duplicate gallery result variants must violate their unique constraint"
+        );
+
+        db.execute_unprepared(
+            "INSERT INTO eh_gallery_push_ledger (chat_id, gid, updated_at) \
+             VALUES (1, 101, CURRENT_TIMESTAMP)",
+        )
+        .await?;
+        assert!(
+            db.execute_unprepared(
+                "INSERT INTO eh_gallery_push_ledger (chat_id, gid, updated_at) \
+                 VALUES (1, 101, CURRENT_TIMESTAMP)"
+            )
+            .await
+            .is_err(),
+            "duplicate chat/gallery ledger rows must violate their unique constraint"
+        );
         Ok(())
     }
 
@@ -1109,8 +1193,11 @@ mod tests {
                 false,
                 "direct",
                 &crate::db::repo::eh_gallery_jobs::EhGalleryVariant::archive("1280x"),
+                None,
+                true,
             )
-            .await?;
+            .await?
+            .expect("delivery should be enqueued");
 
         let attempt = repo
             .append_eh_gp_spend_attempt(queue.id, queue.gid, 218)
@@ -1138,8 +1225,11 @@ mod tests {
                 false,
                 "direct",
                 &crate::db::repo::eh_gallery_jobs::EhGalleryVariant::archive("1280x"),
+                None,
+                true,
             )
-            .await?;
+            .await?
+            .expect("delivery should be enqueued");
 
         let first = repo
             .append_eh_gp_spend_attempt(queue.id, queue.gid, 218)
@@ -1228,8 +1318,11 @@ mod tests {
                 false,
                 "direct",
                 &crate::db::repo::eh_gallery_jobs::EhGalleryVariant::archive("1280x"),
+                None,
+                true,
             )
-            .await?;
+            .await?
+            .expect("delivery should be enqueued");
         let queue_id = queue.id;
         let mut queue: eh_download_queue::ActiveModel = queue.into();
         queue.gp_cost = Set(218);

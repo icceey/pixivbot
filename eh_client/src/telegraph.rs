@@ -27,6 +27,8 @@ pub struct Node {
 pub struct TelegraphImageUrlPair {
     pub preview_url: String,
     pub public_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cid: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -830,6 +832,7 @@ pub trait ImageUploader: Send + Sync {
             .map(|url| TelegraphImageUrlPair {
                 preview_url: url.clone(),
                 public_url: url,
+                cid: None,
             })
             .collect())
     }
@@ -1685,6 +1688,7 @@ impl IpfS3Uploader {
         TelegraphImageUrlPair {
             preview_url,
             public_url,
+            cid: Some(cid.to_owned()),
         }
     }
 
@@ -2540,6 +2544,7 @@ impl TelegraphClient {
             .map(|url| TelegraphImageUrlPair {
                 preview_url: url.clone(),
                 public_url: url.clone(),
+                cid: None,
             })
             .collect();
         Ok(self
@@ -2758,6 +2763,7 @@ mod tests {
             .map(|i| TelegraphImageUrlPair {
                 preview_url: format!("https://p.example/ipfs/cid-{i}"),
                 public_url: format!("https://public.example/ipfs/{}-cid-{i}", "x".repeat(210)),
+                cid: None,
             })
             .collect();
         let preview_urls: Vec<String> = pairs.iter().map(|pair| pair.preview_url.clone()).collect();
@@ -3288,7 +3294,58 @@ mod tests {
             vec![TelegraphImageUrlPair {
                 preview_url: format!("https://preview.example/ipfs/{cid}"),
                 public_url: format!("https://public.example/ipfs/{cid}"),
+                cid: Some(cid.to_string()),
             }]
+        );
+    }
+
+    #[tokio::test]
+    async fn trait_default_url_pairs_have_no_cid() {
+        struct DefaultPairUploader;
+
+        #[async_trait]
+        impl ImageUploader for DefaultPairUploader {
+            async fn upload_images(&self, images: &[ImageUploadInput<'_>]) -> Result<Vec<String>> {
+                Ok(images
+                    .iter()
+                    .map(|image| format!("https://images.example/{}", image.filename))
+                    .collect())
+            }
+        }
+
+        let pairs = DefaultPairUploader
+            .upload_images_with_url_pairs(&[ImageUploadInput {
+                filename: "image.jpg",
+                bytes: b"image",
+                resume_context: None,
+            }])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            pairs,
+            [TelegraphImageUrlPair {
+                preview_url: "https://images.example/image.jpg".to_string(),
+                public_url: "https://images.example/image.jpg".to_string(),
+                cid: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn telegraph_image_url_pair_deserializes_legacy_payload_without_cid() {
+        let pair: TelegraphImageUrlPair = serde_json::from_str(
+            r#"{"preview_url":"https://preview.example/image.jpg","public_url":"https://public.example/image.jpg"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(pair.cid, None);
+        assert_eq!(
+            serde_json::to_value(pair).unwrap(),
+            serde_json::json!({
+                "preview_url": "https://preview.example/image.jpg",
+                "public_url": "https://public.example/image.jpg",
+            })
         );
     }
 
@@ -3531,6 +3588,7 @@ mod tests {
                 &[TelegraphImageUrlPair {
                     preview_url: "https://preview.example/ipfs/cid-one".to_string(),
                     public_url: "https://public.example/ipfs/cid-one".to_string(),
+                    cid: None,
                 }],
                 Some("https://preview.example/ipfs/"),
                 Some("https://public.example/ipfs/"),
@@ -4829,10 +4887,12 @@ mod tests {
                 TelegraphImageUrlPair {
                     preview_url: "https://preview.example/ipfs/bafyFirst".to_string(),
                     public_url: "https://public.example/ipfs/bafyFirst".to_string(),
+                    cid: Some("bafyFirst".to_string()),
                 },
                 TelegraphImageUrlPair {
                     preview_url: "https://preview.example/ipfs/bafySecond".to_string(),
                     public_url: "https://public.example/ipfs/bafySecond".to_string(),
+                    cid: Some("bafySecond".to_string()),
                 },
             ]
         );
@@ -4854,6 +4914,7 @@ mod tests {
             vec![TelegraphImageUrlPair {
                 preview_url: "https://preview.example/ipfs/bafyNormalImage".to_string(),
                 public_url: "https://public.example/ipfs/bafyNormalImage".to_string(),
+                cid: Some("bafyNormalImage".to_string()),
             }]
         );
 
@@ -5579,10 +5640,12 @@ mod tests {
                 TelegraphImageUrlPair {
                     preview_url: "https://public.example/ipfs/bafyFirst".to_string(),
                     public_url: "https://public.example/ipfs/bafyFirst".to_string(),
+                    cid: Some("bafyFirst".to_string()),
                 },
                 TelegraphImageUrlPair {
                     preview_url: "https://public.example/ipfs/bafySecond".to_string(),
                     public_url: "https://public.example/ipfs/bafySecond".to_string(),
+                    cid: Some("bafySecond".to_string()),
                 },
             ]
         );
@@ -5727,6 +5790,7 @@ mod tests {
             [TelegraphImageUrlPair {
                 preview_url: "https://public.example/ipfs/image-cid".to_string(),
                 public_url: "https://public.example/ipfs/image-cid".to_string(),
+                cid: Some("image-cid".to_string()),
             }]
         );
         let requests = server.received_requests().await.unwrap();
@@ -6877,6 +6941,7 @@ mod tests {
             [TelegraphImageUrlPair {
                 preview_url: format!("https://preview.example/ipfs/{cid}"),
                 public_url: format!("{}/ipfs/{cid}", server.uri()),
+                cid: Some(cid.to_string()),
             }]
         );
         for _ in 0..20 {

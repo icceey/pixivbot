@@ -177,6 +177,8 @@ pub struct EhPendingGallery {
     pub token: String,
     pub title: String,
     pub posted: i64,
+    #[serde(default)]
+    pub fingerprint: Option<String>,
 }
 
 impl EhTagState {
@@ -381,6 +383,7 @@ mod tests {
             token: "tok4".to_string(),
             title: "Fourth".to_string(),
             posted: 400,
+            fingerprint: None,
         });
         state.pending_high_water_ts = 400;
         assert_eq!(state.latest_posted_ts, 0);
@@ -397,6 +400,7 @@ mod tests {
                 token: "tok".to_string(),
                 title: "Title".to_string(),
                 posted: 200,
+                fingerprint: None,
             }],
             pending_high_water_ts: 200,
         };
@@ -404,5 +408,13 @@ mod tests {
         let decoded: EhTagState = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded.pending_galleries[0].gid, 2);
         assert_eq!(decoded.pending_high_water_ts, 200);
+    }
+
+    #[test]
+    fn test_eh_pending_gallery_missing_fingerprint_defaults_to_none() {
+        let pending: EhPendingGallery =
+            serde_json::from_str(r#"{"gid":2,"token":"tok","title":"Title","posted":200}"#)
+                .unwrap();
+        assert_eq!(pending.fingerprint, None);
     }
 }

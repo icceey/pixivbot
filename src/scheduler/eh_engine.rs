@@ -1081,7 +1081,7 @@ impl EhEngine {
                 );
                 continue;
             }
-            if let Err(e) = self
+            let consumed_slot = match self
                 .repo
                 .enqueue_eh_subscription_download(
                     sub.chat_id,
@@ -1091,31 +1091,41 @@ impl EhEngine {
                     &pending.title,
                     telegraph_default,
                     &variant,
+                    pending.fingerprint.as_deref(),
+                    self.config.send_archive,
                 )
                 .await
             {
-                if !self.repo.subscription_exists(sub.id).await? {
+                Ok(Some(_)) => true,
+                Ok(None) => false,
+                Err(e) => {
+                    if !self.repo.subscription_exists(sub.id).await? {
+                        self.repo
+                            .cancel_eh_subscription_queue_entries(sub.id, self.config.send_archive)
+                            .await?;
+                        info!(
+                            "Skipping pending EH gallery {} for removed subscription {}",
+                            pending.gid, sub.id
+                        );
+                        continue;
+                    }
+                    let failed_gid = pending.gid;
+                    still_pending.push(pending);
+                    still_pending.extend(backlog_iter);
+                    state.pending_galleries = still_pending;
+                    state.trim_pushed(self.config.pushed_cap);
                     self.repo
-                        .cancel_eh_subscription_queue_entries(sub.id, self.config.send_archive)
-                        .await?;
-                    info!(
-                        "Skipping pending EH gallery {} for removed subscription {}",
-                        pending.gid, sub.id
-                    );
-                    continue;
+                        .update_subscription_latest_data(
+                            sub.id,
+                            Some(SubscriptionState::EhTag(state)),
+                        )
+                        .await
+                        .context("Failed to persist eh pending backlog after enqueue failure")?;
+                    return Err(e).with_context(|| {
+                        format!("Failed to enqueue pending gallery {}", failed_gid)
+                    });
                 }
-                let failed_gid = pending.gid;
-                still_pending.push(pending);
-                still_pending.extend(backlog_iter);
-                state.pending_galleries = still_pending;
-                state.trim_pushed(self.config.pushed_cap);
-                self.repo
-                    .update_subscription_latest_data(sub.id, Some(SubscriptionState::EhTag(state)))
-                    .await
-                    .context("Failed to persist eh pending backlog after enqueue failure")?;
-                return Err(e)
-                    .with_context(|| format!("Failed to enqueue pending gallery {}", failed_gid));
-            }
+            };
             if !self.repo.subscription_exists(sub.id).await? {
                 self.repo
                     .cancel_eh_subscription_queue_entries(sub.id, self.config.send_archive)
@@ -1127,7 +1137,9 @@ impl EhEngine {
                 continue;
             }
             state.add_pushed_gid(pending.gid);
-            remaining_slots -= 1;
+            if consumed_slot {
+                remaining_slots -= 1;
+            }
         }
 
         state.pending_galleries = still_pending;
@@ -1193,6 +1205,7 @@ impl EhEngine {
                 token: g.token.clone(),
                 title: g.title.clone(),
                 posted: g.posted,
+                fingerprint: Some(g.source_fingerprint()),
             })
             .collect();
 
@@ -1220,7 +1233,7 @@ impl EhEngine {
                 );
                 continue;
             }
-            if let Err(e) = self
+            let consumed_slot = match self
                 .repo
                 .enqueue_eh_subscription_download(
                     sub.chat_id,
@@ -1230,31 +1243,40 @@ impl EhEngine {
                     &gallery.title,
                     telegraph_default,
                     &variant,
+                    gallery.fingerprint.as_deref(),
+                    self.config.send_archive,
                 )
                 .await
             {
-                if !self.repo.subscription_exists(sub.id).await? {
+                Ok(Some(_)) => true,
+                Ok(None) => false,
+                Err(e) => {
+                    if !self.repo.subscription_exists(sub.id).await? {
+                        self.repo
+                            .cancel_eh_subscription_queue_entries(sub.id, self.config.send_archive)
+                            .await?;
+                        info!(
+                            "Skipping EH gallery {} for removed subscription {}",
+                            gallery.gid, sub.id
+                        );
+                        continue;
+                    }
+                    let failed_gid = gallery.gid;
+                    state.pending_galleries.push(gallery);
+                    state.pending_galleries.extend(eligible_iter);
+                    state.trim_pushed(self.config.pushed_cap);
                     self.repo
-                        .cancel_eh_subscription_queue_entries(sub.id, self.config.send_archive)
-                        .await?;
-                    info!(
-                        "Skipping EH gallery {} for removed subscription {}",
-                        gallery.gid, sub.id
-                    );
-                    continue;
+                        .update_subscription_latest_data(
+                            sub.id,
+                            Some(SubscriptionState::EhTag(state)),
+                        )
+                        .await
+                        .context("Failed to persist eh collect state after enqueue failure")?;
+                    return Err(e).with_context(|| {
+                        format!("Failed to enqueue download for gallery {}", failed_gid)
+                    });
                 }
-                let failed_gid = gallery.gid;
-                state.pending_galleries.push(gallery);
-                state.pending_galleries.extend(eligible_iter);
-                state.trim_pushed(self.config.pushed_cap);
-                self.repo
-                    .update_subscription_latest_data(sub.id, Some(SubscriptionState::EhTag(state)))
-                    .await
-                    .context("Failed to persist eh collect state after enqueue failure")?;
-                return Err(e).with_context(|| {
-                    format!("Failed to enqueue download for gallery {}", failed_gid)
-                });
-            }
+            };
             if !self.repo.subscription_exists(sub.id).await? {
                 self.repo
                     .cancel_eh_subscription_queue_entries(sub.id, self.config.send_archive)
@@ -1267,7 +1289,9 @@ impl EhEngine {
             }
             state.add_pushed_gid(gallery.gid);
             max_enqueued_posted = max_enqueued_posted.max(gallery.posted);
-            remaining_slots -= 1;
+            if consumed_slot {
+                remaining_slots -= 1;
+            }
         }
 
         // Step 3: If no overflow, safely advance cursor past the entire batch.
@@ -1748,6 +1772,41 @@ fn collect_uploadable_zip_entry_names(zip_path: &std::path::Path) -> Result<Vec<
     Ok(names)
 }
 
+#[derive(serde::Serialize)]
+struct EhGalleryMediaCid<'a> {
+    name: &'a str,
+    cid: &'a str,
+}
+
+fn serialize_eh_gallery_media_cids(
+    entry_names: &[String],
+    url_pairs: &[TelegraphImageUrlPair],
+) -> Result<Option<String>> {
+    if entry_names.len() != url_pairs.len() {
+        anyhow::bail!(
+            "Cannot serialize EH gallery media CIDs: {} entry names for {} URL pairs",
+            entry_names.len(),
+            url_pairs.len()
+        );
+    }
+    let Some(media_cids) = entry_names
+        .iter()
+        .zip(url_pairs)
+        .map(|(name, pair)| {
+            pair.cid.as_deref().map(|cid| EhGalleryMediaCid {
+                name: name.as_str(),
+                cid,
+            })
+        })
+        .collect::<Option<Vec<_>>>()
+    else {
+        return Ok(None);
+    };
+    serde_json::to_string(&media_cids)
+        .map(Some)
+        .context("Failed to serialize ordered EH gallery media CIDs")
+}
+
 impl EhUploadWorker {
     #[cfg(test)]
     pub fn new(
@@ -1995,7 +2054,9 @@ impl EhUploadWorker {
                         entry_names.len()
                     );
                 }
-                self.create_telegraph_page_for_job(job, &url_pairs).await?;
+                let media_cids = serialize_eh_gallery_media_cids(&entry_names, &url_pairs)?;
+                self.create_telegraph_page_for_job(job, &url_pairs, media_cids.as_deref())
+                    .await?;
                 return Ok(());
             }
         }
@@ -2048,6 +2109,7 @@ impl EhUploadWorker {
         });
 
         let mut all_url_pairs: Vec<TelegraphImageUrlPair> = Vec::new();
+        let mut uploaded_entry_names = Vec::new();
         while let Some(image) = image_rx.recv().await {
             let logical_object_id = format!("image-{}", image.uploadable_order);
             let manifest_path = artifacts
@@ -2066,7 +2128,15 @@ impl EhUploadWorker {
                 .upload_images_with_url_pairs(&[input])
                 .await
                 .context("Failed to upload images for Telegraph page")?;
-            all_url_pairs.extend(urls);
+            if urls.len() != 1 {
+                anyhow::bail!(
+                    "Image uploader returned {} URL pairs for one image entry {}",
+                    urls.len(),
+                    image.filename
+                );
+            }
+            uploaded_entry_names.push(image.filename);
+            all_url_pairs.push(urls.into_iter().next().expect("checked URL pair count"));
         }
 
         reader.await.context("spawn_blocking failed")??;
@@ -2075,7 +2145,8 @@ impl EhUploadWorker {
             anyhow::bail!("No images uploaded by configured image uploader");
         }
 
-        self.create_telegraph_page_for_job(job, &all_url_pairs)
+        let media_cids = serialize_eh_gallery_media_cids(&uploaded_entry_names, &all_url_pairs)?;
+        self.create_telegraph_page_for_job(job, &all_url_pairs, media_cids.as_deref())
             .await?;
 
         Ok(())
@@ -2091,6 +2162,7 @@ impl EhUploadWorker {
         &self,
         job: &eh_gallery_jobs::Model,
         all_url_pairs: &[TelegraphImageUrlPair],
+        media_cids: Option<&str>,
     ) -> Result<()> {
         let title = if job.title.is_empty() {
             "Gallery"
@@ -2132,6 +2204,7 @@ impl EhUploadWorker {
                     .context("Claimed shared EH upload is missing started_at")?,
                 &page_url,
                 rewrite_data_json.as_deref(),
+                media_cids,
                 self.config.send_archive,
             )
             .await?;
@@ -2731,7 +2804,8 @@ mod tests {
     use crate::config::EhentaiConfig;
     use crate::db::entities::tasks;
     use crate::db::entities::{
-        eh_download_completions, eh_download_queue, eh_gallery_jobs, eh_gp_spend_attempts,
+        eh_download_completions, eh_download_queue, eh_gallery_jobs, eh_gallery_push_ledger,
+        eh_gallery_results, eh_gp_spend_attempts,
     };
     use crate::db::repo::eh_download_queue::{
         BACKGROUND_STATUS_PENDING, SOURCE_DIRECT, SOURCE_SUBSCRIPTION, STATUS_CANCELED,
@@ -2956,9 +3030,12 @@ mod tests {
                 false,
                 SOURCE_DIRECT,
                 &variant,
+                None,
+                true,
             )
             .await
-            .unwrap();
+            .unwrap()
+            .expect("delivery should be enqueued");
         let downloaded = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
         repo.mark_eh_job_downloaded(
             downloaded.id,
@@ -2992,9 +3069,12 @@ mod tests {
                 false,
                 SOURCE_DIRECT,
                 &variant,
+                None,
+                true,
             )
             .await
-            .unwrap();
+            .unwrap()
+            .expect("delivery should be enqueued");
         assert_eq!(rebound.job_id, Some(downloaded.id));
         let failing_uploader = TerminalCleanupMockUploader {
             fail_abort: true,
@@ -3073,9 +3153,12 @@ mod tests {
                 false,
                 SOURCE_DIRECT,
                 &EhGalleryVariant::archive("1280x"),
+                None,
+                true,
             )
             .await
-            .unwrap();
+            .unwrap()
+            .expect("delivery should be enqueued");
         let dirty_claim = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
         repo.mark_eh_job_downloaded(
             dirty_claim.id,
@@ -3108,9 +3191,12 @@ mod tests {
                 false,
                 SOURCE_DIRECT,
                 &EhGalleryVariant::archive("1280x"),
+                None,
+                true,
             )
             .await
-            .unwrap();
+            .unwrap()
+            .expect("delivery should be enqueued");
         mock_eh_gallery_page(&eh_server, 884, "abcd000001").await;
         let first_download_url = format!("{}/archive/884/token/0", eh_server.uri());
         mock_eh_archiver_post(&eh_server, &first_download_url).await;
@@ -3153,9 +3239,12 @@ mod tests {
                 false,
                 SOURCE_DIRECT,
                 &EhGalleryVariant::archive("1280x"),
+                None,
+                true,
             )
             .await
-            .unwrap();
+            .unwrap()
+            .expect("delivery should be enqueued");
         mock_eh_gallery_page(&eh_server, 885, "abcd000002").await;
         let second_download_url = format!("{}/archive/885/token/0", eh_server.uri());
         mock_eh_archiver_post(&eh_server, &second_download_url).await;
@@ -3229,9 +3318,12 @@ mod tests {
                 "Stale upload",
                 true,
                 &variant,
+                None,
+                true,
             )
             .await
-            .unwrap();
+            .unwrap()
+            .expect("delivery should be enqueued");
         let download = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
         repo.mark_eh_job_downloaded(
             download.id,
@@ -3287,9 +3379,12 @@ mod tests {
                 true,
                 SOURCE_DIRECT,
                 &variant,
+                None,
+                true,
             )
             .await
-            .unwrap();
+            .unwrap()
+            .expect("delivery should be enqueued");
         assert_eq!(rebound.job_id, Some(upload.id));
         assert!(repo.get_next_eh_job_for_download().await.unwrap().is_none());
         assert!(repo
@@ -3363,9 +3458,12 @@ mod tests {
                 false,
                 SOURCE_DIRECT,
                 &variant,
+                None,
+                true,
             )
             .await
-            .unwrap();
+            .unwrap()
+            .expect("delivery should be enqueued");
         let claimed = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
         let zip_path = archive_artifacts_for_job(temp_dir.path(), &claimed)
             .final_zip()
@@ -3431,9 +3529,12 @@ mod tests {
                 false,
                 SOURCE_DIRECT,
                 &variant,
+                None,
+                true,
             )
             .await
-            .unwrap();
+            .unwrap()
+            .expect("delivery should be enqueued");
         assert_eq!(rebound.job_id, Some(claimed.id));
         assert!(repo.get_next_eh_job_for_download().await.unwrap().is_none());
 
@@ -3472,9 +3573,12 @@ mod tests {
                 false,
                 SOURCE_DIRECT,
                 &variant,
+                None,
+                true,
             )
             .await
-            .unwrap();
+            .unwrap()
+            .expect("delivery should be enqueued");
         let normal_claim = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
         repo.schedule_eh_job_background_download(
             normal_claim.id,
@@ -3556,9 +3660,12 @@ mod tests {
                 false,
                 SOURCE_DIRECT,
                 &variant,
+                None,
+                true,
             )
             .await
-            .unwrap();
+            .unwrap()
+            .expect("delivery should be enqueued");
         assert_eq!(rebound.job_id, Some(claimed.id));
         assert!(repo
             .get_next_eh_job_for_background_download()
@@ -4216,9 +4323,12 @@ mod tests {
                     "Shared Gallery",
                     true,
                     &variant,
+                    None,
+                    true,
                 )
                 .await
                 .unwrap()
+                .expect("delivery should be enqueued")
             } else {
                 repo.enqueue_eh_download(
                     *chat_id,
@@ -4228,9 +4338,12 @@ mod tests {
                     true,
                     SOURCE_DIRECT,
                     &variant,
+                    None,
+                    true,
                 )
                 .await
                 .unwrap()
+                .expect("delivery should be enqueued")
             };
             seeded.push(delivery);
         }
@@ -4697,6 +4810,7 @@ mod tests {
                     token: "eeeeeeeeee".to_string(),
                     title: "Pending Gallery".to_string(),
                     posted: 500,
+                    fingerprint: None,
                 }],
                 pending_high_water_ts: 500,
             })),
@@ -4730,6 +4844,285 @@ mod tests {
         let state = eh_tag_subscription_state(&sub).unwrap();
         assert!(state.pending_galleries.is_empty());
         assert_eq!(state.latest_posted_ts, 500);
+        assert_eq!(state.pending_high_water_ts, 0);
+    }
+
+    #[tokio::test]
+    async fn collect_fully_ledgered_gallery_advances_pushed_gids() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        setup_chat(&repo, -100, true).await;
+        let task = repo
+            .get_or_create_task(
+                crate::db::types::TaskType::Ehentai,
+                "eh:artist:ledgered".to_string(),
+                None,
+            )
+            .await
+            .unwrap();
+        repo.upsert_eh_subscription(-100, task.id, crate::db::types::TagFilter::default(), None)
+            .await
+            .unwrap();
+        let sub = repo
+            .list_subscriptions_by_task(task.id)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let sent_at = Local::now().naive_local();
+        eh_gallery_push_ledger::ActiveModel {
+            chat_id: Set(-100),
+            gid: Set(2100),
+            archive_sent_at: Set(Some(sent_at)),
+            telegraph_sent_at: Set(Some(sent_at)),
+            updated_at: Set(sent_at),
+            ..Default::default()
+        }
+        .insert(repo.db())
+        .await
+        .unwrap();
+        let server = MockServer::start().await;
+        let engine = EhEngine::new(
+            Arc::clone(&repo),
+            make_eh_client(&server),
+            Arc::new(make_config()),
+            true,
+            60,
+        );
+        let gallery = EhGallery {
+            gid: 2100,
+            token: "ledgered-token".to_string(),
+            title: "Ledgered Gallery".to_string(),
+            title_jpn: None,
+            category: "Doujinshi".to_string(),
+            thumb: "https://ehgt.org/t/2100.jpg".to_string(),
+            uploader: "tester".to_string(),
+            posted: 2100,
+            filecount: 10,
+            filesize: 1000,
+            expunged: false,
+            rating: 4.0,
+            tags: vec!["artist:ledgered".to_string()],
+        };
+
+        engine
+            .process_eh_sub_with_slots(&sub, &[gallery], 1)
+            .await
+            .unwrap();
+
+        assert_eq!(repo.count_pending_eh_downloads().await.unwrap(), 0);
+        let updated_sub = repo
+            .list_subscriptions_by_task(task.id)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let state = eh_tag_subscription_state(&updated_sub).unwrap();
+        assert_eq!(state.pushed_gids, vec![2100]);
+        assert_eq!(state.latest_posted_ts, 2100);
+        assert!(state.pending_galleries.is_empty());
+        assert_eq!(state.pending_high_water_ts, 0);
+    }
+
+    #[tokio::test]
+    async fn collect_ledgered_gallery_does_not_consume_enqueue_slot() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        setup_chat(&repo, -100, true).await;
+        let task = repo
+            .get_or_create_task(
+                crate::db::types::TaskType::Ehentai,
+                "eh:artist:ledgered-slot".to_string(),
+                None,
+            )
+            .await
+            .unwrap();
+        repo.upsert_eh_subscription(-100, task.id, crate::db::types::TagFilter::default(), None)
+            .await
+            .unwrap();
+        let sub = repo
+            .list_subscriptions_by_task(task.id)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let sent_at = Local::now().naive_local();
+        eh_gallery_push_ledger::ActiveModel {
+            chat_id: Set(-100),
+            gid: Set(2201),
+            archive_sent_at: Set(Some(sent_at)),
+            telegraph_sent_at: Set(Some(sent_at)),
+            updated_at: Set(sent_at),
+            ..Default::default()
+        }
+        .insert(repo.db())
+        .await
+        .unwrap();
+        let server = MockServer::start().await;
+        let engine = EhEngine::new(
+            Arc::clone(&repo),
+            make_eh_client(&server),
+            Arc::new(make_config()),
+            true,
+            60,
+        );
+        let galleries = [
+            EhGallery {
+                gid: 2201,
+                token: "ledgered-token".to_string(),
+                title: "Ledgered Gallery".to_string(),
+                title_jpn: None,
+                category: "Doujinshi".to_string(),
+                thumb: "https://ehgt.org/t/2201.jpg".to_string(),
+                uploader: "tester".to_string(),
+                posted: 2201,
+                filecount: 10,
+                filesize: 1000,
+                expunged: false,
+                rating: 4.0,
+                tags: vec!["artist:ledgered-slot".to_string()],
+            },
+            EhGallery {
+                gid: 2202,
+                token: "unsent-token".to_string(),
+                title: "Unsent Gallery".to_string(),
+                title_jpn: None,
+                category: "Doujinshi".to_string(),
+                thumb: "https://ehgt.org/t/2202.jpg".to_string(),
+                uploader: "tester".to_string(),
+                posted: 2202,
+                filecount: 10,
+                filesize: 1000,
+                expunged: false,
+                rating: 4.0,
+                tags: vec!["artist:ledgered-slot".to_string()],
+            },
+        ];
+
+        engine
+            .process_eh_sub_with_slots(&sub, &galleries, 1)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            eh_download_queue::Entity::find()
+                .filter(eh_download_queue::Column::ChatId.eq(-100))
+                .filter(eh_download_queue::Column::Gid.eq(2201))
+                .count(repo.db())
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            eh_download_queue::Entity::find()
+                .filter(eh_download_queue::Column::ChatId.eq(-100))
+                .filter(eh_download_queue::Column::Gid.eq(2202))
+                .count(repo.db())
+                .await
+                .unwrap(),
+            1
+        );
+        let updated_sub = repo
+            .list_subscriptions_by_task(task.id)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let state = eh_tag_subscription_state(&updated_sub).unwrap();
+        assert_eq!(state.pushed_gids, vec![2201, 2202]);
+        assert_eq!(state.latest_posted_ts, 2202);
+        assert!(state.pending_galleries.is_empty());
+        assert_eq!(state.pending_high_water_ts, 0);
+    }
+
+    #[tokio::test]
+    async fn backlog_ledgered_gallery_does_not_consume_enqueue_slot() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        setup_chat(&repo, -100, true).await;
+        let task = repo
+            .get_or_create_task(
+                crate::db::types::TaskType::Ehentai,
+                "eh:artist:ledgered-backlog-slot".to_string(),
+                None,
+            )
+            .await
+            .unwrap();
+        repo.upsert_eh_subscription(-100, task.id, crate::db::types::TagFilter::default(), None)
+            .await
+            .unwrap();
+        let sub = repo
+            .list_subscriptions_by_task(task.id)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let sent_at = Local::now().naive_local();
+        eh_gallery_push_ledger::ActiveModel {
+            chat_id: Set(-100),
+            gid: Set(2301),
+            archive_sent_at: Set(Some(sent_at)),
+            telegraph_sent_at: Set(Some(sent_at)),
+            updated_at: Set(sent_at),
+            ..Default::default()
+        }
+        .insert(repo.db())
+        .await
+        .unwrap();
+        let server = MockServer::start().await;
+        let engine = EhEngine::new(
+            Arc::clone(&repo),
+            make_eh_client(&server),
+            Arc::new(make_config()),
+            true,
+            60,
+        );
+        let state = EhTagState {
+            pushed_gids: Vec::new(),
+            latest_posted_ts: 0,
+            pending_galleries: vec![
+                EhPendingGallery {
+                    gid: 2301,
+                    token: "ledgered-backlog-token".to_string(),
+                    title: "Ledgered Backlog Gallery".to_string(),
+                    posted: 2301,
+                    fingerprint: Some("2301|10|1000|false".to_string()),
+                },
+                EhPendingGallery {
+                    gid: 2302,
+                    token: "unsent-backlog-token".to_string(),
+                    title: "Unsent Backlog Gallery".to_string(),
+                    posted: 2302,
+                    fingerprint: Some("2302|10|1000|false".to_string()),
+                },
+            ],
+            pending_high_water_ts: 2302,
+        };
+
+        let (_, state, remaining_slots) = engine
+            .drain_pending_backlog(&sub, state, 1, true)
+            .await
+            .unwrap();
+
+        assert_eq!(remaining_slots, 0);
+        assert_eq!(
+            eh_download_queue::Entity::find()
+                .filter(eh_download_queue::Column::ChatId.eq(-100))
+                .filter(eh_download_queue::Column::Gid.eq(2301))
+                .count(repo.db())
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            eh_download_queue::Entity::find()
+                .filter(eh_download_queue::Column::ChatId.eq(-100))
+                .filter(eh_download_queue::Column::Gid.eq(2302))
+                .count(repo.db())
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(state.pushed_gids, vec![2301, 2302]);
+        assert_eq!(state.latest_posted_ts, 2302);
+        assert!(state.pending_galleries.is_empty());
         assert_eq!(state.pending_high_water_ts, 0);
     }
 
@@ -4774,6 +5167,7 @@ mod tests {
                     token: "ffffffffff".to_string(),
                     title: "Pending Before Failure".to_string(),
                     posted: 600,
+                    fingerprint: None,
                 }],
                 pending_high_water_ts: 600,
             })),
@@ -5095,9 +5489,12 @@ mod tests {
                 false,
                 SOURCE_DIRECT,
                 &variant,
+                None,
+                true,
             )
             .await
-            .unwrap();
+            .unwrap()
+            .expect("delivery should be enqueued");
         let second = repo
             .enqueue_eh_download(
                 -200,
@@ -5107,9 +5504,12 @@ mod tests {
                 false,
                 SOURCE_DIRECT,
                 &variant,
+                None,
+                true,
             )
             .await
-            .unwrap();
+            .unwrap()
+            .expect("delivery should be enqueued");
         assert_eq!(first.job_id, second.job_id);
 
         mock_eh_archiver_page_with_cost(&eh_server, 123456, "abcdef0123", "218 GP", "218 GP").await;
@@ -6199,6 +6599,7 @@ mod tests {
         seen_zip_resume_contexts: std::sync::Mutex<Vec<SeenResumeContext>>,
         seen_image_resume_contexts: std::sync::Mutex<Vec<SeenResumeContext>>,
         zip_fallback: bool,
+        emit_image_cids: bool,
         fail_image_call: Option<usize>,
     }
 
@@ -6233,6 +6634,24 @@ mod tests {
                 .collect())
         }
 
+        async fn upload_images_with_url_pairs(
+            &self,
+            images: &[ImageUploadInput<'_>],
+        ) -> eh_client::Result<Vec<TelegraphImageUrlPair>> {
+            let urls = self.upload_images(images).await?;
+            Ok(urls
+                .into_iter()
+                .enumerate()
+                .map(|(index, url)| TelegraphImageUrlPair {
+                    preview_url: url.clone(),
+                    public_url: url,
+                    cid: self
+                        .emit_image_cids
+                        .then(|| format!("bafy-image-{}", images[index].filename)),
+                })
+                .collect())
+        }
+
         async fn upload_zip_archive_with_url_pairs(
             &self,
             archive: ZipArchiveUploadInput<'_>,
@@ -6256,6 +6675,7 @@ mod tests {
                     .map(|name| TelegraphImageUrlPair {
                         preview_url: format!("https://preview.example/ipfs/root/{name}"),
                         public_url: format!("https://public.example/ipfs/root/{name}"),
+                        cid: Some(format!("bafy-zip-{name}")),
                     })
                     .collect(),
             ))
@@ -7250,6 +7670,202 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn successful_upload_persists_result_record_for_ipfs3() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        setup_chat(&repo, -100, true).await;
+        let tg_server = MockServer::start().await;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let zip_path = temp_dir.path().join("ipfs3.zip");
+        create_test_zip_with_names(&zip_path, &["001.jpg", "nested/002.png"]);
+        let zip_path_str = zip_path.to_string_lossy().to_string();
+        let entry = insert_queue_entry(
+            &repo,
+            -100,
+            970,
+            "ipfs3-token",
+            "IPFS3 Gallery",
+            true,
+            STATUS_DOWNLOADED,
+            Some(&zip_path_str),
+            None,
+        )
+        .await;
+        let job = job_for_delivery(&repo, &entry).await;
+        eh_gallery_jobs::Entity::update_many()
+            .col_expr(
+                eh_gallery_jobs::Column::SourceFingerprint,
+                Expr::value(Some("fingerprint-ipfs3".to_string())),
+            )
+            .filter(eh_gallery_jobs::Column::Id.eq(job.id))
+            .exec(repo.db())
+            .await
+            .unwrap();
+        mock_telegraph_create_page(&tg_server).await;
+
+        let worker = EhUploadWorker::new(
+            Arc::clone(&repo),
+            make_notifier(&tg_server),
+            make_telegraph_client(&tg_server),
+            Arc::new(ZipFirstMockUploader::default()),
+            Some(IpfS3PreviewRewriteConfig {
+                preview_gateway_url: "https://preview.example".to_string(),
+                public_gateway_url: "https://public.example".to_string(),
+                delay_sec: 60,
+            }),
+            Arc::new(make_config()),
+        );
+
+        worker.tick().await.unwrap();
+
+        let ready = job_for_delivery(&repo, &entry).await;
+        assert_eq!(
+            ready.telegraph_status,
+            crate::db::repo::eh_gallery_jobs::TELEGRAPH_STATUS_READY
+        );
+        let result = eh_gallery_results::Entity::find()
+            .filter(eh_gallery_results::Column::Gid.eq(970_i64))
+            .filter(eh_gallery_results::Column::Token.eq("ipfs3-token"))
+            .one(repo.db())
+            .await
+            .unwrap()
+            .expect("IPFS3 upload should persist a reusable result");
+        assert_eq!(result.source_fingerprint, "fingerprint-ipfs3");
+        assert_eq!(result.telegraph_url, ready.telegraph_url.unwrap());
+        assert_eq!(result.telegraph_rewrite_data, ready.telegraph_rewrite_data);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(result.media_cids.as_deref().unwrap())
+                .unwrap(),
+            serde_json::json!([
+                {"name": "001.jpg", "cid": "bafy-zip-001.jpg"},
+                {"name": "nested/002.png", "cid": "bafy-zip-nested/002.png"},
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn per_image_upload_persists_cids_in_filename_order() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        setup_chat(&repo, -100, true).await;
+        let tg_server = MockServer::start().await;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let zip_path = temp_dir.path().join("per-image-ipfs3.zip");
+        create_test_zip_with_names(&zip_path, &["001.jpg", "002.png"]);
+        let zip_path_str = zip_path.to_string_lossy().to_string();
+        let entry = insert_queue_entry(
+            &repo,
+            -100,
+            971,
+            "per-image-token",
+            "Per Image IPFS3 Gallery",
+            true,
+            STATUS_DOWNLOADED,
+            Some(&zip_path_str),
+            None,
+        )
+        .await;
+        let job = job_for_delivery(&repo, &entry).await;
+        eh_gallery_jobs::Entity::update_many()
+            .col_expr(
+                eh_gallery_jobs::Column::SourceFingerprint,
+                Expr::value(Some("fingerprint-per-image".to_string())),
+            )
+            .filter(eh_gallery_jobs::Column::Id.eq(job.id))
+            .exec(repo.db())
+            .await
+            .unwrap();
+        mock_telegraph_create_page(&tg_server).await;
+        let uploader = Arc::new(ZipFirstMockUploader {
+            zip_fallback: true,
+            emit_image_cids: true,
+            ..Default::default()
+        });
+        let worker = EhUploadWorker::new(
+            Arc::clone(&repo),
+            make_notifier(&tg_server),
+            make_telegraph_client(&tg_server),
+            uploader,
+            None,
+            Arc::new(make_config()),
+        );
+
+        worker.tick().await.unwrap();
+
+        let result = eh_gallery_results::Entity::find()
+            .filter(eh_gallery_results::Column::Gid.eq(971_i64))
+            .filter(eh_gallery_results::Column::Token.eq("per-image-token"))
+            .one(repo.db())
+            .await
+            .unwrap()
+            .expect("per-image IPFS3 upload should persist a reusable result");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(result.media_cids.as_deref().unwrap())
+                .unwrap(),
+            serde_json::json!([
+                {"name": "001.jpg", "cid": "bafy-image-001.jpg"},
+                {"name": "002.png", "cid": "bafy-image-002.png"},
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn non_ipfs3_upload_writes_no_result_record() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        setup_chat(&repo, -100, true).await;
+        let tg_server = MockServer::start().await;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let zip_path = temp_dir.path().join("pixi.zip");
+        create_test_zip(&zip_path, 2);
+        let zip_path_str = zip_path.to_string_lossy().to_string();
+        let entry = insert_queue_entry(
+            &repo,
+            -100,
+            972,
+            "pixi-token",
+            "Pixi Gallery",
+            true,
+            STATUS_DOWNLOADED,
+            Some(&zip_path_str),
+            None,
+        )
+        .await;
+        let job = job_for_delivery(&repo, &entry).await;
+        eh_gallery_jobs::Entity::update_many()
+            .col_expr(
+                eh_gallery_jobs::Column::SourceFingerprint,
+                Expr::value(Some("fingerprint-pixi".to_string())),
+            )
+            .filter(eh_gallery_jobs::Column::Id.eq(job.id))
+            .exec(repo.db())
+            .await
+            .unwrap();
+        mock_telegraph_upload(&tg_server, 2).await;
+        mock_telegraph_create_page(&tg_server).await;
+        let worker = EhUploadWorker::new(
+            Arc::clone(&repo),
+            make_notifier(&tg_server),
+            make_telegraph_client(&tg_server),
+            make_image_uploader(&tg_server),
+            None,
+            Arc::new(make_config()),
+        );
+
+        worker.tick().await.unwrap();
+
+        let ready = job_for_delivery(&repo, &entry).await;
+        assert_eq!(
+            ready.telegraph_status,
+            crate::db::repo::eh_gallery_jobs::TELEGRAPH_STATUS_READY
+        );
+        assert!(eh_gallery_results::Entity::find()
+            .filter(eh_gallery_results::Column::Gid.eq(972_i64))
+            .filter(eh_gallery_results::Column::Token.eq("pixi-token"))
+            .one(repo.db())
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
     async fn test_upload_worker_falls_back_to_per_image_when_zip_uploader_returns_none() {
         let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
         setup_chat(&repo, -100, true).await;
@@ -7483,6 +8099,8 @@ mod tests {
                             false,
                             SOURCE_DIRECT,
                             &EhGalleryVariant::archive("original"),
+                            None,
+                            true,
                         )
                         .await
                 })
@@ -7518,7 +8136,11 @@ mod tests {
 
         release_done.notify_one();
         publish.await.unwrap().unwrap();
-        let new_wave = enqueue.await.unwrap().unwrap();
+        let new_wave = enqueue
+            .await
+            .unwrap()
+            .expect("enqueue task should succeed")
+            .expect("delivery should be enqueued");
         assert!(enqueue_acquired.load(std::sync::atomic::Ordering::SeqCst));
         assert_eq!(
             new_wave.status,
@@ -7579,9 +8201,12 @@ mod tests {
                 false,
                 SOURCE_DIRECT,
                 &EhGalleryVariant::archive("original"),
+                None,
+                true,
             )
             .await
-            .unwrap();
+            .unwrap()
+            .expect("delivery should be enqueued");
         let requested_job = job_for_delivery(&repo, &rebound).await;
         assert_eq!(
             rebound.status,
@@ -8363,6 +8988,19 @@ mod tests {
         assert_eq!(fallback_claim.delivery.id, entry.id);
         assert!(!fallback_claim.delivery.telegraph);
         assert!(uploader.cleanup_calls.lock().unwrap().is_empty());
+
+        repo.mark_eh_archive_delivery_sent(fallback_claim.delivery.id)
+            .await
+            .unwrap();
+        let ledger = eh_gallery_push_ledger::Entity::find()
+            .filter(eh_gallery_push_ledger::Column::ChatId.eq(entry.chat_id))
+            .filter(eh_gallery_push_ledger::Column::Gid.eq(entry.gid))
+            .one(repo.db())
+            .await
+            .unwrap()
+            .expect("archive fallback's standard publish marker must write the push ledger");
+        assert!(ledger.archive_sent_at.is_some());
+        assert!(ledger.telegraph_sent_at.is_none());
     }
 
     #[tokio::test]
@@ -8967,9 +9605,12 @@ mod tests {
                 true,
                 SOURCE_DIRECT,
                 &EhGalleryVariant::archive("1280x"),
+                None,
+                true,
             )
             .await
-            .unwrap();
+            .unwrap()
+            .expect("delivery should be enqueued");
         let old_download = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
         assert_eq!(old_download.id, initial.job_id.unwrap());
         repo.mark_eh_job_downloaded(
@@ -8986,6 +9627,7 @@ mod tests {
             old_upload.id,
             old_upload.started_at.unwrap(),
             "https://telegra.ph/old-1280",
+            None,
             None,
             true,
         )
@@ -9033,9 +9675,12 @@ mod tests {
                 true,
                 SOURCE_DIRECT,
                 &EhGalleryVariant::archive("1280x"),
+                None,
+                true,
             )
             .await
-            .unwrap();
+            .unwrap()
+            .expect("delivery should be enqueued");
         assert_eq!(same_job.job_id, initial.job_id);
         assert_eq!(same_job.status, partial.status);
         assert_eq!(same_job.archive_sent_at, partial.archive_sent_at);
@@ -9051,9 +9696,12 @@ mod tests {
                 "Subscription original request",
                 true,
                 &EhGalleryVariant::archive("original"),
+                None,
+                true,
             )
             .await
-            .unwrap();
+            .unwrap()
+            .expect("delivery should be enqueued");
         assert_eq!(subscription_merge.job_id, initial.job_id);
         assert_eq!(subscription_merge.archive_sent_at, partial.archive_sent_at);
         assert_eq!(
@@ -9070,9 +9718,12 @@ mod tests {
                 false,
                 SOURCE_DIRECT,
                 &EhGalleryVariant::archive("original"),
+                None,
+                true,
             )
             .await
-            .unwrap();
+            .unwrap()
+            .expect("delivery should be enqueued");
         assert_eq!(forced.id, initial.id);
         assert_eq!(
             forced.status,
@@ -9522,9 +10173,12 @@ mod tests {
                 false,
                 SOURCE_DIRECT,
                 &variant,
+                None,
+                true,
             )
             .await
-            .unwrap();
+            .unwrap()
+            .expect("delivery should be enqueued");
         repo.enqueue_eh_download(
             -200,
             905,
@@ -9533,9 +10187,12 @@ mod tests {
             true,
             SOURCE_DIRECT,
             &variant,
+            None,
+            true,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .expect("delivery should be enqueued");
         let download = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
         let downloaded_generation = download.started_at.unwrap();
         repo.mark_eh_job_downloaded(
@@ -9571,9 +10228,12 @@ mod tests {
                 true,
                 SOURCE_DIRECT,
                 &variant,
+                None,
+                true,
             )
             .await
-            .unwrap();
+            .unwrap()
+            .expect("delivery should be enqueued");
         assert_eq!(late.job_id, Some(download.id));
         let after_late_demand = job_for_delivery(&repo, &late).await;
         assert_eq!(
@@ -9731,9 +10391,12 @@ mod tests {
                 false,
                 SOURCE_DIRECT,
                 &EhGalleryVariant::archive("1280x"),
+                None,
+                true,
             )
             .await
-            .unwrap();
+            .unwrap()
+            .expect("delivery should be enqueued");
         let claim = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
         repo.mark_eh_job_downloaded(
             claim.id,
@@ -10938,9 +11601,12 @@ mod tests {
                 false,
                 SOURCE_DIRECT,
                 &variant,
+                None,
+                true,
             )
             .await
-            .unwrap();
+            .unwrap()
+            .expect("delivery should be enqueued");
         let second = repo
             .enqueue_eh_download(
                 -200,
@@ -10950,9 +11616,12 @@ mod tests {
                 false,
                 SOURCE_DIRECT,
                 &variant,
+                None,
+                true,
             )
             .await
-            .unwrap();
+            .unwrap()
+            .expect("delivery should be enqueued");
         assert_eq!(first.job_id, second.job_id);
         handoff_job_to_background(&repo, &first).await;
 
@@ -11366,5 +12035,891 @@ mod tests {
         assert!(updated.next_retry_at.is_none());
         assert_eq!(updated.retry_count, 0);
         assert!(gp_attempts(repo.as_ref()).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn chat_b_reuses_retired_gallery_result_without_source_work() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        let eh_server = MockServer::start().await;
+        let telegram_server = MockServer::start().await;
+        let temp = tempfile::tempdir().unwrap();
+        let variant = EhGalleryVariant::archive("1280x");
+        let gid = 9_801;
+        let token = "abcd980001";
+        let fingerprint = "9801|2|100|false";
+        setup_chat(&repo, -100, true).await;
+        setup_chat(&repo, -200, true).await;
+
+        let chat_a = repo
+            .enqueue_eh_download(
+                -100,
+                gid,
+                token,
+                "Reusable Gallery",
+                true,
+                SOURCE_DIRECT,
+                &variant,
+                Some(fingerprint),
+                true,
+            )
+            .await
+            .unwrap()
+            .expect("chat A must start the initial subscription wave");
+        let source_zip = temp.path().join("initial-source.zip");
+        create_test_zip(&source_zip, 2);
+        let download_url = format!("{}/archive/{gid}/0", eh_server.uri());
+        mock_eh_gallery_page(&eh_server, gid as u64, token).await;
+        mock_eh_archiver_post(&eh_server, &download_url).await;
+        mock_eh_archive_download(
+            &eh_server,
+            &format!("/archive/{gid}/0"),
+            std::fs::read(&source_zip).unwrap(),
+        )
+        .await;
+
+        let archive_config = Arc::new(make_config());
+        EhDownloadWorker::new(
+            Arc::clone(&repo),
+            make_eh_client(&eh_server),
+            Arc::clone(&archive_config),
+            temp.path().to_path_buf(),
+            None,
+        )
+        .tick()
+        .await
+        .unwrap();
+        let downloaded_a = job_for_delivery(&repo, &chat_a).await;
+        assert_eq!(
+            downloaded_a.status, JOB_STATUS_DOWNLOADED,
+            "{downloaded_a:#?}"
+        );
+        assert!(downloaded_a.telegraph_required, "{downloaded_a:#?}");
+        assert_eq!(
+            downloaded_a.telegraph_status,
+            crate::db::repo::eh_gallery_jobs::TELEGRAPH_STATUS_PENDING,
+            "{downloaded_a:#?}"
+        );
+        let uploader = Arc::new(ZipFirstMockUploader::default());
+        mock_telegraph_create_page(&telegram_server).await;
+        EhUploadWorker::new(
+            Arc::clone(&repo),
+            make_notifier(&telegram_server),
+            make_telegraph_client(&telegram_server),
+            uploader.clone(),
+            Some(IpfS3PreviewRewriteConfig {
+                preview_gateway_url: "https://preview.example".to_string(),
+                public_gateway_url: "https://public.example".to_string(),
+                delay_sec: 60,
+            }),
+            Arc::clone(&archive_config),
+        )
+        .tick()
+        .await
+        .unwrap();
+        let ready_a = job_for_delivery(&repo, &chat_a).await;
+        assert_eq!(
+            ready_a.telegraph_status,
+            crate::db::repo::eh_gallery_jobs::TELEGRAPH_STATUS_READY
+        );
+        let reusable_result = eh_gallery_results::Entity::find()
+            .filter(eh_gallery_results::Column::Gid.eq(gid))
+            .filter(eh_gallery_results::Column::Token.eq(token))
+            .one(repo.db())
+            .await
+            .unwrap()
+            .expect("the IPFS3 upload must persist a reusable gallery result");
+        assert_eq!(reusable_result.source_fingerprint, fingerprint);
+        assert!(reusable_result.media_cids.is_some());
+
+        mock_tg_send_document(&telegram_server).await;
+        mock_tg_send_message(&telegram_server).await;
+        EhPublishWorker::new(
+            Arc::clone(&repo),
+            make_notifier(&telegram_server),
+            make_eh_client(&eh_server),
+            None,
+            Arc::clone(&archive_config),
+        )
+        .tick()
+        .await
+        .unwrap();
+        let completed_a = eh_download_queue::Entity::find_by_id(chat_a.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(completed_a.status, STATUS_DONE);
+        let first_job = job_for_delivery(&repo, &completed_a).await;
+        let first_zip = first_job.zip_path.clone().expect("initial archive path");
+        assert_eq!(
+            run_eh_job_cleanup_maintenance_once(repo.as_ref(), None, 0, true)
+                .await
+                .unwrap(),
+            Some(EhCleanupFinalizeOutcome::CleanRetired)
+        );
+        assert!(!std::path::Path::new(&first_zip).exists());
+        assert_eq!(
+            eh_gallery_jobs::Entity::find_by_id(first_job.id)
+                .one(repo.db())
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            crate::db::repo::eh_gallery_jobs::JOB_STATUS_RETIRED
+        );
+        let archive_posts_before_reuse = eh_server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| {
+                request.method.as_str() == "POST" && request.url.path() == "/archiver.php"
+            })
+            .count();
+        let upload_calls_before_reuse =
+            uploader.zip_calls.load(std::sync::atomic::Ordering::SeqCst);
+
+        let b_task = repo
+            .get_or_create_task(TaskType::Ehentai, "eh:artist:cache-reuse".to_string(), None)
+            .await
+            .unwrap();
+        repo.upsert_eh_subscription(
+            -200,
+            b_task.id,
+            crate::db::types::TagFilter::default(),
+            None,
+        )
+        .await
+        .unwrap();
+        let b_subscription = repo
+            .list_subscriptions_by_task(b_task.id)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let chat_b = repo
+            .enqueue_eh_subscription_download(
+                -200,
+                b_subscription.id,
+                gid,
+                token,
+                "Reusable Gallery",
+                true,
+                &variant,
+                Some(fingerprint),
+                false,
+            )
+            .await
+            .unwrap()
+            .expect("chat B must receive a Telegraph-only subscription wave");
+        let reused_job = job_for_delivery(&repo, &chat_b).await;
+        assert_eq!(reused_job.status, JOB_STATUS_DOWNLOADED);
+        assert_eq!(
+            reused_job.telegraph_url.as_deref(),
+            Some(reusable_result.telegraph_url.as_str())
+        );
+        assert!(reused_job.zip_path.is_none());
+        assert!(repo
+            .get_next_eh_job_for_download_with_policy(false)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(repo.get_next_eh_job_for_upload().await.unwrap().is_none());
+
+        EhPublishWorker::new(
+            Arc::clone(&repo),
+            make_notifier(&telegram_server),
+            make_eh_client(&eh_server),
+            None,
+            Arc::new(EhentaiConfig {
+                send_archive: false,
+                ..make_config()
+            }),
+        )
+        .tick()
+        .await
+        .unwrap();
+        let completed_b = eh_download_queue::Entity::find_by_id(chat_b.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(completed_b.status, STATUS_DONE);
+        let b_ledger = eh_gallery_push_ledger::Entity::find()
+            .filter(eh_gallery_push_ledger::Column::ChatId.eq(-200))
+            .filter(eh_gallery_push_ledger::Column::Gid.eq(gid))
+            .one(repo.db())
+            .await
+            .unwrap()
+            .expect("cached Telegraph publish must write chat B's ledger row");
+        assert!(b_ledger.archive_sent_at.is_none());
+        assert!(b_ledger.telegraph_sent_at.is_some());
+        assert_eq!(
+            eh_gallery_jobs::Entity::find_by_id(reused_job.id)
+                .one(repo.db())
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            crate::db::repo::eh_gallery_jobs::JOB_STATUS_RETIRED
+        );
+        assert_eq!(
+            eh_server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|request| {
+                    request.method.as_str() == "POST" && request.url.path() == "/archiver.php"
+                })
+                .count(),
+            archive_posts_before_reuse,
+            "cache reuse must not start another source archive request"
+        );
+        assert_eq!(
+            uploader.zip_calls.load(std::sync::atomic::Ordering::SeqCst),
+            upload_calls_before_reuse,
+            "cache reuse must not invoke the upload provider"
+        );
+    }
+
+    #[tokio::test]
+    async fn fingerprint_change_forces_full_refetch() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        let eh_server = MockServer::start().await;
+        let telegram_server = MockServer::start().await;
+        let temp = tempfile::tempdir().unwrap();
+        let variant = EhGalleryVariant::archive("1280x");
+        let gid = 9_802;
+        let token = "abcd980002";
+        let old_fingerprint = "9802|2|100|false";
+        let new_fingerprint = "9802|3|100|false";
+        setup_chat(&repo, -100, true).await;
+        let old_result = eh_gallery_results::ActiveModel {
+            gid: Set(gid),
+            token: Set(token.to_string()),
+            download_mode: Set(variant.download_mode.clone()),
+            resolution: Set(variant.resolution.clone()),
+            source_fingerprint: Set(old_fingerprint.to_string()),
+            telegraph_url: Set("https://telegra.ph/stale-result".to_string()),
+            media_cids: Set(Some(
+                "[{\"name\":\"001.jpg\",\"cid\":\"bafk-old\"}]".to_string(),
+            )),
+            created_at: Set(Local::now().naive_local()),
+            updated_at: Set(Local::now().naive_local()),
+            ..Default::default()
+        }
+        .insert(repo.db())
+        .await
+        .unwrap();
+        let delivery = repo
+            .enqueue_eh_download(
+                -100,
+                gid,
+                token,
+                "Changed Gallery",
+                true,
+                SOURCE_DIRECT,
+                &variant,
+                Some(new_fingerprint),
+                false,
+            )
+            .await
+            .unwrap()
+            .expect("a changed filecount must start a new source wave");
+        assert_eq!(
+            job_for_delivery(&repo, &delivery).await.status,
+            STATUS_PENDING
+        );
+
+        let source_zip = temp.path().join("changed-source.zip");
+        create_test_zip(&source_zip, 3);
+        let download_url = format!("{}/archive/{gid}/0", eh_server.uri());
+        mock_eh_gallery_page(&eh_server, gid as u64, token).await;
+        mock_eh_archiver_post(&eh_server, &download_url).await;
+        mock_eh_archive_download(
+            &eh_server,
+            &format!("/archive/{gid}/0"),
+            std::fs::read(&source_zip).unwrap(),
+        )
+        .await;
+        let no_archive_config = Arc::new(EhentaiConfig {
+            send_archive: false,
+            ..make_config()
+        });
+        EhDownloadWorker::new(
+            Arc::clone(&repo),
+            make_eh_client(&eh_server),
+            Arc::clone(&no_archive_config),
+            temp.path().to_path_buf(),
+            None,
+        )
+        .tick()
+        .await
+        .unwrap();
+        let uploader = Arc::new(ZipFirstMockUploader::default());
+        mock_telegraph_create_page(&telegram_server).await;
+        EhUploadWorker::new(
+            Arc::clone(&repo),
+            make_notifier(&telegram_server),
+            make_telegraph_client(&telegram_server),
+            uploader.clone(),
+            Some(IpfS3PreviewRewriteConfig {
+                preview_gateway_url: "https://preview.example".to_string(),
+                public_gateway_url: "https://public.example".to_string(),
+                delay_sec: 60,
+            }),
+            Arc::clone(&no_archive_config),
+        )
+        .tick()
+        .await
+        .unwrap();
+
+        let refetched_job = job_for_delivery(&repo, &delivery).await;
+        assert_eq!(refetched_job.status, JOB_STATUS_DOWNLOADED);
+        assert_eq!(
+            refetched_job.telegraph_status,
+            crate::db::repo::eh_gallery_jobs::TELEGRAPH_STATUS_READY
+        );
+        assert_eq!(
+            refetched_job.source_fingerprint.as_deref(),
+            Some(new_fingerprint)
+        );
+        assert_eq!(
+            eh_download_queue::Entity::find_by_id(delivery.id)
+                .one(repo.db())
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            crate::db::repo::eh_gallery_jobs::DELIVERY_STATUS_WAITING
+        );
+        let updated_result = eh_gallery_results::Entity::find()
+            .filter(eh_gallery_results::Column::Gid.eq(gid))
+            .filter(eh_gallery_results::Column::Token.eq(token))
+            .one(repo.db())
+            .await
+            .unwrap()
+            .expect("the refreshed upload must replace the stale result record");
+        assert_eq!(updated_result.id, old_result.id);
+        assert_eq!(updated_result.source_fingerprint, new_fingerprint);
+        assert_ne!(updated_result.telegraph_url, old_result.telegraph_url);
+        assert_eq!(
+            eh_gallery_results::Entity::find()
+                .filter(eh_gallery_results::Column::Gid.eq(gid))
+                .filter(eh_gallery_results::Column::Token.eq(token))
+                .count(repo.db())
+                .await
+                .unwrap(),
+            1
+        );
+        let requests = eh_server.received_requests().await.unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| {
+                    request.method.as_str() == "POST" && request.url.path() == "/archiver.php"
+                })
+                .count(),
+            1,
+            "a fingerprint change must issue one new source archive POST"
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| {
+                    request.method.as_str() == "GET"
+                        && request.url.path() == format!("/archive/{gid}/0")
+                })
+                .count(),
+            1,
+            "a fingerprint change must download the new archive once"
+        );
+        assert_eq!(
+            uploader.zip_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a fingerprint change must upload the refreshed archive once"
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_upload_failure_fallback_then_later_telegraph_subscription() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        let eh_server = MockServer::start().await;
+        let telegram_server = MockServer::start().await;
+        let temp = tempfile::tempdir().unwrap();
+        let variant = EhGalleryVariant::archive("1280x");
+        let gid = 9_803;
+        let token = "fallback-token";
+        setup_chat(&repo, -100, true).await;
+
+        let first = repo
+            .enqueue_eh_download(
+                -100,
+                gid,
+                token,
+                "Fallback Gallery",
+                true,
+                SOURCE_DIRECT,
+                &variant,
+                None,
+                true,
+            )
+            .await
+            .unwrap()
+            .expect("initial mixed subscription delivery");
+        let first_source = temp.path().join("fallback-first.zip");
+        create_test_zip(&first_source, 2);
+        let first_claim = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        repo.mark_eh_job_downloaded(
+            first_claim.id,
+            first_claim.started_at.unwrap(),
+            std::fs::metadata(&first_source).unwrap().len() as i64,
+            first_source.to_str().unwrap(),
+            0,
+        )
+        .await
+        .unwrap();
+        mock_tg_send_message(&telegram_server).await;
+        let mut failing_config = make_config();
+        failing_config.max_retry_count = 0;
+        let failing_uploader = Arc::new(AlwaysFailUploader {
+            message: "terminal provider failure".to_string(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        EhUploadWorker::new(
+            Arc::clone(&repo),
+            make_notifier(&telegram_server),
+            make_telegraph_client(&telegram_server),
+            failing_uploader.clone(),
+            None,
+            Arc::new(failing_config),
+        )
+        .tick()
+        .await
+        .unwrap();
+        assert_eq!(
+            failing_uploader
+                .calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        let failed_job = job_for_delivery(&repo, &first).await;
+        assert_eq!(failed_job.status, JOB_STATUS_DOWNLOADED);
+        assert_eq!(
+            failed_job.telegraph_status,
+            crate::db::repo::eh_gallery_jobs::TELEGRAPH_STATUS_FAILED
+        );
+        let fallback = eh_download_queue::Entity::find_by_id(first.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            fallback.status,
+            crate::db::repo::eh_gallery_jobs::DELIVERY_STATUS_WAITING
+        );
+        assert!(!fallback.telegraph);
+
+        mock_tg_send_document(&telegram_server).await;
+        let archive_config = Arc::new(make_config());
+        EhPublishWorker::new(
+            Arc::clone(&repo),
+            make_notifier(&telegram_server),
+            make_eh_client(&eh_server),
+            None,
+            Arc::clone(&archive_config),
+        )
+        .tick()
+        .await
+        .unwrap();
+        let archive_ledger = eh_gallery_push_ledger::Entity::find()
+            .filter(eh_gallery_push_ledger::Column::ChatId.eq(-100))
+            .filter(eh_gallery_push_ledger::Column::Gid.eq(gid))
+            .one(repo.db())
+            .await
+            .unwrap()
+            .expect("archive fallback must persist its ledger marker");
+        assert!(archive_ledger.archive_sent_at.is_some());
+        assert!(archive_ledger.telegraph_sent_at.is_none());
+        assert_eq!(
+            run_eh_job_cleanup_maintenance_once(repo.as_ref(), None, 0, true)
+                .await
+                .unwrap(),
+            Some(EhCleanupFinalizeOutcome::CleanRetired)
+        );
+        let document_sends_before_later_subscription = telegram_server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| request.url.path().ends_with("/SendDocument"))
+            .count();
+
+        let later_task = repo
+            .get_or_create_task(
+                TaskType::Ehentai,
+                "eh:artist:fallback-later".to_string(),
+                None,
+            )
+            .await
+            .unwrap();
+        repo.upsert_eh_subscription(
+            -100,
+            later_task.id,
+            crate::db::types::TagFilter::default(),
+            None,
+        )
+        .await
+        .unwrap();
+        let later_subscription = repo
+            .list_subscriptions_by_task(later_task.id)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let later = repo
+            .enqueue_eh_subscription_download(
+                -100,
+                later_subscription.id,
+                gid,
+                token,
+                "Fallback Gallery",
+                true,
+                &variant,
+                None,
+                true,
+            )
+            .await
+            .unwrap()
+            .expect("the missing Telegraph surface must start a later subscription wave");
+        assert_eq!(later.archive_sent_at, archive_ledger.archive_sent_at);
+        assert!(later.telegraph_sent_at.is_none());
+        let second_source = temp.path().join("fallback-second.zip");
+        create_test_zip(&second_source, 2);
+        let later_claim = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        repo.mark_eh_job_downloaded(
+            later_claim.id,
+            later_claim.started_at.unwrap(),
+            std::fs::metadata(&second_source).unwrap().len() as i64,
+            second_source.to_str().unwrap(),
+            0,
+        )
+        .await
+        .unwrap();
+        let succeeding_uploader = Arc::new(ZipFirstMockUploader::default());
+        mock_telegraph_create_page(&telegram_server).await;
+        EhUploadWorker::new(
+            Arc::clone(&repo),
+            make_notifier(&telegram_server),
+            make_telegraph_client(&telegram_server),
+            succeeding_uploader.clone(),
+            Some(IpfS3PreviewRewriteConfig {
+                preview_gateway_url: "https://preview.example".to_string(),
+                public_gateway_url: "https://public.example".to_string(),
+                delay_sec: 60,
+            }),
+            Arc::clone(&archive_config),
+        )
+        .tick()
+        .await
+        .unwrap();
+        let ready_later = job_for_delivery(&repo, &later).await;
+        assert_eq!(ready_later.status, JOB_STATUS_DOWNLOADED);
+        assert_eq!(
+            ready_later.telegraph_status,
+            crate::db::repo::eh_gallery_jobs::TELEGRAPH_STATUS_READY
+        );
+        EhPublishWorker::new(
+            Arc::clone(&repo),
+            make_notifier(&telegram_server),
+            make_eh_client(&eh_server),
+            None,
+            Arc::clone(&archive_config),
+        )
+        .tick()
+        .await
+        .unwrap();
+        assert_eq!(
+            succeeding_uploader
+                .zip_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        let final_delivery = eh_download_queue::Entity::find_by_id(later.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(final_delivery.status, STATUS_DONE);
+        assert_eq!(
+            final_delivery.archive_sent_at,
+            archive_ledger.archive_sent_at
+        );
+        assert!(final_delivery.telegraph_sent_at.is_some());
+        let final_ledger = eh_gallery_push_ledger::Entity::find()
+            .filter(eh_gallery_push_ledger::Column::ChatId.eq(-100))
+            .filter(eh_gallery_push_ledger::Column::Gid.eq(gid))
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(final_ledger.archive_sent_at, archive_ledger.archive_sent_at);
+        assert!(final_ledger.telegraph_sent_at.is_some());
+        assert_eq!(
+            telegram_server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|request| request.url.path().ends_with("/SendDocument"))
+                .count(),
+            document_sends_before_later_subscription,
+            "the later Telegraph-only wave must not resend the archive"
+        );
+    }
+
+    #[tokio::test]
+    async fn overlapping_subscriptions_deliver_gallery_once() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        let eh_server = MockServer::start().await;
+        let telegram_server = MockServer::start().await;
+        let temp = tempfile::tempdir().unwrap();
+        let gid = 9_804_i64;
+        let token = "abcd980004";
+        setup_chat(&repo, -100, true).await;
+        let task_a = repo
+            .get_or_create_task(TaskType::Ehentai, "eh:artist:overlap-a".to_string(), None)
+            .await
+            .unwrap();
+        let task_b = repo
+            .get_or_create_task(TaskType::Ehentai, "eh:artist:overlap-b".to_string(), None)
+            .await
+            .unwrap();
+        let telegraph_filter = Some(EhFilter {
+            telegraph: true,
+            ..Default::default()
+        });
+        repo.upsert_eh_subscription(
+            -100,
+            task_a.id,
+            crate::db::types::TagFilter::default(),
+            telegraph_filter.clone(),
+        )
+        .await
+        .unwrap();
+        repo.upsert_eh_subscription(
+            -100,
+            task_b.id,
+            crate::db::types::TagFilter::default(),
+            telegraph_filter,
+        )
+        .await
+        .unwrap();
+        let subscription_a = repo
+            .list_subscriptions_by_task(task_a.id)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let subscription_b = repo
+            .list_subscriptions_by_task(task_b.id)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let gallery = EhGallery {
+            gid: gid as u64,
+            token: token.to_string(),
+            title: "Overlapping Gallery".to_string(),
+            title_jpn: None,
+            category: "Doujinshi".to_string(),
+            thumb: "https://ehgt.org/t/9804.jpg".to_string(),
+            uploader: "tester".to_string(),
+            posted: gid,
+            filecount: 2,
+            filesize: 100,
+            expunged: false,
+            rating: 4.0,
+            tags: vec![
+                "artist:overlap-a".to_string(),
+                "artist:overlap-b".to_string(),
+            ],
+        };
+        let config = Arc::new(make_config());
+        let engine = EhEngine::new(
+            Arc::clone(&repo),
+            make_eh_client(&eh_server),
+            Arc::clone(&config),
+            true,
+            60,
+        );
+        engine
+            .process_eh_sub_with_slots(&subscription_a, std::slice::from_ref(&gallery), 1)
+            .await
+            .unwrap();
+        let first_delivery = eh_download_queue::Entity::find()
+            .filter(eh_download_queue::Column::ChatId.eq(-100))
+            .filter(eh_download_queue::Column::Gid.eq(gid))
+            .one(repo.db())
+            .await
+            .unwrap()
+            .expect("the first subscription should enqueue the gallery");
+        assert_eq!(first_delivery.subscription_ids.as_deref(), Some("1"));
+
+        let source_zip = temp.path().join("overlap-source.zip");
+        create_test_zip(&source_zip, 2);
+        let download_url = format!("{}/archive/{gid}/0", eh_server.uri());
+        mock_eh_gallery_page(&eh_server, gid as u64, token).await;
+        mock_eh_archiver_post(&eh_server, &download_url).await;
+        mock_eh_archive_download(
+            &eh_server,
+            &format!("/archive/{gid}/0"),
+            std::fs::read(&source_zip).unwrap(),
+        )
+        .await;
+        EhDownloadWorker::new(
+            Arc::clone(&repo),
+            make_eh_client(&eh_server),
+            Arc::clone(&config),
+            temp.path().to_path_buf(),
+            None,
+        )
+        .tick()
+        .await
+        .unwrap();
+        mock_telegraph_create_page(&telegram_server).await;
+        EhUploadWorker::new(
+            Arc::clone(&repo),
+            make_notifier(&telegram_server),
+            make_telegraph_client(&telegram_server),
+            Arc::new(ZipFirstMockUploader::default()),
+            Some(IpfS3PreviewRewriteConfig {
+                preview_gateway_url: "https://preview.example".to_string(),
+                public_gateway_url: "https://public.example".to_string(),
+                delay_sec: 60,
+            }),
+            Arc::clone(&config),
+        )
+        .tick()
+        .await
+        .unwrap();
+        let ready_first = job_for_delivery(&repo, &first_delivery).await;
+        assert_eq!(ready_first.status, JOB_STATUS_DOWNLOADED);
+        assert_eq!(
+            ready_first.telegraph_status,
+            crate::db::repo::eh_gallery_jobs::TELEGRAPH_STATUS_READY
+        );
+        mock_tg_send_document(&telegram_server).await;
+        mock_tg_send_message(&telegram_server).await;
+        EhPublishWorker::new(
+            Arc::clone(&repo),
+            make_notifier(&telegram_server),
+            make_eh_client(&eh_server),
+            None,
+            Arc::clone(&config),
+        )
+        .tick()
+        .await
+        .unwrap();
+        let ledger = eh_gallery_push_ledger::Entity::find()
+            .filter(eh_gallery_push_ledger::Column::ChatId.eq(-100))
+            .filter(eh_gallery_push_ledger::Column::Gid.eq(gid))
+            .one(repo.db())
+            .await
+            .unwrap()
+            .expect("the first completed subscription must mark both surfaces");
+        assert!(ledger.archive_sent_at.is_some());
+        assert!(ledger.telegraph_sent_at.is_some());
+
+        engine
+            .process_eh_sub_with_slots(&subscription_b, std::slice::from_ref(&gallery), 1)
+            .await
+            .unwrap();
+        assert_eq!(
+            eh_download_queue::Entity::find()
+                .filter(eh_download_queue::Column::ChatId.eq(-100))
+                .filter(eh_download_queue::Column::Gid.eq(gid))
+                .count(repo.db())
+                .await
+                .unwrap(),
+            1,
+            "the fully ledgered second subscription must enqueue no delivery wave"
+        );
+        let updated_b = repo
+            .list_subscriptions_by_task(task_b.id)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let state_b = eh_tag_subscription_state(&updated_b).unwrap();
+        assert_eq!(state_b.pushed_gids, vec![gid as u64]);
+        assert!(state_b.pending_galleries.is_empty());
+        let requests = telegram_server.received_requests().await.unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.url.path().ends_with("/SendDocument"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.url.path().ends_with("/SendMessage"))
+                .count(),
+            1,
+            "overlapping subscriptions must publish one gallery link"
+        );
+    }
+
+    #[tokio::test]
+    async fn ipfs3_upload_without_fingerprint_writes_no_result_record() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        let telegram_server = MockServer::start().await;
+        let temp = tempfile::tempdir().unwrap();
+        let gid = 9_805;
+        setup_chat(&repo, -100, true).await;
+        let zip_path = temp.path().join("missing-fingerprint.zip");
+        create_test_zip(&zip_path, 2);
+        let delivery = insert_queue_entry(
+            &repo,
+            -100,
+            gid,
+            "abcd980005",
+            "Missing Fingerprint Gallery",
+            true,
+            STATUS_DOWNLOADED,
+            Some(zip_path.to_str().unwrap()),
+            None,
+        )
+        .await;
+        mock_telegraph_create_page(&telegram_server).await;
+        EhUploadWorker::new(
+            Arc::clone(&repo),
+            make_notifier(&telegram_server),
+            make_telegraph_client(&telegram_server),
+            Arc::new(ZipFirstMockUploader::default()),
+            Some(IpfS3PreviewRewriteConfig {
+                preview_gateway_url: "https://preview.example".to_string(),
+                public_gateway_url: "https://public.example".to_string(),
+                delay_sec: 60,
+            }),
+            Arc::new(make_config()),
+        )
+        .tick()
+        .await
+        .unwrap();
+        assert_eq!(
+            job_for_delivery(&repo, &delivery).await.telegraph_status,
+            crate::db::repo::eh_gallery_jobs::TELEGRAPH_STATUS_READY
+        );
+        assert!(eh_gallery_results::Entity::find()
+            .filter(eh_gallery_results::Column::Gid.eq(gid))
+            .filter(eh_gallery_results::Column::Token.eq("abcd980005"))
+            .one(repo.db())
+            .await
+            .unwrap()
+            .is_none());
     }
 }

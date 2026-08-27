@@ -80,9 +80,12 @@ mod tests {
         let repo = tests_helpers::setup_test_db().await.unwrap();
         let variant = EhGalleryVariant::archive("1280x");
         let first_delivery = repo
-            .enqueue_eh_download(1, 410, "token", "First", false, "direct", &variant)
+            .enqueue_eh_download(
+                1, 410, "token", "First", false, "direct", &variant, None, true,
+            )
             .await
-            .unwrap();
+            .unwrap()
+            .expect("delivery should be enqueued");
         let first_job = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
         let first_started_at = first_job.started_at.unwrap();
         repo.mark_eh_job_downloaded(first_job.id, first_started_at, 100, "/tmp/first.zip", 0)
@@ -113,9 +116,12 @@ mod tests {
             .unwrap();
 
         let second_delivery = repo
-            .enqueue_eh_download(1, 410, "token", "Second", false, "direct", &variant)
+            .enqueue_eh_download(
+                1, 410, "token", "Second", false, "direct", &variant, None, true,
+            )
             .await
-            .unwrap();
+            .unwrap()
+            .expect("delivery should be enqueued");
         assert_eq!(second_delivery.job_id, Some(first_job.id));
         let second_job = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
         assert_eq!(second_job.id, first_job.id);
