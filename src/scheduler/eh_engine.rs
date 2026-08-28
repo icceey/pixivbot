@@ -11022,6 +11022,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn download_worker_replaces_invalid_existing_final_zip_in_same_tick() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        let eh_server = MockServer::start().await;
+        let temp = tempfile::tempdir().unwrap();
+        setup_chat(&repo, -100, true).await;
+        let entry = insert_queue_entry(
+            &repo,
+            -100,
+            4053263,
+            "abcdef0123",
+            "Invalid Final ZIP",
+            false,
+            "pending",
+            None,
+            None,
+        )
+        .await;
+        let job = job_for_delivery(&repo, &entry).await;
+        let artifacts = archive_artifacts_for_job(temp.path(), &job);
+        std::fs::create_dir_all(artifacts.final_zip().parent().unwrap()).unwrap();
+        std::fs::write(artifacts.final_zip(), b"not a ZIP").unwrap();
+        let zip_temp = tempfile::tempdir().unwrap();
+        let source_zip = zip_temp.path().join("source.zip");
+        create_test_zip(&source_zip, 2);
+        let zip_bytes = std::fs::read(&source_zip).unwrap();
+        mock_eh_archiver_page_with_cost(&eh_server, 4053263, "abcdef0123", "Free!", "Free!").await;
+        let fresh_url = format!("{}/archive/fresh", eh_server.uri());
+        mock_eh_archiver_post(&eh_server, &fresh_url).await;
+        Mock::given(method("GET"))
+            .and(path("/archive/fresh"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(zip_bytes.clone()))
+            .expect(1)
+            .mount(&eh_server)
+            .await;
+        let mut config = make_config();
+        config.background_download_enabled = false;
+        config.archive_download_concurrency = 1;
+        let worker = EhDownloadWorker::new(
+            Arc::clone(&repo),
+            make_eh_client(&eh_server),
+            Arc::new(config),
+            temp.path().to_path_buf(),
+            None,
+        );
+
+        worker.tick().await.unwrap();
+
+        let updated = job_for_delivery(&repo, &entry).await;
+        assert_eq!(updated.status, JOB_STATUS_DOWNLOADED);
+        assert_eq!(
+            updated.retry_count, 0,
+            "cache recovery must not consume a retry"
+        );
+        assert!(updated.next_retry_at.is_none());
+        assert!(updated.error.is_none());
+        assert_eq!(std::fs::read(artifacts.final_zip()).unwrap(), zip_bytes);
+        let requests = eh_server.received_requests().await.unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| {
+                    request.method.as_str() == "POST" && request.url.path() == "/archiver.php"
+                })
+                .count(),
+            1,
+            "an invalid final ZIP must prepare and POST a fresh archive in the same tick"
+        );
+    }
+
+    #[tokio::test]
     async fn background_download_worker_adopts_existing_complete_zip_without_archiver_request() {
         let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
         let eh_server = MockServer::start().await;

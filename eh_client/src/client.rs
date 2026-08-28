@@ -530,12 +530,17 @@ impl EhClient {
         let options = options.validate()?;
         let artifacts = ArchiveArtifacts::new(dest);
         if tokio::fs::try_exists(dest).await? {
-            validate_complete_zip(dest).await?;
-            let total = tokio::fs::metadata(dest).await?.len();
-            if artifacts.remove_multipart_state().await.is_err() {
-                tracing::warn!("could not remove completed archive multipart state");
+            match validate_complete_zip(dest).await {
+                Ok(()) => {
+                    let total = tokio::fs::metadata(dest).await?.len();
+                    if artifacts.remove_multipart_state().await.is_err() {
+                        tracing::warn!("could not remove completed archive multipart state");
+                    }
+                    return Ok(Some(total));
+                }
+                Err(Error::Parse(_)) => tokio::fs::remove_file(dest).await?,
+                Err(error) => return Err(error),
             }
-            return Ok(Some(total));
         }
         if !resume_persisted_download_to_partial(&self.http, &self.cookies, &artifacts, options)
             .await?
@@ -1124,25 +1129,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn persisted_manifest_rejects_invalid_existing_final_zip_without_deleting_it() {
+    async fn persisted_manifest_discards_invalid_existing_final_zip_without_manifest() {
         let temp = tempfile::tempdir().unwrap();
         let dest = temp.path().join("archive.zip");
+        let artifacts = ArchiveArtifacts::new(&dest);
         let invalid_zip = b"not a ZIP";
         tokio::fs::write(&dest, invalid_zip).await.unwrap();
+        tokio::fs::write(artifacts.assembly_scratch(), b"partial")
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(artifacts.parts_dir())
+            .await
+            .unwrap();
+        tokio::fs::write(artifacts.parts_dir().join("part-0000000000000000"), b"part")
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(artifacts.uploads_dir())
+            .await
+            .unwrap();
+        tokio::fs::write(artifacts.uploads_dir().join("upload-state.json"), b"upload")
+            .await
+            .unwrap();
 
         let client = EhClientBuilder::new()
             .base_url("http://127.0.0.1:9")
             .build();
-        let error = client
-            .resume_archive_from_persisted_manifest(
-                &dest,
-                ArchiveDownloadOptions { max_concurrency: 2 },
-            )
-            .await
-            .unwrap_err();
+        assert_eq!(
+            client
+                .resume_archive_from_persisted_manifest(
+                    &dest,
+                    ArchiveDownloadOptions { max_concurrency: 2 },
+                )
+                .await
+                .unwrap(),
+            None
+        );
 
-        assert!(matches!(error, Error::Parse(_)));
-        assert_eq!(tokio::fs::read(&dest).await.unwrap(), invalid_zip);
+        assert!(!dest.exists());
+        assert!(artifacts.assembly_scratch().exists());
+        assert!(artifacts.parts_dir().join("part-0000000000000000").exists());
+        assert!(artifacts.uploads_dir().join("upload-state.json").exists());
     }
 
     #[test]
