@@ -3466,14 +3466,16 @@ impl Repo {
             .context("Failed to reread shared EH gallery background claim")
     }
 
-    /// Return a background-owned job to its own retry queue without consuming a
-    /// retry attempt. Used by rate-limit and availability deferrals.
+    /// Return one expected background claim to its retry queue without
+    /// consuming a retry attempt. Returns `false` when the claim generation is
+    /// stale, leaving its successor untouched.
     pub async fn defer_eh_job_background_download(
         &self,
         job_id: i32,
+        expected_started_at: DateTime,
         delay_secs: i64,
         reason: &str,
-    ) -> Result<eh_gallery_jobs::Model> {
+    ) -> Result<bool> {
         let now = Local::now().naive_local();
         let result = eh_gallery_jobs::Entity::update_many()
             .col_expr(
@@ -3486,7 +3488,7 @@ impl Repo {
             )
             .col_expr(
                 eh_gallery_jobs::Column::BackgroundDownloadNextRetryAt,
-                Expr::value(Some(now + chrono::Duration::seconds(delay_secs))),
+                Expr::value(Some(now + chrono::Duration::seconds(delay_secs.max(1)))),
             )
             .col_expr(
                 eh_gallery_jobs::Column::BackgroundDownloadError,
@@ -3496,21 +3498,11 @@ impl Repo {
             .filter(eh_gallery_jobs::Column::Status.eq(JOB_STATUS_PENDING))
             .filter(eh_gallery_jobs::Column::CleanupStatus.eq(CLEANUP_STATUS_NONE))
             .filter(eh_gallery_jobs::Column::BackgroundDownloadStatus.eq(BACKGROUND_STATUS_RUNNING))
+            .filter(eh_gallery_jobs::Column::StartedAt.eq(expected_started_at))
             .exec(&self.db)
             .await
             .context("Failed to defer shared EH gallery background download")?;
-        if result.rows_affected != 1 {
-            anyhow::bail!(
-                "Cannot defer shared EH gallery background download {}: claim changed concurrently",
-                job_id
-            );
-        }
-
-        eh_gallery_jobs::Entity::find_by_id(job_id)
-            .one(&self.db)
-            .await
-            .context("Failed to reread shared EH gallery job after background defer")?
-            .context("Shared EH gallery job disappeared after background defer")
+        Ok(result.rows_affected == 1)
     }
 
     /// Complete a background download and append its immutable completion row in
@@ -9587,6 +9579,75 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn stale_background_defer_cannot_release_new_generation() {
+        let repo = tests_helpers::setup_test_db().await.unwrap();
+        let variant = EhGalleryVariant::archive("1280x");
+        let delivery = repo
+            .enqueue_eh_download(
+                -100, 79, "token", "Gallery", false, "direct", &variant, None, true,
+            )
+            .await
+            .unwrap()
+            .expect("delivery should be enqueued");
+        let job_id = delivery.job_id.unwrap();
+        let normal_claim = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        repo.schedule_eh_job_background_download(job_id, normal_claim.status.as_str(), "slow")
+            .await
+            .unwrap();
+        let first_claim = repo
+            .get_next_eh_job_for_background_download()
+            .await
+            .unwrap()
+            .unwrap();
+        let first_generation = first_claim.started_at.unwrap();
+
+        assert!(repo
+            .defer_eh_job_background_download(job_id, first_generation, 60, "first defer")
+            .await
+            .unwrap());
+        let deferred = load_eh_job(&repo, job_id).await;
+        assert_eq!(deferred.started_at, Some(first_generation));
+        assert_eq!(deferred.background_download_attempt_count, 0);
+
+        // Advance only the retry deadline to produce an adjacent generation
+        // without involving stale-reset behavior or a wall-clock sleep.
+        eh_gallery_jobs::Entity::update_many()
+            .col_expr(
+                eh_gallery_jobs::Column::BackgroundDownloadNextRetryAt,
+                Expr::value(Some(
+                    Local::now().naive_local() - chrono::Duration::seconds(1),
+                )),
+            )
+            .filter(eh_gallery_jobs::Column::Id.eq(job_id))
+            .exec(repo.db())
+            .await
+            .unwrap();
+        let replacement_claim = repo
+            .get_next_eh_job_for_background_download()
+            .await
+            .unwrap()
+            .unwrap();
+        let replacement_generation = replacement_claim.started_at.unwrap();
+        assert!(replacement_generation > first_generation);
+
+        assert!(!repo
+            .defer_eh_job_background_download(job_id, first_generation, 60, "stale defer")
+            .await
+            .unwrap());
+        let retained = load_eh_job(&repo, job_id).await;
+        assert_eq!(
+            retained.background_download_status.as_deref(),
+            Some(BACKGROUND_STATUS_RUNNING)
+        );
+        assert_eq!(retained.started_at, Some(replacement_generation));
+        assert_eq!(retained.background_download_attempt_count, 0);
+        assert_eq!(
+            retained.background_download_error.as_deref(),
+            Some("first defer")
+        );
     }
 
     #[tokio::test]

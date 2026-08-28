@@ -15,6 +15,7 @@ use eh_client::{
     ZipArchiveUploadInput,
 };
 use rand::RngExt;
+use sea_orm::prelude::DateTime;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use tokio::sync::{mpsc, Mutex};
@@ -323,6 +324,7 @@ enum BackgroundDownloadOutcome {
     Deferred {
         reason: String,
     },
+    Stale,
     Rejected {
         reason: String,
     },
@@ -536,15 +538,52 @@ impl EhBackgroundDownloadWorker {
         let expected_started_at = job.started_at.context(
             "Cannot process shared EH gallery background job: missing download claim started_at",
         )?;
+        let result = self
+            .process_claimed_generation(&job, expected_started_at)
+            .await;
+        if let Err(error) = &result {
+            let reason = format!("EH background claim failed before completion: {error:#}");
+            match self
+                .repo
+                .defer_eh_job_background_download(
+                    job.id,
+                    expected_started_at,
+                    self.config.download_poll_interval_sec.max(1) as i64,
+                    &reason,
+                )
+                .await
+            {
+                Ok(true) => warn!(
+                    "Released failed EH background claim gid={} back to the background queue",
+                    job.gid
+                ),
+                Ok(false) => debug!(
+                    "Skipped releasing stale failed EH background claim gid={}",
+                    job.gid
+                ),
+                Err(defer_error) => error!(
+                    "Failed to release EH background claim gid={} after error: {:#}",
+                    job.gid, defer_error
+                ),
+            }
+        }
+        result
+    }
+
+    async fn process_claimed_generation(
+        &self,
+        job: &eh_gallery_jobs::Model,
+        expected_started_at: DateTime,
+    ) -> Result<()> {
         if !self.repo.eh_job_has_active_deliveries(job.id).await? {
             self.repo
-                .retire_eh_job_without_active_deliveries(&job)
+                .retire_eh_job_without_active_deliveries(job)
                 .await?;
             info!("Retired consumerless shared EH background job {}", job.id);
             return Ok(());
         }
 
-        let zip_path = archive_artifacts_for_job(&self.cache_dir, &job)
+        let zip_path = archive_artifacts_for_job(&self.cache_dir, job)
             .final_zip()
             .to_path_buf();
         let zip_path_str = zip_path.to_string_lossy().to_string();
@@ -587,7 +626,7 @@ impl EhBackgroundDownloadWorker {
         }
         if !has_active_delivery {
             self.repo
-                .retire_eh_job_without_active_deliveries(&job)
+                .retire_eh_job_without_active_deliveries(job)
                 .await?;
             info!("Retired canceled shared EH background job {}", job.id);
             return Ok(());
@@ -598,17 +637,26 @@ impl EhBackgroundDownloadWorker {
                 "Deferring shared EH background gid={} because {}",
                 job.gid, reason
             );
-            self.repo
+            let deferred = self
+                .repo
                 .defer_eh_job_background_download(
                     job.id,
+                    expected_started_at,
                     self.config.download_poll_interval_sec as i64,
                     reason,
                 )
                 .await?;
+            if !deferred {
+                info!(
+                    "Skipping stale shared EH background job {} after notification preflight",
+                    job.id
+                );
+                return Ok(());
+            }
             return Ok(());
         }
 
-        match self.download_claimed(&job).await {
+        match self.download_claimed(job, expected_started_at).await {
             Ok(BackgroundDownloadOutcome::Completed {
                 file_size,
                 zip_path,
@@ -636,9 +684,15 @@ impl EhBackgroundDownloadWorker {
                     .evaluate_eh_job_liveness(job.id, self.config.send_archive)
                     .await?;
             }
+            Ok(BackgroundDownloadOutcome::Stale) => {
+                info!(
+                    "Skipping stale shared EH background job {} after background defer",
+                    job.id
+                );
+            }
             Ok(BackgroundDownloadOutcome::Rejected { reason }) => {
                 self.repo
-                    .fail_eh_job_background_download_for_archive_policy(&job, &reason)
+                    .fail_eh_job_background_download_for_archive_policy(job, &reason)
                     .await
                     .map_err(|error| error.context(ArchivePolicyTransitionError))?;
                 warn!(
@@ -679,6 +733,7 @@ impl EhBackgroundDownloadWorker {
     async fn download_claimed(
         &self,
         job: &eh_gallery_jobs::Model,
+        expected_started_at: DateTime,
     ) -> Result<BackgroundDownloadOutcome> {
         let gid = job.gid as u64;
         let token = &job.token;
@@ -756,9 +811,18 @@ impl EhBackgroundDownloadWorker {
                         // increment attempt_count - quota exhaustion is not a
                         // retryable failure, it just needs to wait for the window
                         // to recover.
-                        self.repo
-                            .defer_eh_job_background_download(job.id, delay_secs, &reason)
+                        let deferred = self
+                            .repo
+                            .defer_eh_job_background_download(
+                                job.id,
+                                expected_started_at,
+                                delay_secs,
+                                &reason,
+                            )
                             .await?;
+                        if !deferred {
+                            return Ok(BackgroundDownloadOutcome::Stale);
+                        }
                         return Ok(BackgroundDownloadOutcome::Deferred { reason });
                     }
                     ArchiveCostCheck::Reject { reason } => {
@@ -10794,6 +10858,261 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn download_worker_adopts_existing_complete_zip_without_archiver_request() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        let eh_server = MockServer::start().await;
+        let temp = tempfile::tempdir().unwrap();
+        setup_chat(&repo, -100, true).await;
+        let entry = insert_queue_entry(
+            &repo,
+            -100,
+            4053259,
+            "persisted-manifest",
+            "Resumed Gallery",
+            false,
+            "pending",
+            None,
+            None,
+        )
+        .await;
+        let job = job_for_delivery(&repo, &entry).await;
+        let artifacts = archive_artifacts_for_job(temp.path(), &job);
+        let zip_temp = tempfile::tempdir().unwrap();
+        let source_zip = zip_temp.path().join("source.zip");
+        create_test_zip(&source_zip, 2);
+        let zip_bytes = std::fs::read(&source_zip).unwrap();
+        std::fs::create_dir_all(artifacts.final_zip().parent().unwrap()).unwrap();
+        std::fs::write(artifacts.final_zip(), &zip_bytes).unwrap();
+        std::fs::create_dir_all(artifacts.parts_dir()).unwrap();
+        std::fs::write(
+            artifacts.parts_dir().join("part-0000000000000000"),
+            &zip_bytes,
+        )
+        .unwrap();
+        std::fs::write(
+            artifacts.parts_dir().join("manifest.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "version": 1,
+                "download_url": format!("{}/archive/never-requested", eh_server.uri()),
+                "total_len": zip_bytes.len(),
+                "etag": null,
+                "last_modified": null,
+                "next_part_id": 1,
+                "parts": [{ "id": 0, "start": 0, "end": zip_bytes.len() }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let mut config = make_config();
+        config.background_download_enabled = false;
+        let worker = EhDownloadWorker::new(
+            Arc::clone(&repo),
+            make_eh_client(&eh_server),
+            Arc::new(config),
+            temp.path().to_path_buf(),
+            None,
+        );
+
+        worker.tick().await.unwrap();
+
+        let updated = job_for_delivery(&repo, &entry).await;
+        assert_eq!(updated.status, JOB_STATUS_DOWNLOADED);
+        assert!(artifacts.final_zip().exists());
+        assert!(!artifacts.parts_dir().exists());
+        assert!(
+            eh_server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .all(|request| { request.url.path() != "/archiver.php" }),
+            "an existing final ZIP must resume without an archiver prepare/POST or GP reservation"
+        );
+        assert!(gp_attempts(repo.as_ref()).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn background_download_worker_adopts_existing_complete_zip_without_archiver_request() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        let eh_server = MockServer::start().await;
+        let temp = tempfile::tempdir().unwrap();
+        setup_chat(&repo, -100, true).await;
+        let entry = insert_queue_entry(
+            &repo,
+            -100,
+            4053261,
+            "background-persisted-manifest",
+            "Background Resumed Gallery",
+            false,
+            "pending",
+            None,
+            None,
+        )
+        .await;
+        handoff_job_to_background(&repo, &entry).await;
+        let job = job_for_delivery(&repo, &entry).await;
+        let artifacts = archive_artifacts_for_job(temp.path(), &job);
+        let zip_temp = tempfile::tempdir().unwrap();
+        let source_zip = zip_temp.path().join("source.zip");
+        create_test_zip(&source_zip, 2);
+        let zip_bytes = std::fs::read(&source_zip).unwrap();
+        std::fs::create_dir_all(artifacts.final_zip().parent().unwrap()).unwrap();
+        std::fs::write(artifacts.final_zip(), &zip_bytes).unwrap();
+        std::fs::create_dir_all(artifacts.parts_dir()).unwrap();
+        std::fs::write(
+            artifacts.parts_dir().join("part-0000000000000000"),
+            &zip_bytes,
+        )
+        .unwrap();
+        std::fs::write(
+            artifacts.parts_dir().join("manifest.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "version": 1,
+                "download_url": format!("{}/archive/never-requested", eh_server.uri()),
+                "total_len": zip_bytes.len(),
+                "etag": null,
+                "last_modified": null,
+                "next_part_id": 1,
+                "parts": [{ "id": 0, "start": 0, "end": zip_bytes.len() }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let mut config = make_config();
+        config.background_download_enabled = true;
+        config.background_download_concurrency = 1;
+        let worker = EhBackgroundDownloadWorker::new(
+            Arc::clone(&repo),
+            make_eh_client(&eh_server),
+            Arc::new(config),
+            temp.path().to_path_buf(),
+        );
+
+        worker.tick().await.unwrap();
+
+        let updated = job_for_delivery(&repo, &entry).await;
+        assert_eq!(updated.status, JOB_STATUS_DOWNLOADED);
+        assert!(artifacts.final_zip().exists());
+        assert!(!artifacts.parts_dir().exists());
+        assert!(
+            eh_server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .all(|request| { request.url.path() != "/archiver.php" }),
+            "an existing final ZIP must resume without an archiver prepare/POST or GP reservation"
+        );
+        assert!(gp_attempts(repo.as_ref()).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn background_preflight_db_error_releases_claim_without_retrying() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        let eh_server = MockServer::start().await;
+        let temp = tempfile::tempdir().unwrap();
+        setup_chat(&repo, -100, true).await;
+        let entry = insert_queue_entry(
+            &repo,
+            -100,
+            4053262,
+            "background-preflight-failure",
+            "Background Preflight Failure",
+            false,
+            STATUS_PENDING,
+            None,
+            None,
+        )
+        .await;
+        handoff_job_to_background(&repo, &entry).await;
+
+        // Make the activity inspection take the subscription-owner path. With
+        // no subscription IDs it attempts to soft-cancel this delivery, where
+        // the trigger injects a deterministic pre-download database failure.
+        eh_download_queue::Entity::update_many()
+            .col_expr(
+                eh_download_queue::Column::Source,
+                Expr::value(SOURCE_SUBSCRIPTION),
+            )
+            .filter(eh_download_queue::Column::Id.eq(entry.id))
+            .exec(repo.db())
+            .await
+            .unwrap();
+        repo.db()
+            .execute(Statement::from_string(
+                DbBackend::Sqlite,
+                r#"
+                CREATE TRIGGER fail_background_activity_preflight
+                BEFORE UPDATE OF status ON eh_download_queue
+                WHEN NEW.status = 'canceled'
+                BEGIN
+                    SELECT RAISE(FAIL, 'injected background activity preflight failure');
+                END
+                "#,
+            ))
+            .await
+            .unwrap();
+
+        let mut config = make_config();
+        config.background_download_enabled = true;
+        config.background_download_concurrency = 1;
+        let worker = EhBackgroundDownloadWorker::new(
+            Arc::clone(&repo),
+            make_eh_client(&eh_server),
+            Arc::new(config),
+            temp.path().to_path_buf(),
+        );
+
+        let error = worker
+            .tick()
+            .await
+            .expect_err("preflight database failure must reach the background tick");
+        assert!(format!("{error:#}").contains("injected background activity preflight failure"));
+
+        let deferred = job_for_delivery(&repo, &entry).await;
+        assert_eq!(deferred.status, STATUS_PENDING);
+        assert_eq!(
+            deferred.background_download_status.as_deref(),
+            Some(BACKGROUND_STATUS_PENDING)
+        );
+        assert!(deferred.background_download_started_at.is_none());
+        assert!(deferred
+            .background_download_next_retry_at
+            .is_some_and(|next_retry_at| next_retry_at > Local::now().naive_local()));
+        assert_eq!(deferred.background_download_attempt_count, 0);
+        assert!(deferred
+            .background_download_error
+            .as_deref()
+            .unwrap()
+            .contains("injected background activity preflight failure"));
+        assert!(
+            deferred.zip_path.is_some(),
+            "preflight recovery must preserve archive artifact ownership"
+        );
+        let failed_generation = deferred.started_at.unwrap();
+
+        // Make the deferred job due without waiting so a later tick can claim
+        // it. The new generation proves the old worker cannot strand the job.
+        eh_gallery_jobs::Entity::update_many()
+            .col_expr(
+                eh_gallery_jobs::Column::BackgroundDownloadNextRetryAt,
+                Expr::value(Some(
+                    Local::now().naive_local() - chrono::Duration::seconds(1),
+                )),
+            )
+            .filter(eh_gallery_jobs::Column::Id.eq(deferred.id))
+            .exec(repo.db())
+            .await
+            .unwrap();
+        let reclaimed = repo
+            .get_next_eh_job_for_background_download()
+            .await
+            .unwrap()
+            .expect("preflight recovery must leave the job reclaimable");
+        assert!(reclaimed.started_at.unwrap() > failed_generation);
+    }
+
+    #[tokio::test]
     async fn test_download_worker_free_cost_proceeds_with_post() {
         let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
         let eh_server = MockServer::start().await;
@@ -11612,10 +11931,12 @@ mod tests {
         std::fs::write(parts_dir.join("nested").join("part-0001"), b"part").unwrap();
 
         mock_eh_gallery_page(&eh_server, 123456, "abcdef0123").await;
+        // A malformed persisted final ZIP now fails validation before the
+        // archiver request, then follows the permanent-failure cleanup path.
         Mock::given(method("POST"))
             .and(path("/archiver.php"))
             .respond_with(ResponseTemplate::new(500))
-            .expect(1)
+            .expect(0)
             .mount(&eh_server)
             .await;
 
