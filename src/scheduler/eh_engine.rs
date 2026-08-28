@@ -10784,6 +10784,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn download_worker_replaces_terminally_rejected_persisted_manifest_in_same_tick() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        let eh_server = MockServer::start().await;
+        let temp = tempfile::tempdir().unwrap();
+        setup_chat(&repo, -100, true).await;
+        let entry = insert_queue_entry(
+            &repo,
+            -100,
+            4053260,
+            "abcdef0123",
+            "Reprepared Gallery",
+            false,
+            "pending",
+            None,
+            None,
+        )
+        .await;
+        let job = job_for_delivery(&repo, &entry).await;
+        let artifacts = archive_artifacts_for_job(temp.path(), &job);
+        let zip_temp = tempfile::tempdir().unwrap();
+        let source_zip = zip_temp.path().join("source.zip");
+        create_test_zip(&source_zip, 2);
+        let zip_bytes = std::fs::read(&source_zip).unwrap();
+        let stale_url = format!("{}/archive/stale", eh_server.uri());
+        std::fs::create_dir_all(artifacts.parts_dir()).unwrap();
+        std::fs::write(artifacts.parts_dir().join("part-0000000000000000"), []).unwrap();
+        std::fs::write(
+            artifacts.parts_dir().join("manifest.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "version": 1,
+                "download_url": stale_url,
+                "total_len": zip_bytes.len(),
+                "etag": null,
+                "last_modified": null,
+                "next_part_id": 1,
+                "parts": [{ "id": 0, "start": 0, "end": zip_bytes.len() }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        Mock::given(method("GET"))
+            .and(path("/archive/stale"))
+            .respond_with(ResponseTemplate::new(403))
+            .expect(1)
+            .mount(&eh_server)
+            .await;
+        mock_eh_archiver_page_with_cost(&eh_server, 4053260, "abcdef0123", "Free!", "Free!").await;
+        let fresh_url = format!("{}/archive/fresh", eh_server.uri());
+        mock_eh_archiver_post(&eh_server, &fresh_url).await;
+        Mock::given(method("GET"))
+            .and(path("/archive/fresh"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(zip_bytes))
+            .expect(1)
+            .mount(&eh_server)
+            .await;
+        let mut config = make_config();
+        config.background_download_enabled = false;
+        config.archive_download_concurrency = 1;
+        let worker = EhDownloadWorker::new(
+            Arc::clone(&repo),
+            make_eh_client(&eh_server),
+            Arc::new(config),
+            temp.path().to_path_buf(),
+            None,
+        );
+
+        worker.tick().await.unwrap();
+
+        let updated = job_for_delivery(&repo, &entry).await;
+        assert_eq!(
+            updated.status, JOB_STATUS_DOWNLOADED,
+            "error: {:?}",
+            updated.error
+        );
+        assert!(artifacts.final_zip().exists());
+        assert!(!artifacts.parts_dir().exists());
+        let requests = eh_server.received_requests().await.unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| {
+                    request.method.as_str() == "POST" && request.url.path() == "/archiver.php"
+                })
+                .count(),
+            1,
+            "a stale persisted URL must prepare and POST a fresh archive in the same tick"
+        );
+    }
+
+    #[tokio::test]
     async fn background_download_worker_resumes_persisted_manifest_without_archiver_post() {
         let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
         let eh_server = MockServer::start().await;

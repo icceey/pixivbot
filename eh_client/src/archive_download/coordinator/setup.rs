@@ -19,6 +19,7 @@ impl MultipartCoordinator {
         mut manifest: ArchiveManifest,
         max_concurrency: usize,
         mut seed: Option<SeedResponse>,
+        resuming_persisted_manifest: bool,
     ) -> Result<Self> {
         if max_concurrency == 0 {
             return Err(Error::Other(
@@ -77,6 +78,7 @@ impl MultipartCoordinator {
             samples_tx,
             samples_rx,
             max_concurrency,
+            resuming_persisted_manifest,
             initial_downloaded,
             started_at: Instant::now(),
         };

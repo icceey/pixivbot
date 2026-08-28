@@ -492,6 +492,7 @@ impl EhClient {
             &download_url,
             &artifacts,
             options,
+            false,
         )
         .await?;
 

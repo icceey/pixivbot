@@ -165,8 +165,19 @@ pub(super) fn validate_part_response(
     requested_end: u64,
     total_len: u64,
     validator: &Validator,
+    resuming_persisted_manifest: bool,
 ) -> std::result::Result<(), PartFailure> {
     if status != StatusCode::PARTIAL_CONTENT {
+        if resuming_persisted_manifest && !status.is_success() {
+            return Err(PartFailure {
+                kind: PartFailureKind::Retryable,
+                error: Error::Api {
+                    message: format!("archive download returned {status}"),
+                    status: status.as_u16(),
+                },
+                attempts: 0,
+            });
+        }
         return Err(PartFailure::restart_sequential(
             "archive part response did not return 206 Partial Content",
         ));
@@ -284,6 +295,7 @@ mod tests {
             20,
             100,
             &Validator::None,
+            false,
         )
         .unwrap();
     }
@@ -303,6 +315,7 @@ mod tests {
                 20,
                 100,
                 &Validator::None,
+                false,
             ));
         }
         let headers = part_headers("bytes 10-19/100");
@@ -314,6 +327,7 @@ mod tests {
                 20,
                 100,
                 &Validator::None,
+                false,
             ));
         }
     }
@@ -380,6 +394,7 @@ mod tests {
                 20,
                 100,
                 &validator,
+                false,
             )
             .unwrap();
 
@@ -391,6 +406,7 @@ mod tests {
                 20,
                 100,
                 &validator,
+                false,
             ));
             assert_restart(validate_part_response(
                 StatusCode::PARTIAL_CONTENT,
@@ -399,6 +415,7 @@ mod tests {
                 20,
                 100,
                 &validator,
+                false,
             ));
         }
     }
@@ -425,6 +442,7 @@ mod tests {
             100,
             100,
             &Validator::None,
+            false,
         )
         .unwrap();
     }

@@ -19,6 +19,7 @@ pub(in crate::archive_download) async fn run_part(
     url: String,
     total_len: u64,
     validator: Validator,
+    resuming_persisted_manifest: bool,
     part: ManifestPart,
     part_path: PathBuf,
     mut attempts_used: usize,
@@ -91,6 +92,7 @@ pub(in crate::archive_download) async fn run_part(
             range.1,
             total_len,
             &validator,
+            resuming_persisted_manifest,
         ) {
             failure.attempts = attempts_used;
             return (part.id, PartExit::Failed(failure));
@@ -193,6 +195,7 @@ mod tests {
             format!("{}/archive", server.uri()),
             8,
             Validator::None,
+            false,
             part,
             part_path,
             0,
@@ -253,6 +256,7 @@ mod tests {
             format!("{}/archive", server.uri()),
             8,
             Validator::None,
+            false,
             part.clone(),
             part_path.clone(),
             3,
@@ -288,6 +292,7 @@ mod tests {
             format!("{}/archive", server.uri()),
             8,
             Validator::None,
+            false,
             part,
             part_path,
             attempts_used,

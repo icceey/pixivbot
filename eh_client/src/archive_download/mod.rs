@@ -47,6 +47,7 @@ pub(crate) async fn download_to_partial(
     download_url: &str,
     artifacts: &ArchiveArtifacts,
     options: ArchiveDownloadOptions,
+    resuming_persisted_manifest: bool,
 ) -> Result<()> {
     let options = options.validate()?;
     let outcome = if tokio::fs::try_exists(artifacts.parts_dir()).await? {
@@ -61,6 +62,7 @@ pub(crate) async fn download_to_partial(
                     manifest,
                     options.max_concurrency,
                     None,
+                    resuming_persisted_manifest,
                 )
                 .await?
                 .run()
@@ -101,6 +103,7 @@ pub(crate) async fn download_to_partial(
                     manifest,
                     options.max_concurrency,
                     Some(seed),
+                    false,
                 )
                 .await?
                 .run()
@@ -155,8 +158,23 @@ pub(crate) async fn resume_persisted_download_to_partial(
     let Some(download_url) = recover_persisted_download_url(artifacts).await? else {
         return Ok(false);
     };
-    download_to_partial(http, cookies, &download_url, artifacts, options).await?;
-    Ok(true)
+    match download_to_partial(http, cookies, &download_url, artifacts, options, true).await {
+        Ok(()) => Ok(true),
+        Err(error) if is_terminal_persisted_download_rejection(&error) => {
+            artifacts.remove_multipart_state().await?;
+            Ok(false)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn is_terminal_persisted_download_rejection(error: &Error) -> bool {
+    match error {
+        Error::Api { status, .. } => {
+            (400..500).contains(status) && *status != 408 && *status != 429
+        }
+        _ => false,
+    }
 }
 
 #[cfg(test)]
