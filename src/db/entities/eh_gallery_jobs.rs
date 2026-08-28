@@ -18,6 +18,7 @@ pub struct Model {
     pub file_size: i64,
     pub gp_cost: i64,
     pub zip_path: Option<String>,
+    pub legacy_artifact_handoff: Option<String>,
     pub telegraph_url: Option<String>,
     pub error: Option<String>,
     pub retry_count: i32,

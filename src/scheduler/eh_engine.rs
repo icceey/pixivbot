@@ -707,67 +707,73 @@ impl EhBackgroundDownloadWorker {
             ),
         };
         let (file_size, gp_cost) = if let Some(resolution) = archive_resolution {
-            let archive_request = self
+            let options = ArchiveDownloadOptions {
+                max_concurrency: self.config.archive_download_concurrency,
+            };
+            if let Some(downloaded_file_size) = self
                 .client
-                .prepare_archive_download(gid, token, resolution)
+                .resume_archive_from_persisted_manifest(&zip_path, options)
                 .await
-                .context("Failed to prepare archive download")?;
-            if let Some(reason) =
-                archive_cost_policy_reject_reason(self.config.as_ref(), archive_request.cost())
+                .context("Failed to resume persisted archive download")?
             {
-                return Ok(BackgroundDownloadOutcome::Rejected { reason });
-            }
-            ensure_eh_archive_under_size_limit(
-                self.config.as_ref(),
-                archive_request.estimated_size_bytes(),
-            )?;
-
-            // GP / quota reservation: same as main worker. Background downloads
-            // must also reserve the shared ledger budget before archive POSTs.
-            match check_and_reserve_archive_cost(
-                self.repo.as_ref(),
-                self.config.as_ref(),
-                Some(job.id),
-                None,
-                job.gid,
-                archive_request.cost(),
-            )
-            .await?
-            {
-                ArchiveCostCheck::Proceed => {}
-                ArchiveCostCheck::Defer { delay_secs, reason } => {
-                    info!(
-                        "Deferring EH background download for gid={} ({}), no reservation or POST",
-                        gid, reason
-                    );
-                    // Non-error defer: keep the entry in the background queue
-                    // but push next_retry_at out by `delay_secs`. Do NOT
-                    // increment attempt_count - quota exhaustion is not a
-                    // retryable failure, it just needs to wait for the window
-                    // to recover.
-                    self.repo
-                        .defer_eh_job_background_download(job.id, delay_secs, &reason)
-                        .await?;
-                    return Ok(BackgroundDownloadOutcome::Deferred { reason });
-                }
-                ArchiveCostCheck::Reject { reason } => {
+                (downloaded_file_size, 0)
+            } else {
+                let archive_request = self
+                    .client
+                    .prepare_archive_download(gid, token, resolution)
+                    .await
+                    .context("Failed to prepare archive download")?;
+                if let Some(reason) =
+                    archive_cost_policy_reject_reason(self.config.as_ref(), archive_request.cost())
+                {
                     return Ok(BackgroundDownloadOutcome::Rejected { reason });
                 }
-            };
+                ensure_eh_archive_under_size_limit(
+                    self.config.as_ref(),
+                    archive_request.estimated_size_bytes(),
+                )?;
 
-            let downloaded_file_size = self
-                .client
-                .download_archive_with_request_and_options(
-                    &archive_request,
-                    &zip_path,
-                    ArchiveDownloadOptions {
-                        max_concurrency: self.config.archive_download_concurrency,
-                    },
+                // GP / quota reservation: same as main worker. Background downloads
+                // must also reserve the shared ledger budget before archive POSTs.
+                match check_and_reserve_archive_cost(
+                    self.repo.as_ref(),
+                    self.config.as_ref(),
+                    Some(job.id),
+                    None,
+                    job.gid,
+                    archive_request.cost(),
                 )
-                .await
-                .context("Failed to download archive")?;
-            let gp_cost = archive_request.cost().gp_amount().unwrap_or(0) as i64;
-            (downloaded_file_size, gp_cost)
+                .await?
+                {
+                    ArchiveCostCheck::Proceed => {}
+                    ArchiveCostCheck::Defer { delay_secs, reason } => {
+                        info!(
+                            "Deferring EH background download for gid={} ({}), no reservation or POST",
+                            gid, reason
+                        );
+                        // Non-error defer: keep the entry in the background queue
+                        // but push next_retry_at out by `delay_secs`. Do NOT
+                        // increment attempt_count - quota exhaustion is not a
+                        // retryable failure, it just needs to wait for the window
+                        // to recover.
+                        self.repo
+                            .defer_eh_job_background_download(job.id, delay_secs, &reason)
+                            .await?;
+                        return Ok(BackgroundDownloadOutcome::Deferred { reason });
+                    }
+                    ArchiveCostCheck::Reject { reason } => {
+                        return Ok(BackgroundDownloadOutcome::Rejected { reason });
+                    }
+                };
+
+                let downloaded_file_size = self
+                    .client
+                    .download_archive_with_request_and_options(&archive_request, &zip_path, options)
+                    .await
+                    .context("Failed to download archive")?;
+                let gp_cost = archive_request.cost().gp_amount().unwrap_or(0) as i64;
+                (downloaded_file_size, gp_cost)
+            }
         } else {
             let file_size = self
                 .client
@@ -1626,51 +1632,25 @@ impl EhDownloadWorker {
             ),
         };
         let (file_size, gp_cost) = if let Some(resolution) = archive_resolution {
-            let archive_request = self
+            let options = ArchiveDownloadOptions {
+                max_concurrency: self.config.archive_download_concurrency,
+            };
+            if let Some(downloaded_file_size) = self
                 .client
-                .prepare_archive_download(gid, token, resolution)
+                .resume_archive_from_persisted_manifest(&zip_path, options)
                 .await
-                .context("Failed to prepare archive download")?;
-            if let Some(reason) =
-                archive_cost_policy_reject_reason(self.config.as_ref(), archive_request.cost())
+                .context("Failed to resume persisted archive download")?
             {
-                self.repo
-                    .fail_eh_job_for_archive_policy(job, &reason)
+                (downloaded_file_size, 0)
+            } else {
+                let archive_request = self
+                    .client
+                    .prepare_archive_download(gid, token, resolution)
                     .await
-                    .map_err(|error| error.context(ArchivePolicyTransitionError))?;
-                warn!(
-                    "Rejecting EH download for gid={} due to archive policy: {}",
-                    gid, reason
-                );
-                return Ok(());
-            }
-            ensure_eh_archive_under_size_limit(
-                self.config.as_ref(),
-                archive_request.estimated_size_bytes(),
-            )?;
-
-            // Parse the archiver-page cost, then reserve any positive GP attempt
-            // in the ledger before POSTing the archive request.
-            match check_and_reserve_archive_cost(
-                self.repo.as_ref(),
-                self.config.as_ref(),
-                Some(job.id),
-                None,
-                job.gid,
-                archive_request.cost(),
-            )
-            .await?
-            {
-                ArchiveCostCheck::Proceed => {}
-                ArchiveCostCheck::Defer { delay_secs, reason } => {
-                    info!(
-                        "Deferring EH download for gid={} ({}), no reservation or POST",
-                        gid, reason
-                    );
-                    self.repo.defer_eh_job_download(job.id, delay_secs).await?;
-                    return Ok(());
-                }
-                ArchiveCostCheck::Reject { reason } => {
+                    .context("Failed to prepare archive download")?;
+                if let Some(reason) =
+                    archive_cost_policy_reject_reason(self.config.as_ref(), archive_request.cost())
+                {
                     self.repo
                         .fail_eh_job_for_archive_policy(job, &reason)
                         .await
@@ -1681,21 +1661,53 @@ impl EhDownloadWorker {
                     );
                     return Ok(());
                 }
-            };
+                ensure_eh_archive_under_size_limit(
+                    self.config.as_ref(),
+                    archive_request.estimated_size_bytes(),
+                )?;
 
-            let downloaded_file_size = self
-                .client
-                .download_archive_with_request_and_options(
-                    &archive_request,
-                    &zip_path,
-                    ArchiveDownloadOptions {
-                        max_concurrency: self.config.archive_download_concurrency,
-                    },
+                // Parse the archiver-page cost, then reserve any positive GP attempt
+                // in the ledger before POSTing the archive request.
+                match check_and_reserve_archive_cost(
+                    self.repo.as_ref(),
+                    self.config.as_ref(),
+                    Some(job.id),
+                    None,
+                    job.gid,
+                    archive_request.cost(),
                 )
-                .await
-                .context("Failed to download archive")?;
-            let gp_cost = archive_request.cost().gp_amount().unwrap_or(0) as i64;
-            (downloaded_file_size, gp_cost)
+                .await?
+                {
+                    ArchiveCostCheck::Proceed => {}
+                    ArchiveCostCheck::Defer { delay_secs, reason } => {
+                        info!(
+                            "Deferring EH download for gid={} ({}), no reservation or POST",
+                            gid, reason
+                        );
+                        self.repo.defer_eh_job_download(job.id, delay_secs).await?;
+                        return Ok(());
+                    }
+                    ArchiveCostCheck::Reject { reason } => {
+                        self.repo
+                            .fail_eh_job_for_archive_policy(job, &reason)
+                            .await
+                            .map_err(|error| error.context(ArchivePolicyTransitionError))?;
+                        warn!(
+                            "Rejecting EH download for gid={} due to archive policy: {}",
+                            gid, reason
+                        );
+                        return Ok(());
+                    }
+                };
+
+                let downloaded_file_size = self
+                    .client
+                    .download_archive_with_request_and_options(&archive_request, &zip_path, options)
+                    .await
+                    .context("Failed to download archive")?;
+                let gp_cost = archive_request.cost().gp_amount().unwrap_or(0) as i64;
+                (downloaded_file_size, gp_cost)
+            }
         } else {
             info!("Not logged in, using direct image download for gid={}", gid);
             let file_size = self
@@ -10631,6 +10643,153 @@ mod tests {
             .unwrap();
         assert_eq!(delivery.status, STATUS_FAILED);
         assert!(delivery.error.is_none());
+        assert!(gp_attempts(repo.as_ref()).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn download_worker_resumes_persisted_manifest_without_archiver_post() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        let eh_server = MockServer::start().await;
+        let temp = tempfile::tempdir().unwrap();
+        setup_chat(&repo, -100, true).await;
+        let entry = insert_queue_entry(
+            &repo,
+            -100,
+            4053259,
+            "persisted-manifest",
+            "Resumed Gallery",
+            false,
+            "pending",
+            None,
+            None,
+        )
+        .await;
+        let job = job_for_delivery(&repo, &entry).await;
+        let artifacts = archive_artifacts_for_job(temp.path(), &job);
+        let zip_temp = tempfile::tempdir().unwrap();
+        let source_zip = zip_temp.path().join("source.zip");
+        create_test_zip(&source_zip, 2);
+        let zip_bytes = std::fs::read(&source_zip).unwrap();
+        std::fs::create_dir_all(artifacts.parts_dir()).unwrap();
+        std::fs::write(
+            artifacts.parts_dir().join("part-0000000000000000"),
+            &zip_bytes,
+        )
+        .unwrap();
+        std::fs::write(
+            artifacts.parts_dir().join("manifest.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "version": 1,
+                "download_url": format!("{}/archive/never-requested", eh_server.uri()),
+                "total_len": zip_bytes.len(),
+                "etag": null,
+                "last_modified": null,
+                "next_part_id": 1,
+                "parts": [{ "id": 0, "start": 0, "end": zip_bytes.len() }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let mut config = make_config();
+        config.background_download_enabled = false;
+        let worker = EhDownloadWorker::new(
+            Arc::clone(&repo),
+            make_eh_client(&eh_server),
+            Arc::new(config),
+            temp.path().to_path_buf(),
+            None,
+        );
+
+        worker.tick().await.unwrap();
+
+        let updated = job_for_delivery(&repo, &entry).await;
+        assert_eq!(updated.status, JOB_STATUS_DOWNLOADED);
+        assert!(artifacts.final_zip().exists());
+        assert!(
+            eh_server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .all(|request| {
+                    !(request.method.as_str() == "POST" && request.url.path() == "/archiver.php")
+                }),
+            "a persisted manifest must resume without an archiver POST or GP reservation"
+        );
+        assert!(gp_attempts(repo.as_ref()).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn background_download_worker_resumes_persisted_manifest_without_archiver_post() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        let eh_server = MockServer::start().await;
+        let temp = tempfile::tempdir().unwrap();
+        setup_chat(&repo, -100, true).await;
+        let entry = insert_queue_entry(
+            &repo,
+            -100,
+            4053261,
+            "background-persisted-manifest",
+            "Background Resumed Gallery",
+            false,
+            "pending",
+            None,
+            None,
+        )
+        .await;
+        handoff_job_to_background(&repo, &entry).await;
+        let job = job_for_delivery(&repo, &entry).await;
+        let artifacts = archive_artifacts_for_job(temp.path(), &job);
+        let zip_temp = tempfile::tempdir().unwrap();
+        let source_zip = zip_temp.path().join("source.zip");
+        create_test_zip(&source_zip, 2);
+        let zip_bytes = std::fs::read(&source_zip).unwrap();
+        std::fs::create_dir_all(artifacts.parts_dir()).unwrap();
+        std::fs::write(
+            artifacts.parts_dir().join("part-0000000000000000"),
+            &zip_bytes,
+        )
+        .unwrap();
+        std::fs::write(
+            artifacts.parts_dir().join("manifest.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "version": 1,
+                "download_url": format!("{}/archive/never-requested", eh_server.uri()),
+                "total_len": zip_bytes.len(),
+                "etag": null,
+                "last_modified": null,
+                "next_part_id": 1,
+                "parts": [{ "id": 0, "start": 0, "end": zip_bytes.len() }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let mut config = make_config();
+        config.background_download_enabled = true;
+        config.background_download_concurrency = 1;
+        let worker = EhBackgroundDownloadWorker::new(
+            Arc::clone(&repo),
+            make_eh_client(&eh_server),
+            Arc::new(config),
+            temp.path().to_path_buf(),
+        );
+
+        worker.tick().await.unwrap();
+
+        let updated = job_for_delivery(&repo, &entry).await;
+        assert_eq!(updated.status, JOB_STATUS_DOWNLOADED);
+        assert!(artifacts.final_zip().exists());
+        assert!(
+            eh_server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .all(|request| {
+                    !(request.method.as_str() == "POST" && request.url.path() == "/archiver.php")
+                }),
+            "a background persisted manifest must resume without an archiver POST or GP reservation"
+        );
         assert!(gp_attempts(repo.as_ref()).await.is_empty());
     }
 

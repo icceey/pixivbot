@@ -122,6 +122,11 @@ async fn create_shared_gallery_job_schema_and_backfill(
                         .default(0),
                 )
                 .col(ColumnDef::new(EhGalleryJobs::ZipPath).text().null())
+                .col(
+                    ColumnDef::new(EhGalleryJobs::LegacyArtifactHandoff)
+                        .string()
+                        .null(),
+                )
                 .col(ColumnDef::new(EhGalleryJobs::TelegraphUrl).text().null())
                 .col(ColumnDef::new(EhGalleryJobs::Error).text().null())
                 .col(
@@ -628,8 +633,93 @@ async fn create_shared_gallery_job_schema_and_backfill(
                     gid, \
                     file_size, \
                     completed_at \
-               FROM eh_download_queue \
+             FROM eh_download_queue \
               WHERE file_size > 0 AND completed_at IS NOT NULL",
+        )
+        .await?;
+    // Active legacy deliveries can leave a resumable `gid_token.zip` family,
+    // but the shared job's deterministic family is job-specific. Simultaneous
+    // active claims, or multiple never-claimed variants, cannot prove which
+    // resolution owns that family, so mark every candidate conflict-blocked.
+    // Otherwise select the most recent concrete legacy claim before
+    // compatibility state is cleared. The runtime startup handoff derives the
+    // configured cache path and moves the files.
+    manager
+        .get_connection()
+        .execute_unprepared(
+            "UPDATE eh_gallery_jobs AS job \
+                SET legacy_artifact_handoff = 'conflict' \
+              WHERE job.download_mode = 'legacy' \
+                AND job.status = 'pending' \
+                AND (\
+                    1 < (\
+                        SELECT COUNT(DISTINCT active.job_id) \
+                          FROM eh_download_queue AS active \
+                         WHERE active.gid = job.gid \
+                           AND active.token = job.token \
+                           AND active.job_id IS NOT NULL \
+                           AND (active.status = 'downloading' \
+                                OR active.background_download_status = 'running')\
+                    ) \
+                    OR (\
+                        NOT EXISTS (\
+                            SELECT 1 \
+                              FROM eh_download_queue AS claimed \
+                             WHERE claimed.gid = job.gid \
+                               AND claimed.token = job.token \
+                               AND claimed.job_id IS NOT NULL \
+                               AND (claimed.status = 'downloading' \
+                                    OR claimed.background_download_status = 'running' \
+                                    OR (claimed.status = 'pending' AND claimed.started_at IS NOT NULL) \
+                                    OR (claimed.background_download_status = 'pending' \
+                                        AND claimed.background_download_started_at IS NOT NULL))\
+                        ) \
+                        AND 1 < (\
+                            SELECT COUNT(DISTINCT candidate.job_id) \
+                              FROM eh_download_queue AS candidate \
+                             WHERE candidate.gid = job.gid \
+                               AND candidate.token = job.token \
+                               AND candidate.job_id IS NOT NULL \
+                               AND (candidate.status IN ('pending', 'downloading') \
+                                    OR candidate.background_download_status IN ('pending', 'running'))\
+                        )\
+                    )\
+                )",
+        )
+        .await?;
+    manager
+        .get_connection()
+        .execute_unprepared(
+            "UPDATE eh_gallery_jobs AS job \
+                SET legacy_artifact_handoff = 'pending' \
+              WHERE job.download_mode = 'legacy' \
+                AND job.status = 'pending' \
+                AND job.legacy_artifact_handoff IS NULL \
+                AND job.id = (\
+                    SELECT candidate.job_id \
+                      FROM eh_download_queue AS candidate \
+                     WHERE candidate.gid = job.gid \
+                       AND candidate.token = job.token \
+                       AND candidate.job_id IS NOT NULL \
+                       AND (candidate.status IN ('pending', 'downloading') \
+                            OR candidate.background_download_status IN ('pending', 'running')) \
+                     ORDER BY CASE \
+                                  WHEN candidate.status = 'downloading' \
+                                       OR candidate.background_download_status = 'running' THEN 0 \
+                                  WHEN (candidate.status = 'pending' \
+                                        AND candidate.started_at IS NOT NULL) \
+                                       OR (candidate.background_download_status = 'pending' \
+                                           AND candidate.background_download_started_at IS NOT NULL) THEN 1 \
+                                  ELSE 2 \
+                              END, \
+                              CASE \
+                                  WHEN candidate.background_download_status IN ('running', 'pending') \
+                                      THEN COALESCE(candidate.background_download_started_at, candidate.started_at) \
+                                  ELSE candidate.started_at \
+                              END DESC, \
+                              candidate.id DESC \
+                     LIMIT 1\
+                )",
         )
         .await?;
     manager
@@ -681,6 +771,7 @@ enum EhGalleryJobs {
     FileSize,
     GpCost,
     ZipPath,
+    LegacyArtifactHandoff,
     TelegraphUrl,
     Error,
     RetryCount,

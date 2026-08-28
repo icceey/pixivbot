@@ -93,6 +93,7 @@ pub mod tests_helpers {
                 file_size INTEGER NOT NULL DEFAULT 0,
                 gp_cost INTEGER NOT NULL DEFAULT 0,
                 zip_path TEXT,
+                legacy_artifact_handoff TEXT,
                 telegraph_url TEXT,
                 error TEXT,
                 retry_count INTEGER NOT NULL DEFAULT 0,

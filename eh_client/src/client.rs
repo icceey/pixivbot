@@ -1,5 +1,6 @@
 use crate::archive_download::{
-    archive_http_error, download_to_partial, ArchiveArtifacts, ArchiveDownloadOptions,
+    archive_http_error, download_to_partial, resume_persisted_download_to_partial,
+    ArchiveArtifacts, ArchiveDownloadOptions,
 };
 use crate::error::{Error, Result};
 use crate::models::{EhCookies, EhGallery, EhGalleryRef, RawApiResponse, RawGalleryMetaEntry};
@@ -517,6 +518,44 @@ impl EhClient {
         Ok(total)
     }
 
+    /// Resume a valid multipart archive using its persisted download URL without
+    /// fetching the archiver page or POSTing a new archive request. Returns
+    /// `None` when no valid multipart manifest is available.
+    pub async fn resume_archive_from_persisted_manifest(
+        &self,
+        dest: &Path,
+        options: ArchiveDownloadOptions,
+    ) -> Result<Option<u64>> {
+        let options = options.validate()?;
+        let artifacts = ArchiveArtifacts::new(dest);
+        if tokio::fs::try_exists(dest).await? {
+            return Err(Error::Other(
+                "cannot resume persisted archive manifest over an existing final ZIP".into(),
+            ));
+        }
+        if !resume_persisted_download_to_partial(&self.http, &self.cookies, &artifacts, options)
+            .await?
+        {
+            return Ok(None);
+        }
+
+        if let Err(error) = validate_complete_zip(artifacts.assembly_scratch()).await {
+            let _ = artifacts.remove_multipart_state().await;
+            return Err(error);
+        }
+        let total = tokio::fs::metadata(artifacts.assembly_scratch())
+            .await?
+            .len();
+        if let Err(error) = tokio::fs::rename(artifacts.assembly_scratch(), dest).await {
+            let _ = tokio::fs::remove_file(artifacts.assembly_scratch()).await;
+            return Err(error.into());
+        }
+        if artifacts.remove_parts_dir().await.is_err() {
+            tracing::warn!("could not remove completed archive multipart state");
+        }
+        Ok(Some(total))
+    }
+
     /// Get the base URL.
     pub fn base_url(&self) -> &str {
         &self.base_url
@@ -981,6 +1020,62 @@ async fn validate_complete_zip(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+
+    #[tokio::test]
+    async fn persisted_multipart_manifest_resumes_without_an_archiver_request() {
+        let temp = tempfile::tempdir().unwrap();
+        let dest = temp.path().join("archive.zip");
+        let artifacts = ArchiveArtifacts::new(&dest);
+        let cursor = std::io::Cursor::new(Vec::new());
+        let mut writer = zip::ZipWriter::new(cursor);
+        writer
+            .start_file("page.jpg", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(b"image").unwrap();
+        let archive_bytes = writer.finish().unwrap().into_inner();
+
+        tokio::fs::create_dir_all(artifacts.parts_dir())
+            .await
+            .unwrap();
+        tokio::fs::write(
+            artifacts.parts_dir().join("part-0000000000000000"),
+            &archive_bytes,
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            artifacts.parts_dir().join("manifest.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "version": 1,
+                "download_url": "http://127.0.0.1:9/already-prepared.zip",
+                "total_len": archive_bytes.len(),
+                "etag": null,
+                "last_modified": null,
+                "next_part_id": 1,
+                "parts": [{ "id": 0, "start": 0, "end": archive_bytes.len() }]
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let client = EhClientBuilder::new()
+            .base_url("http://127.0.0.1:9")
+            .build();
+        assert_eq!(
+            client
+                .resume_archive_from_persisted_manifest(
+                    &dest,
+                    ArchiveDownloadOptions { max_concurrency: 2 },
+                )
+                .await
+                .unwrap(),
+            Some(archive_bytes.len() as u64)
+        );
+        assert!(dest.exists());
+        assert!(!artifacts.parts_dir().exists());
+    }
 
     #[test]
     fn test_build_search_url_basic() {

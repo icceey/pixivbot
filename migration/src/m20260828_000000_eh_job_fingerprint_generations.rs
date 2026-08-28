@@ -116,7 +116,7 @@ async fn rebuild_eh_gallery_jobs(
         .execute_unprepared(
             "INSERT INTO eh_gallery_jobs (\
                  id, gid, token, download_mode, resolution, title, status, telegraph_status, \
-                 telegraph_required, file_size, gp_cost, zip_path, telegraph_url, error, \
+                  telegraph_required, file_size, gp_cost, zip_path, legacy_artifact_handoff, telegraph_url, error, \
                  retry_count, next_retry_at, cleanup_status, cleanup_started_at, cleanup_error, \
                  cleanup_next_retry_at, created_at, started_at, completed_at, \
                  background_download_status, background_download_started_at, \
@@ -127,7 +127,7 @@ async fn rebuild_eh_gallery_jobs(
                  telegraph_rewrite_error, telegraph_rewritten_at, source_fingerprint\
              ) SELECT \
                  id, gid, token, download_mode, resolution, title, status, telegraph_status, \
-                 telegraph_required, file_size, gp_cost, zip_path, telegraph_url, error, \
+                  telegraph_required, file_size, gp_cost, zip_path, legacy_artifact_handoff, telegraph_url, error, \
                  retry_count, next_retry_at, cleanup_status, cleanup_started_at, cleanup_error, \
                  cleanup_next_retry_at, created_at, started_at, completed_at, \
                  background_download_status, background_download_started_at, \
@@ -264,6 +264,11 @@ async fn create_eh_gallery_jobs_table(manager: &SchemaManager<'_>) -> Result<(),
                         .default(0),
                 )
                 .col(ColumnDef::new(EhGalleryJobs::ZipPath).text().null())
+                .col(
+                    ColumnDef::new(EhGalleryJobs::LegacyArtifactHandoff)
+                        .string()
+                        .null(),
+                )
                 .col(ColumnDef::new(EhGalleryJobs::TelegraphUrl).text().null())
                 .col(ColumnDef::new(EhGalleryJobs::Error).text().null())
                 .col(
@@ -469,6 +474,7 @@ enum EhGalleryJobs {
     FileSize,
     GpCost,
     ZipPath,
+    LegacyArtifactHandoff,
     TelegraphUrl,
     Error,
     RetryCount,

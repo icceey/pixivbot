@@ -1,10 +1,10 @@
 use super::Repo;
 use crate::db::entities::{eh_download_queue, eh_gallery_jobs};
 use crate::db::repo::eh_gallery_jobs::{
-    eh_gallery_job_artifact_path, CLEANUP_STATUS_FAILED, CLEANUP_STATUS_NONE,
-    CLEANUP_STATUS_PENDING, CLEANUP_STATUS_RUNNING, JOB_STATUS_DOWNLOADED, JOB_STATUS_DOWNLOADING,
-    JOB_STATUS_PENDING, JOB_STATUS_RETIRED, TELEGRAPH_STATUS_PENDING, TELEGRAPH_STATUS_READY,
-    TELEGRAPH_STATUS_UPLOADING,
+    eh_gallery_job_artifact_path, legacy_eh_gallery_job_artifact_path, CLEANUP_STATUS_FAILED,
+    CLEANUP_STATUS_NONE, CLEANUP_STATUS_PENDING, CLEANUP_STATUS_RUNNING, JOB_STATUS_DOWNLOADED,
+    JOB_STATUS_DOWNLOADING, JOB_STATUS_PENDING, JOB_STATUS_RETIRED, TELEGRAPH_STATUS_PENDING,
+    TELEGRAPH_STATUS_READY, TELEGRAPH_STATUS_UPLOADING,
 };
 use crate::db::repo::eh_gallery_push_ledger::{record_eh_push_in_txn, EhPushSurface};
 use anyhow::{Context, Result};
@@ -4175,6 +4175,12 @@ impl Repo {
                     | crate::db::repo::eh_gallery_jobs::JOB_STATUS_DOWNLOADING
             ) {
                 owned_final_zips.insert(eh_gallery_job_artifact_path(cache_dir, &job));
+            }
+            if job.legacy_artifact_handoff.is_some()
+                && job.status == crate::db::repo::eh_gallery_jobs::JOB_STATUS_PENDING
+                && job.cleanup_status == crate::db::repo::eh_gallery_jobs::CLEANUP_STATUS_NONE
+            {
+                owned_final_zips.insert(legacy_eh_gallery_job_artifact_path(cache_dir, &job));
             }
         }
 

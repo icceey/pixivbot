@@ -11,6 +11,7 @@ use crate::db::repo::eh_gallery_results::{
 };
 use anyhow::{Context, Result};
 use chrono::{Local, Timelike};
+use eh_client::ArchiveArtifacts;
 use sea_orm::prelude::DateTime;
 use sea_orm::sea_query::{Expr, Query, SimpleExpr};
 use sea_orm::{
@@ -45,6 +46,10 @@ pub const CLEANUP_STATUS_NONE: &str = "none";
 pub const CLEANUP_STATUS_PENDING: &str = "pending";
 pub const CLEANUP_STATUS_RUNNING: &str = "running";
 pub const CLEANUP_STATUS_FAILED: &str = "failed";
+
+pub const LEGACY_ARTIFACT_HANDOFF_PENDING: &str = "pending";
+pub const LEGACY_ARTIFACT_HANDOFF_MOVING: &str = "moving";
+pub const LEGACY_ARTIFACT_HANDOFF_CONFLICT: &str = "conflict";
 
 pub const DELIVERY_STATUS_WAITING: &str = "waiting";
 pub const DELIVERY_STATUS_PUBLISHING: &str = "publishing";
@@ -257,6 +262,13 @@ pub(crate) fn eh_gallery_job_artifact_path(
     job: &eh_gallery_jobs::Model,
 ) -> std::path::PathBuf {
     cache_dir.join(eh_gallery_job_artifact_filename(job))
+}
+
+pub(crate) fn legacy_eh_gallery_job_artifact_path(
+    cache_dir: &std::path::Path,
+    job: &eh_gallery_jobs::Model,
+) -> std::path::PathBuf {
+    cache_dir.join(format!("{}_{}.zip", job.gid, job.token))
 }
 
 fn sanitize_artifact_component(value: &str) -> String {
@@ -1426,6 +1438,7 @@ impl Repo {
         let mut query = eh_gallery_jobs::Entity::find()
             .filter(eh_gallery_jobs::Column::Status.eq(JOB_STATUS_PENDING))
             .filter(eh_gallery_jobs::Column::CleanupStatus.eq(CLEANUP_STATUS_NONE))
+            .filter(eh_gallery_jobs::Column::LegacyArtifactHandoff.is_null())
             .filter(eh_gallery_jobs::Column::BackgroundDownloadStatus.is_null())
             .filter(eh_job_has_configured_source_work_candidate_filter(
                 send_archive,
@@ -1473,6 +1486,7 @@ impl Repo {
             .filter(eh_gallery_jobs::Column::Id.eq(job.id))
             .filter(eh_gallery_jobs::Column::Status.eq(JOB_STATUS_PENDING))
             .filter(eh_gallery_jobs::Column::CleanupStatus.eq(CLEANUP_STATUS_NONE))
+            .filter(eh_gallery_jobs::Column::LegacyArtifactHandoff.is_null())
             .filter(eh_gallery_jobs::Column::BackgroundDownloadStatus.is_null())
             .filter(eh_job_has_configured_source_work_filter(
                 job.id,
@@ -1520,6 +1534,7 @@ impl Repo {
             .filter(eh_gallery_jobs::Column::Id.eq(job_id))
             .filter(eh_gallery_jobs::Column::CleanupStatus.eq(CLEANUP_STATUS_NONE))
             .filter(eh_gallery_jobs::Column::StartedAt.eq(expected_started_at))
+            .filter(eh_gallery_jobs::Column::LegacyArtifactHandoff.is_null())
             .filter(
                 eh_gallery_jobs::Column::ZipPath
                     .is_null()
@@ -2812,6 +2827,178 @@ impl Repo {
         }
     }
 
+    /// Move migration-marked legacy archive families into their single shared
+    /// job-specific family before workers or orphan cleanup can touch them.
+    ///
+    /// The durable marker is first changed from `pending` to `moving`; both
+    /// source and target families remain cleanup-owned until the final DB
+    /// update. An ambiguous `conflict` marker likewise blocks workers until
+    /// its source disappears. This makes interrupted renames restart-safe
+    /// without allowing a worker to claim an ambiguous legacy family.
+    pub async fn handoff_legacy_eh_archive_artifacts(
+        &self,
+        cache_dir: &std::path::Path,
+    ) -> Result<u64> {
+        let jobs = eh_gallery_jobs::Entity::find()
+            .filter(eh_gallery_jobs::Column::LegacyArtifactHandoff.is_not_null())
+            .filter(eh_gallery_jobs::Column::Status.eq(JOB_STATUS_PENDING))
+            .filter(eh_gallery_jobs::Column::CleanupStatus.eq(CLEANUP_STATUS_NONE))
+            .order_by(eh_gallery_jobs::Column::Id, Order::Asc)
+            .all(&self.db)
+            .await
+            .context("Failed to fetch legacy EH archive handoff jobs")?;
+        let mut completed = 0;
+
+        for job in jobs {
+            let Some(state) = job.legacy_artifact_handoff.as_deref() else {
+                continue;
+            };
+            let source =
+                ArchiveArtifacts::new(legacy_eh_gallery_job_artifact_path(cache_dir, &job));
+            let target = ArchiveArtifacts::new(eh_gallery_job_artifact_path(cache_dir, &job));
+            let source_has_members = archive_artifacts_have_members(&source).await?;
+            let target_has_members = archive_artifacts_have_members(&target).await?;
+
+            if state == LEGACY_ARTIFACT_HANDOFF_CONFLICT {
+                if source_has_members {
+                    tracing::warn!(
+                        job_id = job.id,
+                        gid = job.gid,
+                        "Preserving an ambiguous legacy EH archive family"
+                    );
+                    continue;
+                }
+                if self
+                    .finish_legacy_eh_archive_handoff(
+                        job.id,
+                        LEGACY_ARTIFACT_HANDOFF_CONFLICT,
+                        None,
+                    )
+                    .await?
+                {
+                    completed += 1;
+                }
+                continue;
+            }
+
+            if state == LEGACY_ARTIFACT_HANDOFF_PENDING {
+                if source_has_members && target_has_members {
+                    tracing::warn!(
+                        job_id = job.id,
+                        gid = job.gid,
+                        "Preserving conflicting legacy and shared EH archive families"
+                    );
+                    continue;
+                }
+                if !source_has_members {
+                    if target_has_members {
+                        tracing::warn!(
+                            job_id = job.id,
+                            gid = job.gid,
+                            "Preserving unexpected shared EH archive family without its legacy source"
+                        );
+                        continue;
+                    }
+                    if self
+                        .finish_legacy_eh_archive_handoff(
+                            job.id,
+                            LEGACY_ARTIFACT_HANDOFF_PENDING,
+                            None,
+                        )
+                        .await?
+                    {
+                        completed += 1;
+                    }
+                    continue;
+                }
+
+                let claimed = eh_gallery_jobs::Entity::update_many()
+                    .col_expr(
+                        eh_gallery_jobs::Column::LegacyArtifactHandoff,
+                        Expr::value(Some(LEGACY_ARTIFACT_HANDOFF_MOVING.to_string())),
+                    )
+                    .filter(eh_gallery_jobs::Column::Id.eq(job.id))
+                    .filter(
+                        eh_gallery_jobs::Column::LegacyArtifactHandoff
+                            .eq(LEGACY_ARTIFACT_HANDOFF_PENDING),
+                    )
+                    .filter(eh_gallery_jobs::Column::Status.eq(JOB_STATUS_PENDING))
+                    .filter(eh_gallery_jobs::Column::CleanupStatus.eq(CLEANUP_STATUS_NONE))
+                    .exec(&self.db)
+                    .await
+                    .context("Failed to mark legacy EH archive handoff as moving")?;
+                if claimed.rows_affected != 1 {
+                    continue;
+                }
+            } else if state != LEGACY_ARTIFACT_HANDOFF_MOVING {
+                tracing::warn!(
+                    job_id = job.id,
+                    gid = job.gid,
+                    state,
+                    "Preserving EH archive family with an unknown legacy handoff state"
+                );
+                continue;
+            }
+
+            if let Err(error) = move_archive_artifacts_without_overwrite(&source, &target).await {
+                tracing::warn!(
+                    job_id = job.id,
+                    gid = job.gid,
+                    error = %error,
+                    "Failed to move legacy EH archive family; preserving both families"
+                );
+                continue;
+            }
+            if archive_artifacts_have_members(&source).await? {
+                tracing::warn!(
+                    job_id = job.id,
+                    gid = job.gid,
+                    "Legacy EH archive source remains after handoff; preserving both families"
+                );
+                continue;
+            }
+
+            let target_path = archive_artifacts_have_members(&target)
+                .await?
+                .then_some(target.final_zip());
+            if self
+                .finish_legacy_eh_archive_handoff(
+                    job.id,
+                    LEGACY_ARTIFACT_HANDOFF_MOVING,
+                    target_path,
+                )
+                .await?
+            {
+                completed += 1;
+            }
+        }
+
+        Ok(completed)
+    }
+
+    async fn finish_legacy_eh_archive_handoff(
+        &self,
+        job_id: i32,
+        expected_state: &str,
+        zip_path: Option<&std::path::Path>,
+    ) -> Result<bool> {
+        let zip_path = zip_path.map(|path| path.to_string_lossy().into_owned());
+        let updated = eh_gallery_jobs::Entity::update_many()
+            .col_expr(
+                eh_gallery_jobs::Column::LegacyArtifactHandoff,
+                Expr::value(None::<String>),
+            )
+            .col_expr(eh_gallery_jobs::Column::ZipPath, Expr::value(zip_path))
+            .filter(eh_gallery_jobs::Column::Id.eq(job_id))
+            .filter(eh_gallery_jobs::Column::LegacyArtifactHandoff.eq(expected_state))
+            .filter(eh_gallery_jobs::Column::Status.eq(JOB_STATUS_PENDING))
+            .filter(eh_gallery_jobs::Column::CleanupStatus.eq(CLEANUP_STATUS_NONE))
+            .exec(&self.db)
+            .await
+            .context("Failed to finalize legacy EH archive handoff")?;
+        Ok(updated.rows_affected == 1)
+    }
+
     /// Recover every shared-work lease at the one startup boundary.  Lease
     /// generations remain persisted so a subsequent claim always advances past
     /// a crashed worker; payloads, paths, and sent markers are deliberately
@@ -3199,6 +3386,7 @@ impl Repo {
         let mut query = eh_gallery_jobs::Entity::find()
             .filter(eh_gallery_jobs::Column::Status.eq(JOB_STATUS_PENDING))
             .filter(eh_gallery_jobs::Column::CleanupStatus.eq(CLEANUP_STATUS_NONE))
+            .filter(eh_gallery_jobs::Column::LegacyArtifactHandoff.is_null())
             .filter(eh_gallery_jobs::Column::BackgroundDownloadStatus.eq(BACKGROUND_STATUS_PENDING))
             .filter(eh_job_has_configured_source_work_candidate_filter(
                 send_archive,
@@ -3247,6 +3435,7 @@ impl Repo {
             .filter(eh_gallery_jobs::Column::Id.eq(job.id))
             .filter(eh_gallery_jobs::Column::Status.eq(JOB_STATUS_PENDING))
             .filter(eh_gallery_jobs::Column::CleanupStatus.eq(CLEANUP_STATUS_NONE))
+            .filter(eh_gallery_jobs::Column::LegacyArtifactHandoff.is_null())
             .filter(eh_gallery_jobs::Column::BackgroundDownloadStatus.eq(BACKGROUND_STATUS_PENDING))
             .filter(eh_job_has_configured_source_work_filter(
                 job.id,
@@ -4542,6 +4731,80 @@ fn cleanup_pending_when_zip_owned_expr() -> SimpleExpr {
     )
     .finally(Expr::col(eh_gallery_jobs::Column::CleanupStatus))
     .into()
+}
+
+fn archive_artifact_members(artifacts: &ArchiveArtifacts) -> [&std::path::Path; 4] {
+    [
+        artifacts.final_zip(),
+        artifacts.assembly_scratch(),
+        artifacts.parts_dir(),
+        artifacts.uploads_dir(),
+    ]
+}
+
+async fn archive_artifacts_have_members(artifacts: &ArchiveArtifacts) -> Result<bool> {
+    for member in archive_artifact_members(artifacts) {
+        if tokio::fs::try_exists(member).await.with_context(|| {
+            format!("Failed to inspect EH archive artifact {}", member.display())
+        })? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+async fn move_archive_artifacts_without_overwrite(
+    source: &ArchiveArtifacts,
+    target: &ArchiveArtifacts,
+) -> Result<()> {
+    for (source_member, target_member) in archive_artifact_members(source)
+        .into_iter()
+        .zip(archive_artifact_members(target))
+    {
+        let source_exists = tokio::fs::try_exists(source_member)
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to inspect EH archive source {}",
+                    source_member.display()
+                )
+            })?;
+        if !source_exists {
+            continue;
+        }
+        if tokio::fs::try_exists(target_member)
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to inspect EH archive target {}",
+                    target_member.display()
+                )
+            })?
+        {
+            anyhow::bail!(
+                "Refusing to overwrite existing EH archive target {}",
+                target_member.display()
+            );
+        }
+        match tokio::fs::rename(source_member, target_member).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if !tokio::fs::try_exists(target_member)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "Failed to recheck moved EH archive target {}",
+                            target_member.display()
+                        )
+                    })?
+                {
+                    return Err(error.into());
+                }
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
 }
 
 fn optional_job_string_filter(column: eh_gallery_jobs::Column, value: Option<&str>) -> SimpleExpr {

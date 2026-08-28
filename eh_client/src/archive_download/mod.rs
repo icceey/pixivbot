@@ -16,7 +16,7 @@ use assembly::assemble_parts;
 use coordinator::{MultipartCoordinator, MultipartOutcome};
 pub(crate) use http::archive_http_error;
 use initialization::{initialize_multipart, MultipartInitialization};
-use manifest::{recover_manifest, ManifestRecovery};
+use manifest::{recover_manifest, recover_persisted_download_url, ManifestRecovery};
 use sequential::download_sequential;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -144,6 +144,19 @@ pub(crate) async fn download_to_partial(
             .await
         }
     }
+}
+
+pub(crate) async fn resume_persisted_download_to_partial(
+    http: &reqwest::Client,
+    cookies: &EhCookies,
+    artifacts: &ArchiveArtifacts,
+    options: ArchiveDownloadOptions,
+) -> Result<bool> {
+    let Some(download_url) = recover_persisted_download_url(artifacts).await? else {
+        return Ok(false);
+    };
+    download_to_partial(http, cookies, &download_url, artifacts, options).await?;
+    Ok(true)
 }
 
 #[cfg(test)]

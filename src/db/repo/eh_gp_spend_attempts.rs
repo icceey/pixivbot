@@ -86,12 +86,18 @@ mod tests {
     use crate::db::entities::{
         eh_download_completions, eh_download_queue, eh_gallery_jobs, eh_gp_spend_attempts,
     };
+    use crate::db::repo::eh_gallery_jobs::{
+        eh_gallery_job_artifact_path, LEGACY_ARTIFACT_HANDOFF_CONFLICT,
+        LEGACY_ARTIFACT_HANDOFF_MOVING, LEGACY_ARTIFACT_HANDOFF_PENDING,
+    };
+    use crate::db::repo::Repo;
     use anyhow::{bail, Result};
     use chrono::{Duration, Local};
+    use eh_client::ArchiveArtifacts;
     use migration::{MigrationTrait, Migrator, MigratorTrait, SchemaManager};
     use sea_orm::{
-        ActiveModelTrait, ConnectionTrait, Database, DatabaseConnection, DbBackend, EntityTrait,
-        Set, Statement,
+        ActiveModelTrait, ColumnTrait, ConnectionTrait, Database, DatabaseConnection, DbBackend,
+        EntityTrait, QueryFilter, Set, Statement,
     };
 
     const TABLE: &str = "eh_gp_spend_attempts";
@@ -99,6 +105,8 @@ mod tests {
     const MIGRATION_NAME: &str = "m20260719_000000_eh_gp_spend_attempts";
     const SHARED_JOBS_MIGRATION_NAME: &str = "m20260824_000000_eh_shared_gallery_jobs";
     const REUSE_LEDGER_MIGRATION_NAME: &str = "m20260826_000000_eh_result_reuse_and_push_ledger";
+    const LEGACY_ARTIFACT_HANDOFF_COMPAT_MIGRATION_NAME: &str =
+        "m20260827_000000_eh_legacy_artifact_handoff";
     const FINGERPRINT_GENERATIONS_MIGRATION_NAME: &str =
         "m20260828_000000_eh_job_fingerprint_generations";
     const JOB_REBUILD_INDEXES: [&str; 6] = [
@@ -177,6 +185,31 @@ mod tests {
         Ok(())
     }
 
+    fn legacy_artifact_handoff_compat_target_migration() -> Result<Box<dyn MigrationTrait>> {
+        Migrator::migrations()
+            .into_iter()
+            .find(|migration| migration.name() == LEGACY_ARTIFACT_HANDOFF_COMPAT_MIGRATION_NAME)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "migration {LEGACY_ARTIFACT_HANDOFF_COMPAT_MIGRATION_NAME} is not registered"
+                )
+            })
+    }
+
+    async fn migrate_legacy_artifact_handoff_compat_up(db: &DatabaseConnection) -> Result<()> {
+        legacy_artifact_handoff_compat_target_migration()?
+            .up(&SchemaManager::new(db))
+            .await?;
+        Ok(())
+    }
+
+    async fn migrate_legacy_artifact_handoff_compat_down(db: &DatabaseConnection) -> Result<()> {
+        legacy_artifact_handoff_compat_target_migration()?
+            .down(&SchemaManager::new(db))
+            .await?;
+        Ok(())
+    }
+
     fn fingerprint_generations_target_migration() -> Result<Box<dyn MigrationTrait>> {
         Migrator::migrations()
             .into_iter()
@@ -190,6 +223,7 @@ mod tests {
 
     async fn migrate_fingerprint_generations_up(db: &DatabaseConnection) -> Result<()> {
         migrate_reuse_ledger_up(db).await?;
+        migrate_legacy_artifact_handoff_compat_up(db).await?;
         migrate_fingerprint_generations_from_reuse_schema_up(db).await
     }
 
@@ -641,6 +675,200 @@ mod tests {
             row.try_get::<i64>("", "id")? > prior_max_id,
             "the rebuilt table must retain its AUTOINCREMENT sequence"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn migration_compat_backfills_post_fingerprint_legacy_handoffs_and_preserves_references(
+    ) -> Result<()> {
+        let db = new_db().await?;
+        create_legacy_shared_jobs_tables(&db).await?;
+        migrate_fingerprint_generations_up(&db).await?;
+        db.execute_unprepared("ALTER TABLE eh_gallery_jobs DROP COLUMN legacy_artifact_handoff")
+            .await?;
+        assert!(
+            !table_has_column(&db, "eh_gallery_jobs", "legacy_artifact_handoff").await?,
+            "fixture must simulate the already applied old shared/fingerprint migrations"
+        );
+        db.execute_unprepared(
+            "INSERT INTO eh_gallery_jobs (\
+                 id, gid, token, download_mode, resolution, source_fingerprint, title, \
+                 status, file_size, zip_path, completed_at\
+              ) VALUES \
+                 (701, 9701, 'compat-token', 'archive', '1280x', 'fingerprint', 'Completed archive job', \
+                  'downloaded', 4096, '/existing/archive.zip', '2026-08-27 01:02:03'), \
+                 (702, 9702, 'single-token', 'legacy', 'subscription', NULL, 'Single legacy job', \
+                  'pending', 0, NULL, NULL), \
+                 (703, 9703, 'ambiguous-token', 'legacy', 'direct', NULL, 'Ambiguous direct legacy job', \
+                  'pending', 0, NULL, NULL), \
+                 (704, 9703, 'ambiguous-token', 'legacy', 'subscription', NULL, 'Ambiguous subscription legacy job', \
+                  'pending', 0, NULL, NULL)",
+        )
+        .await?;
+        db.execute_unprepared(
+            "INSERT INTO eh_download_queue (\
+                 id, job_id, chat_id, gid, token, title, telegraph, source, status\
+              ) VALUES \
+                 (801, 701, 80, 9701, 'compat-token', 'Completed archive delivery', 0, 'direct', 'waiting'), \
+                 (802, 702, 81, 9702, 'single-token', 'Single legacy delivery', 0, 'subscription', 'waiting'), \
+                 (803, 703, 82, 9703, 'ambiguous-token', 'Ambiguous direct delivery', 0, 'direct', 'waiting'), \
+                 (804, 704, 83, 9703, 'ambiguous-token', 'Ambiguous subscription delivery', 0, 'subscription', 'waiting')",
+        )
+        .await?;
+        db.execute_unprepared(
+            "INSERT INTO eh_gp_spend_attempts (id, job_id, queue_id, gid, gp_cost, created_at) \
+             VALUES (901, 701, 801, 9701, 7, '2026-08-27 01:02:03')",
+        )
+        .await?;
+        db.execute_unprepared(
+            "INSERT INTO eh_download_completions (id, job_id, gid, file_size, created_at) \
+             VALUES (1001, 701, 9701, 4096, '2026-08-27 01:02:03')",
+        )
+        .await?;
+
+        migrate_legacy_artifact_handoff_compat_up(&db).await?;
+        migrate_legacy_artifact_handoff_compat_up(&db).await?;
+        assert!(table_has_column(&db, "eh_gallery_jobs", "legacy_artifact_handoff").await?);
+
+        let jobs = eh_gallery_jobs::Entity::find().all(&db).await?;
+        let by_id = |id| {
+            jobs.iter()
+                .find(|job| job.id == id)
+                .expect("compatibility fixture job must survive")
+        };
+        assert_eq!(
+            by_id(702).legacy_artifact_handoff.as_deref(),
+            Some(LEGACY_ARTIFACT_HANDOFF_PENDING),
+            "the only legacy variant must be handed off before cleanup"
+        );
+        for id in [703, 704] {
+            assert_eq!(
+                by_id(id).legacy_artifact_handoff.as_deref(),
+                Some(LEGACY_ARTIFACT_HANDOFF_CONFLICT),
+                "unproven legacy variants must fail closed instead of choosing a resolution"
+            );
+        }
+        assert_eq!(
+            by_id(701).legacy_artifact_handoff,
+            None,
+            "non-legacy archive jobs must not gain migration handoff state"
+        );
+
+        let job = db
+            .query_one(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT id, gid, token, source_fingerprint, status, zip_path \
+                 FROM eh_gallery_jobs WHERE id = 701"
+                    .to_owned(),
+            ))
+            .await?
+            .expect("pre-compatibility job must survive the rebuild");
+        assert_eq!(job.try_get::<i64>("", "gid")?, 9701);
+        assert_eq!(job.try_get::<String>("", "token")?, "compat-token");
+        assert_eq!(
+            job.try_get::<Option<String>>("", "source_fingerprint")?,
+            Some("fingerprint".to_owned())
+        );
+        assert_eq!(job.try_get::<String>("", "status")?, "downloaded");
+        assert_eq!(
+            job.try_get::<Option<String>>("", "zip_path")?,
+            Some("/existing/archive.zip".to_owned())
+        );
+        for (table, id) in [
+            ("eh_download_queue", 801),
+            ("eh_gp_spend_attempts", 901),
+            ("eh_download_completions", 1001),
+        ] {
+            let row = db
+                .query_one(Statement::from_string(
+                    DbBackend::Sqlite,
+                    format!("SELECT job_id FROM {table} WHERE id = {id}"),
+                ))
+                .await?
+                .expect("pre-compatibility reference must survive the rebuild");
+            assert_eq!(row.try_get::<i64>("", "job_id")?, 701);
+        }
+        assert_foreign_key_check_is_clean(&db).await?;
+
+        let repo = Repo::new(db.clone());
+        let temp = tempfile::tempdir()?;
+        let cache_dir = temp.path().join("eh_cache");
+        std::fs::create_dir_all(&cache_dir)?;
+        let single_source = ArchiveArtifacts::new(cache_dir.join("9702_single-token.zip"));
+        std::fs::write(single_source.assembly_scratch(), b"single partial")?;
+        std::fs::create_dir_all(single_source.parts_dir().join("nested"))?;
+        std::fs::write(
+            single_source.parts_dir().join("manifest.json"),
+            b"single manifest",
+        )?;
+        std::fs::write(
+            single_source.parts_dir().join("nested/part-0001"),
+            b"single part",
+        )?;
+        let ambiguous_source = ArchiveArtifacts::new(cache_dir.join("9703_ambiguous-token.zip"));
+        std::fs::write(ambiguous_source.assembly_scratch(), b"ambiguous partial")?;
+
+        repo.reset_stale_eh_shared_work(60, 60).await?;
+        repo.reconcile_eh_shared_job_liveness(true).await?;
+        assert_eq!(
+            repo.handoff_legacy_eh_archive_artifacts(&cache_dir).await?,
+            1
+        );
+        repo.cleanup_eh_cache_orphans(&cache_dir, None).await?;
+
+        let single_job = eh_gallery_jobs::Entity::find_by_id(702)
+            .one(repo.db())
+            .await?
+            .expect("single legacy job must survive handoff");
+        let single_target =
+            ArchiveArtifacts::new(eh_gallery_job_artifact_path(&cache_dir, &single_job));
+        assert_eq!(single_job.legacy_artifact_handoff, None);
+        assert!(!single_source.assembly_scratch().exists());
+        assert!(!single_source.parts_dir().exists());
+        assert_eq!(
+            std::fs::read(single_target.assembly_scratch())?,
+            b"single partial"
+        );
+        assert!(single_target.parts_dir().join("nested/part-0001").exists());
+        assert!(
+            ambiguous_source.assembly_scratch().exists(),
+            "ambiguous old source must remain cleanup-owned"
+        );
+
+        let claimed = repo
+            .get_next_eh_job_for_download()
+            .await?
+            .expect("the single adopted job must be claimable");
+        assert_eq!(claimed.id, 702);
+        assert!(
+            repo.get_next_eh_job_for_download().await?.is_none(),
+            "conflict-marked jobs must remain blocked while their old source exists"
+        );
+        std::fs::remove_file(ambiguous_source.assembly_scratch())?;
+        assert_eq!(
+            repo.handoff_legacy_eh_archive_artifacts(&cache_dir).await?,
+            2
+        );
+        repo.cleanup_eh_cache_orphans(&cache_dir, None).await?;
+        let ambiguous_jobs = eh_gallery_jobs::Entity::find()
+            .filter(eh_gallery_jobs::Column::Id.is_in([703, 704]))
+            .all(repo.db())
+            .await?;
+        assert!(ambiguous_jobs
+            .iter()
+            .all(|job| job.legacy_artifact_handoff.is_none()));
+        assert!(
+            repo.get_next_eh_job_for_download().await?.is_some(),
+            "missing ambiguous source must release jobs for ordinary shared work"
+        );
+
+        migrate_fingerprint_generations_down(&db).await?;
+        migrate_legacy_artifact_handoff_compat_down(&db).await?;
+        assert!(
+            !table_has_column(&db, "eh_gallery_jobs", "legacy_artifact_handoff").await?,
+            "compatibility migration down must restore the pre-compatibility schema"
+        );
+        assert_foreign_key_check_is_clean(&db).await?;
         Ok(())
     }
 
@@ -1195,6 +1423,385 @@ mod tests {
             terminal.try_get::<Option<String>>("", "error")?,
             Some("terminal error".to_owned())
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn migration_startup_handoff_moves_crash_left_legacy_partial_before_cleanup() -> Result<()>
+    {
+        let db = new_db().await?;
+        create_legacy_shared_jobs_tables(&db).await?;
+        db.execute_unprepared(
+            "INSERT INTO eh_download_queue (\
+                 id, chat_id, gid, token, title, source, status, created_at\
+             ) VALUES (1, 10, 912, 'legacy-token', 'Crash left partial', 'subscription', \
+                       'downloading', '2026-08-24 00:00:00')",
+        )
+        .await?;
+        migrate_fingerprint_generations_up(&db).await?;
+
+        let repo = Repo::new(db);
+        let temp = tempfile::tempdir()?;
+        let cache_dir = temp.path().join("eh_cache");
+        std::fs::create_dir_all(&cache_dir)?;
+        let legacy = ArchiveArtifacts::new(cache_dir.join("912_legacy-token.zip"));
+        std::fs::write(legacy.assembly_scratch(), b"partial")?;
+        std::fs::create_dir_all(legacy.parts_dir().join("nested"))?;
+        std::fs::write(legacy.parts_dir().join("manifest.json"), b"manifest")?;
+        std::fs::write(legacy.parts_dir().join("nested/part-0001"), b"part")?;
+
+        repo.reset_stale_eh_shared_work(60, 60).await?;
+        repo.reconcile_eh_shared_job_liveness(true).await?;
+        assert_eq!(
+            repo.handoff_legacy_eh_archive_artifacts(&cache_dir).await?,
+            1
+        );
+        repo.cleanup_eh_cache_orphans(&cache_dir, None).await?;
+
+        let job = eh_gallery_jobs::Entity::find()
+            .one(repo.db())
+            .await?
+            .expect("migration must create one shared job");
+        let target = ArchiveArtifacts::new(eh_gallery_job_artifact_path(&cache_dir, &job));
+        assert!(
+            !legacy.assembly_scratch().exists() && !legacy.parts_dir().exists(),
+            "the old family must be gone only after it is handed off"
+        );
+        assert!(
+            target.assembly_scratch().exists() && target.parts_dir().exists(),
+            "the job-specific family must retain every resumable member through orphan cleanup"
+        );
+        assert_eq!(job.legacy_artifact_handoff, None);
+        assert_eq!(
+            job.zip_path.as_deref(),
+            Some(target.final_zip().to_string_lossy().as_ref())
+        );
+
+        let claimed = repo
+            .get_next_eh_job_for_download()
+            .await?
+            .expect("the adopted job must be claimable by a shared worker");
+        assert_eq!(claimed.id, job.id);
+        assert!(
+            repo.persist_eh_job_archive_artifact_ownership(
+                claimed.id,
+                claimed.started_at.expect("claim must have a generation"),
+                &target.final_zip().to_string_lossy(),
+                false,
+            )
+            .await?,
+            "the shared worker must accept the migrated target family before making a provider request"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn migration_handoff_assigns_one_background_owner_and_is_idempotent() -> Result<()> {
+        let db = new_db().await?;
+        create_legacy_shared_jobs_tables(&db).await?;
+        db.execute_unprepared(
+            "INSERT INTO eh_download_queue (\
+                 id, chat_id, gid, token, title, source, status, background_download_status, created_at\
+             ) VALUES \
+                 (1, 10, 913, 'shared-token', 'Direct pending', 'direct', 'pending', 'pending', '2026-08-24 00:00:00'), \
+                 (2, 20, 913, 'shared-token', 'Background running', 'subscription', 'pending', 'running', '2026-08-24 00:01:00')",
+        )
+        .await?;
+        migrate_fingerprint_generations_up(&db).await?;
+
+        let repo = Repo::new(db);
+        let jobs = eh_gallery_jobs::Entity::find().all(repo.db()).await?;
+        let marked: Vec<_> = jobs
+            .iter()
+            .filter(|job| {
+                job.legacy_artifact_handoff.as_deref() == Some(LEGACY_ARTIFACT_HANDOFF_PENDING)
+            })
+            .collect();
+        assert_eq!(marked.len(), 1, "only one shared job may own an old family");
+        assert_eq!(marked[0].resolution, "subscription");
+
+        let temp = tempfile::tempdir()?;
+        let cache_dir = temp.path().join("eh_cache");
+        std::fs::create_dir_all(&cache_dir)?;
+        let legacy = ArchiveArtifacts::new(cache_dir.join("913_shared-token.zip"));
+        std::fs::write(legacy.assembly_scratch(), b"background partial")?;
+        std::fs::create_dir_all(legacy.parts_dir())?;
+        std::fs::write(legacy.parts_dir().join("manifest.json"), b"manifest")?;
+
+        repo.reset_stale_eh_shared_work(60, 60).await?;
+        repo.reconcile_eh_shared_job_liveness(true).await?;
+        assert_eq!(
+            repo.handoff_legacy_eh_archive_artifacts(&cache_dir).await?,
+            1
+        );
+        assert_eq!(
+            repo.handoff_legacy_eh_archive_artifacts(&cache_dir).await?,
+            0,
+            "a completed handoff must be safe to repeat after a restart"
+        );
+        repo.cleanup_eh_cache_orphans(&cache_dir, None).await?;
+
+        let target = ArchiveArtifacts::new(eh_gallery_job_artifact_path(&cache_dir, marked[0]));
+        assert!(!legacy.assembly_scratch().exists());
+        assert!(!legacy.parts_dir().exists());
+        assert!(target.assembly_scratch().exists());
+        assert!(target.parts_dir().exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn migration_handoff_prefers_the_latest_normal_and_background_claims() -> Result<()> {
+        let db = new_db().await?;
+        create_legacy_shared_jobs_tables(&db).await?;
+        db.execute_unprepared(
+            "INSERT INTO eh_download_queue (\
+                 id, chat_id, gid, token, title, source, status, started_at, \
+                 background_download_status, background_download_started_at, created_at\
+             ) VALUES \
+                 (1, 10, 916, 'normal-claim-token', 'Earlier direct claim', 'direct', 'pending', \
+                  '2026-08-24 00:01:00', NULL, NULL, '2026-08-24 00:00:00'), \
+                 (2, 20, 916, 'normal-claim-token', 'Later subscription claim', 'subscription', 'pending', \
+                  '2026-08-24 00:02:00', NULL, NULL, '2026-08-24 00:00:00'), \
+                 (3, 30, 917, 'background-claim-token', 'Earlier direct background claim', 'direct', 'pending', \
+                  NULL, 'pending', '2026-08-24 00:03:00', '2026-08-24 00:00:00'), \
+                 (4, 40, 917, 'background-claim-token', 'Later subscription background claim', 'subscription', 'pending', \
+                  NULL, 'pending', '2026-08-24 00:04:00', '2026-08-24 00:00:00')",
+        )
+        .await?;
+        migrate_fingerprint_generations_up(&db).await?;
+
+        for gid in [916, 917] {
+            let jobs = eh_gallery_jobs::Entity::find()
+                .filter(eh_gallery_jobs::Column::Gid.eq(gid))
+                .all(&db)
+                .await?;
+            let marked: Vec<_> = jobs
+                .iter()
+                .filter(|job| {
+                    job.legacy_artifact_handoff.as_deref() == Some(LEGACY_ARTIFACT_HANDOFF_PENDING)
+                })
+                .collect();
+            assert_eq!(marked.len(), 1, "gid {gid} must have one handoff owner");
+            assert_eq!(
+                marked[0].resolution, "subscription",
+                "gid {gid} must retain the resume identity from the most recently claimed row"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn migration_handoff_conflicting_active_claims_preserve_source_and_unblock_when_absent(
+    ) -> Result<()> {
+        let db = new_db().await?;
+        create_legacy_shared_jobs_tables(&db).await?;
+        db.execute_unprepared(
+            "INSERT INTO eh_download_queue (\
+                 id, chat_id, gid, token, title, source, status, started_at, created_at\
+             ) VALUES \
+                 (1, 10, 918, 'ambiguous-token', 'Direct active claim', 'direct', 'downloading', \
+                  '2026-08-24 00:01:00', '2026-08-24 00:00:00'), \
+                 (2, 20, 918, 'ambiguous-token', 'Subscription active claim', 'subscription', 'downloading', \
+                  '2026-08-24 00:02:00', '2026-08-24 00:00:00')",
+        )
+        .await?;
+        migrate_fingerprint_generations_up(&db).await?;
+
+        let repo = Repo::new(db);
+        let jobs = eh_gallery_jobs::Entity::find().all(repo.db()).await?;
+        assert_eq!(jobs.len(), 2);
+        assert!(jobs.iter().all(|job| {
+            job.legacy_artifact_handoff.as_deref() == Some(LEGACY_ARTIFACT_HANDOFF_CONFLICT)
+        }));
+
+        let temp = tempfile::tempdir()?;
+        let cache_dir = temp.path().join("eh_cache");
+        std::fs::create_dir_all(&cache_dir)?;
+        let legacy = ArchiveArtifacts::new(cache_dir.join("918_ambiguous-token.zip"));
+        std::fs::write(legacy.assembly_scratch(), b"ambiguous partial")?;
+        let target = ArchiveArtifacts::new(eh_gallery_job_artifact_path(&cache_dir, &jobs[0]));
+        std::fs::write(target.assembly_scratch(), b"ambiguous target partial")?;
+
+        repo.reset_stale_eh_shared_work(60, 60).await?;
+        repo.reconcile_eh_shared_job_liveness(true).await?;
+        assert_eq!(
+            repo.handoff_legacy_eh_archive_artifacts(&cache_dir).await?,
+            0
+        );
+        repo.cleanup_eh_cache_orphans(&cache_dir, None).await?;
+        assert!(legacy.assembly_scratch().exists());
+        assert!(
+            target.assembly_scratch().exists(),
+            "conflict state must retain a target family until source ownership is resolved"
+        );
+        assert!(
+            repo.get_next_eh_job_for_download().await?.is_none(),
+            "all ambiguous owners must block shared workers while the source remains"
+        );
+
+        std::fs::remove_file(legacy.assembly_scratch())?;
+        assert_eq!(
+            repo.handoff_legacy_eh_archive_artifacts(&cache_dir).await?,
+            2
+        );
+        repo.cleanup_eh_cache_orphans(&cache_dir, None).await?;
+        let unblocked = eh_gallery_jobs::Entity::find().all(repo.db()).await?;
+        assert!(
+            unblocked
+                .iter()
+                .all(|job| job.legacy_artifact_handoff.is_none()),
+            "a missing source must not strand conflict-marked jobs"
+        );
+        assert!(
+            repo.get_next_eh_job_for_download().await?.is_some(),
+            "workers may resume ordinary work after the ambiguous source is gone"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn migration_handoff_clears_a_benign_pending_marker_when_source_is_absent() -> Result<()>
+    {
+        let db = new_db().await?;
+        create_legacy_shared_jobs_tables(&db).await?;
+        db.execute_unprepared(
+            "INSERT INTO eh_download_queue (\
+                 id, chat_id, gid, token, title, source, status, started_at, created_at\
+             ) VALUES (1, 10, 919, 'missing-source-token', 'Missing source', 'subscription', \
+                       'downloading', '2026-08-24 00:01:00', '2026-08-24 00:00:00')",
+        )
+        .await?;
+        migrate_fingerprint_generations_up(&db).await?;
+
+        let repo = Repo::new(db);
+        let temp = tempfile::tempdir()?;
+        let cache_dir = temp.path().join("eh_cache");
+        std::fs::create_dir_all(&cache_dir)?;
+        repo.reset_stale_eh_shared_work(60, 60).await?;
+        repo.reconcile_eh_shared_job_liveness(true).await?;
+        assert_eq!(
+            repo.handoff_legacy_eh_archive_artifacts(&cache_dir).await?,
+            1
+        );
+        repo.cleanup_eh_cache_orphans(&cache_dir, None).await?;
+
+        let job = eh_gallery_jobs::Entity::find()
+            .one(repo.db())
+            .await?
+            .expect("migration must create one shared job");
+        assert_eq!(job.legacy_artifact_handoff, None);
+        assert!(
+            repo.get_next_eh_job_for_download().await?.is_some(),
+            "a harmless missing legacy family must not block a shared worker"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn migration_handoff_conflict_preserves_both_families_and_blocks_workers() -> Result<()> {
+        let db = new_db().await?;
+        create_legacy_shared_jobs_tables(&db).await?;
+        db.execute_unprepared(
+            "INSERT INTO eh_download_queue (\
+                 id, chat_id, gid, token, title, source, status, created_at\
+             ) VALUES (1, 10, 914, 'conflict-token', 'Conflicting family', 'subscription', \
+                       'downloading', '2026-08-24 00:00:00')",
+        )
+        .await?;
+        migrate_fingerprint_generations_up(&db).await?;
+
+        let repo = Repo::new(db);
+        let job = eh_gallery_jobs::Entity::find()
+            .one(repo.db())
+            .await?
+            .expect("migration must create one shared job");
+        let temp = tempfile::tempdir()?;
+        let cache_dir = temp.path().join("eh_cache");
+        std::fs::create_dir_all(&cache_dir)?;
+        let legacy = ArchiveArtifacts::new(cache_dir.join("914_conflict-token.zip"));
+        std::fs::write(legacy.assembly_scratch(), b"legacy partial")?;
+        let target = ArchiveArtifacts::new(eh_gallery_job_artifact_path(&cache_dir, &job));
+        std::fs::write(target.assembly_scratch(), b"unexpected target partial")?;
+
+        repo.reset_stale_eh_shared_work(60, 60).await?;
+        repo.reconcile_eh_shared_job_liveness(true).await?;
+        assert_eq!(
+            repo.handoff_legacy_eh_archive_artifacts(&cache_dir).await?,
+            0
+        );
+        assert_eq!(
+            repo.handoff_legacy_eh_archive_artifacts(&cache_dir).await?,
+            0,
+            "a conflicting handoff must remain fail-closed across repeated startups"
+        );
+        repo.cleanup_eh_cache_orphans(&cache_dir, None).await?;
+
+        let updated = eh_gallery_jobs::Entity::find_by_id(job.id)
+            .one(repo.db())
+            .await?
+            .expect("job must survive the conflict");
+        assert_eq!(
+            updated.legacy_artifact_handoff.as_deref(),
+            Some(LEGACY_ARTIFACT_HANDOFF_PENDING)
+        );
+        assert!(legacy.assembly_scratch().exists());
+        assert!(target.assembly_scratch().exists());
+        assert!(
+            repo.get_next_eh_job_for_download().await?.is_none(),
+            "a worker must not create a second download while source ownership is ambiguous"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn migration_handoff_resumes_a_partial_rename_without_cleanup_loss() -> Result<()> {
+        let db = new_db().await?;
+        create_legacy_shared_jobs_tables(&db).await?;
+        db.execute_unprepared(
+            "INSERT INTO eh_download_queue (\
+                 id, chat_id, gid, token, title, source, status, created_at\
+             ) VALUES (1, 10, 915, 'moving-token', 'Interrupted handoff', 'subscription', \
+                       'downloading', '2026-08-24 00:00:00')",
+        )
+        .await?;
+        migrate_fingerprint_generations_up(&db).await?;
+
+        let repo = Repo::new(db);
+        let job = eh_gallery_jobs::Entity::find()
+            .one(repo.db())
+            .await?
+            .expect("migration must create one shared job");
+        repo.db()
+            .execute_unprepared(&format!(
+                "UPDATE eh_gallery_jobs SET legacy_artifact_handoff = '{LEGACY_ARTIFACT_HANDOFF_MOVING}' WHERE id = {}",
+                job.id
+            ))
+            .await?;
+        let temp = tempfile::tempdir()?;
+        let cache_dir = temp.path().join("eh_cache");
+        std::fs::create_dir_all(&cache_dir)?;
+        let legacy = ArchiveArtifacts::new(cache_dir.join("915_moving-token.zip"));
+        std::fs::write(legacy.assembly_scratch(), b"source partial")?;
+        let target = ArchiveArtifacts::new(eh_gallery_job_artifact_path(&cache_dir, &job));
+        std::fs::create_dir_all(target.parts_dir())?;
+        std::fs::write(target.parts_dir().join("manifest.json"), b"moved first")?;
+
+        repo.reset_stale_eh_shared_work(60, 60).await?;
+        repo.reconcile_eh_shared_job_liveness(true).await?;
+        assert_eq!(
+            repo.handoff_legacy_eh_archive_artifacts(&cache_dir).await?,
+            1
+        );
+        repo.cleanup_eh_cache_orphans(&cache_dir, None).await?;
+
+        let updated = eh_gallery_jobs::Entity::find_by_id(job.id)
+            .one(repo.db())
+            .await?
+            .expect("job must survive the partial handoff");
+        assert_eq!(updated.legacy_artifact_handoff, None);
+        assert!(!legacy.assembly_scratch().exists());
+        assert!(target.assembly_scratch().exists());
+        assert!(target.parts_dir().join("manifest.json").exists());
         Ok(())
     }
 

@@ -317,6 +317,12 @@ async fn main() -> Result<()> {
             tracing::warn!("Failed to reconcile shared EH job liveness: {:#}", e);
         }
         if let Err(e) = repo
+            .handoff_legacy_eh_archive_artifacts(&eh_cache_dir.join("eh_cache"))
+            .await
+        {
+            tracing::warn!("Failed to hand off legacy EH archive families: {:#}", e);
+        }
+        if let Err(e) = repo
             .cleanup_eh_cache_orphans(
                 &eh_cache_dir.join("eh_cache"),
                 eh_startup_abort_uploader.as_deref(),
