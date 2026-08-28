@@ -393,6 +393,171 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn migration_preserves_pending_rewrite_from_completed_delivery() -> Result<()> {
+        let db = new_db().await?;
+        create_legacy_shared_jobs_tables(&db).await?;
+        db.execute_unprepared(
+            "INSERT INTO eh_download_queue (\
+                id, chat_id, gid, token, title, telegraph, source, status, created_at, \
+                telegraph_url, telegraph_sent_at, telegraph_rewrite_data, \
+                telegraph_rewrite_status, telegraph_rewrite_after, \
+                telegraph_rewrite_next_retry_at, telegraph_rewrite_retry_count, \
+                telegraph_rewrite_error, telegraph_rewritten_at\
+             ) VALUES \
+                (1, 10, 150, 'token-150', 'Completed rewrite delivery', 1, 'subscription', 'done', '2026-08-01 00:00:00', 'https://old.example/completed', '2026-08-01 00:30:00', 'rewrite payload', 'pending', '1970-01-01 01:00:00', '1970-01-01 02:00:00', 5, 'previous rewrite error', NULL), \
+                (2, 20, 150, 'token-150', 'Active sibling delivery', 0, 'subscription', 'pending', '2026-08-02 00:00:00', NULL, NULL, NULL, NULL, NULL, NULL, 0, NULL, NULL), \
+                (3, 30, 151, 'token-151', 'Earlier ordinary page', 0, 'subscription', 'uploading', '2026-08-03 00:00:00', 'https://old.example/ordinary', '2026-08-03 00:30:00', NULL, NULL, NULL, NULL, 0, NULL, NULL), \
+                (4, 40, 151, 'token-151', 'Terminal rewrite winner', 1, 'subscription', 'done', '2026-08-04 00:00:00', 'https://old.example/rewrite', '2026-08-04 00:30:00', 'winner payload', 'pending', '2026-08-04 01:00:00', NULL, 2, 'winner retry error', NULL)",
+        )
+        .await?;
+
+        migrate_shared_jobs_up(&db).await?;
+
+        let job_count = db
+            .query_one(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT COUNT(*) AS count FROM eh_gallery_jobs WHERE gid = 150".to_owned(),
+            ))
+            .await?
+            .expect("job count query returns one row");
+        assert_eq!(
+            job_count.try_get::<i64>("", "count")?,
+            1,
+            "an active delivery and terminal rewrite share one variant job"
+        );
+        let job = db
+            .query_one(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT id, title, telegraph_required, telegraph_status, telegraph_url, telegraph_rewrite_data, telegraph_rewrite_status, telegraph_rewrite_after, telegraph_rewrite_started_at, telegraph_rewrite_next_retry_at, telegraph_rewrite_retry_count, telegraph_rewrite_error, telegraph_rewritten_at FROM eh_gallery_jobs WHERE gid = 150".to_owned(),
+            ))
+            .await?
+            .expect("terminal rewrite and active sibling share one job");
+        let job_id = job.try_get::<i64>("", "id")?;
+        assert_eq!(
+            job.try_get::<String>("", "title")?,
+            "Completed rewrite delivery",
+            "a terminal rewrite-bearing row remains a title candidate"
+        );
+        assert!(
+            !job.try_get::<bool>("", "telegraph_required")?,
+            "already-sent terminal work must not create unsent Telegraph demand"
+        );
+        assert_eq!(job.try_get::<String>("", "telegraph_status")?, "ready");
+        assert_eq!(
+            job.try_get::<Option<String>>("", "telegraph_url")?,
+            Some("https://old.example/completed".to_owned())
+        );
+        assert_eq!(
+            job.try_get::<Option<String>>("", "telegraph_rewrite_data")?,
+            Some("rewrite payload".to_owned())
+        );
+        assert_eq!(
+            job.try_get::<Option<String>>("", "telegraph_rewrite_status")?,
+            Some("pending".to_owned())
+        );
+        assert_eq!(
+            job.try_get::<Option<String>>("", "telegraph_rewrite_after")?,
+            Some("1970-01-01 01:00:00".to_owned())
+        );
+        assert_eq!(
+            job.try_get::<Option<String>>("", "telegraph_rewrite_started_at")?,
+            None
+        );
+        assert_eq!(
+            job.try_get::<Option<String>>("", "telegraph_rewrite_next_retry_at")?,
+            Some("1970-01-01 02:00:00".to_owned())
+        );
+        assert_eq!(job.try_get::<i64>("", "telegraph_rewrite_retry_count")?, 5);
+        assert_eq!(
+            job.try_get::<Option<String>>("", "telegraph_rewrite_error")?,
+            Some("previous rewrite error".to_owned())
+        );
+        assert_eq!(
+            job.try_get::<Option<String>>("", "telegraph_rewritten_at")?,
+            None
+        );
+
+        let rewrite_claimable = db
+            .query_one(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT id FROM eh_gallery_jobs \
+                 WHERE gid = 150 \
+                   AND telegraph_rewrite_status = 'pending' \
+                   AND telegraph_rewrite_data IS NOT NULL \
+                   AND telegraph_rewritten_at IS NULL \
+                   AND (telegraph_rewrite_after IS NULL OR telegraph_rewrite_after <= CURRENT_TIMESTAMP) \
+                   AND (telegraph_rewrite_next_retry_at IS NULL OR telegraph_rewrite_next_retry_at <= CURRENT_TIMESTAMP)".to_owned(),
+            ))
+            .await?
+            .expect("migrated rewrite must satisfy the job rewrite lane predicate");
+        assert_eq!(rewrite_claimable.try_get::<i64>("", "id")?, job_id);
+
+        let rewrite_winner = db
+            .query_one(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT telegraph_required, telegraph_status, telegraph_url, telegraph_rewrite_data, telegraph_rewrite_status FROM eh_gallery_jobs WHERE gid = 151".to_owned(),
+            ))
+            .await?
+            .expect("ordinary and terminal pages share one job");
+        assert!(
+            !rewrite_winner.try_get::<bool>("", "telegraph_required")?,
+            "a sent terminal page does not create Telegraph demand"
+        );
+        assert_eq!(
+            rewrite_winner.try_get::<String>("", "telegraph_status")?,
+            "ready"
+        );
+        assert_eq!(
+            rewrite_winner.try_get::<Option<String>>("", "telegraph_url")?,
+            Some("https://old.example/rewrite".to_owned()),
+            "unfinished rewrite work must win over an earlier ordinary page"
+        );
+        assert_eq!(
+            rewrite_winner.try_get::<Option<String>>("", "telegraph_rewrite_data")?,
+            Some("winner payload".to_owned())
+        );
+        assert_eq!(
+            rewrite_winner.try_get::<Option<String>>("", "telegraph_rewrite_status")?,
+            Some("pending".to_owned())
+        );
+
+        let deliveries = db
+            .query_all(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT id, job_id, status, telegraph_url, telegraph_sent_at, telegraph_rewrite_data, telegraph_rewrite_status FROM eh_download_queue WHERE id IN (1, 2) ORDER BY id".to_owned(),
+            ))
+            .await?;
+        assert_eq!(deliveries.len(), 2);
+        assert_eq!(
+            deliveries[0].try_get::<Option<i64>>("", "job_id")?,
+            Some(job_id)
+        );
+        assert_eq!(deliveries[0].try_get::<String>("", "status")?, "done");
+        assert_eq!(
+            deliveries[0].try_get::<Option<String>>("", "telegraph_url")?,
+            Some("https://old.example/completed".to_owned())
+        );
+        assert_eq!(
+            deliveries[0].try_get::<Option<String>>("", "telegraph_sent_at")?,
+            Some("2026-08-01 00:30:00".to_owned())
+        );
+        assert_eq!(
+            deliveries[0].try_get::<Option<String>>("", "telegraph_rewrite_data")?,
+            Some("rewrite payload".to_owned())
+        );
+        assert_eq!(
+            deliveries[0].try_get::<Option<String>>("", "telegraph_rewrite_status")?,
+            Some("pending".to_owned())
+        );
+        assert_eq!(
+            deliveries[1].try_get::<Option<i64>>("", "job_id")?,
+            Some(job_id)
+        );
+        assert_eq!(deliveries[1].try_get::<String>("", "status")?, "waiting");
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn migration_groups_active_legacy_variants_and_leaves_terminal_history_unbound(
     ) -> Result<()> {
         let db = new_db().await?;
