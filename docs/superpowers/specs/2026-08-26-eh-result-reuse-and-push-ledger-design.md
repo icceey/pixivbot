@@ -38,7 +38,7 @@ CREATE TABLE eh_gallery_results (
 )
 ```
 
-- Keyed by the same variant identity as `eh_gallery_jobs` (`EhGalleryVariant`: gid, token, download_mode, resolution).
+- Results remain keyed only by `EhGalleryVariant` (`gid, token, download_mode, resolution`). Jobs are more specific: each Job is one variant plus an immutable source-fingerprint generation (with one NULL/unknown bucket), so concurrent generations never mutate each other. The result table deliberately retains only the latest row per variant.
 - One record per variant: each successful upload **upserts** (replaces) the previous record. No history of superseded results.
 - `telegraph_rewrite_data` stores the full page set (paths + content + gateways) exactly as the job's rewrite payload did, captured at upload success while it still exists.
 - `media_cids` stores the ordered `(entry_name, cid)` list; `cid` comes from the new `TelegraphImageUrlPair.cid` field (Part A.2). Empty/absent when the uploader is not IPFS3.
@@ -50,6 +50,7 @@ CREATE TABLE eh_gallery_results (
 - **Rating and title are excluded** — they change without content changes and would permanently invalidate the cache. `posted` is stable; `filecount`/`filesize` change whenever pages are added or replaced; `expunged` toggles are treated as source changes (conservative).
 - New column `eh_gallery_jobs.source_fingerprint TEXT NULL`:
   - Set at job creation from the enqueue request (both direct and subscription paths provide `EhGallery` metadata today).
+  - It is immutable Job identity rather than mutable freshness state: a different known fingerprint creates a distinct concurrent Job, while repeated NULL requests share the unknown bucket.
   - `NULL` means "fingerprint unknown" (legacy rows, tests): the job never consults the cache and its upload success does not write a result record.
   - `EhPendingGallery` (overflow backlog in `EhTagState`) gains `fingerprint: Option<String>` with `#[serde(default)]` so old serialized states keep deserializing; backlog re-drain reuses the stored value.
 

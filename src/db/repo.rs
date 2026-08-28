@@ -116,8 +116,7 @@ pub mod tests_helpers {
                 telegraph_rewrite_next_retry_at TIMESTAMP,
                 telegraph_rewrite_retry_count INTEGER NOT NULL DEFAULT 0,
                 telegraph_rewrite_error TEXT,
-                telegraph_rewritten_at TIMESTAMP,
-                UNIQUE(gid, token, download_mode, resolution)
+                telegraph_rewritten_at TIMESTAMP
             )
             "#,
         ))
@@ -161,6 +160,8 @@ pub mod tests_helpers {
         .await?;
 
         for index in [
+            "CREATE UNIQUE INDEX uq_eh_gallery_jobs_known_fingerprint ON eh_gallery_jobs(gid, token, download_mode, resolution, source_fingerprint) WHERE source_fingerprint IS NOT NULL",
+            "CREATE UNIQUE INDEX uq_eh_gallery_jobs_unknown_fingerprint ON eh_gallery_jobs(gid, token, download_mode, resolution) WHERE source_fingerprint IS NULL",
             "CREATE INDEX idx_eh_gallery_jobs_status_retry ON eh_gallery_jobs(status, next_retry_at)",
             "CREATE INDEX idx_eh_gallery_jobs_telegraph_retry ON eh_gallery_jobs(telegraph_status, next_retry_at)",
             "CREATE INDEX idx_eh_gallery_jobs_cleanup_retry ON eh_gallery_jobs(cleanup_status, cleanup_next_retry_at)",

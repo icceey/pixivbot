@@ -60,7 +60,9 @@ a sibling, after which the sibling returns to `pending` and downloads the galler
 
 ### `eh_gallery_jobs`
 
-Add a table whose row owns one active gallery variant and every shared side effect.
+Add a table whose row owns one active gallery-variant **source-fingerprint generation** and every
+shared side effect. `EhGalleryVariant` remains only `(gid, token, download_mode, resolution)`;
+the Job identity adds the immutable fingerprint bucket.
 
 | Column | Meaning |
 | --- | --- |
@@ -68,6 +70,7 @@ Add a table whose row owns one active gallery variant and every shared side effe
 | `gid`, `token` | EH gallery identity and access token. |
 | `download_mode` | `archive` for logged-in archive downloads, `images` for direct image ZIP creation, or transitional `legacy` for migrated active work. |
 | `resolution` | Canonical archive resolution; empty string for `images`. |
+| `source_fingerprint` | Immutable source-generation identity. Non-NULL values distinguish concurrent known generations; NULL is one shared unknown-fingerprint bucket for the variant. |
 | `title` | Shared gallery title used for filenames and the Telegraph page. |
 | `status` | Download lifecycle: `pending`, `downloading`, `downloaded`, `failed`, `retired`. |
 | `telegraph_status` | Shared publication lifecycle: `not_required`, `pending`, `uploading`, `ready`, `failed`. |
@@ -80,7 +83,9 @@ Add a table whose row owns one active gallery variant and every shared side effe
 | background download fields | Existing background status, retry, and progress fields moved to job scope. |
 | Telegraph rewrite fields | Existing rewrite payload, status, retry, and completion fields moved to job scope. |
 
-The unique index is `(gid, token, download_mode, resolution)`. A variant helper computes:
+SQLite uses two partial unique indexes for Job identity: `(gid, token, download_mode, resolution,
+source_fingerprint) WHERE source_fingerprint IS NOT NULL` and `(gid, token, download_mode,
+resolution) WHERE source_fingerprint IS NULL`. A variant helper computes:
 
 ```text
 logged in + direct request       => archive:<download_resolution>
@@ -141,7 +146,7 @@ Enqueue runs in one database transaction:
 
 1. Compute the complete variant from authentication mode, request source, and configured
    resolution.
-2. Upsert the unique gallery job. A clean `retired` or retryable `failed` job is reset to `pending`
+2. Upsert the exact fingerprint-generation job. A clean `retired` or retryable `failed` job is reset to `pending`
    only when a new active consumer wave requires work. A retired job with pending/failed cleanup is
    bound to the new delivery but remains non-claimable until maintenance completes cleanup.
 3. Select or insert the `(chat_id, gid)` delivery with existing CAS merge rules.
@@ -152,7 +157,7 @@ Enqueue runs in one database transaction:
    old job is retired or canceled only when it has no active deliveries.
 
 Concurrent inserts recover from both unique constraints by re-selecting and retrying the
-transaction. At commit there is exactly one job per variant and at most one delivery per
+transaction. At commit there is exactly one Job per `(variant, source-fingerprint bucket)` and at most one delivery per
 `(chat_id, gid)`.
 
 ## Shared Job Pipeline
@@ -231,7 +236,8 @@ completion/abort rules finish the already-started shared side effect.
 
 After every delivery cancellation, completion, or rebind, repository code evaluates job liveness:
 
-- with active consumers, retain the job and artifacts;
+- active consumers retain the job; its ZIP remains only while an unsent archive surface or an
+  upload stage still needs it;
 - with no active consumers during a cancellable shared stage, retire the job and mark cleanup
   pending; abort persisted multipart state through the configured uploader before local deletion;
 - delete the ZIP only after no active delivery still needs archive sending and no upload stage

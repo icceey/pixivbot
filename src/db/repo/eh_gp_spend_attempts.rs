@@ -99,6 +99,19 @@ mod tests {
     const MIGRATION_NAME: &str = "m20260719_000000_eh_gp_spend_attempts";
     const SHARED_JOBS_MIGRATION_NAME: &str = "m20260824_000000_eh_shared_gallery_jobs";
     const REUSE_LEDGER_MIGRATION_NAME: &str = "m20260826_000000_eh_result_reuse_and_push_ledger";
+    const FINGERPRINT_GENERATIONS_MIGRATION_NAME: &str =
+        "m20260828_000000_eh_job_fingerprint_generations";
+    const JOB_REBUILD_INDEXES: [&str; 6] = [
+        "idx_eh_gallery_jobs_status_retry",
+        "idx_eh_gallery_jobs_telegraph_retry",
+        "idx_eh_gallery_jobs_cleanup_retry",
+        "idx_eh_gallery_jobs_background_status",
+        "idx_eh_gallery_jobs_rewrite_status",
+        "idx_eh_gallery_jobs_completed_at",
+    ];
+    const KNOWN_FINGERPRINT_INDEX: &str = "uq_eh_gallery_jobs_known_fingerprint";
+    const UNKNOWN_FINGERPRINT_INDEX: &str = "uq_eh_gallery_jobs_unknown_fingerprint";
+    const LEGACY_VARIANT_INDEX: &str = "uq_eh_gallery_jobs_variant";
 
     async fn new_db() -> Result<DatabaseConnection> {
         let db = Database::connect("sqlite::memory:").await?;
@@ -160,6 +173,38 @@ mod tests {
         migrate_shared_jobs_up(db).await?;
         reuse_ledger_target_migration()?
             .up(&SchemaManager::new(db))
+            .await?;
+        Ok(())
+    }
+
+    fn fingerprint_generations_target_migration() -> Result<Box<dyn MigrationTrait>> {
+        Migrator::migrations()
+            .into_iter()
+            .find(|migration| migration.name() == FINGERPRINT_GENERATIONS_MIGRATION_NAME)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "migration {FINGERPRINT_GENERATIONS_MIGRATION_NAME} is not registered"
+                )
+            })
+    }
+
+    async fn migrate_fingerprint_generations_up(db: &DatabaseConnection) -> Result<()> {
+        migrate_reuse_ledger_up(db).await?;
+        migrate_fingerprint_generations_from_reuse_schema_up(db).await
+    }
+
+    async fn migrate_fingerprint_generations_from_reuse_schema_up(
+        db: &DatabaseConnection,
+    ) -> Result<()> {
+        fingerprint_generations_target_migration()?
+            .up(&SchemaManager::new(db))
+            .await?;
+        Ok(())
+    }
+
+    async fn migrate_fingerprint_generations_down(db: &DatabaseConnection) -> Result<()> {
+        fingerprint_generations_target_migration()?
+            .down(&SchemaManager::new(db))
             .await?;
         Ok(())
     }
@@ -279,6 +324,152 @@ mod tests {
         }))
     }
 
+    async fn table_difference_count(
+        db: &DatabaseConnection,
+        left_table: &str,
+        right_table: &str,
+    ) -> Result<i64> {
+        let row = db
+            .query_one(Statement::from_string(
+                DbBackend::Sqlite,
+                format!(
+                    "SELECT COUNT(*) AS count FROM (SELECT * FROM {left_table} EXCEPT SELECT * FROM {right_table})"
+                ),
+            ))
+            .await?
+            .expect("table difference query returns one row");
+        Ok(row.try_get("", "count")?)
+    }
+
+    async fn assert_same_table_rows(
+        db: &DatabaseConnection,
+        expected_table: &str,
+        actual_table: &str,
+    ) -> Result<()> {
+        assert_eq!(
+            table_difference_count(db, expected_table, actual_table).await?,
+            0,
+            "{expected_table} contains rows missing from {actual_table}"
+        );
+        assert_eq!(
+            table_difference_count(db, actual_table, expected_table).await?,
+            0,
+            "{actual_table} contains rows missing from {expected_table}"
+        );
+        Ok(())
+    }
+
+    async fn snapshot_job_rebuild_data(db: &DatabaseConnection) -> Result<()> {
+        for (snapshot_table, source) in [
+            ("expected_eh_gallery_jobs", "SELECT * FROM eh_gallery_jobs"),
+            (
+                "expected_eh_download_queue_job_ids",
+                "SELECT id, job_id FROM eh_download_queue WHERE job_id IS NOT NULL",
+            ),
+            (
+                "expected_eh_gp_spend_attempts_job_ids",
+                "SELECT id, job_id FROM eh_gp_spend_attempts WHERE job_id IS NOT NULL",
+            ),
+            (
+                "expected_eh_download_completions_job_ids",
+                "SELECT id, job_id FROM eh_download_completions WHERE job_id IS NOT NULL",
+            ),
+        ] {
+            db.execute_unprepared(&format!("CREATE TEMP TABLE {snapshot_table} AS {source}"))
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn assert_job_rebuild_data_is_preserved(db: &DatabaseConnection) -> Result<()> {
+        for (expected_table, actual_table) in [
+            ("expected_eh_gallery_jobs", "eh_gallery_jobs"),
+            (
+                "expected_eh_download_queue_job_ids",
+                "(SELECT id, job_id FROM eh_download_queue WHERE job_id IS NOT NULL)",
+            ),
+            (
+                "expected_eh_gp_spend_attempts_job_ids",
+                "(SELECT id, job_id FROM eh_gp_spend_attempts WHERE job_id IS NOT NULL)",
+            ),
+            (
+                "expected_eh_download_completions_job_ids",
+                "(SELECT id, job_id FROM eh_download_completions WHERE job_id IS NOT NULL)",
+            ),
+        ] {
+            assert_same_table_rows(db, expected_table, actual_table).await?;
+        }
+        Ok(())
+    }
+
+    async fn assert_foreign_key_check_is_clean(db: &DatabaseConnection) -> Result<()> {
+        let violations = db
+            .query_all(Statement::from_string(
+                DbBackend::Sqlite,
+                "PRAGMA foreign_key_check".to_owned(),
+            ))
+            .await?;
+        assert!(
+            violations.is_empty(),
+            "foreign_key_check reported {} violation(s)",
+            violations.len()
+        );
+        Ok(())
+    }
+
+    async fn seed_fingerprint_generation_fixture(db: &DatabaseConnection) -> Result<i64> {
+        migrate_reuse_ledger_up(db).await?;
+        db.execute_unprepared(
+            "INSERT INTO eh_gallery_jobs (\
+                id, gid, token, download_mode, resolution, title, status, telegraph_status, \
+                telegraph_required, file_size, gp_cost, zip_path, telegraph_url, error, \
+                retry_count, next_retry_at, cleanup_status, cleanup_started_at, cleanup_error, \
+                cleanup_next_retry_at, created_at, started_at, completed_at, \
+                background_download_status, background_download_started_at, \
+                background_download_next_retry_at, background_download_attempt_count, \
+                background_download_error, telegraph_rewrite_data, telegraph_rewrite_status, \
+                telegraph_rewrite_after, telegraph_rewrite_started_at, \
+                telegraph_rewrite_next_retry_at, telegraph_rewrite_retry_count, \
+                telegraph_rewrite_error, telegraph_rewritten_at, source_fingerprint\
+             ) VALUES (\
+                410, 7001, 'fixture-token', 'archive', '1280x', 'Complete fixture', 'downloaded', 'ready', \
+                1, 4096, 23, '/tmp/fixture.zip', 'https://fixture.example/page', 'fixture error', \
+                7, '2026-08-28 01:02:03', 'pending', '2026-08-28 02:03:04', 'cleanup error', \
+                '2026-08-28 03:04:05', '2026-08-28 04:05:06', '2026-08-28 05:06:07', '2026-08-28 06:07:08', \
+                'running', '2026-08-28 07:08:09', '2026-08-28 08:09:10', 11, 'background error', \
+                'rewrite data', 'pending', '2026-08-28 09:10:11', '2026-08-28 10:11:12', \
+                '2026-08-28 11:12:13', 13, 'rewrite error', '2026-08-28 12:13:14', 'fixture-fingerprint'\
+             )",
+        )
+        .await?;
+        db.execute_unprepared(
+            "INSERT INTO eh_download_queue (\
+                id, job_id, chat_id, gid, token, title, telegraph, source, status\
+             ) VALUES (601, 410, 61, 7001, 'fixture-token', 'Fixture delivery', 0, 'direct', 'waiting')",
+        )
+        .await?;
+        db.execute_unprepared(
+            "INSERT INTO eh_gp_spend_attempts (id, job_id, queue_id, gid, gp_cost, created_at) \
+             VALUES (701, 410, 601, 7001, 23, '2026-08-28 13:14:15')",
+        )
+        .await?;
+        db.execute_unprepared(
+            "INSERT INTO eh_download_completions (id, job_id, gid, file_size, created_at) \
+             VALUES (801, 410, 7001, 4096, '2026-08-28 14:15:16')",
+        )
+        .await?;
+        snapshot_job_rebuild_data(db).await?;
+
+        let row = db
+            .query_one(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT MAX(id) AS max_id FROM eh_gallery_jobs".to_owned(),
+            ))
+            .await?
+            .expect("maximum job ID query returns one row");
+        Ok(row.try_get("", "max_id")?)
+    }
+
     #[tokio::test]
     async fn migration_creates_ledger_table_and_created_at_index() -> Result<()> {
         let db = new_db().await?;
@@ -354,6 +545,198 @@ mod tests {
             .is_err(),
             "duplicate chat/gallery ledger rows must violate their unique constraint"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn migration_isolates_known_fingerprint_generations_and_deduplicates_null() -> Result<()>
+    {
+        let db = new_db().await?;
+        create_legacy_shared_jobs_tables(&db).await?;
+        migrate_reuse_ledger_up(&db).await?;
+
+        db.execute_unprepared(
+            "INSERT INTO eh_gallery_jobs (gid, token, download_mode, resolution, source_fingerprint, title) \
+             VALUES (501, 'token', 'archive', '1280x', 'fingerprint-a', 'A')",
+        )
+        .await?;
+        let legacy_error = db
+            .execute_unprepared(
+                "INSERT INTO eh_gallery_jobs (gid, token, download_mode, resolution, source_fingerprint, title) \
+                 VALUES (501, 'token', 'archive', '1280x', 'fingerprint-b', 'B')",
+            )
+            .await
+            .expect_err("legacy variant uniqueness must reject a second known fingerprint");
+        assert!(
+            legacy_error
+                .to_string()
+                .contains("UNIQUE constraint failed"),
+            "unexpected legacy uniqueness error: {legacy_error:#}"
+        );
+
+        migrate_fingerprint_generations_from_reuse_schema_up(&db).await?;
+        db.execute_unprepared(
+            "INSERT INTO eh_gallery_jobs (gid, token, download_mode, resolution, source_fingerprint, title) VALUES \
+                (501, 'token', 'archive', '1280x', 'fingerprint-b', 'B'), \
+                (502, 'token', 'archive', '1280x', NULL, 'unknown')",
+        )
+        .await?;
+        assert!(
+            db.execute_unprepared(
+                "INSERT INTO eh_gallery_jobs (gid, token, download_mode, resolution, source_fingerprint, title) \
+                 VALUES (501, 'token', 'archive', '1280x', 'fingerprint-a', 'duplicate A')"
+            )
+            .await
+            .is_err(),
+            "the same known fingerprint must be unique within a variant"
+        );
+        assert!(
+            db.execute_unprepared(
+                "INSERT INTO eh_gallery_jobs (gid, token, download_mode, resolution, source_fingerprint, title) \
+                 VALUES (502, 'token', 'archive', '1280x', NULL, 'duplicate unknown')"
+            )
+            .await
+            .is_err(),
+            "a variant must have at most one unknown fingerprint bucket"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn migration_fingerprint_generations_up_preserves_jobs_references_and_sequence(
+    ) -> Result<()> {
+        let db = new_db().await?;
+        create_legacy_shared_jobs_tables(&db).await?;
+        let prior_max_id = seed_fingerprint_generation_fixture(&db).await?;
+
+        migrate_fingerprint_generations_from_reuse_schema_up(&db).await?;
+
+        assert_job_rebuild_data_is_preserved(&db).await?;
+        assert_foreign_key_check_is_clean(&db).await?;
+        let fingerprint = db
+            .query_one(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT source_fingerprint FROM eh_gallery_jobs WHERE id = 410".to_owned(),
+            ))
+            .await?
+            .expect("fixture job survives the rebuild");
+        assert_eq!(
+            fingerprint.try_get::<Option<String>>("", "source_fingerprint")?,
+            Some("fixture-fingerprint".to_owned())
+        );
+
+        db.execute_unprepared(
+            "INSERT INTO eh_gallery_jobs (gid, token, download_mode, resolution, title) \
+             VALUES (7002, 'new-token', 'archive', '1280x', 'New job')",
+        )
+        .await?;
+        let row = db
+            .query_one(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT id FROM eh_gallery_jobs WHERE gid = 7002".to_owned(),
+            ))
+            .await?
+            .expect("new job is inserted");
+        assert!(
+            row.try_get::<i64>("", "id")? > prior_max_id,
+            "the rebuilt table must retain its AUTOINCREMENT sequence"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn migration_fingerprint_generations_creates_expected_indexes() -> Result<()> {
+        let db = new_db().await?;
+        create_legacy_shared_jobs_tables(&db).await?;
+
+        migrate_fingerprint_generations_up(&db).await?;
+
+        for index in JOB_REBUILD_INDEXES {
+            assert!(
+                sqlite_master_entry_exists(&db, "index", index).await?,
+                "{index} must be recreated"
+            );
+        }
+        assert!(
+            sqlite_master_entry_exists(&db, "index", KNOWN_FINGERPRINT_INDEX).await?,
+            "known-fingerprint partial unique index must exist"
+        );
+        assert!(
+            sqlite_master_entry_exists(&db, "index", UNKNOWN_FINGERPRINT_INDEX).await?,
+            "unknown-fingerprint partial unique index must exist"
+        );
+        assert!(
+            !sqlite_master_entry_exists(&db, "index", LEGACY_VARIANT_INDEX).await?,
+            "legacy variant unique index must be removed"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn migration_fingerprint_generations_down_restores_legacy_variant_without_data_loss(
+    ) -> Result<()> {
+        let db = new_db().await?;
+        create_legacy_shared_jobs_tables(&db).await?;
+        seed_fingerprint_generation_fixture(&db).await?;
+        migrate_fingerprint_generations_from_reuse_schema_up(&db).await?;
+
+        migrate_fingerprint_generations_down(&db).await?;
+
+        assert_job_rebuild_data_is_preserved(&db).await?;
+        assert_foreign_key_check_is_clean(&db).await?;
+        assert!(
+            sqlite_master_entry_exists(&db, "index", LEGACY_VARIANT_INDEX).await?,
+            "compatible down migration must restore the legacy variant index"
+        );
+        assert!(
+            db.execute_unprepared(
+                "INSERT INTO eh_gallery_jobs (\
+                    gid, token, download_mode, resolution, source_fingerprint, title\
+                 ) VALUES (7001, 'fixture-token', 'archive', '1280x', 'other-fingerprint', 'duplicate variant')"
+            )
+            .await
+            .is_err(),
+            "legacy variant uniqueness must reject a different fingerprint for the same variant"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn migration_fingerprint_generations_down_rejects_duplicate_generations_without_changes(
+    ) -> Result<()> {
+        let db = new_db().await?;
+        create_legacy_shared_jobs_tables(&db).await?;
+        migrate_fingerprint_generations_up(&db).await?;
+        db.execute_unprepared(
+            "INSERT INTO eh_gallery_jobs (gid, token, download_mode, resolution, source_fingerprint, title) VALUES \
+                (8001, 'duplicate-token', 'archive', '1280x', 'fingerprint-a', 'Generation A'), \
+                (8001, 'duplicate-token', 'archive', '1280x', 'fingerprint-b', 'Generation B')",
+        )
+        .await?;
+        db.execute_unprepared(
+            "CREATE TEMP TABLE expected_eh_gallery_jobs AS SELECT * FROM eh_gallery_jobs",
+        )
+        .await?;
+
+        let error = migrate_fingerprint_generations_down(&db)
+            .await
+            .expect_err("down migration must reject multiple generations for one variant");
+        assert!(error.to_string().contains("multiple source fingerprints"));
+
+        assert_same_table_rows(&db, "expected_eh_gallery_jobs", "eh_gallery_jobs").await?;
+        assert!(
+            sqlite_master_entry_exists(&db, "index", KNOWN_FINGERPRINT_INDEX).await?,
+            "failed down migration must keep the known-fingerprint index"
+        );
+        assert!(
+            sqlite_master_entry_exists(&db, "index", UNKNOWN_FINGERPRINT_INDEX).await?,
+            "failed down migration must keep the unknown-fingerprint index"
+        );
+        assert!(
+            !sqlite_master_entry_exists(&db, "index", LEGACY_VARIANT_INDEX).await?,
+            "failed down migration must not create the legacy variant index"
+        );
+        assert_foreign_key_check_is_clean(&db).await?;
         Ok(())
     }
 
@@ -1265,6 +1648,7 @@ mod tests {
             token: Set("shared-token".to_owned()),
             download_mode: Set("archive".to_owned()),
             resolution: Set("large".to_owned()),
+            source_fingerprint: Set(Some("fingerprint-a".to_owned())),
             title: Set("Large variant".to_owned()),
             ..Default::default()
         }
@@ -1281,7 +1665,34 @@ mod tests {
             .insert(db)
             .await
             .is_err(),
-            "identical gallery job variants must be unique"
+            "identical unknown-fingerprint gallery job variants must be unique"
+        );
+
+        eh_gallery_jobs::ActiveModel {
+            gid: Set(301),
+            token: Set("shared-token".to_owned()),
+            download_mode: Set("archive".to_owned()),
+            resolution: Set("large".to_owned()),
+            source_fingerprint: Set(Some("fingerprint-b".to_owned())),
+            title: Set("Different known generation".to_owned()),
+            ..Default::default()
+        }
+        .insert(db)
+        .await?;
+        assert!(
+            eh_gallery_jobs::ActiveModel {
+                gid: Set(301),
+                token: Set("shared-token".to_owned()),
+                download_mode: Set("archive".to_owned()),
+                resolution: Set("large".to_owned()),
+                source_fingerprint: Set(Some("fingerprint-a".to_owned())),
+                title: Set("Duplicate known generation".to_owned()),
+                ..Default::default()
+            }
+            .insert(db)
+            .await
+            .is_err(),
+            "identical known-fingerprint gallery job generations must be unique"
         );
 
         let queue = eh_download_queue::ActiveModel {

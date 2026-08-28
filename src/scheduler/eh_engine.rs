@@ -8256,6 +8256,116 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn marker_bearing_subscription_fingerprint_rebind_makes_stale_publish_claim_a_noop() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        setup_chat(&repo, -100, true).await;
+        let tg_server = MockServer::start().await;
+        let eh_server = MockServer::start().await;
+        let variant = EhGalleryVariant::archive("1280x");
+        let first = repo
+            .enqueue_eh_subscription_download(
+                -100,
+                101,
+                913,
+                "same-token",
+                "Old fingerprint",
+                true,
+                &variant,
+                Some("fingerprint-a"),
+                true,
+            )
+            .await
+            .unwrap()
+            .expect("old fingerprint delivery should be enqueued");
+        let old_job = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        repo.mark_eh_job_downloaded(
+            old_job.id,
+            old_job.started_at.unwrap(),
+            123,
+            "old-fingerprint.zip",
+            0,
+        )
+        .await
+        .unwrap();
+        let upload = repo.get_next_eh_job_for_upload().await.unwrap().unwrap();
+        repo.mark_eh_job_telegraph_ready(
+            upload.id,
+            upload.started_at.unwrap(),
+            "https://telegra.ph/old-fingerprint",
+            None,
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+        let old_claim = repo
+            .get_next_eh_delivery_for_publish(true)
+            .await
+            .unwrap()
+            .expect("old fingerprint delivery should be claimed for publish");
+        repo.mark_eh_archive_delivery_sent(old_claim.delivery.id)
+            .await
+            .unwrap();
+
+        let rebound = repo
+            .enqueue_eh_subscription_download(
+                -100,
+                202,
+                913,
+                "same-token",
+                "New fingerprint",
+                true,
+                &variant,
+                Some("fingerprint-b"),
+                true,
+            )
+            .await
+            .unwrap()
+            .expect("new fingerprint must retain the unsent link demand");
+        let requested_job_id = rebound.job_id.expect("rebound delivery should have a job");
+        assert_ne!(requested_job_id, old_job.id);
+        assert_eq!(
+            rebound.status,
+            crate::db::repo::eh_gallery_jobs::DELIVERY_STATUS_WAITING
+        );
+        assert!(rebound.archive_sent_at.is_some());
+        assert!(rebound.telegraph_sent_at.is_none());
+
+        let worker = EhPublishWorker::new(
+            Arc::clone(&repo),
+            make_notifier(&tg_server),
+            make_eh_client(&eh_server),
+            None,
+            Arc::new(make_config()),
+        );
+        worker.process_claimed(old_claim).await.unwrap();
+        assert!(
+            tg_server.received_requests().await.unwrap().is_empty(),
+            "the stale publisher must reread the rebound delivery before sending the old link"
+        );
+        let rebound = eh_download_queue::Entity::find_by_id(first.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(rebound.job_id, Some(requested_job_id));
+        assert_eq!(
+            rebound.status,
+            crate::db::repo::eh_gallery_jobs::DELIVERY_STATUS_WAITING
+        );
+        assert!(rebound.archive_sent_at.is_some());
+        assert!(rebound.telegraph_sent_at.is_none());
+        assert_eq!(
+            repo.get_next_eh_job_for_download()
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            requested_job_id
+        );
+    }
+
+    #[tokio::test]
     async fn publish_tick_drains_started_sibling_before_returning_refill_claim_error() {
         let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
         setup_chat(&repo, -100, true).await;
@@ -12629,6 +12739,17 @@ mod tests {
         assert_eq!(
             ready_later.telegraph_status,
             crate::db::repo::eh_gallery_jobs::TELEGRAPH_STATUS_READY
+        );
+        assert_eq!(
+            ready_later.cleanup_status,
+            crate::db::repo::eh_gallery_jobs::CLEANUP_STATUS_PENDING,
+            "the archive is no longer an active surface after its persisted marker"
+        );
+        assert_eq!(
+            run_eh_job_cleanup_maintenance_once(repo.as_ref(), None, 0, true)
+                .await
+                .unwrap(),
+            Some(EhCleanupFinalizeOutcome::FinalizedWithoutSourceWork)
         );
         EhPublishWorker::new(
             Arc::clone(&repo),
