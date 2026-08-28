@@ -670,6 +670,9 @@ impl Repo {
         let (mut job, mut started_new_generation) = if let Some(job) = existing {
             (job, false)
         } else {
+            let source_generation =
+                next_eh_gallery_source_generation_in_txn(txn, req.gid, req.token, req.variant)
+                    .await?;
             (
                 eh_gallery_jobs::ActiveModel {
                     gid: Set(req.gid),
@@ -677,6 +680,7 @@ impl Repo {
                     download_mode: Set(req.variant.download_mode.clone()),
                     resolution: Set(req.variant.resolution.clone()),
                     source_fingerprint: Set(req.fingerprint.clone()),
+                    source_generation: Set(source_generation),
                     title: Set(req.title.to_string()),
                     status: Set(JOB_STATUS_PENDING.to_string()),
                     telegraph_status: Set(TELEGRAPH_STATUS_NOT_REQUIRED.to_string()),
@@ -700,11 +704,15 @@ impl Repo {
         let should_update_title = !req.title.is_empty() && job.title != req.title;
 
         if should_reactivate {
+            let source_generation =
+                next_eh_gallery_source_generation_in_txn(txn, req.gid, req.token, req.variant)
+                    .await?;
             reset_eh_gallery_job_generation_in_txn(
                 txn,
                 job.id,
                 req.title,
                 req.fingerprint.as_deref(),
+                source_generation,
             )
             .await?;
             job = eh_gallery_jobs::Entity::find_by_id(job.id)
@@ -2170,6 +2178,7 @@ impl Repo {
                     &completed_job.token,
                     &variant,
                     fingerprint,
+                    completed_job.source_generation,
                     telegraph_url,
                     rewrite_data_json,
                     Some(media_cids),
@@ -4903,6 +4912,7 @@ async fn reset_eh_gallery_job_generation_in_txn(
     job_id: i32,
     title: &str,
     fingerprint: Option<&str>,
+    source_generation: i64,
 ) -> Result<()> {
     let mut update = eh_gallery_jobs::Entity::update_many()
         .col_expr(
@@ -4912,6 +4922,10 @@ async fn reset_eh_gallery_job_generation_in_txn(
         .col_expr(
             eh_gallery_jobs::Column::TelegraphStatus,
             Expr::value(TELEGRAPH_STATUS_NOT_REQUIRED),
+        )
+        .col_expr(
+            eh_gallery_jobs::Column::SourceGeneration,
+            Expr::value(source_generation),
         )
         .col_expr(
             eh_gallery_jobs::Column::TelegraphRequired,
@@ -5019,6 +5033,28 @@ async fn reset_eh_gallery_job_generation_in_txn(
     Ok(())
 }
 
+async fn next_eh_gallery_source_generation_in_txn(
+    txn: &DatabaseTransaction,
+    gid: i64,
+    token: &str,
+    variant: &EhGalleryVariant,
+) -> Result<i64> {
+    let maximum = eh_gallery_jobs::Entity::find()
+        .filter(eh_gallery_jobs::Column::Gid.eq(gid))
+        .filter(eh_gallery_jobs::Column::Token.eq(token))
+        .filter(eh_gallery_jobs::Column::DownloadMode.eq(&variant.download_mode))
+        .filter(eh_gallery_jobs::Column::Resolution.eq(&variant.resolution))
+        .order_by_desc(eh_gallery_jobs::Column::SourceGeneration)
+        .one(txn)
+        .await
+        .context("Failed to read the current shared EH gallery source generation")?
+        .map(|job| job.source_generation)
+        .unwrap_or(0);
+    maximum
+        .checked_add(1)
+        .context("Shared EH gallery source generation overflow")
+}
+
 fn optional_i32_filter(
     column: eh_download_queue::Column,
     value: Option<i32>,
@@ -5085,12 +5121,16 @@ mod tests {
         sea_query::Expr, ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter, TransactionTrait,
     };
 
+    const INITIAL_SOURCE_GENERATION: i64 = 1;
+
+    #[allow(clippy::too_many_arguments)]
     async fn seed_cached_result(
         repo: &Repo,
         gid: i64,
         token: &str,
         variant: &EhGalleryVariant,
         fingerprint: &str,
+        source_generation: i64,
         telegraph_url: &str,
         rewrite_data: Option<&str>,
     ) {
@@ -5101,6 +5141,7 @@ mod tests {
             token,
             variant,
             fingerprint,
+            source_generation,
             telegraph_url,
             rewrite_data,
             Some("[{\"name\":\"001.jpg\",\"cid\":\"bafk-cached\"}]"),
@@ -5546,6 +5587,7 @@ mod tests {
             "token",
             &variant,
             "fingerprint",
+            INITIAL_SOURCE_GENERATION,
             "https://telegra.ph/cached-only",
             Some("{\"pages\":[]}"),
         )
@@ -5607,6 +5649,7 @@ mod tests {
             "token",
             &variant,
             "fingerprint",
+            INITIAL_SOURCE_GENERATION,
             "https://telegra.ph/cached-archive",
             None,
         )
@@ -5661,6 +5704,7 @@ mod tests {
             "token",
             &variant,
             "old-fingerprint",
+            INITIAL_SOURCE_GENERATION,
             "https://telegra.ph/stale",
             None,
         )
@@ -5766,7 +5810,290 @@ mod tests {
             second_job.source_fingerprint.as_deref(),
             Some("fingerprint-b")
         );
+        assert_eq!(first_job.source_generation, 1);
+        assert_eq!(second_job.source_generation, 2);
         assert_eq!(load_eh_job(&repo, first_job.id).await, first_job);
+    }
+
+    #[tokio::test]
+    async fn reenqueueing_retired_fingerprint_advances_generation_and_replaces_newer_cache() {
+        let repo = tests_helpers::setup_test_db().await.unwrap();
+        let variant = EhGalleryVariant::archive("1280x");
+        let first_a = repo
+            .enqueue_eh_download(
+                -28103,
+                28103,
+                "token",
+                "Generation A",
+                true,
+                SOURCE_DIRECT,
+                &variant,
+                Some("fingerprint-a"),
+                true,
+            )
+            .await
+            .unwrap()
+            .expect("first A generation should be enqueued");
+        let first_a_job = load_eh_job(&repo, first_a.job_id.unwrap()).await;
+        assert_eq!(first_a_job.source_generation, 1);
+        eh_download_queue::Entity::update_many()
+            .col_expr(
+                eh_download_queue::Column::Status,
+                Expr::value(DELIVERY_STATUS_DONE),
+            )
+            .filter(eh_download_queue::Column::Id.eq(first_a.id))
+            .exec(repo.db())
+            .await
+            .unwrap();
+        eh_gallery_jobs::Entity::update_many()
+            .col_expr(
+                eh_gallery_jobs::Column::Status,
+                Expr::value(JOB_STATUS_RETIRED),
+            )
+            .filter(eh_gallery_jobs::Column::Id.eq(first_a_job.id))
+            .exec(repo.db())
+            .await
+            .unwrap();
+
+        let second_b = repo
+            .enqueue_eh_download(
+                -38103,
+                28103,
+                "token",
+                "Generation B",
+                true,
+                SOURCE_DIRECT,
+                &variant,
+                Some("fingerprint-b"),
+                true,
+            )
+            .await
+            .unwrap()
+            .expect("B generation should be enqueued");
+        let second_b_job = load_eh_job(&repo, second_b.job_id.unwrap()).await;
+        assert_eq!(second_b_job.source_generation, 2);
+        let download_b = repo
+            .get_next_eh_job_for_download()
+            .await
+            .unwrap()
+            .expect("B should be the only claimable generation");
+        assert_eq!(download_b.id, second_b_job.id);
+        repo.mark_eh_job_downloaded(
+            download_b.id,
+            download_b.started_at.unwrap(),
+            123,
+            "generation-b.zip",
+            0,
+        )
+        .await
+        .unwrap();
+        let upload_b = repo
+            .get_next_eh_job_for_upload()
+            .await
+            .unwrap()
+            .expect("B should need an upload");
+        repo.mark_eh_job_telegraph_ready(
+            upload_b.id,
+            upload_b.started_at.unwrap(),
+            "https://telegra.ph/generation-b",
+            None,
+            Some("[{\"name\":\"001.jpg\",\"cid\":\"bafk-b\"}]"),
+            true,
+        )
+        .await
+        .unwrap();
+
+        let reactivated_a = repo
+            .enqueue_eh_download(
+                -48103,
+                28103,
+                "token",
+                "Generation A again",
+                true,
+                SOURCE_DIRECT,
+                &variant,
+                Some("fingerprint-a"),
+                true,
+            )
+            .await
+            .unwrap()
+            .expect("retired A should be reactivated");
+        assert_eq!(reactivated_a.job_id, Some(first_a_job.id));
+        let reactivated_a_job = load_eh_job(&repo, first_a_job.id).await;
+        assert_eq!(reactivated_a_job.source_generation, 3);
+        assert_eq!(reactivated_a_job.status, JOB_STATUS_PENDING);
+        assert_eq!(
+            reactivated_a_job.telegraph_status,
+            TELEGRAPH_STATUS_NOT_REQUIRED
+        );
+
+        let download_a = repo
+            .get_next_eh_job_for_download()
+            .await
+            .unwrap()
+            .expect("reactivated A should be claimable");
+        assert_eq!(download_a.id, reactivated_a_job.id);
+        repo.mark_eh_job_downloaded(
+            download_a.id,
+            download_a.started_at.unwrap(),
+            123,
+            "generation-a-again.zip",
+            0,
+        )
+        .await
+        .unwrap();
+        let upload_a = repo
+            .get_next_eh_job_for_upload()
+            .await
+            .unwrap()
+            .expect("reactivated A should need an upload");
+        repo.mark_eh_job_telegraph_ready(
+            upload_a.id,
+            upload_a.started_at.unwrap(),
+            "https://telegra.ph/generation-a-again",
+            None,
+            Some("[{\"name\":\"001.jpg\",\"cid\":\"bafk-a-again\"}]"),
+            true,
+        )
+        .await
+        .unwrap();
+
+        let txn = repo.db().begin().await.unwrap();
+        let cached = find_eh_gallery_result_in_txn(&txn, 28103, "token", &variant)
+            .await
+            .unwrap()
+            .expect("reactivated A result should be cached");
+        txn.commit().await.unwrap();
+        assert_eq!(cached.source_generation, 3);
+        assert_eq!(cached.source_fingerprint, "fingerprint-a");
+        assert_eq!(
+            cached.telegraph_url,
+            "https://telegra.ph/generation-a-again"
+        );
+    }
+
+    #[tokio::test]
+    async fn late_older_ready_does_not_overwrite_newer_generation_result() {
+        let repo = tests_helpers::setup_test_db().await.unwrap();
+        let variant = EhGalleryVariant::archive("1280x");
+        let older = repo
+            .enqueue_eh_download(
+                -38104,
+                28104,
+                "token",
+                "Generation A",
+                true,
+                SOURCE_DIRECT,
+                &variant,
+                Some("fingerprint-a"),
+                true,
+            )
+            .await
+            .unwrap()
+            .expect("older generation should be enqueued");
+        let newer = repo
+            .enqueue_eh_download(
+                -48104,
+                28104,
+                "token",
+                "Generation B",
+                true,
+                SOURCE_DIRECT,
+                &variant,
+                Some("fingerprint-b"),
+                true,
+            )
+            .await
+            .unwrap()
+            .expect("newer generation should be enqueued");
+        let older_job = load_eh_job(&repo, older.job_id.unwrap()).await;
+        let newer_job = load_eh_job(&repo, newer.job_id.unwrap()).await;
+        assert_eq!(older_job.source_generation, 1);
+        assert_eq!(newer_job.source_generation, 2);
+
+        let first_download = repo
+            .get_next_eh_job_for_download()
+            .await
+            .unwrap()
+            .expect("one generation should be claimable");
+        let second_download = repo
+            .get_next_eh_job_for_download()
+            .await
+            .unwrap()
+            .expect("the other generation should also be claimable");
+        let (older_download, newer_download) = if first_download.id == older_job.id {
+            (first_download, second_download)
+        } else {
+            (second_download, first_download)
+        };
+        assert_eq!(older_download.id, older_job.id);
+        assert_eq!(newer_download.id, newer_job.id);
+
+        repo.mark_eh_job_downloaded(
+            newer_download.id,
+            newer_download.started_at.unwrap(),
+            123,
+            "generation-b.zip",
+            0,
+        )
+        .await
+        .unwrap();
+        let newer_upload = repo
+            .get_next_eh_job_for_upload()
+            .await
+            .unwrap()
+            .expect("newer generation should need an upload");
+        assert_eq!(newer_upload.id, newer_job.id);
+        repo.mark_eh_job_telegraph_ready(
+            newer_upload.id,
+            newer_upload.started_at.unwrap(),
+            "https://telegra.ph/generation-b",
+            None,
+            Some("[{\"name\":\"001.jpg\",\"cid\":\"bafk-b\"}]"),
+            true,
+        )
+        .await
+        .unwrap();
+
+        repo.mark_eh_job_downloaded(
+            older_download.id,
+            older_download.started_at.unwrap(),
+            123,
+            "generation-a.zip",
+            0,
+        )
+        .await
+        .unwrap();
+        let older_upload = repo
+            .get_next_eh_job_for_upload()
+            .await
+            .unwrap()
+            .expect("older generation should still settle successfully");
+        assert_eq!(older_upload.id, older_job.id);
+        repo.mark_eh_job_telegraph_ready(
+            older_upload.id,
+            older_upload.started_at.unwrap(),
+            "https://telegra.ph/generation-a",
+            None,
+            Some("[{\"name\":\"001.jpg\",\"cid\":\"bafk-a\"}]"),
+            true,
+        )
+        .await
+        .unwrap();
+
+        let txn = repo.db().begin().await.unwrap();
+        let cached = find_eh_gallery_result_in_txn(&txn, 28104, "token", &variant)
+            .await
+            .unwrap()
+            .expect("newer result should remain cached");
+        txn.commit().await.unwrap();
+        assert_eq!(cached.source_generation, newer_job.source_generation);
+        assert_eq!(cached.source_fingerprint, "fingerprint-b");
+        assert_eq!(cached.telegraph_url, "https://telegra.ph/generation-b");
+        assert_eq!(
+            cached.media_cids.as_deref(),
+            Some("[{\"name\":\"001.jpg\",\"cid\":\"bafk-b\"}]")
+        );
     }
 
     #[tokio::test]
@@ -6306,6 +6633,7 @@ mod tests {
             "token",
             &variant,
             "fingerprint",
+            INITIAL_SOURCE_GENERATION,
             "https://telegra.ph/late",
             None,
         )
@@ -6374,6 +6702,7 @@ mod tests {
             "normal",
             &variant,
             "fingerprint",
+            INITIAL_SOURCE_GENERATION,
             "https://telegra.ph/normal",
             Some("{\"pages\":[]}"),
         )
@@ -6427,6 +6756,7 @@ mod tests {
             "background",
             &variant,
             "fingerprint",
+            INITIAL_SOURCE_GENERATION,
             "https://telegra.ph/background",
             Some("{\"pages\":[]}"),
         )
@@ -6604,6 +6934,7 @@ mod tests {
             "token",
             &variant,
             "fingerprint",
+            INITIAL_SOURCE_GENERATION,
             "https://telegra.ph/unused",
             None,
         )
@@ -7501,6 +7832,7 @@ mod tests {
             "token",
             &variant,
             "old-fingerprint",
+            download.source_generation,
             "https://telegra.ph/old-cache",
             Some("{\"pages\":[\"old\"]}"),
         )

@@ -12,6 +12,7 @@ pub struct Model {
     pub download_mode: String,
     pub resolution: String,
     pub source_fingerprint: String,
+    pub source_generation: i64,
     pub telegraph_url: String,
     pub telegraph_rewrite_data: Option<String>,
     pub media_cids: Option<String>,

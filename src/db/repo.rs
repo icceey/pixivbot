@@ -86,6 +86,7 @@ pub mod tests_helpers {
                 download_mode TEXT NOT NULL,
                 resolution TEXT NOT NULL DEFAULT '',
                 source_fingerprint TEXT,
+                source_generation INTEGER NOT NULL DEFAULT 0,
                 title TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'pending',
                 telegraph_status TEXT NOT NULL DEFAULT 'not_required',
@@ -133,6 +134,7 @@ pub mod tests_helpers {
                 download_mode TEXT NOT NULL,
                 resolution TEXT NOT NULL,
                 source_fingerprint TEXT NOT NULL,
+                source_generation INTEGER NOT NULL DEFAULT 0,
                 telegraph_url TEXT NOT NULL,
                 telegraph_rewrite_data TEXT,
                 media_cids TEXT,
@@ -163,6 +165,7 @@ pub mod tests_helpers {
         for index in [
             "CREATE UNIQUE INDEX uq_eh_gallery_jobs_known_fingerprint ON eh_gallery_jobs(gid, token, download_mode, resolution, source_fingerprint) WHERE source_fingerprint IS NOT NULL",
             "CREATE UNIQUE INDEX uq_eh_gallery_jobs_unknown_fingerprint ON eh_gallery_jobs(gid, token, download_mode, resolution) WHERE source_fingerprint IS NULL",
+            "CREATE UNIQUE INDEX uq_eh_gallery_jobs_variant_source_generation ON eh_gallery_jobs(gid, token, download_mode, resolution, source_generation)",
             "CREATE INDEX idx_eh_gallery_jobs_status_retry ON eh_gallery_jobs(status, next_retry_at)",
             "CREATE INDEX idx_eh_gallery_jobs_telegraph_retry ON eh_gallery_jobs(telegraph_status, next_retry_at)",
             "CREATE INDEX idx_eh_gallery_jobs_cleanup_retry ON eh_gallery_jobs(cleanup_status, cleanup_next_retry_at)",

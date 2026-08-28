@@ -109,6 +109,8 @@ mod tests {
         "m20260827_000000_eh_legacy_artifact_handoff";
     const FINGERPRINT_GENERATIONS_MIGRATION_NAME: &str =
         "m20260828_000000_eh_job_fingerprint_generations";
+    const RESULT_GENERATION_ORDER_MIGRATION_NAME: &str =
+        "m20260829_000000_eh_result_generation_order";
     const JOB_REBUILD_INDEXES: [&str; 6] = [
         "idx_eh_gallery_jobs_status_retry",
         "idx_eh_gallery_jobs_telegraph_retry",
@@ -120,6 +122,7 @@ mod tests {
     const KNOWN_FINGERPRINT_INDEX: &str = "uq_eh_gallery_jobs_known_fingerprint";
     const UNKNOWN_FINGERPRINT_INDEX: &str = "uq_eh_gallery_jobs_unknown_fingerprint";
     const LEGACY_VARIANT_INDEX: &str = "uq_eh_gallery_jobs_variant";
+    const JOB_GENERATION_INDEX: &str = "uq_eh_gallery_jobs_variant_source_generation";
 
     async fn new_db() -> Result<DatabaseConnection> {
         let db = Database::connect("sqlite::memory:").await?;
@@ -238,6 +241,31 @@ mod tests {
 
     async fn migrate_fingerprint_generations_down(db: &DatabaseConnection) -> Result<()> {
         fingerprint_generations_target_migration()?
+            .down(&SchemaManager::new(db))
+            .await?;
+        Ok(())
+    }
+
+    fn result_generation_order_target_migration() -> Result<Box<dyn MigrationTrait>> {
+        Migrator::migrations()
+            .into_iter()
+            .find(|migration| migration.name() == RESULT_GENERATION_ORDER_MIGRATION_NAME)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "migration {RESULT_GENERATION_ORDER_MIGRATION_NAME} is not registered"
+                )
+            })
+    }
+
+    async fn migrate_result_generation_order_up(db: &DatabaseConnection) -> Result<()> {
+        result_generation_order_target_migration()?
+            .up(&SchemaManager::new(db))
+            .await?;
+        Ok(())
+    }
+
+    async fn migrate_result_generation_order_down(db: &DatabaseConnection) -> Result<()> {
+        result_generation_order_target_migration()?
             .down(&SchemaManager::new(db))
             .await?;
         Ok(())
@@ -728,6 +756,7 @@ mod tests {
 
         migrate_legacy_artifact_handoff_compat_up(&db).await?;
         migrate_legacy_artifact_handoff_compat_up(&db).await?;
+        migrate_result_generation_order_up(&db).await?;
         assert!(table_has_column(&db, "eh_gallery_jobs", "legacy_artifact_handoff").await?);
 
         let jobs = eh_gallery_jobs::Entity::find().all(&db).await?;
@@ -862,6 +891,7 @@ mod tests {
             "missing ambiguous source must release jobs for ordinary shared work"
         );
 
+        migrate_result_generation_order_down(&db).await?;
         migrate_fingerprint_generations_down(&db).await?;
         migrate_legacy_artifact_handoff_compat_down(&db).await?;
         assert!(
@@ -897,6 +927,110 @@ mod tests {
             !sqlite_master_entry_exists(&db, "index", LEGACY_VARIANT_INDEX).await?,
             "legacy variant unique index must be removed"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn migration_orders_result_generations_and_preserves_schema_references() -> Result<()> {
+        let db = new_db().await?;
+        create_legacy_shared_jobs_tables(&db).await?;
+        migrate_fingerprint_generations_up(&db).await?;
+        db.execute_unprepared(
+            "INSERT INTO eh_gallery_jobs (\
+                 id, gid, token, download_mode, resolution, source_fingerprint, title, created_at\
+             ) VALUES \
+                 (901, 9901, 'token', 'archive', '1280x', 'fingerprint-a', 'First generation', '2026-08-29 00:00:00'), \
+                 (902, 9901, 'token', 'archive', '1280x', 'fingerprint-b', 'Second generation', '2026-08-29 00:00:00'), \
+                 (903, 9902, 'other-token', 'archive', '1280x', 'fingerprint-c', 'Other variant', '2026-08-29 00:00:00')",
+        )
+        .await?;
+        db.execute_unprepared(
+            "INSERT INTO eh_download_queue (id, job_id, chat_id, gid, token, title, status) \
+             VALUES (901, 902, 90, 9901, 'token', 'Referenced job', 'waiting')",
+        )
+        .await?;
+        db.execute_unprepared(
+            "INSERT INTO eh_gallery_results (\
+                 gid, token, download_mode, resolution, source_fingerprint, telegraph_url, created_at, updated_at\
+             ) VALUES \
+                 (9901, 'token', 'archive', '1280x', 'fingerprint-b', 'https://telegra.ph/b', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP), \
+                 (9902, 'other-token', 'archive', '1280x', 'missing-fingerprint', 'https://telegra.ph/missing', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        )
+        .await?;
+
+        migrate_result_generation_order_up(&db).await?;
+
+        let ordered_generations = db
+            .query_all(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT source_fingerprint, source_generation \
+                 FROM eh_gallery_jobs WHERE gid = 9901 ORDER BY id"
+                    .to_owned(),
+            ))
+            .await?;
+        assert_eq!(ordered_generations.len(), 2);
+        assert_eq!(
+            ordered_generations[0].try_get::<Option<String>>("", "source_fingerprint")?,
+            Some("fingerprint-a".to_owned())
+        );
+        assert_eq!(
+            ordered_generations[0].try_get::<i64>("", "source_generation")?,
+            1,
+            "created_at ties must rank by job ID"
+        );
+        assert_eq!(
+            ordered_generations[1].try_get::<Option<String>>("", "source_fingerprint")?,
+            Some("fingerprint-b".to_owned())
+        );
+        assert_eq!(
+            ordered_generations[1].try_get::<i64>("", "source_generation")?,
+            2
+        );
+        let result_generations = db
+            .query_all(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT gid, source_generation FROM eh_gallery_results ORDER BY gid".to_owned(),
+            ))
+            .await?;
+        assert_eq!(result_generations.len(), 2);
+        assert_eq!(result_generations[0].try_get::<i64>("", "gid")?, 9901);
+        assert_eq!(
+            result_generations[0].try_get::<i64>("", "source_generation")?,
+            2,
+            "a result must adopt its matching fingerprint's latest job generation"
+        );
+        assert_eq!(result_generations[1].try_get::<i64>("", "gid")?, 9902);
+        assert_eq!(
+            result_generations[1].try_get::<i64>("", "source_generation")?,
+            0,
+            "unmatched legacy result generations must remain conservative"
+        );
+        assert!(
+            db.execute_unprepared(
+                "INSERT INTO eh_gallery_jobs (\
+                     gid, token, download_mode, resolution, source_fingerprint, source_generation, title\
+                 ) VALUES (9901, 'token', 'archive', '1280x', 'fingerprint-c', 2, 'Duplicate generation')"
+            )
+            .await
+            .is_err(),
+            "variant source generations must be unique"
+        );
+        assert!(
+            sqlite_master_entry_exists(&db, "index", JOB_GENERATION_INDEX).await?,
+            "generation uniqueness index must exist"
+        );
+        assert!(table_has_column(&db, "eh_gallery_jobs", "source_generation").await?);
+        assert!(table_has_column(&db, "eh_gallery_results", "source_generation").await?);
+        assert_foreign_key_check_is_clean(&db).await?;
+
+        migrate_result_generation_order_down(&db).await?;
+        assert!(
+            !sqlite_master_entry_exists(&db, "index", JOB_GENERATION_INDEX).await?,
+            "down migration must remove the generation uniqueness index first"
+        );
+        assert!(!table_has_column(&db, "eh_gallery_jobs", "source_generation").await?);
+        assert!(!table_has_column(&db, "eh_gallery_results", "source_generation").await?);
+        assert_foreign_key_check_is_clean(&db).await?;
         Ok(())
     }
 
@@ -1439,6 +1573,7 @@ mod tests {
         )
         .await?;
         migrate_fingerprint_generations_up(&db).await?;
+        migrate_result_generation_order_up(&db).await?;
 
         let repo = Repo::new(db);
         let temp = tempfile::tempdir()?;
@@ -1508,6 +1643,7 @@ mod tests {
         )
         .await?;
         migrate_fingerprint_generations_up(&db).await?;
+        migrate_result_generation_order_up(&db).await?;
 
         let repo = Repo::new(db);
         let jobs = eh_gallery_jobs::Entity::find().all(repo.db()).await?;
@@ -1569,6 +1705,7 @@ mod tests {
         )
         .await?;
         migrate_fingerprint_generations_up(&db).await?;
+        migrate_result_generation_order_up(&db).await?;
 
         for gid in [916, 917] {
             let jobs = eh_gallery_jobs::Entity::find()
@@ -1606,6 +1743,7 @@ mod tests {
         )
         .await?;
         migrate_fingerprint_generations_up(&db).await?;
+        migrate_result_generation_order_up(&db).await?;
 
         let repo = Repo::new(db);
         let jobs = eh_gallery_jobs::Entity::find().all(repo.db()).await?;
@@ -1672,6 +1810,7 @@ mod tests {
         )
         .await?;
         migrate_fingerprint_generations_up(&db).await?;
+        migrate_result_generation_order_up(&db).await?;
 
         let repo = Repo::new(db);
         let temp = tempfile::tempdir()?;
@@ -1709,6 +1848,7 @@ mod tests {
         )
         .await?;
         migrate_fingerprint_generations_up(&db).await?;
+        migrate_result_generation_order_up(&db).await?;
 
         let repo = Repo::new(db);
         let job = eh_gallery_jobs::Entity::find()
@@ -1765,6 +1905,7 @@ mod tests {
         )
         .await?;
         migrate_fingerprint_generations_up(&db).await?;
+        migrate_result_generation_order_up(&db).await?;
 
         let repo = Repo::new(db);
         let job = eh_gallery_jobs::Entity::find()

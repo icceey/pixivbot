@@ -14,6 +14,7 @@ pub async fn upsert_eh_gallery_result_in_txn(
     token: &str,
     variant: &EhGalleryVariant,
     fingerprint: &str,
+    source_generation: i64,
     telegraph_url: &str,
     rewrite_data: Option<&str>,
     media_cids: Option<&str>,
@@ -24,16 +25,18 @@ pub async fn upsert_eh_gallery_result_in_txn(
         r#"
         INSERT INTO eh_gallery_results (
             gid, token, download_mode, resolution,
-            source_fingerprint, telegraph_url,
+            source_fingerprint, source_generation, telegraph_url,
             telegraph_rewrite_data, media_cids,
             created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(gid, token, download_mode, resolution) DO UPDATE SET
             source_fingerprint = excluded.source_fingerprint,
+            source_generation = excluded.source_generation,
             telegraph_url = excluded.telegraph_url,
             telegraph_rewrite_data = excluded.telegraph_rewrite_data,
             media_cids = excluded.media_cids,
             updated_at = excluded.updated_at
+        WHERE excluded.source_generation >= eh_gallery_results.source_generation
         "#,
         vec![
             gid.into(),
@@ -41,6 +44,7 @@ pub async fn upsert_eh_gallery_result_in_txn(
             variant.download_mode.clone().into(),
             variant.resolution.clone().into(),
             fingerprint.to_string().into(),
+            source_generation.into(),
             telegraph_url.to_string().into(),
             rewrite_data.map(str::to_string).into(),
             media_cids.map(str::to_string).into(),
@@ -98,6 +102,7 @@ mod tests {
             download_mode: Set(variant.download_mode.clone()),
             resolution: Set(variant.resolution.clone()),
             source_fingerprint: Set(fingerprint.map(str::to_string)),
+            source_generation: Set(1),
             title: Set(format!("Gallery {gid}")),
             status: Set(JOB_STATUS_PENDING.to_string()),
             telegraph_status: Set(TELEGRAPH_STATUS_NOT_REQUIRED.to_string()),
@@ -135,12 +140,14 @@ mod tests {
         .unwrap()
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn insert_cached_result(
         repo: &Repo,
         gid: i64,
         token: &str,
         variant: &EhGalleryVariant,
         fingerprint: &str,
+        source_generation: i64,
         telegraph_url: &str,
         rewrite_data: Option<&str>,
     ) {
@@ -151,6 +158,7 @@ mod tests {
             token,
             variant,
             fingerprint,
+            source_generation,
             telegraph_url,
             rewrite_data,
             None,
@@ -178,7 +186,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upsert_replaces_prior_generation() {
+    async fn upsert_preserves_newer_generation_and_updates_equal_generation() {
         let repo = setup_test_db().await.unwrap();
         let variant = EhGalleryVariant::archive("1280x");
         let txn = repo.db().begin().await.unwrap();
@@ -189,6 +197,7 @@ mod tests {
             "token",
             &variant,
             "fingerprint-v1",
+            1,
             "https://telegra.ph/v1",
             Some("rewrite-v1"),
             Some("cid-v1"),
@@ -209,6 +218,7 @@ mod tests {
             "token",
             &variant,
             "fingerprint-v2",
+            2,
             "https://telegra.ph/v2",
             Some("rewrite-v2"),
             Some("cid-v2"),
@@ -227,6 +237,53 @@ mod tests {
         assert_eq!(result.telegraph_url, "https://telegra.ph/v2");
         assert_eq!(result.telegraph_rewrite_data.as_deref(), Some("rewrite-v2"));
         assert_eq!(result.media_cids.as_deref(), Some("cid-v2"));
+
+        upsert_eh_gallery_result_in_txn(
+            &txn,
+            101,
+            "token",
+            &variant,
+            "fingerprint-v1-late",
+            1,
+            "https://telegra.ph/v1-late",
+            Some("rewrite-v1-late"),
+            Some("cid-v1-late"),
+        )
+        .await
+        .unwrap();
+        let result = find_eh_gallery_result_in_txn(&txn, 101, "token", &variant)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.source_fingerprint, "fingerprint-v2");
+        assert_eq!(result.telegraph_url, "https://telegra.ph/v2");
+        assert_eq!(result.telegraph_rewrite_data.as_deref(), Some("rewrite-v2"));
+        assert_eq!(result.media_cids.as_deref(), Some("cid-v2"));
+
+        upsert_eh_gallery_result_in_txn(
+            &txn,
+            101,
+            "token",
+            &variant,
+            "fingerprint-v2-retry",
+            2,
+            "https://telegra.ph/v2-retry",
+            Some("rewrite-v2-retry"),
+            Some("cid-v2-retry"),
+        )
+        .await
+        .unwrap();
+        let result = find_eh_gallery_result_in_txn(&txn, 101, "token", &variant)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.source_fingerprint, "fingerprint-v2-retry");
+        assert_eq!(result.telegraph_url, "https://telegra.ph/v2-retry");
+        assert_eq!(
+            result.telegraph_rewrite_data.as_deref(),
+            Some("rewrite-v2-retry")
+        );
+        assert_eq!(result.media_cids.as_deref(), Some("cid-v2-retry"));
         assert_eq!(
             eh_gallery_results::Entity::find()
                 .filter(eh_gallery_results::Column::Gid.eq(101))
@@ -253,6 +310,7 @@ mod tests {
             &job.token,
             &variant,
             "fingerprint",
+            job.source_generation,
             "https://telegra.ph/cached",
             Some("cached-rewrite"),
         )
@@ -308,6 +366,7 @@ mod tests {
             &job.token,
             &variant,
             "fingerprint",
+            job.source_generation,
             "https://telegra.ph/cached",
             None,
         )
@@ -340,6 +399,7 @@ mod tests {
             &mismatch.token,
             &variant,
             "other-fingerprint",
+            mismatch.source_generation,
             "https://telegra.ph/mismatch",
             None,
         )
@@ -354,6 +414,7 @@ mod tests {
             &null_fingerprint.token,
             &variant,
             "fingerprint",
+            null_fingerprint.source_generation,
             "https://telegra.ph/null",
             None,
         )
@@ -374,6 +435,7 @@ mod tests {
             &job.token,
             &other_variant,
             "fingerprint",
+            job.source_generation,
             "https://telegra.ph/images",
             None,
         )
@@ -405,6 +467,7 @@ mod tests {
             &normal.token,
             &variant,
             "fingerprint",
+            normal.source_generation,
             "https://telegra.ph/normal",
             Some("normal-rewrite"),
         )
@@ -440,6 +503,7 @@ mod tests {
             &background.token,
             &variant,
             "fingerprint",
+            background.source_generation,
             "https://telegra.ph/background",
             Some("background-rewrite"),
         )
