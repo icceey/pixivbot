@@ -841,7 +841,7 @@ mod tests {
         repo.reconcile_eh_shared_job_liveness(true).await?;
         assert_eq!(
             repo.handoff_legacy_eh_archive_artifacts(&cache_dir).await?,
-            1
+            3
         );
         repo.cleanup_eh_cache_orphans(&cache_dir, None).await?;
 
@@ -859,26 +859,25 @@ mod tests {
             b"single partial"
         );
         assert!(single_target.parts_dir().join("nested/part-0001").exists());
-        assert!(
-            ambiguous_source.assembly_scratch().exists(),
-            "ambiguous old source must remain cleanup-owned"
+        let ambiguous_quarantine =
+            ArchiveArtifacts::new(cache_dir.join("legacy-conflicts/9703_ambiguous-token.zip"));
+        assert!(!ambiguous_source.assembly_scratch().exists());
+        assert_eq!(
+            std::fs::read(ambiguous_quarantine.assembly_scratch())?,
+            b"ambiguous partial"
         );
 
-        let claimed = repo
-            .get_next_eh_job_for_download()
-            .await?
-            .expect("the single adopted job must be claimable");
-        assert_eq!(claimed.id, 702);
-        assert!(
-            repo.get_next_eh_job_for_download().await?.is_none(),
-            "conflict-marked jobs must remain blocked while their old source exists"
-        );
-        std::fs::remove_file(ambiguous_source.assembly_scratch())?;
-        assert_eq!(
-            repo.handoff_legacy_eh_archive_artifacts(&cache_dir).await?,
-            2
-        );
-        repo.cleanup_eh_cache_orphans(&cache_dir, None).await?;
+        let mut claimed_ids = Vec::new();
+        for _ in 0..3 {
+            claimed_ids.push(
+                repo.get_next_eh_job_for_download()
+                    .await?
+                    .expect("every released legacy job must be claimable")
+                    .id,
+            );
+        }
+        claimed_ids.sort_unstable();
+        assert_eq!(claimed_ids, vec![702, 703, 704]);
         let ambiguous_jobs = eh_gallery_jobs::Entity::find()
             .filter(eh_gallery_jobs::Column::Id.is_in([703, 704]))
             .all(repo.db())
@@ -886,10 +885,6 @@ mod tests {
         assert!(ambiguous_jobs
             .iter()
             .all(|job| job.legacy_artifact_handoff.is_none()));
-        assert!(
-            repo.get_next_eh_job_for_download().await?.is_some(),
-            "missing ambiguous source must release jobs for ordinary shared work"
-        );
 
         migrate_result_generation_order_down(&db).await?;
         migrate_fingerprint_generations_down(&db).await?;
@@ -1728,7 +1723,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migration_handoff_conflicting_active_claims_preserve_source_and_unblock_when_absent(
+    async fn migration_handoff_conflicting_active_claims_quarantine_source_and_unblock_jobs(
     ) -> Result<()> {
         let db = new_db().await?;
         create_legacy_shared_jobs_tables(&db).await?;
@@ -1764,25 +1759,20 @@ mod tests {
         repo.reconcile_eh_shared_job_liveness(true).await?;
         assert_eq!(
             repo.handoff_legacy_eh_archive_artifacts(&cache_dir).await?,
-            0
-        );
-        repo.cleanup_eh_cache_orphans(&cache_dir, None).await?;
-        assert!(legacy.assembly_scratch().exists());
-        assert!(
-            target.assembly_scratch().exists(),
-            "conflict state must retain a target family until source ownership is resolved"
-        );
-        assert!(
-            repo.get_next_eh_job_for_download().await?.is_none(),
-            "all ambiguous owners must block shared workers while the source remains"
-        );
-
-        std::fs::remove_file(legacy.assembly_scratch())?;
-        assert_eq!(
-            repo.handoff_legacy_eh_archive_artifacts(&cache_dir).await?,
             2
         );
         repo.cleanup_eh_cache_orphans(&cache_dir, None).await?;
+        let quarantine =
+            ArchiveArtifacts::new(cache_dir.join("legacy-conflicts/918_ambiguous-token.zip"));
+        assert!(!legacy.assembly_scratch().exists());
+        assert_eq!(
+            std::fs::read(quarantine.assembly_scratch())?,
+            b"ambiguous partial"
+        );
+        assert!(
+            target.assembly_scratch().exists(),
+            "quarantining the shared source must not remove a job-specific target family"
+        );
         let unblocked = eh_gallery_jobs::Entity::find().all(repo.db()).await?;
         assert!(
             unblocked

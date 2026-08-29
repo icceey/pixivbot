@@ -1,6 +1,6 @@
 use crate::archive_download::{
-    archive_http_error, download_to_partial, resume_persisted_download_to_partial,
-    ArchiveArtifacts, ArchiveDownloadOptions,
+    archive_http_error, download_to_partial, ensure_archive_size_under_limit,
+    resume_persisted_download_to_partial, ArchiveArtifacts, ArchiveDownloadOptions,
 };
 use crate::error::{Error, Result};
 use crate::models::{EhCookies, EhGallery, EhGalleryRef, RawApiResponse, RawGalleryMetaEntry};
@@ -521,11 +521,14 @@ impl EhClient {
 
     /// Resume a valid multipart archive using its persisted download URL without
     /// fetching the archiver page or POSTing a new archive request. Returns
-    /// `None` when no valid multipart manifest is available.
+    /// `None` when no valid multipart manifest is available. A reusable final
+    /// archive or manifest larger than `max_size_bytes` is rejected before any
+    /// persisted download URL is requested.
     pub async fn resume_archive_from_persisted_manifest(
         &self,
         dest: &Path,
         options: ArchiveDownloadOptions,
+        max_size_bytes: Option<u64>,
     ) -> Result<Option<u64>> {
         let options = options.validate()?;
         let artifacts = ArchiveArtifacts::new(dest);
@@ -533,6 +536,7 @@ impl EhClient {
             match validate_complete_zip(dest).await {
                 Ok(()) => {
                     let total = tokio::fs::metadata(dest).await?.len();
+                    ensure_archive_size_under_limit(total, max_size_bytes)?;
                     if artifacts.remove_multipart_state().await.is_err() {
                         tracing::warn!("could not remove completed archive multipart state");
                     }
@@ -542,8 +546,14 @@ impl EhClient {
                 Err(error) => return Err(error),
             }
         }
-        if !resume_persisted_download_to_partial(&self.http, &self.cookies, &artifacts, options)
-            .await?
+        if !resume_persisted_download_to_partial(
+            &self.http,
+            &self.cookies,
+            &artifacts,
+            options,
+            max_size_bytes,
+        )
+        .await?
         {
             return Ok(None);
         }
@@ -1077,6 +1087,7 @@ mod tests {
                 .resume_archive_from_persisted_manifest(
                     &dest,
                     ArchiveDownloadOptions { max_concurrency: 2 },
+                    None,
                 )
                 .await
                 .unwrap(),
@@ -1084,6 +1095,54 @@ mod tests {
         );
         assert!(dest.exists());
         assert!(!artifacts.parts_dir().exists());
+    }
+
+    #[tokio::test]
+    async fn persisted_multipart_manifest_obeys_current_size_limit_before_network() {
+        let temp = tempfile::tempdir().unwrap();
+        let dest = temp.path().join("archive.zip");
+        let artifacts = ArchiveArtifacts::new(&dest);
+        tokio::fs::create_dir_all(artifacts.parts_dir())
+            .await
+            .unwrap();
+        tokio::fs::write(
+            artifacts.parts_dir().join("part-0000000000000000"),
+            b"partial",
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            artifacts.parts_dir().join("manifest.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "version": 1,
+                "download_url": "http://127.0.0.1:9/already-prepared.zip",
+                "total_len": 1024,
+                "etag": null,
+                "last_modified": null,
+                "next_part_id": 1,
+                "parts": [{ "id": 0, "start": 0, "end": 1024 }]
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let error = EhClientBuilder::new()
+            .base_url("http://127.0.0.1:9")
+            .build()
+            .resume_archive_from_persisted_manifest(
+                &dest,
+                ArchiveDownloadOptions { max_concurrency: 2 },
+                Some(512),
+            )
+            .await
+            .expect_err("oversized persisted archive must be rejected");
+
+        assert!(error
+            .to_string()
+            .contains("1024 bytes exceeds configured 512 byte limit"));
+        assert!(artifacts.parts_dir().join("manifest.json").exists());
+        assert!(artifacts.parts_dir().join("part-0000000000000000").exists());
     }
 
     #[tokio::test]
@@ -1118,6 +1177,7 @@ mod tests {
                 .resume_archive_from_persisted_manifest(
                     &dest,
                     ArchiveDownloadOptions { max_concurrency: 2 },
+                    None,
                 )
                 .await
                 .unwrap(),
@@ -1159,6 +1219,7 @@ mod tests {
                 .resume_archive_from_persisted_manifest(
                     &dest,
                     ArchiveDownloadOptions { max_concurrency: 2 },
+                    None,
                 )
                 .await
                 .unwrap(),

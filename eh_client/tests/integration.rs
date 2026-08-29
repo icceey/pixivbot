@@ -2328,6 +2328,7 @@ async fn test_persisted_manifest_terminal_url_rejection_clears_multipart_state()
             .resume_archive_from_persisted_manifest(
                 &dest,
                 ArchiveDownloadOptions { max_concurrency: 1 },
+                None,
             )
             .await
             .expect("terminal persisted URL rejection should allow a fresh archive preparation");
@@ -2367,6 +2368,7 @@ async fn test_persisted_manifest_transient_status_preserves_multipart_state() {
             .resume_archive_from_persisted_manifest(
                 &dest,
                 ArchiveDownloadOptions { max_concurrency: 1 },
+                None,
             )
             .await
             .expect_err("transient persisted URL failure must remain recoverable");
@@ -2392,6 +2394,7 @@ async fn test_persisted_manifest_local_recovery_error_preserves_state() {
         .resume_archive_from_persisted_manifest(
             &dest,
             ArchiveDownloadOptions { max_concurrency: 1 },
+            None,
         )
         .await
         .expect_err("local manifest recovery errors must not discard recoverable state");
@@ -2427,6 +2430,7 @@ async fn test_persisted_manifest_successful_incompatible_range_restarts_sequenti
         .resume_archive_from_persisted_manifest(
             &dest,
             ArchiveDownloadOptions { max_concurrency: 1 },
+            None,
         )
         .await
         .expect("successful incompatible range response must fall back sequentially");

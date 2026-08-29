@@ -767,7 +767,11 @@ impl EhBackgroundDownloadWorker {
             };
             if let Some(downloaded_file_size) = self
                 .client
-                .resume_archive_from_persisted_manifest(&zip_path, options)
+                .resume_archive_from_persisted_manifest(
+                    &zip_path,
+                    options,
+                    self.config.max_archive_size_bytes(),
+                )
                 .await
                 .context("Failed to resume persisted archive download")?
             {
@@ -1701,7 +1705,11 @@ impl EhDownloadWorker {
             };
             if let Some(downloaded_file_size) = self
                 .client
-                .resume_archive_from_persisted_manifest(&zip_path, options)
+                .resume_archive_from_persisted_manifest(
+                    &zip_path,
+                    options,
+                    self.config.max_archive_size_bytes(),
+                )
                 .await
                 .context("Failed to resume persisted archive download")?
             {
@@ -2028,7 +2036,7 @@ impl EhUploadWorker {
 
         if let Err(error) = self.process(&job).await {
             error!("Upload failed for shared EH job {}: {:#}", job.id, error);
-            match self
+            let failure_outcome = match self
                 .repo
                 .record_eh_job_upload_failure(
                     job.id,
@@ -2037,8 +2045,38 @@ impl EhUploadWorker {
                     self.config.max_retry_count,
                     self.config.send_archive,
                 )
-                .await?
+                .await
             {
+                Ok(outcome) => outcome,
+                Err(persistence_error) => {
+                    error!(
+                        "Failed to persist upload failure for shared EH job {}: {:#}",
+                        job.id, persistence_error
+                    );
+                    match self
+                        .repo
+                        .defer_eh_job_upload(
+                            job.id,
+                            expected_started_at,
+                            defer_delay_secs as i64,
+                            self.config.send_archive,
+                        )
+                        .await
+                    {
+                        Ok(true) => {}
+                        Ok(false) => info!(
+                            "Shared EH gallery upload {} changed before failure-persistence recovery",
+                            job.id
+                        ),
+                        Err(release_error) => error!(
+                            "Failed to release shared EH gallery upload {} after failure-persistence error: {:#}",
+                            job.id, release_error
+                        ),
+                    }
+                    return Err(persistence_error);
+                }
+            };
+            match failure_outcome {
                 EhJobUploadFailureOutcome::RetryScheduled(_) => {}
                 EhJobUploadFailureOutcome::Stale => return Err(error),
                 EhJobUploadFailureOutcome::Terminal { job: _, deliveries } => {
@@ -6651,6 +6689,67 @@ mod tests {
             "should be back to downloaded for retry"
         );
         assert_eq!(updated.retry_count, 1);
+    }
+
+    #[tokio::test]
+    async fn upload_failure_persistence_error_releases_claim() {
+        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+        let tg_server = MockServer::start().await;
+        setup_chat(&repo, -100, true).await;
+
+        let temp = tempfile::tempdir().unwrap();
+        let zip_path = temp.path().join("failure-persistence.zip");
+        create_test_zip(&zip_path, 1);
+        let (job, _) = seed_downloaded_job_with_deliveries(
+            &repo,
+            123457,
+            "failure-token",
+            "Failure persistence",
+            &zip_path,
+            &[(-100, true, "Failure persistence")],
+        )
+        .await;
+        repo.db()
+            .execute_unprepared(
+                "CREATE TRIGGER fail_eh_upload_failure_persistence \
+                 BEFORE UPDATE ON eh_gallery_jobs \
+                 WHEN OLD.telegraph_status = 'uploading' \
+                      AND NEW.retry_count > OLD.retry_count \
+                 BEGIN \
+                     SELECT RAISE(ABORT, 'simulated upload failure persistence error'); \
+                 END",
+            )
+            .await
+            .unwrap();
+
+        let worker = EhUploadWorker::new(
+            Arc::clone(&repo),
+            make_notifier(&tg_server),
+            make_telegraph_client(&tg_server),
+            Arc::new(AlwaysFailUploader {
+                message: "simulated upload error".to_string(),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }),
+            None,
+            Arc::new(make_config()),
+        );
+        let error = worker
+            .tick()
+            .await
+            .expect_err("failure persistence should still be reported");
+        assert!(format!("{error:#}").contains("simulated upload failure persistence error"));
+
+        let released = eh_gallery_jobs::Entity::find_by_id(job.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            released.telegraph_status,
+            crate::db::repo::eh_gallery_jobs::TELEGRAPH_STATUS_PENDING
+        );
+        assert_eq!(released.retry_count, 0);
+        assert!(released.next_retry_at.is_some());
     }
 
     // === ZIP-archive uploader tests ===

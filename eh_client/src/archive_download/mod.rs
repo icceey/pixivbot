@@ -16,7 +16,7 @@ use assembly::assemble_parts;
 use coordinator::{MultipartCoordinator, MultipartOutcome};
 pub(crate) use http::archive_http_error;
 use initialization::{initialize_multipart, MultipartInitialization};
-use manifest::{recover_manifest, recover_persisted_download_url, ManifestRecovery};
+use manifest::{recover_manifest, recover_persisted_download, ManifestRecovery};
 use sequential::download_sequential;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -154,10 +154,12 @@ pub(crate) async fn resume_persisted_download_to_partial(
     cookies: &EhCookies,
     artifacts: &ArchiveArtifacts,
     options: ArchiveDownloadOptions,
+    max_size_bytes: Option<u64>,
 ) -> Result<bool> {
-    let Some(download_url) = recover_persisted_download_url(artifacts).await? else {
+    let Some((download_url, total_len)) = recover_persisted_download(artifacts).await? else {
         return Ok(false);
     };
+    ensure_archive_size_under_limit(total_len, max_size_bytes)?;
     match download_to_partial(http, cookies, &download_url, artifacts, options, true).await {
         Ok(()) => Ok(true),
         Err(error) if is_terminal_persisted_download_rejection(&error) => {
@@ -166,6 +168,18 @@ pub(crate) async fn resume_persisted_download_to_partial(
         }
         Err(error) => Err(error),
     }
+}
+
+pub(crate) fn ensure_archive_size_under_limit(
+    total_len: u64,
+    max_size_bytes: Option<u64>,
+) -> Result<()> {
+    if let Some(limit) = max_size_bytes.filter(|limit| total_len > *limit) {
+        return Err(Error::Other(format!(
+            "persisted EH archive size {total_len} bytes exceeds configured {limit} byte limit"
+        )));
+    }
+    Ok(())
 }
 
 fn is_terminal_persisted_download_rejection(error: &Error) -> bool {

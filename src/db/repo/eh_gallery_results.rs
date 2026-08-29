@@ -1,9 +1,10 @@
-use crate::db::entities::eh_gallery_results;
+use crate::db::entities::{eh_gallery_jobs, eh_gallery_results};
 use crate::db::repo::eh_gallery_jobs::EhGalleryVariant;
 use anyhow::{Context, Result};
 use chrono::Local;
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, DatabaseTransaction, EntityTrait, QueryFilter, Statement,
+    sea_query::Expr, ColumnTrait, ConnectionTrait, DatabaseTransaction, EntityTrait, QueryFilter,
+    Statement,
 };
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -72,6 +73,36 @@ pub async fn find_eh_gallery_result_in_txn(
         .one(txn)
         .await
         .context("Failed to find cached EH gallery result")
+}
+
+pub async fn clear_rewritten_eh_gallery_result_in_txn(
+    txn: &DatabaseTransaction,
+    job: &eh_gallery_jobs::Model,
+) -> Result<()> {
+    let (Some(fingerprint), Some(telegraph_url), Some(rewrite_data)) = (
+        job.source_fingerprint.as_deref(),
+        job.telegraph_url.as_deref(),
+        job.telegraph_rewrite_data.as_deref(),
+    ) else {
+        return Ok(());
+    };
+    eh_gallery_results::Entity::update_many()
+        .col_expr(
+            eh_gallery_results::Column::TelegraphRewriteData,
+            Expr::value(None::<String>),
+        )
+        .filter(eh_gallery_results::Column::Gid.eq(job.gid))
+        .filter(eh_gallery_results::Column::Token.eq(&job.token))
+        .filter(eh_gallery_results::Column::DownloadMode.eq(&job.download_mode))
+        .filter(eh_gallery_results::Column::Resolution.eq(&job.resolution))
+        .filter(eh_gallery_results::Column::SourceFingerprint.eq(fingerprint))
+        .filter(eh_gallery_results::Column::SourceGeneration.eq(job.source_generation))
+        .filter(eh_gallery_results::Column::TelegraphUrl.eq(telegraph_url))
+        .filter(eh_gallery_results::Column::TelegraphRewriteData.eq(rewrite_data))
+        .exec(txn)
+        .await
+        .context("Failed to clear completed cached EH Telegraph rewrite")?;
+    Ok(())
 }
 
 #[cfg(test)]

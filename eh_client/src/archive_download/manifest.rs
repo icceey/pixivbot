@@ -190,9 +190,9 @@ pub(super) async fn recover_manifest(
     Ok(ManifestRecovery::Valid(manifest))
 }
 
-pub(super) async fn recover_persisted_download_url(
+pub(super) async fn recover_persisted_download(
     artifacts: &ArchiveArtifacts,
-) -> Result<Option<String>> {
+) -> Result<Option<(String, u64)>> {
     let bytes = match tokio::fs::read(ArchiveManifest::manifest_path(artifacts)).await {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
@@ -204,7 +204,7 @@ pub(super) async fn recover_persisted_download_url(
     };
     let download_url = manifest.download_url.clone();
     match recover_manifest(artifacts, &download_url).await? {
-        ManifestRecovery::Valid(_) => Ok(Some(download_url)),
+        ManifestRecovery::Valid(manifest) => Ok(Some((download_url, manifest.total_len))),
         ManifestRecovery::Invalid(_) => Ok(None),
     }
 }

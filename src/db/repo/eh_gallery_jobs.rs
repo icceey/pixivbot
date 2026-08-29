@@ -7,7 +7,8 @@ use crate::db::repo::eh_download_queue::{
 };
 use crate::db::repo::eh_gallery_push_ledger::{record_eh_push_in_txn, EhPushSurface};
 use crate::db::repo::eh_gallery_results::{
-    find_eh_gallery_result_in_txn, upsert_eh_gallery_result_in_txn,
+    clear_rewritten_eh_gallery_result_in_txn, find_eh_gallery_result_in_txn,
+    upsert_eh_gallery_result_in_txn,
 };
 use anyhow::{Context, Result};
 use chrono::{Local, Timelike};
@@ -2435,42 +2436,85 @@ impl Repo {
         job_id: i32,
         expected_started_at: DateTime,
     ) -> Result<bool> {
-        let now = Local::now().naive_local();
-        let updated = eh_gallery_jobs::Entity::update_many()
-            .col_expr(
-                eh_gallery_jobs::Column::TelegraphRewriteStatus,
-                Expr::value(None::<String>),
-            )
-            .col_expr(
-                eh_gallery_jobs::Column::TelegraphRewriteAfter,
-                Expr::value(None::<DateTime>),
-            )
-            .col_expr(
-                eh_gallery_jobs::Column::TelegraphRewriteNextRetryAt,
-                Expr::value(None::<DateTime>),
-            )
-            .col_expr(
-                eh_gallery_jobs::Column::TelegraphRewriteRetryCount,
-                Expr::value(0_i32),
-            )
-            .col_expr(
-                eh_gallery_jobs::Column::TelegraphRewriteError,
-                Expr::value(None::<String>),
-            )
-            .col_expr(
-                eh_gallery_jobs::Column::TelegraphRewrittenAt,
-                Expr::value(Some(now)),
-            )
-            .filter(eh_gallery_jobs::Column::Id.eq(job_id))
-            .filter(
-                eh_gallery_jobs::Column::TelegraphRewriteStatus
-                    .eq(TELEGRAPH_REWRITE_STATUS_REWRITING),
-            )
-            .filter(eh_gallery_jobs::Column::TelegraphRewriteStartedAt.eq(expected_started_at))
-            .exec(&self.db)
+        let txn = self
+            .db
+            .begin()
             .await
-            .context("Failed to complete shared EH Telegraph rewrite")?;
-        Ok(updated.rows_affected == 1)
+            .context("Failed to begin shared EH Telegraph rewrite completion transaction")?;
+        let now = Local::now().naive_local();
+        let result: Result<bool> = async {
+            let Some(job) = eh_gallery_jobs::Entity::find_by_id(job_id)
+                .filter(
+                    eh_gallery_jobs::Column::TelegraphRewriteStatus
+                        .eq(TELEGRAPH_REWRITE_STATUS_REWRITING),
+                )
+                .filter(eh_gallery_jobs::Column::TelegraphRewriteStartedAt.eq(expected_started_at))
+                .one(&txn)
+                .await
+                .context("Failed to select shared EH Telegraph rewrite completion")?
+            else {
+                return Ok(false);
+            };
+            let updated = eh_gallery_jobs::Entity::update_many()
+                .col_expr(
+                    eh_gallery_jobs::Column::TelegraphRewriteStatus,
+                    Expr::value(None::<String>),
+                )
+                .col_expr(
+                    eh_gallery_jobs::Column::TelegraphRewriteAfter,
+                    Expr::value(None::<DateTime>),
+                )
+                .col_expr(
+                    eh_gallery_jobs::Column::TelegraphRewriteNextRetryAt,
+                    Expr::value(None::<DateTime>),
+                )
+                .col_expr(
+                    eh_gallery_jobs::Column::TelegraphRewriteRetryCount,
+                    Expr::value(0_i32),
+                )
+                .col_expr(
+                    eh_gallery_jobs::Column::TelegraphRewriteError,
+                    Expr::value(None::<String>),
+                )
+                .col_expr(
+                    eh_gallery_jobs::Column::TelegraphRewrittenAt,
+                    Expr::value(Some(now)),
+                )
+                .filter(eh_gallery_jobs::Column::Id.eq(job_id))
+                .filter(
+                    eh_gallery_jobs::Column::TelegraphRewriteStatus
+                        .eq(TELEGRAPH_REWRITE_STATUS_REWRITING),
+                )
+                .filter(eh_gallery_jobs::Column::TelegraphRewriteStartedAt.eq(expected_started_at))
+                .exec(&txn)
+                .await
+                .context("Failed to complete shared EH Telegraph rewrite")?;
+            if updated.rows_affected != 1 {
+                return Ok(false);
+            }
+            clear_rewritten_eh_gallery_result_in_txn(&txn, &job).await?;
+            Ok(true)
+        }
+        .await;
+        match result {
+            Ok(true) => txn
+                .commit()
+                .await
+                .context("Failed to commit shared EH Telegraph rewrite completion")
+                .map(|()| true),
+            Ok(false) => {
+                txn.rollback()
+                    .await
+                    .context("Failed to roll back stale shared EH Telegraph rewrite completion")?;
+                Ok(false)
+            }
+            Err(error) => {
+                txn.rollback()
+                    .await
+                    .context("Failed to roll back shared EH Telegraph rewrite completion")?;
+                Err(error)
+            }
+        }
     }
 
     /// Retry a claimed shared Telegraph rewrite. Returns true only when the
@@ -2841,8 +2885,8 @@ impl Repo {
     ///
     /// The durable marker is first changed from `pending` to `moving`; both
     /// source and target families remain cleanup-owned until the final DB
-    /// update. An ambiguous `conflict` marker likewise blocks workers until
-    /// its source disappears. This makes interrupted renames restart-safe
+    /// update. Ambiguous `conflict` families are moved aside before their jobs
+    /// are released for fresh work. This makes interrupted renames restart-safe
     /// without allowing a worker to claim an ambiguous legacy family.
     pub async fn handoff_legacy_eh_archive_artifacts(
         &self,
@@ -2870,12 +2914,40 @@ impl Repo {
 
             if state == LEGACY_ARTIFACT_HANDOFF_CONFLICT {
                 if source_has_members {
+                    let quarantine_dir = cache_dir.join("legacy-conflicts");
+                    tokio::fs::create_dir_all(&quarantine_dir)
+                        .await
+                        .context("Failed to create legacy EH archive quarantine")?;
+                    let source_name = source
+                        .final_zip()
+                        .file_name()
+                        .context("Legacy EH archive source has no file name")?;
+                    let quarantine = ArchiveArtifacts::new(quarantine_dir.join(source_name));
+                    if let Err(error) =
+                        move_archive_artifacts_without_overwrite(&source, &quarantine).await
+                    {
+                        tracing::warn!(
+                            job_id = job.id,
+                            gid = job.gid,
+                            error = %error,
+                            "Failed to quarantine ambiguous legacy EH archive family"
+                        );
+                        continue;
+                    }
+                    if archive_artifacts_have_members(&source).await? {
+                        tracing::warn!(
+                            job_id = job.id,
+                            gid = job.gid,
+                            "Ambiguous legacy EH archive source remains after quarantine"
+                        );
+                        continue;
+                    }
                     tracing::warn!(
                         job_id = job.id,
                         gid = job.gid,
-                        "Preserving an ambiguous legacy EH archive family"
+                        path = %quarantine.final_zip().display(),
+                        "Quarantined ambiguous legacy EH archive family"
                     );
-                    continue;
                 }
                 if self
                     .finish_legacy_eh_archive_handoff(
@@ -5112,7 +5184,9 @@ fn is_retryable_enqueue_db_error(error: &sea_orm::DbErr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::entities::{eh_download_completions, eh_gallery_push_ledger};
+    use crate::db::entities::{
+        eh_download_completions, eh_gallery_push_ledger, eh_gallery_results,
+    };
     use crate::db::repo::eh_gallery_results::{
         find_eh_gallery_result_in_txn, upsert_eh_gallery_result_in_txn,
     };
@@ -5149,6 +5223,21 @@ mod tests {
         .await
         .unwrap();
         txn.commit().await.unwrap();
+    }
+
+    async fn load_cached_result(
+        repo: &Repo,
+        gid: i64,
+        token: &str,
+        variant: &EhGalleryVariant,
+    ) -> eh_gallery_results::Model {
+        let txn = repo.db().begin().await.unwrap();
+        let result = find_eh_gallery_result_in_txn(&txn, gid, token, variant)
+            .await
+            .unwrap()
+            .unwrap();
+        txn.commit().await.unwrap();
+        result
     }
 
     async fn load_eh_job(repo: &Repo, job_id: i32) -> eh_gallery_jobs::Model {
@@ -9331,6 +9420,31 @@ mod tests {
     async fn job_telegraph_rewrite_retry_and_success_are_generation_guarded() {
         let repo = tests_helpers::setup_test_db().await.unwrap();
         let (job, delivery) = seed_rewrite_ready_job(&repo, 74).await;
+        eh_gallery_jobs::Entity::update_many()
+            .col_expr(
+                eh_gallery_jobs::Column::SourceFingerprint,
+                Expr::value(Some("fingerprint".to_string())),
+            )
+            .filter(eh_gallery_jobs::Column::Id.eq(job.id))
+            .exec(repo.db())
+            .await
+            .unwrap();
+        let job = load_eh_job(&repo, job.id).await;
+        let variant = EhGalleryVariant {
+            download_mode: job.download_mode.clone(),
+            resolution: job.resolution.clone(),
+        };
+        seed_cached_result(
+            &repo,
+            job.gid,
+            &job.token,
+            &variant,
+            "fingerprint",
+            job.source_generation,
+            job.telegraph_url.as_deref().unwrap(),
+            job.telegraph_rewrite_data.as_deref(),
+        )
+        .await;
         repo.mark_eh_telegraph_delivery_sent(delivery.id, job.id, Some(0))
             .await
             .unwrap();
@@ -9384,6 +9498,8 @@ mod tests {
             .mark_eh_job_telegraph_rewritten(job.id, first_generation)
             .await
             .unwrap());
+        let cached_after_stale = load_cached_result(&repo, job.gid, &job.token, &variant).await;
+        assert!(cached_after_stale.telegraph_rewrite_data.is_some());
         assert!(!repo
             .schedule_eh_job_telegraph_rewrite_retry(job.id, first_generation, "stale", 0)
             .await
@@ -9410,6 +9526,8 @@ mod tests {
             .unwrap();
         assert!(before_liveness.telegraph_rewrite_data.is_some());
         assert!(before_liveness.telegraph_rewritten_at.is_some());
+        let cached_after_success = load_cached_result(&repo, job.gid, &job.token, &variant).await;
+        assert!(cached_after_success.telegraph_rewrite_data.is_none());
         repo.evaluate_eh_job_liveness(job.id, true).await.unwrap();
         let completed = eh_gallery_jobs::Entity::find_by_id(job.id)
             .one(repo.db())
