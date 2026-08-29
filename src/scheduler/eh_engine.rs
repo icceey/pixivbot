@@ -6030,8 +6030,12 @@ mod tests {
             crate::db::repo::eh_gallery_jobs::CLEANUP_STATUS_PENDING
         );
         assert!(
-            zip_path.exists(),
-            "cleanup ownership is durable before local removal"
+            !zip_path.exists(),
+            "invalid final ZIP is discarded as a cache miss before the fresh prepare"
+        );
+        assert!(
+            part_path.exists() && parts_dir.exists(),
+            "durable cleanup owns the remaining partial artifacts before local removal"
         );
         assert_eq!(
             run_eh_job_cleanup_maintenance_once(repo.as_ref(), None, 0, true)
@@ -12091,12 +12095,13 @@ mod tests {
         std::fs::write(parts_dir.join("nested").join("part-0001"), b"part").unwrap();
 
         mock_eh_gallery_page(&eh_server, 123456, "abcdef0123").await;
-        // A malformed persisted final ZIP now fails validation before the
-        // archiver request, then follows the permanent-failure cleanup path.
+        // A malformed persisted final ZIP is discarded as a cache miss, so the
+        // worker still performs one fresh archiver POST; that prepare then fails
+        // terminally and follows the permanent-failure cleanup path.
         Mock::given(method("POST"))
             .and(path("/archiver.php"))
             .respond_with(ResponseTemplate::new(500))
-            .expect(0)
+            .expect(1)
             .mount(&eh_server)
             .await;
 
@@ -12118,8 +12123,12 @@ mod tests {
         );
         assert_eq!(updated.background_download_status, None);
         assert!(
-            zip_path.exists(),
-            "cleanup ownership is durable before local removal"
+            !zip_path.exists(),
+            "invalid final ZIP is discarded as a cache miss before the fresh prepare"
+        );
+        assert!(
+            part_path.exists() && parts_dir.exists(),
+            "durable cleanup owns the remaining partial artifacts before local removal"
         );
         assert_eq!(
             run_eh_job_cleanup_maintenance_once(repo.as_ref(), None, 0, true)

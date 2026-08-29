@@ -2422,11 +2422,27 @@ mod tests {
             download_mode: Set("archive".to_owned()),
             resolution: Set("large".to_owned()),
             source_fingerprint: Set(Some("fingerprint-b".to_owned())),
+            source_generation: Set(1),
             title: Set("Different known generation".to_owned()),
             ..Default::default()
         }
         .insert(db)
         .await?;
+        assert!(
+            eh_gallery_jobs::ActiveModel {
+                gid: Set(301),
+                token: Set("shared-token".to_owned()),
+                download_mode: Set("archive".to_owned()),
+                resolution: Set("large".to_owned()),
+                source_fingerprint: Set(Some("fingerprint-c".to_owned())),
+                title: Set("Duplicate generation".to_owned()),
+                ..Default::default()
+            }
+            .insert(db)
+            .await
+            .is_err(),
+            "distinct fingerprints sharing a source generation must be unique"
+        );
         assert!(
             eh_gallery_jobs::ActiveModel {
                 gid: Set(301),
