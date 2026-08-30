@@ -1,8 +1,15 @@
-use sea_orm::{ConnectionTrait, DbBackend, TransactionTrait};
+use sea_orm::{ConnectionTrait, DbBackend, FromQueryResult, Statement, TransactionTrait};
 use sea_orm_migration::prelude::*;
+use std::collections::BTreeMap;
 
 #[derive(DeriveMigrationName)]
 pub struct Migration;
+
+#[derive(FromQueryResult)]
+struct LegacyTelegraphRewrite {
+    job_id: i32,
+    rewrite_data: String,
+}
 
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
@@ -492,10 +499,9 @@ async fn create_shared_gallery_job_schema_and_backfill(
         .await?;
     // Preserve already-completed Telegraph work: the earliest unfinished
     // rewrite-bearing delivery, then the earliest other page URL, hands its
-    // URL and delayed-rewrite payload to the shared job so the upload is never
-    // repeated. A preserved pending rewrite (data non-null, rewritten_at null)
-    // resumes naturally through the ordinary rewrite claim; a preserved
-    // in-flight `rewriting` claim is recovered by the stale-rewrite reset.
+    // URL to the shared job so the upload is never repeated. Every unfinished
+    // rewrite payload is migrated below as one batch, so collapsing deliveries
+    // onto a shared job cannot strand any previously sent page.
     // Terminal deliveries only upgrade a `not_required` job when they carry an
     // unfinished rewrite; an already-sent terminal page never creates unsent
     // Telegraph demand.
@@ -506,94 +512,6 @@ async fn create_shared_gallery_job_schema_and_backfill(
                  SET telegraph_status = 'ready', \
                      telegraph_url = (\
                          SELECT winner.telegraph_url \
-                           FROM eh_download_queue AS winner \
-                           WHERE winner.job_id = job.id \
-                             AND winner.telegraph_url IS NOT NULL \
-                           ORDER BY CASE WHEN winner.telegraph_rewrite_data IS NOT NULL \
-                                               AND winner.telegraph_rewrite_status IN ('pending', 'rewriting') \
-                                               AND winner.telegraph_rewritten_at IS NULL \
-                                         THEN 0 ELSE 1 END, winner.id \
-                           LIMIT 1\
-                     ), \
-                     telegraph_rewrite_data = (\
-                         SELECT winner.telegraph_rewrite_data \
-                           FROM eh_download_queue AS winner \
-                           WHERE winner.job_id = job.id \
-                             AND winner.telegraph_url IS NOT NULL \
-                           ORDER BY CASE WHEN winner.telegraph_rewrite_data IS NOT NULL \
-                                               AND winner.telegraph_rewrite_status IN ('pending', 'rewriting') \
-                                               AND winner.telegraph_rewritten_at IS NULL \
-                                         THEN 0 ELSE 1 END, winner.id \
-                           LIMIT 1\
-                     ), \
-                     telegraph_rewrite_status = (\
-                         SELECT winner.telegraph_rewrite_status \
-                           FROM eh_download_queue AS winner \
-                           WHERE winner.job_id = job.id \
-                             AND winner.telegraph_url IS NOT NULL \
-                           ORDER BY CASE WHEN winner.telegraph_rewrite_data IS NOT NULL \
-                                               AND winner.telegraph_rewrite_status IN ('pending', 'rewriting') \
-                                               AND winner.telegraph_rewritten_at IS NULL \
-                                         THEN 0 ELSE 1 END, winner.id \
-                           LIMIT 1\
-                     ), \
-                     telegraph_rewrite_after = (\
-                         SELECT winner.telegraph_rewrite_after \
-                           FROM eh_download_queue AS winner \
-                           WHERE winner.job_id = job.id \
-                             AND winner.telegraph_url IS NOT NULL \
-                           ORDER BY CASE WHEN winner.telegraph_rewrite_data IS NOT NULL \
-                                               AND winner.telegraph_rewrite_status IN ('pending', 'rewriting') \
-                                               AND winner.telegraph_rewritten_at IS NULL \
-                                         THEN 0 ELSE 1 END, winner.id \
-                           LIMIT 1\
-                     ), \
-                     telegraph_rewrite_started_at = (\
-                         SELECT winner.telegraph_rewrite_started_at \
-                           FROM eh_download_queue AS winner \
-                           WHERE winner.job_id = job.id \
-                             AND winner.telegraph_url IS NOT NULL \
-                           ORDER BY CASE WHEN winner.telegraph_rewrite_data IS NOT NULL \
-                                               AND winner.telegraph_rewrite_status IN ('pending', 'rewriting') \
-                                               AND winner.telegraph_rewritten_at IS NULL \
-                                         THEN 0 ELSE 1 END, winner.id \
-                           LIMIT 1\
-                     ), \
-                     telegraph_rewrite_next_retry_at = (\
-                         SELECT winner.telegraph_rewrite_next_retry_at \
-                           FROM eh_download_queue AS winner \
-                           WHERE winner.job_id = job.id \
-                             AND winner.telegraph_url IS NOT NULL \
-                           ORDER BY CASE WHEN winner.telegraph_rewrite_data IS NOT NULL \
-                                               AND winner.telegraph_rewrite_status IN ('pending', 'rewriting') \
-                                               AND winner.telegraph_rewritten_at IS NULL \
-                                         THEN 0 ELSE 1 END, winner.id \
-                           LIMIT 1\
-                     ), \
-                     telegraph_rewrite_retry_count = (\
-                         SELECT winner.telegraph_rewrite_retry_count \
-                           FROM eh_download_queue AS winner \
-                           WHERE winner.job_id = job.id \
-                             AND winner.telegraph_url IS NOT NULL \
-                           ORDER BY CASE WHEN winner.telegraph_rewrite_data IS NOT NULL \
-                                               AND winner.telegraph_rewrite_status IN ('pending', 'rewriting') \
-                                               AND winner.telegraph_rewritten_at IS NULL \
-                                         THEN 0 ELSE 1 END, winner.id \
-                           LIMIT 1\
-                     ), \
-                     telegraph_rewrite_error = (\
-                         SELECT winner.telegraph_rewrite_error \
-                           FROM eh_download_queue AS winner \
-                           WHERE winner.job_id = job.id \
-                             AND winner.telegraph_url IS NOT NULL \
-                           ORDER BY CASE WHEN winner.telegraph_rewrite_data IS NOT NULL \
-                                               AND winner.telegraph_rewrite_status IN ('pending', 'rewriting') \
-                                               AND winner.telegraph_rewritten_at IS NULL \
-                                         THEN 0 ELSE 1 END, winner.id \
-                           LIMIT 1\
-                     ), \
-                     telegraph_rewritten_at = (\
-                         SELECT winner.telegraph_rewritten_at \
                            FROM eh_download_queue AS winner \
                            WHERE winner.job_id = job.id \
                              AND winner.telegraph_url IS NOT NULL \
@@ -622,6 +540,7 @@ async fn create_shared_gallery_job_schema_and_backfill(
                         ))",
         )
         .await?;
+    migrate_pending_telegraph_rewrites(manager.get_connection()).await?;
     manager
         .get_connection()
         .execute_unprepared(
@@ -750,6 +669,118 @@ async fn create_shared_gallery_job_schema_and_backfill(
                     telegraph_rewrite_error = NULL, \
                     telegraph_rewritten_at = NULL \
               WHERE status IN ('pending', 'downloading', 'downloaded', 'uploading', 'uploaded', 'publishing')",
+        )
+        .await?;
+
+    Ok(())
+}
+
+async fn migrate_pending_telegraph_rewrites(
+    connection: &SchemaManagerConnection<'_>,
+) -> Result<(), DbErr> {
+    let backend = connection.get_database_backend();
+    let rows = LegacyTelegraphRewrite::find_by_statement(Statement::from_string(
+        backend,
+        "SELECT job_id, telegraph_rewrite_data AS rewrite_data \
+           FROM eh_download_queue \
+          WHERE job_id IS NOT NULL \
+            AND telegraph_url IS NOT NULL \
+            AND telegraph_rewrite_data IS NOT NULL \
+            AND telegraph_rewrite_status IN ('pending', 'rewriting') \
+            AND telegraph_rewritten_at IS NULL \
+          ORDER BY job_id, id"
+            .to_owned(),
+    ))
+    .all(connection)
+    .await?;
+
+    let mut grouped = BTreeMap::<i32, Vec<serde_json::Value>>::new();
+    for row in rows {
+        let payload = serde_json::from_str(&row.rewrite_data).map_err(|error| {
+            DbErr::Migration(format!(
+                "invalid legacy Telegraph rewrite payload for job {}: {error}",
+                row.job_id
+            ))
+        })?;
+        grouped.entry(row.job_id).or_default().push(payload);
+    }
+    let batches = grouped
+        .into_iter()
+        .map(|(job_id, rewrites)| {
+            serde_json::to_string(&rewrites)
+                .map(|batch| (job_id, batch))
+                .map_err(|error| {
+                    DbErr::Migration(format!(
+                        "failed to serialize Telegraph rewrite batch for job {job_id}: {error}"
+                    ))
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    for (job_id, batch) in batches {
+        connection
+            .execute(Statement::from_sql_and_values(
+                backend,
+                "UPDATE eh_gallery_jobs AS job \
+                    SET telegraph_rewrite_data = ?, \
+                        telegraph_rewrite_status = 'pending', \
+                        telegraph_rewrite_after = (\
+                            SELECT MAX(source.telegraph_rewrite_after) \
+                              FROM eh_download_queue AS source \
+                             WHERE source.job_id = job.id \
+                               AND source.telegraph_rewrite_data IS NOT NULL \
+                               AND source.telegraph_rewrite_status IN ('pending', 'rewriting') \
+                               AND source.telegraph_rewritten_at IS NULL\
+                        ), \
+                        telegraph_rewrite_started_at = NULL, \
+                        telegraph_rewrite_next_retry_at = (\
+                            SELECT MAX(source.telegraph_rewrite_next_retry_at) \
+                              FROM eh_download_queue AS source \
+                             WHERE source.job_id = job.id \
+                               AND source.telegraph_rewrite_data IS NOT NULL \
+                               AND source.telegraph_rewrite_status IN ('pending', 'rewriting') \
+                               AND source.telegraph_rewritten_at IS NULL\
+                        ), \
+                        telegraph_rewrite_retry_count = (\
+                            SELECT MAX(source.telegraph_rewrite_retry_count) \
+                              FROM eh_download_queue AS source \
+                             WHERE source.job_id = job.id \
+                               AND source.telegraph_rewrite_data IS NOT NULL \
+                               AND source.telegraph_rewrite_status IN ('pending', 'rewriting') \
+                               AND source.telegraph_rewritten_at IS NULL\
+                        ), \
+                        telegraph_rewrite_error = (\
+                            SELECT source.telegraph_rewrite_error \
+                              FROM eh_download_queue AS source \
+                             WHERE source.job_id = job.id \
+                               AND source.telegraph_rewrite_data IS NOT NULL \
+                               AND source.telegraph_rewrite_status IN ('pending', 'rewriting') \
+                               AND source.telegraph_rewritten_at IS NULL \
+                             ORDER BY source.telegraph_rewrite_retry_count DESC, source.id \
+                             LIMIT 1\
+                        ), \
+                        telegraph_rewritten_at = NULL \
+                  WHERE job.id = ?",
+                [batch.into(), job_id.into()],
+            ))
+            .await?;
+    }
+
+    connection
+        .execute_unprepared(
+            "UPDATE eh_download_queue \
+                SET telegraph_rewrite_data = NULL, \
+                    telegraph_rewrite_status = NULL, \
+                    telegraph_rewrite_after = NULL, \
+                    telegraph_rewrite_started_at = NULL, \
+                    telegraph_rewrite_next_retry_at = NULL, \
+                    telegraph_rewrite_retry_count = 0, \
+                    telegraph_rewrite_error = NULL, \
+                    telegraph_rewritten_at = NULL \
+              WHERE job_id IS NOT NULL \
+                AND telegraph_rewrite_data IS NOT NULL \
+                AND telegraph_rewrite_status IN ('pending', 'rewriting') \
+                AND telegraph_rewritten_at IS NULL",
         )
         .await?;
 

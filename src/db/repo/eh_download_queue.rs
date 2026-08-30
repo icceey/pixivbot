@@ -206,9 +206,6 @@ fn eh_delivery_is_ready_for_publish(
     job: &eh_gallery_jobs::Model,
     send_archive: bool,
 ) -> bool {
-    if job.cleanup_status != CLEANUP_STATUS_NONE {
-        return false;
-    }
     let archive_required = send_archive && delivery.archive_sent_at.is_none();
     let telegraph_required = delivery.telegraph && delivery.telegraph_sent_at.is_none();
     let has_requested_surface = send_archive
@@ -222,6 +219,9 @@ fn eh_delivery_is_ready_for_publish(
     // Archive-only consumers intentionally do not wait for a pending, running,
     // or terminally failed Telegraph upload.
     if telegraph_required && !telegraph_ready {
+        return false;
+    }
+    if archive_required && job.cleanup_status != CLEANUP_STATUS_NONE {
         return false;
     }
 
@@ -279,9 +279,18 @@ fn eh_delivery_ready_for_publish_filter(send_archive: bool) -> Condition {
                 .add(eh_gallery_jobs::Column::ZipPath.is_not_null()),
         );
     }
-    Condition::all()
+    let ready = Condition::all()
         .add(telegraph_not_required_or_ready)
-        .add(ready)
+        .add(ready);
+    if send_archive {
+        ready.add(
+            Condition::any()
+                .add(eh_gallery_jobs::Column::CleanupStatus.eq(CLEANUP_STATUS_NONE))
+                .add(eh_download_queue::Column::ArchiveSentAt.is_not_null()),
+        )
+    } else {
+        ready
+    }
 }
 
 fn eh_job_cleanup_is_none_filter(job_id: i32) -> SimpleExpr {
@@ -1569,7 +1578,6 @@ impl Repo {
                 .find_also_related(eh_gallery_jobs::Entity)
                 .filter(eh_download_queue::Column::Status.eq(STATUS_WAITING))
                 .filter(eh_download_queue::Column::JobId.is_not_null())
-                .filter(eh_gallery_jobs::Column::CleanupStatus.eq(CLEANUP_STATUS_NONE))
                 .filter(
                     eh_download_queue::Column::NextRetryAt
                         .is_null()
@@ -1609,7 +1617,6 @@ impl Repo {
                 .filter(eh_download_queue::Column::Id.eq(delivery.id))
                 .filter(eh_download_queue::Column::JobId.eq(job.id))
                 .filter(eh_download_queue::Column::Status.eq(STATUS_WAITING))
-                .filter(eh_job_cleanup_is_none_filter(job.id))
                 .filter(claim_generation_filter(delivery.started_at))
                 .filter(
                     eh_download_queue::Column::NextRetryAt
@@ -1633,7 +1640,6 @@ impl Repo {
                 .context("Failed to reread shared EH delivery publish claim")?
                 .context("Shared EH delivery changed before publish claim readback")?;
             let claimed_job = eh_gallery_jobs::Entity::find_by_id(job.id)
-                .filter(eh_gallery_jobs::Column::CleanupStatus.eq(CLEANUP_STATUS_NONE))
                 .one(&txn)
                 .await
                 .context("Failed to reread shared EH job for delivery claim")?
@@ -1681,6 +1687,7 @@ impl Repo {
     pub async fn get_eh_delivery_publish_claim(
         &self,
         delivery_id: i32,
+        send_archive: bool,
     ) -> Result<Option<EhDeliveryClaim>> {
         let Some((delivery, job)) = eh_download_queue::Entity::find()
             .find_also_related(eh_gallery_jobs::Entity)
@@ -1695,7 +1702,7 @@ impl Repo {
         let Some(job) = job else {
             return Ok(None);
         };
-        if job.cleanup_status != CLEANUP_STATUS_NONE {
+        if !eh_delivery_is_ready_for_publish(&delivery, &job, send_archive) {
             eh_download_queue::Entity::update_many()
                 .col_expr(
                     eh_download_queue::Column::Status,
@@ -1710,7 +1717,7 @@ impl Repo {
                 .filter(eh_download_queue::Column::Status.eq(STATUS_PUBLISHING))
                 .exec(&self.db)
                 .await
-                .context("Failed to release dirty shared EH publishing delivery")?;
+                .context("Failed to release unready shared EH publishing delivery")?;
             return Ok(None);
         }
         Ok(Some(EhDeliveryClaim { delivery, job }))
@@ -3750,7 +3757,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_dirty_cleanup_job_cannot_be_claimed_or_reread_for_publish() {
+    async fn test_ready_telegraph_can_publish_after_cleanup_failure_without_archive() {
         let repo = tests_helpers::setup_test_db().await.unwrap();
         let delivery = repo
             .enqueue_eh_download(
@@ -3791,7 +3798,7 @@ mod tests {
         eh_gallery_jobs::Entity::update_many()
             .col_expr(
                 eh_gallery_jobs::Column::CleanupStatus,
-                Expr::value(CLEANUP_STATUS_PENDING),
+                Expr::value(CLEANUP_STATUS_FAILED),
             )
             .filter(eh_gallery_jobs::Column::Id.eq(download.id))
             .exec(repo.db())
@@ -3799,25 +3806,25 @@ mod tests {
             .unwrap();
 
         assert!(
-            repo.get_next_eh_delivery_for_publish(false)
+            repo.get_next_eh_delivery_for_publish(true)
                 .await
                 .unwrap()
                 .is_none(),
-            "dirty cleanup must block publish claims even with a ready Telegraph URL"
+            "failed cleanup must still block a delivery that needs the archive"
         );
 
-        Entity::update_many()
-            .col_expr(Column::Status, Expr::value(STATUS_PUBLISHING))
-            .filter(Column::Id.eq(delivery.id))
-            .exec(repo.db())
+        let claim = repo
+            .get_next_eh_delivery_for_publish(false)
             .await
-            .unwrap();
+            .unwrap()
+            .expect("ready Telegraph must not depend on archive cleanup");
+        assert_eq!(claim.delivery.id, delivery.id);
         assert!(
-            repo.get_eh_delivery_publish_claim(delivery.id)
+            repo.get_eh_delivery_publish_claim(delivery.id, false)
                 .await
                 .unwrap()
-                .is_none(),
-            "dirty cleanup must also reject a claimed delivery reread"
+                .is_some(),
+            "the chat-locked reread must preserve the Telegraph-only claim"
         );
     }
 

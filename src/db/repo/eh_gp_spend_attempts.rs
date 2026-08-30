@@ -1017,7 +1017,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migration_preserves_pending_rewrite_from_completed_delivery() -> Result<()> {
+    async fn migration_preserves_every_pending_rewrite_from_completed_deliveries() -> Result<()> {
         let db = new_db().await?;
         create_legacy_shared_jobs_tables(&db).await?;
         db.execute_unprepared(
@@ -1028,10 +1028,11 @@ mod tests {
                 telegraph_rewrite_next_retry_at, telegraph_rewrite_retry_count, \
                 telegraph_rewrite_error, telegraph_rewritten_at\
              ) VALUES \
-                (1, 10, 150, 'token-150', 'Completed rewrite delivery', 1, 'subscription', 'done', '2026-08-01 00:00:00', 'https://old.example/completed', '2026-08-01 00:30:00', 'rewrite payload', 'pending', '1970-01-01 01:00:00', '1970-01-01 02:00:00', 5, 'previous rewrite error', NULL), \
+                (1, 10, 150, 'token-150', 'Completed rewrite delivery', 1, 'subscription', 'done', '2026-08-01 00:00:00', 'https://old.example/completed', '2026-08-01 00:30:00', '{\"pages\":[],\"preview_gateway_url\":\"https://preview-a.example\",\"public_gateway_url\":\"https://public-a.example\"}', 'pending', '1970-01-01 01:00:00', '1970-01-01 02:00:00', 5, 'previous rewrite error', NULL), \
                 (2, 20, 150, 'token-150', 'Active sibling delivery', 0, 'subscription', 'pending', '2026-08-02 00:00:00', NULL, NULL, NULL, NULL, NULL, NULL, 0, NULL, NULL), \
                 (3, 30, 151, 'token-151', 'Earlier ordinary page', 0, 'subscription', 'uploading', '2026-08-03 00:00:00', 'https://old.example/ordinary', '2026-08-03 00:30:00', NULL, NULL, NULL, NULL, 0, NULL, NULL), \
-                (4, 40, 151, 'token-151', 'Terminal rewrite winner', 1, 'subscription', 'done', '2026-08-04 00:00:00', 'https://old.example/rewrite', '2026-08-04 00:30:00', 'winner payload', 'pending', '2026-08-04 01:00:00', NULL, 2, 'winner retry error', NULL)",
+                (4, 40, 151, 'token-151', 'Terminal rewrite winner', 1, 'subscription', 'done', '2026-08-04 00:00:00', 'https://old.example/rewrite', '2026-08-04 00:30:00', '{\"pages\":[],\"preview_gateway_url\":\"https://preview-c.example\",\"public_gateway_url\":\"https://public-c.example\"}', 'pending', '2026-08-04 01:00:00', NULL, 2, 'winner retry error', NULL), \
+                (5, 50, 150, 'token-150', 'Second completed rewrite delivery', 1, 'subscription', 'done', '2026-08-05 00:00:00', 'https://old.example/completed-2', '2026-08-05 00:30:00', '{\"pages\":[],\"preview_gateway_url\":\"https://preview-b.example\",\"public_gateway_url\":\"https://public-b.example\"}', 'rewriting', '1970-01-01 03:00:00', NULL, 2, 'second rewrite error', NULL)",
         )
         .await?;
 
@@ -1071,9 +1072,18 @@ mod tests {
             job.try_get::<Option<String>>("", "telegraph_url")?,
             Some("https://old.example/completed".to_owned())
         );
+        let rewrite_data = job
+            .try_get::<Option<String>>("", "telegraph_rewrite_data")?
+            .expect("pending rewrites must move to the shared job");
+        let rewrites: Vec<serde_json::Value> = serde_json::from_str(&rewrite_data)?;
+        assert_eq!(rewrites.len(), 2);
         assert_eq!(
-            job.try_get::<Option<String>>("", "telegraph_rewrite_data")?,
-            Some("rewrite payload".to_owned())
+            rewrites[0]["public_gateway_url"],
+            "https://public-a.example"
+        );
+        assert_eq!(
+            rewrites[1]["public_gateway_url"],
+            "https://public-b.example"
         );
         assert_eq!(
             job.try_get::<Option<String>>("", "telegraph_rewrite_status")?,
@@ -1081,7 +1091,7 @@ mod tests {
         );
         assert_eq!(
             job.try_get::<Option<String>>("", "telegraph_rewrite_after")?,
-            Some("1970-01-01 01:00:00".to_owned())
+            Some("1970-01-01 03:00:00".to_owned())
         );
         assert_eq!(
             job.try_get::<Option<String>>("", "telegraph_rewrite_started_at")?,
@@ -1136,9 +1146,15 @@ mod tests {
             Some("https://old.example/rewrite".to_owned()),
             "unfinished rewrite work must win over an earlier ordinary page"
         );
+        let rewrite_winner_data = rewrite_winner
+            .try_get::<Option<String>>("", "telegraph_rewrite_data")?
+            .expect("single pending rewrite must remain claimable as a batch");
+        let rewrite_winner_batch: Vec<serde_json::Value> =
+            serde_json::from_str(&rewrite_winner_data)?;
+        assert_eq!(rewrite_winner_batch.len(), 1);
         assert_eq!(
-            rewrite_winner.try_get::<Option<String>>("", "telegraph_rewrite_data")?,
-            Some("winner payload".to_owned())
+            rewrite_winner_batch[0]["public_gateway_url"],
+            "https://public-c.example"
         );
         assert_eq!(
             rewrite_winner.try_get::<Option<String>>("", "telegraph_rewrite_status")?,
@@ -1148,10 +1164,10 @@ mod tests {
         let deliveries = db
             .query_all(Statement::from_string(
                 DbBackend::Sqlite,
-                "SELECT id, job_id, status, telegraph_url, telegraph_sent_at, telegraph_rewrite_data, telegraph_rewrite_status FROM eh_download_queue WHERE id IN (1, 2) ORDER BY id".to_owned(),
+                "SELECT id, job_id, status, telegraph_url, telegraph_sent_at, telegraph_rewrite_data, telegraph_rewrite_status FROM eh_download_queue WHERE id IN (1, 2, 5) ORDER BY id".to_owned(),
             ))
             .await?;
-        assert_eq!(deliveries.len(), 2);
+        assert_eq!(deliveries.len(), 3);
         assert_eq!(
             deliveries[0].try_get::<Option<i64>>("", "job_id")?,
             Some(job_id)
@@ -1167,17 +1183,35 @@ mod tests {
         );
         assert_eq!(
             deliveries[0].try_get::<Option<String>>("", "telegraph_rewrite_data")?,
-            Some("rewrite payload".to_owned())
+            None,
+            "the migrated terminal row must not retain a dead delivery-level rewrite"
         );
         assert_eq!(
             deliveries[0].try_get::<Option<String>>("", "telegraph_rewrite_status")?,
-            Some("pending".to_owned())
+            None
         );
         assert_eq!(
             deliveries[1].try_get::<Option<i64>>("", "job_id")?,
             Some(job_id)
         );
         assert_eq!(deliveries[1].try_get::<String>("", "status")?, "waiting");
+        assert_eq!(
+            deliveries[2].try_get::<Option<i64>>("", "job_id")?,
+            Some(job_id)
+        );
+        assert_eq!(deliveries[2].try_get::<String>("", "status")?, "done");
+        assert_eq!(
+            deliveries[2].try_get::<Option<String>>("", "telegraph_url")?,
+            Some("https://old.example/completed-2".to_owned())
+        );
+        assert_eq!(
+            deliveries[2].try_get::<Option<String>>("", "telegraph_rewrite_data")?,
+            None
+        );
+        assert_eq!(
+            deliveries[2].try_get::<Option<String>>("", "telegraph_rewrite_status")?,
+            None
+        );
         Ok(())
     }
 
@@ -1268,35 +1302,36 @@ mod tests {
         );
         assert_eq!(
             jobs[1].try_get::<Option<String>>("", "telegraph_rewrite_data")?,
-            Some("rewrite data".to_owned())
+            None,
+            "already-completed rewrite state must not be copied into the worker lane"
         );
         assert_eq!(
             jobs[1].try_get::<Option<String>>("", "telegraph_rewrite_status")?,
-            Some("rewriting".to_owned())
+            None
         );
         assert_eq!(
             jobs[1].try_get::<Option<String>>("", "telegraph_rewrite_after")?,
-            Some("2026-08-02 07:00:00".to_owned())
+            None
         );
         assert_eq!(
             jobs[1].try_get::<Option<String>>("", "telegraph_rewrite_started_at")?,
-            Some("2026-08-02 08:00:00".to_owned())
+            None
         );
         assert_eq!(
             jobs[1].try_get::<Option<String>>("", "telegraph_rewrite_next_retry_at")?,
-            Some("2026-08-02 09:00:00".to_owned())
+            None
         );
         assert_eq!(
             jobs[1].try_get::<i64>("", "telegraph_rewrite_retry_count")?,
-            4
+            0
         );
         assert_eq!(
             jobs[1].try_get::<Option<String>>("", "telegraph_rewrite_error")?,
-            Some("rewrite error".to_owned())
+            None
         );
         assert_eq!(
             jobs[1].try_get::<Option<String>>("", "telegraph_rewritten_at")?,
-            Some("2026-08-02 10:00:00".to_owned())
+            None
         );
 
         // Gallery 101 direct group: row 3 (`downloaded`) completed its download,
@@ -1838,7 +1873,7 @@ mod tests {
              ) VALUES \
                 (1, 10, 301, 'token-301', 'Earlier pending row', 0, 'subscription', '1', NULL, 'pending', 0, 0, NULL, 0, '2026-08-01 00:00:00', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 0, NULL, NULL, NULL, NULL, NULL, NULL, 0, NULL, NULL), \
                 (2, 20, 301, 'token-301', 'Later downloaded row', 0, 'subscription', '2', NULL, 'downloaded', 500, 70, NULL, 0, '2026-08-02 00:00:00', '2026-08-02 01:00:00', '2026-08-02 02:00:00', '/new/subscription.zip', NULL, NULL, NULL, NULL, NULL, NULL, NULL, 0, NULL, NULL, NULL, NULL, NULL, NULL, 0, NULL, NULL), \
-                (3, 30, 302, 'token-302', 'Uploading row', 1, 'subscription', '3', '3', 'uploading', 80, 0, NULL, 0, '2026-08-03 00:00:00', '2026-08-03 01:00:00', '2026-08-03 02:00:00', '/new/uploading.zip', 'https://new.example/uploading', NULL, NULL, NULL, NULL, NULL, NULL, 0, NULL, 'rw', 'pending', '2026-08-03 03:00:00', NULL, NULL, 0, NULL, NULL)",
+                (3, 30, 302, 'token-302', 'Uploading row', 1, 'subscription', '3', '3', 'uploading', 80, 0, NULL, 0, '2026-08-03 00:00:00', '2026-08-03 01:00:00', '2026-08-03 02:00:00', '/new/uploading.zip', 'https://new.example/uploading', NULL, NULL, NULL, NULL, NULL, NULL, 0, NULL, '{\"pages\":[],\"preview_gateway_url\":\"https://preview.example\",\"public_gateway_url\":\"https://public.example\"}', 'pending', '2026-08-03 03:00:00', NULL, NULL, 0, NULL, NULL)",
         )
         .await?;
 
@@ -1891,10 +1926,12 @@ mod tests {
             jobs[1].try_get::<Option<String>>("", "telegraph_url")?,
             Some("https://new.example/uploading".to_owned())
         );
-        assert_eq!(
-            jobs[1].try_get::<Option<String>>("", "telegraph_rewrite_data")?,
-            Some("rw".to_owned())
-        );
+        let rewrite_data = jobs[1]
+            .try_get::<Option<String>>("", "telegraph_rewrite_data")?
+            .expect("pending rewrite must migrate to the shared job");
+        let rewrites: Vec<serde_json::Value> = serde_json::from_str(&rewrite_data)?;
+        assert_eq!(rewrites.len(), 1);
+        assert_eq!(rewrites[0]["public_gateway_url"], "https://public.example");
         assert_eq!(
             jobs[1].try_get::<Option<String>>("", "telegraph_rewrite_status")?,
             Some("pending".to_owned())

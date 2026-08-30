@@ -2487,7 +2487,7 @@ impl EhPublishWorker {
         let _chat_guard = EH_CHAT_LOCKS.lock_chat(claim.delivery.chat_id).await;
         let Some(EhDeliveryClaim { delivery, job }) = self
             .repo
-            .get_eh_delivery_publish_claim(claim.delivery.id)
+            .get_eh_delivery_publish_claim(claim.delivery.id, self.config.send_archive)
             .await?
         else {
             return Ok(());
@@ -2715,6 +2715,13 @@ impl EhPublishWorker {
 // Stage 5: EhTelegraphRewriteWorker — Rewrite Telegraph image URLs after send
 // ============================================================================
 
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum PersistedTelegraphRewriteData {
+    Single(TelegraphRewriteData),
+    Batch(Vec<TelegraphRewriteData>),
+}
+
 pub struct EhTelegraphRewriteWorker {
     repo: Arc<Repo>,
     telegraph: Arc<TelegraphClient>,
@@ -2809,19 +2816,40 @@ impl EhTelegraphRewriteWorker {
             .telegraph_rewrite_data
             .as_deref()
             .context("shared job telegraph_rewrite_data missing for claimed rewrite")?;
-        let data: TelegraphRewriteData = serde_json::from_str(data_json)
+        let data: PersistedTelegraphRewriteData = serde_json::from_str(data_json)
             .context("Failed to deserialize Telegraph rewrite data")?;
+        let rewrites = match data {
+            PersistedTelegraphRewriteData::Single(data) => vec![data],
+            PersistedTelegraphRewriteData::Batch(data) => data,
+        };
 
-        for page in &data.pages {
-            let content = rewrite_ipfs_gateway_nodes(
-                &page.content,
-                &data.preview_gateway_url,
-                &data.public_gateway_url,
-            );
-            self.telegraph
-                .edit_page(&page.path, &page.title, &content)
-                .await
-                .with_context(|| format!("Failed to edit Telegraph page {}", page.path))?;
+        let mut failed_rewrites = 0_usize;
+        let mut first_error = None;
+        for data in rewrites {
+            for page in &data.pages {
+                let content = rewrite_ipfs_gateway_nodes(
+                    &page.content,
+                    &data.preview_gateway_url,
+                    &data.public_gateway_url,
+                );
+                if let Err(error) = self
+                    .telegraph
+                    .edit_page(&page.path, &page.title, &content)
+                    .await
+                    .with_context(|| format!("Failed to edit Telegraph page {}", page.path))
+                {
+                    failed_rewrites += 1;
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                    break;
+                }
+            }
+        }
+        if let Some(error) = first_error {
+            return Err(error.context(format!(
+                "{failed_rewrites} independent Telegraph rewrite payload(s) failed"
+            )));
         }
         Ok(())
     }
@@ -2928,7 +2956,7 @@ mod tests {
     use std::io::Write;
     use teloxide::requests::RequesterExt;
     use teloxide::Bot;
-    use wiremock::matchers::{header, method, path, query_param};
+    use wiremock::matchers::{body_string_contains, header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn make_notifier(tg_server: &MockServer) -> Notifier {
@@ -7168,33 +7196,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn job_telegraph_rewrite_worker_edits_each_page_once() {
+    async fn job_telegraph_rewrite_worker_attempts_each_migrated_payload_independently() {
         let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
         let tg_server = MockServer::start().await;
         let (job, deliveries) =
             seed_ready_telegraph_job_with_deliveries(&repo, 714, &[(-100, None)]).await;
-        let rewrite_data = serde_json::json!({
-            "pages": [
-                {
+        let rewrite_data = serde_json::json!([
+            {
+                "pages": [{
                     "path": "Shared-Gallery-01-01",
                     "title": "Shared Gallery 1",
                     "content": [{
                         "tag": "img",
                         "attrs": {"src": "https://preview.example/ipfs/first"}
                     }]
-                },
-                {
+                }],
+                "preview_gateway_url": "https://preview.example",
+                "public_gateway_url": "https://public.example"
+            },
+            {
+                "pages": [{
                     "path": "Shared-Gallery-01-02",
                     "title": "Shared Gallery 2",
                     "content": [{
                         "tag": "img",
                         "attrs": {"src": "https://preview.example/ipfs/second"}
                     }]
-                }
-            ],
-            "preview_gateway_url": "https://preview.example",
-            "public_gateway_url": "https://public.example"
-        })
+                }],
+                "preview_gateway_url": "https://preview.example",
+                "public_gateway_url": "https://public.example"
+            }
+        ])
         .to_string();
         eh_gallery_jobs::Entity::update_many()
             .col_expr(
@@ -7211,18 +7243,28 @@ mod tests {
 
         Mock::given(method("POST"))
             .and(path("/editPage"))
+            .and(body_string_contains("path=Shared-Gallery-01-01"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(1)
+            .mount(&tg_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/editPage"))
+            .and(body_string_contains("path=Shared-Gallery-01-02"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "ok": true,
                 "result": {"url": "https://telegra.ph/Shared-Gallery"}
             })))
-            .expect(2)
+            .expect(1)
             .mount(&tg_server)
             .await;
+        let mut config = make_config();
+        config.max_retry_count = 0;
         let worker = EhTelegraphRewriteWorker::new(
             Arc::clone(&repo),
             make_telegraph_client(&tg_server),
             true,
-            Arc::new(make_config()),
+            Arc::new(config),
         );
         worker.tick().await.unwrap();
 
@@ -7246,6 +7288,15 @@ mod tests {
             assert!(content.contains("https://public.example/ipfs/"));
             assert!(!content.contains("https://preview.example/ipfs/"));
         }
+        let terminal = eh_gallery_jobs::Entity::find_by_id(job.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            terminal.telegraph_rewrite_status.as_deref(),
+            Some(crate::db::repo::eh_gallery_jobs::TELEGRAPH_REWRITE_STATUS_FAILED)
+        );
     }
 
     #[tokio::test]
