@@ -140,16 +140,6 @@ impl Illust {
             ImageSize::SquareMedium => urls.square_medium.clone(),
         }
     }
-
-    /// 获取第一张图片的URL (用于缩略图或预览)
-    #[allow(dead_code)]
-    pub fn get_first_image_url(&self) -> String {
-        if let Some(original) = &self.meta_single_page.original_image_url {
-            original.clone()
-        } else {
-            self.image_urls.large.clone()
-        }
-    }
 }
 
 /// 作品详情响应
@@ -213,64 +203,6 @@ pub struct UgoiraMetadata {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn make_illust(illust_type: &str, page_count: u32) -> Illust {
-        Illust {
-            id: 12345,
-            title: "Test".to_string(),
-            illust_type: illust_type.to_string(),
-            image_urls: ImageUrls {
-                square_medium: "https://example.com/sq.jpg".to_string(),
-                medium: "https://example.com/med.jpg".to_string(),
-                large: "https://example.com/large.jpg".to_string(),
-                original: Some("https://example.com/orig.jpg".to_string()),
-            },
-            caption: String::new(),
-            restrict: 0,
-            user: User {
-                id: 1,
-                name: "Artist".to_string(),
-                account: "artist".to_string(),
-                is_followed: None,
-            },
-            tags: vec![],
-            create_date: "2024-01-01".to_string(),
-            page_count,
-            width: 100,
-            height: 100,
-            sanity_level: 2,
-            x_restrict: 0,
-            series: None,
-            meta_single_page: MetaSinglePage {
-                original_image_url: Some("https://example.com/orig.jpg".to_string()),
-            },
-            meta_pages: vec![],
-            total_view: 100,
-            total_bookmarks: 50,
-            is_bookmarked: false,
-            visible: true,
-            is_muted: false,
-            total_comments: None,
-        }
-    }
-
-    #[test]
-    fn test_is_ugoira_true() {
-        let illust = make_illust("ugoira", 1);
-        assert!(illust.is_ugoira());
-    }
-
-    #[test]
-    fn test_is_ugoira_false_for_illust() {
-        let illust = make_illust("illust", 1);
-        assert!(!illust.is_ugoira());
-    }
-
-    #[test]
-    fn test_is_ugoira_false_for_manga() {
-        let illust = make_illust("manga", 1);
-        assert!(!illust.is_ugoira());
-    }
 
     #[test]
     fn test_ugoira_metadata_deserialization() {

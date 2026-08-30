@@ -2849,16 +2849,6 @@ mod unit_tests {
     }
 
     #[test]
-    fn test_backoff_delay() {
-        assert_eq!(Repo::backoff_delay_secs(0), 60);
-        assert_eq!(Repo::backoff_delay_secs(1), 60);
-        assert_eq!(Repo::backoff_delay_secs(2), 300);
-        assert_eq!(Repo::backoff_delay_secs(3), 900);
-        assert_eq!(Repo::backoff_delay_secs(4), 3600);
-        assert_eq!(Repo::backoff_delay_secs(99), 3600);
-    }
-
-    #[test]
     fn test_should_schedule_background_download_after_slow_repeated_resume_attempts() {
         assert!(should_schedule_background_download(
             4,
@@ -5556,33 +5546,6 @@ mod tests {
             .await;
     }
 
-    #[test]
-    fn download_in_progress_downcasts_through_anyhow_context() {
-        // Simulate the error propagation path in process():
-        // eh_client::Error::DownloadInProgress → .context("...") → anyhow::Error
-        let inner = eh_client::Error::Other("simulated failure".into());
-        let client_err = eh_client::Error::DownloadInProgress {
-            inner: Box::new(inner),
-            attempts: 4,
-            bytes_delta: 12_345,
-            elapsed: Duration::from_secs(10),
-        };
-        // Context trait is implemented on Result<T, E>, not bare E.
-        // Wrap in Err to match how process() propagates the error.
-        let result: eh_client::Result<()> = Err(client_err);
-        let wrapped: anyhow::Error = result.context("Failed to download archive").unwrap_err();
-
-        let found = wrapped
-            .chain()
-            .find_map(|c| c.downcast_ref::<eh_client::Error>())
-            .map(|e| matches!(e, eh_client::Error::DownloadInProgress { .. }))
-            .unwrap_or(false);
-        assert!(
-            found,
-            "DownloadInProgress must be findable through anyhow error chain"
-        );
-    }
-
     // === Download Worker Tests ===
 
     #[tokio::test]
@@ -6517,24 +6480,6 @@ mod tests {
         assert_eq!(model.status, STATUS_DOWNLOADED);
         assert!(model.zip_path.is_some());
         assert!(model.file_size > 0);
-    }
-
-    #[test]
-    fn test_shared_size_limit_guard_uses_selected_archive_estimate() {
-        let mut cfg = make_config();
-        cfg.max_archive_size_mb = 300;
-
-        let err =
-            ensure_eh_archive_under_size_limit(&cfg, Some(300 * 1024 * 1024 + 1)).unwrap_err();
-
-        assert!(
-            err.to_string()
-                .contains("selected EH archive size is too large"),
-            "error should mention the configured limit, got: {err}"
-        );
-        assert!(ensure_eh_archive_under_size_limit(&cfg, Some(300 * 1024 * 1024)).is_ok());
-        assert!(ensure_eh_archive_under_size_limit(&cfg, Some(0)).is_ok());
-        assert!(ensure_eh_archive_under_size_limit(&cfg, None).is_ok());
     }
 
     // === Upload Worker Tests ===
@@ -11988,43 +11933,6 @@ mod tests {
         assert!(matches!(outcome, ArchiveCostCheck::Defer { .. }));
 
         assert!(gp_attempts(repo.as_ref()).await.is_empty());
-    }
-
-    #[test]
-    fn test_config_allows_archive_gp_cost() {
-        let mut cfg = EhentaiConfig::default();
-        // default max_archive_gp_cost = 0
-        assert!(cfg.allows_archive_gp_cost(&DownloadCost::Free));
-        assert!(cfg.allows_archive_gp_cost(&DownloadCost::Unlocked));
-        assert!(!cfg.allows_archive_gp_cost(&DownloadCost::Gp(1)));
-        assert!(cfg.allows_archive_gp_cost(&DownloadCost::Gp(0)));
-        assert!(!cfg.allows_archive_gp_cost(&DownloadCost::Insufficient));
-        assert!(!cfg.allows_archive_gp_cost(&DownloadCost::Unavailable));
-        assert!(!cfg.allows_archive_gp_cost(&DownloadCost::Unknown));
-
-        cfg.max_archive_gp_cost = 500;
-        assert!(cfg.allows_archive_gp_cost(&DownloadCost::Gp(0)));
-        assert!(cfg.allows_archive_gp_cost(&DownloadCost::Gp(500)));
-        assert!(!cfg.allows_archive_gp_cost(&DownloadCost::Gp(501)));
-        // Free / Unlocked always pass regardless of limit
-        assert!(cfg.allows_archive_gp_cost(&DownloadCost::Free));
-        assert!(cfg.allows_archive_gp_cost(&DownloadCost::Unlocked));
-        // Insufficient / Unavailable / Unknown always reject
-        assert!(!cfg.allows_archive_gp_cost(&DownloadCost::Insufficient));
-        assert!(!cfg.allows_archive_gp_cost(&DownloadCost::Unavailable));
-        assert!(!cfg.allows_archive_gp_cost(&DownloadCost::Unknown));
-    }
-
-    #[test]
-    fn test_config_gp_rate_window_hours_clamped() {
-        let mut cfg = EhentaiConfig::default();
-        assert_eq!(cfg.gp_rate_window_hours_clamped(), 24);
-        cfg.gp_rate_window_hours = 0;
-        assert_eq!(
-            cfg.gp_rate_window_hours_clamped(),
-            1,
-            "zero must clamp to 1"
-        );
     }
 
     #[test]

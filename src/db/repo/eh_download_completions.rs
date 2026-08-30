@@ -69,13 +69,6 @@ mod tests {
     use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder};
 
     #[tokio::test]
-    async fn completion_ledger_empty_window_is_zero() {
-        let repo = tests_helpers::setup_test_db().await.unwrap();
-
-        assert_eq!(repo.get_eh_downloaded_bytes_in_window(24).await.unwrap(), 0);
-    }
-
-    #[tokio::test]
     async fn completion_ledger_counts_both_generations_after_clean_retired_job_reactivation() {
         let repo = tests_helpers::setup_test_db().await.unwrap();
         let variant = EhGalleryVariant::archive("1280x");

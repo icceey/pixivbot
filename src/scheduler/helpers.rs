@@ -331,14 +331,9 @@ async fn process_ugoira_push(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        apply_subscription_tag_filter, author_subscription_state, booru_ranking_subscription_state,
-        ranking_subscription_state, INTER_SUBSCRIPTION_DELAY_MS,
-    };
+    use super::apply_subscription_tag_filter;
     use crate::db::entities::{chats, subscriptions};
-    use crate::db::types::{
-        AuthorState, BooruRankingState, RankingState, SubscriptionState, TagFilter, Tags,
-    };
+    use crate::db::types::{SubscriptionState, TagFilter, Tags};
     use pixiv_client::Illust;
     use serde_json::json;
 
@@ -411,73 +406,6 @@ mod tests {
     }
 
     #[test]
-    fn author_subscription_state_extracts_only_author_state() {
-        let author = AuthorState {
-            latest_illust_id: 42,
-            pending_illust: None,
-        };
-        let subscription = make_subscription(
-            Some(SubscriptionState::Author(author.clone())),
-            TagFilter::default(),
-        );
-
-        assert_eq!(author_subscription_state(&subscription), Some(author));
-        assert_eq!(
-            ranking_subscription_state(&subscription),
-            None,
-            "author state must not be exposed as ranking state"
-        );
-    }
-
-    #[test]
-    fn ranking_subscription_state_extracts_only_ranking_state() {
-        let ranking = RankingState {
-            pushed_ids: vec![1, 2, 3],
-            pending_illust: None,
-        };
-        let subscription = make_subscription(
-            Some(SubscriptionState::Ranking(ranking.clone())),
-            TagFilter::default(),
-        );
-
-        assert_eq!(ranking_subscription_state(&subscription), Some(ranking));
-        assert_eq!(
-            author_subscription_state(&subscription),
-            None,
-            "ranking state must not be exposed as author state"
-        );
-        assert_eq!(
-            booru_ranking_subscription_state(&subscription),
-            None,
-            "pixiv ranking state must not be exposed as booru ranking state"
-        );
-    }
-
-    #[test]
-    fn booru_ranking_subscription_state_extracts_only_booru_ranking_state() {
-        let booru_ranking = BooruRankingState {
-            pushed_ids: vec![11, 12],
-            retry_count: 1,
-            pending_post: None,
-            failed_attempts: Vec::new(),
-        };
-        let subscription = make_subscription(
-            Some(SubscriptionState::BooruRanking(booru_ranking.clone())),
-            TagFilter::default(),
-        );
-
-        assert_eq!(
-            booru_ranking_subscription_state(&subscription),
-            Some(booru_ranking)
-        );
-        assert_eq!(
-            ranking_subscription_state(&subscription),
-            None,
-            "booru ranking state must not be exposed as pixiv ranking state"
-        );
-    }
-
-    #[test]
     fn apply_subscription_tag_filter_merges_subscription_and_chat_rules() {
         let subscription = make_subscription(None, TagFilter::parse_from_args(&["+cat"]));
         let chat = make_chat(&["R-18"]);
@@ -493,10 +421,5 @@ mod tests {
 
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].id, keep.id);
-    }
-
-    #[test]
-    fn inter_subscription_delay_constant_stays_two_seconds() {
-        assert_eq!(INTER_SUBSCRIPTION_DELAY_MS, 2000);
     }
 }

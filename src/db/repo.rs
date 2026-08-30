@@ -472,62 +472,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_has_owner_empty_database() {
-        let repo = setup_test_db().await.unwrap();
-
-        let has_owner = repo.has_owner().await.unwrap();
-        assert!(!has_owner);
-    }
-
-    #[tokio::test]
-    async fn test_has_owner_only_non_owner_users() {
-        let repo = setup_test_db().await.unwrap();
-
-        repo.upsert_user(12345, Some("user1".to_string()), UserRole::User)
-            .await
-            .unwrap();
-
-        repo.upsert_user(67890, Some("admin1".to_string()), UserRole::Admin)
-            .await
-            .unwrap();
-
-        let has_owner = repo.has_owner().await.unwrap();
-        assert!(!has_owner);
-    }
-
-    #[tokio::test]
-    async fn test_has_owner_with_owner() {
-        let repo = setup_test_db().await.unwrap();
-
-        repo.upsert_user(12345, Some("user1".to_string()), UserRole::User)
-            .await
-            .unwrap();
-
-        repo.upsert_user(99999, Some("owner1".to_string()), UserRole::Owner)
-            .await
-            .unwrap();
-
-        let has_owner = repo.has_owner().await.unwrap();
-        assert!(has_owner);
-    }
-
-    #[tokio::test]
-    async fn test_has_owner_multiple_owners() {
-        let repo = setup_test_db().await.unwrap();
-
-        repo.upsert_user(11111, Some("owner1".to_string()), UserRole::Owner)
-            .await
-            .unwrap();
-
-        repo.upsert_user(22222, Some("owner2".to_string()), UserRole::Owner)
-            .await
-            .unwrap();
-
-        let has_owner = repo.has_owner().await.unwrap();
-        assert!(has_owner);
-    }
-
-    #[tokio::test]
     async fn test_create_user_with_auto_owner_first_user() {
         let repo = setup_test_db().await.unwrap();
 

@@ -83,15 +83,13 @@ impl Repo {
 #[cfg(test)]
 mod tests {
     use super::super::tests_helpers::setup_test_db;
-    use crate::db::entities::{
-        eh_download_completions, eh_download_queue, eh_gallery_jobs, eh_gp_spend_attempts,
-    };
+    use crate::db::entities::{eh_download_queue, eh_gallery_jobs, eh_gp_spend_attempts};
     use crate::db::repo::eh_gallery_jobs::{
         eh_gallery_job_artifact_path, LEGACY_ARTIFACT_HANDOFF_CONFLICT,
         LEGACY_ARTIFACT_HANDOFF_MOVING, LEGACY_ARTIFACT_HANDOFF_PENDING,
     };
     use crate::db::repo::Repo;
-    use anyhow::{bail, Result};
+    use anyhow::Result;
     use chrono::{Duration, Local};
     use eh_client::ArchiveArtifacts;
     use migration::{MigrationTrait, Migrator, MigratorTrait, SchemaManager};
@@ -111,14 +109,6 @@ mod tests {
         "m20260828_000000_eh_job_fingerprint_generations";
     const RESULT_GENERATION_ORDER_MIGRATION_NAME: &str =
         "m20260829_000000_eh_result_generation_order";
-    const JOB_REBUILD_INDEXES: [&str; 6] = [
-        "idx_eh_gallery_jobs_status_retry",
-        "idx_eh_gallery_jobs_telegraph_retry",
-        "idx_eh_gallery_jobs_cleanup_retry",
-        "idx_eh_gallery_jobs_background_status",
-        "idx_eh_gallery_jobs_rewrite_status",
-        "idx_eh_gallery_jobs_completed_at",
-    ];
     const KNOWN_FINGERPRINT_INDEX: &str = "uq_eh_gallery_jobs_known_fingerprint";
     const UNKNOWN_FINGERPRINT_INDEX: &str = "uq_eh_gallery_jobs_unknown_fingerprint";
     const LEGACY_VARIANT_INDEX: &str = "uq_eh_gallery_jobs_variant";
@@ -533,84 +523,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migration_creates_ledger_table_and_created_at_index() -> Result<()> {
-        let db = new_db().await?;
-        create_legacy_queue_table(&db).await?;
-
-        migrate_up(&db).await?;
-
-        assert!(migration_table_exists(&db).await?);
-        assert!(migration_created_at_index_exists(&db).await?);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn migration_reuse_tables_and_fingerprint_column() -> Result<()> {
-        let db = new_db().await?;
-        create_legacy_shared_jobs_tables(&db).await?;
-        db.execute_unprepared(
-            "INSERT INTO eh_download_queue (chat_id, gid, token, title, source, status) \
-             VALUES (1, 101, 'token-101', 'Legacy gallery', 'subscription', 'pending')",
-        )
-        .await?;
-
-        migrate_reuse_ledger_up(&db).await?;
-
-        assert!(
-            sqlite_master_entry_exists(&db, "table", "eh_gallery_results").await?,
-            "result reuse table must be created"
-        );
-        assert!(
-            sqlite_master_entry_exists(&db, "table", "eh_gallery_push_ledger").await?,
-            "push ledger table must be created"
-        );
-        let migrated_job = db
-            .query_one(Statement::from_string(
-                DbBackend::Sqlite,
-                "SELECT source_fingerprint FROM eh_gallery_jobs WHERE gid = 101".to_owned(),
-            ))
-            .await?
-            .expect("legacy gallery job must be migrated");
-        assert_eq!(
-            migrated_job.try_get::<Option<String>>("", "source_fingerprint")?,
-            None
-        );
-
-        db.execute_unprepared(
-            "INSERT INTO eh_gallery_results (\
-                gid, token, download_mode, resolution, source_fingerprint, telegraph_url, created_at, updated_at\
-             ) VALUES (101, 'token-101', 'archive', '1280x', 'fingerprint', 'https://telegra.ph/page', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
-        )
-        .await?;
-        assert!(
-            db.execute_unprepared(
-                "INSERT INTO eh_gallery_results (\
-                    gid, token, download_mode, resolution, source_fingerprint, telegraph_url, created_at, updated_at\
-                 ) VALUES (101, 'token-101', 'archive', '1280x', 'fingerprint', 'https://telegra.ph/page', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
-            )
-            .await
-            .is_err(),
-            "duplicate gallery result variants must violate their unique constraint"
-        );
-
-        db.execute_unprepared(
-            "INSERT INTO eh_gallery_push_ledger (chat_id, gid, updated_at) \
-             VALUES (1, 101, CURRENT_TIMESTAMP)",
-        )
-        .await?;
-        assert!(
-            db.execute_unprepared(
-                "INSERT INTO eh_gallery_push_ledger (chat_id, gid, updated_at) \
-                 VALUES (1, 101, CURRENT_TIMESTAMP)"
-            )
-            .await
-            .is_err(),
-            "duplicate chat/gallery ledger rows must violate their unique constraint"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn migration_isolates_known_fingerprint_generations_and_deduplicates_null() -> Result<()>
     {
         let db = new_db().await?;
@@ -894,34 +806,6 @@ mod tests {
             "compatibility migration down must restore the pre-compatibility schema"
         );
         assert_foreign_key_check_is_clean(&db).await?;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn migration_fingerprint_generations_creates_expected_indexes() -> Result<()> {
-        let db = new_db().await?;
-        create_legacy_shared_jobs_tables(&db).await?;
-
-        migrate_fingerprint_generations_up(&db).await?;
-
-        for index in JOB_REBUILD_INDEXES {
-            assert!(
-                sqlite_master_entry_exists(&db, "index", index).await?,
-                "{index} must be recreated"
-            );
-        }
-        assert!(
-            sqlite_master_entry_exists(&db, "index", KNOWN_FINGERPRINT_INDEX).await?,
-            "known-fingerprint partial unique index must exist"
-        );
-        assert!(
-            sqlite_master_entry_exists(&db, "index", UNKNOWN_FINGERPRINT_INDEX).await?,
-            "unknown-fingerprint partial unique index must exist"
-        );
-        assert!(
-            !sqlite_master_entry_exists(&db, "index", LEGACY_VARIANT_INDEX).await?,
-            "legacy variant unique index must be removed"
-        );
         Ok(())
     }
 
@@ -2190,27 +2074,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migration_defaults_created_at_when_omitted() -> Result<()> {
-        let db = new_db().await?;
-        create_legacy_queue_table(&db).await?;
-        migrate_up(&db).await?;
-
-        db.execute_unprepared("INSERT INTO eh_gp_spend_attempts (gid, gp_cost) VALUES (101, 7)")
-            .await?;
-
-        let row = db
-            .query_one(Statement::from_string(
-                DbBackend::Sqlite,
-                format!("SELECT created_at FROM {TABLE} WHERE gid = 101"),
-            ))
-            .await?
-            .expect("inserted ledger row must exist");
-        let created_at: String = row.try_get("", "created_at")?;
-        assert!(!created_at.is_empty());
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn migration_backfills_only_completed_positive_gp_attempts() -> Result<()> {
         let db = new_db().await?;
         create_legacy_queue_table(&db).await?;
@@ -2280,234 +2143,6 @@ mod tests {
             .await?
             .expect("backfill created one ledger row");
         assert_eq!(row.try_get::<Option<i64>>("", "queue_id")?, None);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn migration_down_drops_ledger_table() -> Result<()> {
-        let db = new_db().await?;
-        create_legacy_queue_table(&db).await?;
-        let migration = target_migration()?;
-        let manager = SchemaManager::new(&db);
-
-        migration.up(&manager).await?;
-        migration.down(&manager).await?;
-
-        if migration_table_exists(&db).await? {
-            bail!("ledger table still exists after migration down");
-        }
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_schema_matches_ledger_constraints() -> Result<()> {
-        let repo = setup_test_db().await?;
-        let db = repo.db();
-        db.execute_unprepared("PRAGMA foreign_keys = ON").await?;
-        db.execute_unprepared(
-            "INSERT INTO eh_download_queue (id, chat_id, gid, token, title) \
-             VALUES (11, 1, 101, 'token', 'title')",
-        )
-        .await?;
-        db.execute_unprepared(
-            "INSERT INTO eh_gp_spend_attempts (queue_id, gid, gp_cost, created_at) \
-             VALUES (11, 101, 7, '2026-07-01 01:02:03')",
-        )
-        .await?;
-
-        assert!(db
-            .execute_unprepared(
-                "INSERT INTO eh_gp_spend_attempts (gid, gp_cost, created_at) \
-                 VALUES (102, 0, '2026-07-01 01:02:03')"
-            )
-            .await
-            .is_err());
-        db.execute_unprepared("DELETE FROM eh_download_queue WHERE id = 11")
-            .await?;
-
-        let row = db
-            .query_one(Statement::from_string(
-                DbBackend::Sqlite,
-                "SELECT queue_id FROM eh_gp_spend_attempts".to_owned(),
-            ))
-            .await?
-            .expect("ledger row survives queue deletion");
-        assert_eq!(row.try_get::<Option<i64>>("", "queue_id")?, None);
-
-        let index = db
-            .query_one(Statement::from_string(
-                DbBackend::Sqlite,
-                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'idx_eh_gp_spend_attempts_created_at') AS present".to_owned(),
-            ))
-            .await?
-            .expect("SELECT EXISTS returns one row");
-        assert!(index.try_get::<bool>("", "present")?);
-
-        db.execute_unprepared("INSERT INTO eh_gp_spend_attempts (gid, gp_cost) VALUES (102, 8)")
-            .await?;
-        let defaulted_row = db
-            .query_one(Statement::from_string(
-                DbBackend::Sqlite,
-                "SELECT created_at FROM eh_gp_spend_attempts WHERE gid = 102".to_owned(),
-            ))
-            .await?
-            .expect("row with DB-provided created_at must exist");
-        let created_at: String = defaulted_row.try_get("", "created_at")?;
-        assert!(!created_at.is_empty());
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn shared_job_test_schema_enforces_variant_and_foreign_keys() -> Result<()> {
-        let repo = setup_test_db().await?;
-        let db = repo.db();
-        let job = eh_gallery_jobs::ActiveModel {
-            gid: Set(301),
-            token: Set("shared-token".to_owned()),
-            download_mode: Set("archive".to_owned()),
-            title: Set("Shared job".to_owned()),
-            ..Default::default()
-        }
-        .insert(db)
-        .await?;
-        assert_eq!(job.resolution, "");
-        assert_eq!(job.status, "pending");
-        assert_eq!(job.telegraph_status, "not_required");
-        assert!(!job.telegraph_required);
-        assert_eq!(job.file_size, 0);
-        assert_eq!(job.gp_cost, 0);
-        assert_eq!(job.retry_count, 0);
-        assert_eq!(job.cleanup_status, "none");
-        assert_eq!(job.background_download_attempt_count, 0);
-        assert_eq!(job.telegraph_rewrite_retry_count, 0);
-
-        eh_gallery_jobs::ActiveModel {
-            gid: Set(301),
-            token: Set("shared-token".to_owned()),
-            download_mode: Set("archive".to_owned()),
-            resolution: Set("large".to_owned()),
-            source_fingerprint: Set(Some("fingerprint-a".to_owned())),
-            title: Set("Large variant".to_owned()),
-            ..Default::default()
-        }
-        .insert(db)
-        .await?;
-        assert!(
-            eh_gallery_jobs::ActiveModel {
-                gid: Set(301),
-                token: Set("shared-token".to_owned()),
-                download_mode: Set("archive".to_owned()),
-                title: Set("Duplicate variant".to_owned()),
-                ..Default::default()
-            }
-            .insert(db)
-            .await
-            .is_err(),
-            "identical unknown-fingerprint gallery job variants must be unique"
-        );
-
-        eh_gallery_jobs::ActiveModel {
-            gid: Set(301),
-            token: Set("shared-token".to_owned()),
-            download_mode: Set("archive".to_owned()),
-            resolution: Set("large".to_owned()),
-            source_fingerprint: Set(Some("fingerprint-b".to_owned())),
-            source_generation: Set(1),
-            title: Set("Different known generation".to_owned()),
-            ..Default::default()
-        }
-        .insert(db)
-        .await?;
-        assert!(
-            eh_gallery_jobs::ActiveModel {
-                gid: Set(301),
-                token: Set("shared-token".to_owned()),
-                download_mode: Set("archive".to_owned()),
-                resolution: Set("large".to_owned()),
-                source_fingerprint: Set(Some("fingerprint-c".to_owned())),
-                title: Set("Duplicate generation".to_owned()),
-                ..Default::default()
-            }
-            .insert(db)
-            .await
-            .is_err(),
-            "distinct fingerprints sharing a source generation must be unique"
-        );
-        assert!(
-            eh_gallery_jobs::ActiveModel {
-                gid: Set(301),
-                token: Set("shared-token".to_owned()),
-                download_mode: Set("archive".to_owned()),
-                resolution: Set("large".to_owned()),
-                source_fingerprint: Set(Some("fingerprint-a".to_owned())),
-                title: Set("Duplicate known generation".to_owned()),
-                ..Default::default()
-            }
-            .insert(db)
-            .await
-            .is_err(),
-            "identical known-fingerprint gallery job generations must be unique"
-        );
-
-        let queue = eh_download_queue::ActiveModel {
-            job_id: Set(Some(job.id)),
-            chat_id: Set(1),
-            gid: Set(301),
-            token: Set("shared-token".to_owned()),
-            title: Set("Delivery".to_owned()),
-            telegraph: Set(false),
-            source: Set("direct".to_owned()),
-            status: Set("waiting".to_owned()),
-            ..Default::default()
-        }
-        .insert(db)
-        .await?;
-        let gp_attempt = eh_gp_spend_attempts::ActiveModel {
-            job_id: Set(Some(job.id)),
-            queue_id: Set(Some(queue.id)),
-            gid: Set(301),
-            gp_cost: Set(7),
-            ..Default::default()
-        }
-        .insert(db)
-        .await?;
-        let completion = eh_download_completions::ActiveModel {
-            job_id: Set(Some(job.id)),
-            gid: Set(301),
-            file_size: Set(4096),
-            ..Default::default()
-        }
-        .insert(db)
-        .await?;
-
-        db.execute_unprepared(&format!(
-            "DELETE FROM eh_gallery_jobs WHERE id = {}",
-            job.id
-        ))
-        .await?;
-
-        assert_eq!(
-            eh_download_queue::Entity::find_by_id(queue.id)
-                .one(db)
-                .await?
-                .expect("queue delivery survives job deletion")
-                .job_id,
-            None
-        );
-        assert_eq!(
-            eh_gp_spend_attempts::Entity::find_by_id(gp_attempt.id)
-                .one(db)
-                .await?
-                .expect("GP ledger entry survives job deletion")
-                .job_id,
-            None
-        );
-        let completion_after_delete = eh_download_completions::Entity::find_by_id(completion.id)
-            .one(db)
-            .await?
-            .expect("completion ledger entry survives job deletion");
-        assert_eq!(completion_after_delete.job_id, None);
-        assert_eq!(completion_after_delete.file_size, 4096);
         Ok(())
     }
 

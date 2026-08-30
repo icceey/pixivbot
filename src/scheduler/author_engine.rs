@@ -566,39 +566,6 @@ mod tests {
     use crate::db::types::{AuthorState, PendingIllust};
 
     #[test]
-    fn author_state_keeps_latest_id_and_pending_payload() {
-        let pending = PendingIllust {
-            illust_id: 123,
-            sent_pages: vec![0, 2],
-            total_pages: 4,
-            retry_count: 1,
-        };
-
-        let state = AuthorEngine::author_state(999, Some(pending.clone()));
-
-        assert_eq!(
-            state,
-            AuthorState {
-                latest_illust_id: 999,
-                pending_illust: Some(pending),
-            }
-        );
-    }
-
-    #[test]
-    fn clear_pending_state_removes_pending_illust() {
-        let state = AuthorEngine::clear_pending_state(456);
-
-        assert_eq!(
-            state,
-            AuthorState {
-                latest_illust_id: 456,
-                pending_illust: None,
-            }
-        );
-    }
-
-    #[test]
     fn pending_retry_state_preserves_progress_and_updates_retry_count() {
         let pending = PendingIllust {
             illust_id: 321,

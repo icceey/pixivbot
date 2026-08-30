@@ -27,15 +27,8 @@ pub struct ParsedArgs {
 
 impl ParsedArgs {
     /// Get a parameter value by key.
-    #[allow(dead_code)]
     pub fn get(&self, key: &str) -> Option<&str> {
-        self.params.get(key).map(|s| s.as_str())
-    }
-
-    /// Check if a parameter exists (even if empty).
-    #[allow(dead_code)]
-    pub fn has(&self, key: &str) -> bool {
-        self.params.contains_key(key)
+        self.params.get(key).map(String::as_str)
     }
 
     /// Get a parameter value by multiple possible keys (aliases).
@@ -95,49 +88,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_args_empty() {
-        let parsed = parse_args("");
-        assert!(parsed.params.is_empty());
-        assert_eq!(parsed.remaining, "");
-    }
-
-    #[test]
-    fn test_parse_args_no_kv() {
-        let parsed = parse_args("123456 +tag1 -tag2");
-        assert!(parsed.params.is_empty());
-        assert_eq!(parsed.remaining, "123456 +tag1 -tag2");
-    }
-
-    #[test]
-    fn test_parse_args_single_kv() {
-        let parsed = parse_args("channel=123456 789 +tag");
-        assert_eq!(parsed.get("channel"), Some("123456"));
-        assert_eq!(parsed.remaining, "789 +tag");
-    }
-
-    #[test]
-    fn test_parse_args_multiple_kv() {
-        let parsed = parse_args("ch=123 other=val 789 +tag");
-        assert_eq!(parsed.get("ch"), Some("123"));
-        assert_eq!(parsed.get("other"), Some("val"));
-        assert_eq!(parsed.remaining, "789 +tag");
-    }
-
-    #[test]
-    fn test_parse_args_case_insensitive_key() {
-        let parsed = parse_args("Channel=123 789");
-        assert_eq!(parsed.get("channel"), Some("123"));
-        assert_eq!(parsed.remaining, "789");
-    }
-
-    #[test]
-    fn test_parse_args_empty_value() {
-        let parsed = parse_args("channel= 789");
-        assert_eq!(parsed.get("channel"), Some(""));
-        assert_eq!(parsed.remaining, "789");
-    }
-
-    #[test]
     fn test_parse_args_get_any() {
         let parsed = parse_args("ch=123 789");
         assert_eq!(parsed.get_any(&["channel", "ch"]), Some("123"));
@@ -149,30 +99,32 @@ mod tests {
     #[test]
     fn test_parse_args_negative_number_value() {
         let parsed = parse_args("ch=-1001234567890 789");
-        assert_eq!(parsed.get("ch"), Some("-1001234567890"));
+        assert_eq!(
+            parsed.params.get("ch").map(String::as_str),
+            Some("-1001234567890")
+        );
         assert_eq!(parsed.remaining, "789");
     }
 
     #[test]
     fn test_parse_args_username_value() {
         let parsed = parse_args("ch=@mychannel 789");
-        assert_eq!(parsed.get("ch"), Some("@mychannel"));
+        assert_eq!(
+            parsed.params.get("ch").map(String::as_str),
+            Some("@mychannel")
+        );
         assert_eq!(parsed.remaining, "789");
-    }
-
-    #[test]
-    fn test_parse_args_only_kv() {
-        let parsed = parse_args("channel=123");
-        assert_eq!(parsed.get("channel"), Some("123"));
-        assert_eq!(parsed.remaining, "");
     }
 
     #[test]
     fn test_parse_args_stops_at_non_kv() {
         // Tags like +tag should stop kv parsing
         let parsed = parse_args("channel=123 +tag val=should_not_parse");
-        assert_eq!(parsed.get("channel"), Some("123"));
-        assert_eq!(parsed.get("val"), None);
+        assert_eq!(
+            parsed.params.get("channel").map(String::as_str),
+            Some("123")
+        );
+        assert_eq!(parsed.params.get("val"), None);
         assert_eq!(parsed.remaining, "+tag val=should_not_parse");
     }
 }

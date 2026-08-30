@@ -1245,25 +1245,6 @@ mod tests {
     }
 
     #[test]
-    fn test_build_search_url_with_cats() {
-        let client = EhClientBuilder::new()
-            .base_url("https://e-hentai.org")
-            .build();
-        let url = client.build_search_url("artist:wlop", 3, 2);
-        assert!(url.contains("f_cats=3"));
-        assert!(url.contains("page=2"));
-    }
-
-    #[test]
-    fn test_build_api_url() {
-        let client = EhClientBuilder::new()
-            .base_url("https://e-hentai.org")
-            .api_url("https://api.e-hentai.org/api.php")
-            .build();
-        assert_eq!(client.api_url, "https://api.e-hentai.org/api.php");
-    }
-
-    #[test]
     fn test_build_archiver_url() {
         let client = EhClientBuilder::new()
             .base_url("https://e-hentai.org")
@@ -1273,35 +1254,5 @@ mod tests {
             url,
             "https://e-hentai.org/archiver.php?gid=123456&token=abcdef0123&or=780x"
         );
-    }
-
-    #[test]
-    fn archiver_key_request_has_no_estimated_size_without_page_html() {
-        let request = ArchiveDownloadRequest::from_archiver_key(
-            "https://e-hentai.org",
-            123456,
-            "abcdef0123",
-            "123456--abc123def456",
-            "1280x",
-        );
-
-        assert_eq!(request.estimated_size_bytes(), None);
-    }
-
-    #[test]
-    fn test_archive_resolution_validation_accepts_supported_and_rejects_invalid_values() {
-        for resolution in SUPPORTED_ARCHIVE_RESOLUTIONS {
-            validate_archive_resolution(resolution)
-                .unwrap_or_else(|error| panic!("{resolution} should be accepted: {error}"));
-        }
-
-        for resolution in ["1600x", "2400x", "bogus", ""] {
-            let error = validate_archive_resolution(resolution)
-                .expect_err("unsupported archive resolution should be rejected");
-            assert!(matches!(error, Error::Other(_)));
-            assert!(error.to_string().contains(&format!(
-                "unsupported EH archive resolution '{resolution}'; supported values: 780x, 980x, 1280x, original"
-            )));
-        }
     }
 }

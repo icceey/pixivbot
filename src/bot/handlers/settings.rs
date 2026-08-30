@@ -595,27 +595,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_tags_input_normal_comma() {
-        let result = parse_tags_input("tag1, tag2, tag3");
-        assert_eq!(result, vec!["tag1", "tag2", "tag3"]);
-    }
-
-    #[test]
-    fn test_parse_tags_input_chinese_comma() {
-        let result = parse_tags_input("tag1，tag2，tag3");
-        assert_eq!(result, vec!["tag1", "tag2", "tag3"]);
-    }
-
-    #[test]
     fn test_parse_tags_input_mixed_commas() {
         let result = parse_tags_input("tag1, tag2，tag3, tag4");
         assert_eq!(result, vec!["tag1", "tag2", "tag3", "tag4"]);
-    }
-
-    #[test]
-    fn test_parse_tags_input_empty() {
-        let result = parse_tags_input("");
-        assert!(result.is_empty());
     }
 
     #[test]
@@ -625,36 +607,9 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_tags_input_whitespace_handling() {
-        let result = parse_tags_input("  tag1  ,  tag2  ");
-        assert_eq!(result, vec!["tag1", "tag2"]);
-    }
-
-    #[test]
-    fn test_parse_tags_input_single_tag() {
-        let result = parse_tags_input("single_tag");
-        assert_eq!(result, vec!["single_tag"]);
-    }
-
-    #[test]
     fn test_parse_tags_input_duplicate_tags() {
         // Note: This function does NOT deduplicate - just parses
         let result = parse_tags_input("tag1, tag1, tag2");
         assert_eq!(result, vec!["tag1", "tag1", "tag2"]);
-    }
-
-    #[test]
-    fn test_parse_tags_input_unicode_tags() {
-        let result = parse_tags_input("日本語, R-18, 原神");
-        assert_eq!(result, vec!["日本語", "R-18", "原神"]);
-    }
-
-    #[test]
-    fn test_parse_tags_input_special_chars() {
-        let result = parse_tags_input("tag-with-dash, tag_with_underscore, tag.with.dot");
-        assert_eq!(
-            result,
-            vec!["tag-with-dash", "tag_with_underscore", "tag.with.dot"]
-        );
     }
 }

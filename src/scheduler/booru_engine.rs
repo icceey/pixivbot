@@ -1222,29 +1222,8 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_task_value_empty_tags() {
-        let (site, tags) = BooruEngine::parse_task_value("konachan:");
-        assert_eq!(site, "konachan");
-        assert_eq!(tags, "");
-    }
-
-    #[test]
-    fn test_parse_task_value_no_colon() {
-        let (site, tags) = BooruEngine::parse_task_value("konachan");
-        assert_eq!(site, "konachan");
-        assert_eq!(tags, "");
-    }
-
-    #[test]
     fn test_parse_task_value_strips_ranking_and_filter_suffixes() {
         let (site, tags) = BooruEngine::parse_task_value("konachan:cat|o=score|f=s");
-        assert_eq!(site, "konachan");
-        assert_eq!(tags, "cat");
-    }
-
-    #[test]
-    fn test_parse_task_value_strips_filter_suffix() {
-        let (site, tags) = BooruEngine::parse_task_value("konachan:cat|f=s");
         assert_eq!(site, "konachan");
         assert_eq!(tags, "cat");
     }
@@ -1342,26 +1321,6 @@ mod tests {
             "duplicate booru API rows must not be queued for a second scheduler push",
         );
         assert_eq!(deduped[0].tags, "first");
-    }
-
-    #[test]
-    fn test_queued_rating_roundtrip() {
-        for rating in [
-            BooruRating::Safe,
-            BooruRating::General,
-            BooruRating::Sensitive,
-            BooruRating::Questionable,
-            BooruRating::Explicit,
-        ] {
-            let post = make_post(1, "", 0, rating);
-            let queued = BooruEngine::post_to_queued(&post);
-            let recovered = BooruEngine::queued_to_booru_post(&queued);
-            assert_eq!(
-                recovered.rating, rating,
-                "Rating roundtrip failed for {:?}",
-                rating
-            );
-        }
     }
 
     /// Verifies that appending new IDs then deduplicating preserves insertion

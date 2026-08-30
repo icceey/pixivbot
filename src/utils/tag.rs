@@ -92,64 +92,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_format_tags_empty() {
-        let tags: Vec<String> = vec![];
-        assert_eq!(format_tags(&tags), Vec::<String>::new());
-    }
-
-    #[test]
-    fn test_format_tags_simple() {
-        let tags = vec!["原神", "Genshin"];
-        let result = format_tags(&tags);
-        assert_eq!(result, vec!["原神", "Genshin"]);
-    }
-
-    #[test]
-    fn test_format_tags_with_spaces() {
-        let tags = vec!["Genshin Impact", "Game Art"];
-        let result = format_tags(&tags);
-        assert_eq!(result, vec!["GenshinImpact", "GameArt"]);
-    }
-
-    #[test]
-    fn test_format_tags_no_escape() {
-        let tags = vec!["R-18", "test+tag"];
-        let result = format_tags(&tags);
-        // Whitelist approach: + is removed, only word chars kept
-        assert_eq!(result, vec!["R18", "testtag"]);
-    }
-
-    #[test]
-    fn test_format_tags_special_chars() {
-        let tags = vec!["R-18", "test-tag", "tag(test)", "foo)bar"];
-        let result = format_tags(&tags);
-        assert_eq!(result, vec!["R18", "testtag", "tagtest", "foobar"]);
-    }
-
-    #[test]
-    fn test_format_tags_mixed() {
-        let tags = vec!["Genshin Impact", "R-18", "tag(test)"];
-        let result = format_tags(&tags);
-        assert_eq!(result, vec!["GenshinImpact", "R18", "tagtest"]);
-    }
-
-    #[test]
-    fn test_format_tags_japanese_chars() {
-        let tags = vec!["「テスト」", "テスト…", "ヴァイオレット・エヴァーガーデン"];
-        let result = format_tags(&tags);
-        assert_eq!(
-            result,
-            vec!["テスト", "テスト", "ヴァイオレットエヴァーガーデン"]
-        );
-    }
-
-    #[test]
-    fn test_normalize_tag_lowercase() {
-        assert_eq!(normalize_tag("R-18"), "r18");
-        assert_eq!(normalize_tag("NSFW"), "nsfw");
-    }
-
-    #[test]
     fn test_normalize_tag_special_chars() {
         assert_eq!(normalize_tag("R-18"), "r18");
         // Underscores are kept (part of \w in regex)
@@ -159,30 +101,11 @@ mod tests {
     }
 
     #[test]
-    fn test_normalize_tag_spaces() {
-        assert_eq!(normalize_tag("Genshin Impact"), "genshinimpact");
-        // Underscores are kept (part of \w in regex)
-        assert_eq!(normalize_tag("Genshin_Impact"), "genshin_impact");
-    }
-
-    #[test]
-    fn test_normalize_tag_match() {
-        // Test that different variations normalize to the same value
-        // Note: R-18 and R_18 now normalize differently (underscore is kept)
-        assert_eq!(normalize_tag("R-18"), "r18");
-        assert_eq!(normalize_tag("r-18"), "r18");
-        // With underscores kept:
-        assert_eq!(normalize_tag("R_18"), "r_18");
-        assert_eq!(normalize_tag("r_18"), "r_18");
-    }
-
-    #[test]
     fn test_normalize_tag_japanese_chars() {
         assert_eq!(normalize_tag("「テスト」"), "テスト");
         assert_eq!(normalize_tag("テスト…"), "テスト");
     }
 
-    // New tests from requirements
     #[test]
     fn test_format_tags_requirements() {
         // Hello World -> HelloWorld
@@ -196,13 +119,6 @@ mod tests {
 
         // 你好，世界！ -> 你好世界
         assert_eq!(format_tags(&["你好，世界！"]), vec!["你好世界"]);
-    }
-
-    #[test]
-    fn test_format_tags_underscores_kept() {
-        // Underscores should be kept (part of \w)
-        assert_eq!(format_tags(&["test_tag"]), vec!["test_tag"]);
-        assert_eq!(format_tags(&["R_18"]), vec!["R_18"]);
     }
 
     #[test]

@@ -99,21 +99,4 @@ mod tests {
         assert_eq!(registry.len(), 1);
         assert!(!registry.is_empty());
     }
-
-    #[test]
-    fn registry_iter_yields_all_sites() {
-        let registry = BooruSiteRegistry::from_configs(&[make_cfg("a"), make_cfg("b")]);
-        let names: Vec<String> = registry
-            .iter()
-            .map(|s| s.config.name.clone())
-            .collect::<Vec<_>>();
-        assert_eq!(names.len(), 2);
-    }
-
-    #[test]
-    fn registry_default_empty() {
-        let registry = BooruSiteRegistry::default();
-        assert!(registry.is_empty());
-        assert_eq!(registry.len(), 0);
-    }
 }

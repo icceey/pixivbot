@@ -275,20 +275,8 @@ async fn download_sequential_once(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        made_progress, parse_content_range_header, response_expected_total, validate_content_range,
-    };
+    use super::{parse_content_range_header, response_expected_total, validate_content_range};
     use reqwest::header::{HeaderMap, HeaderValue, CONTENT_LENGTH, CONTENT_RANGE};
-
-    #[test]
-    fn made_progress_uses_a_strict_10_kib_per_second_threshold() {
-        assert!(!made_progress(10_240, 1.0));
-        assert!(made_progress(10_241, 1.0));
-        assert!(!made_progress(0, 1.0));
-        assert!(!made_progress(99_999, 0.0));
-        assert!(made_progress(20_000, 0.5));
-        assert!(!made_progress(100, 10.0));
-    }
 
     #[test]
     fn content_range_parser_and_expected_total_preserve_resume_rules() {

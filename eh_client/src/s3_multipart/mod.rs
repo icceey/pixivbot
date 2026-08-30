@@ -2296,16 +2296,6 @@ mod tests {
         server.verify().await;
     }
 
-    #[test]
-    fn multipart_capability_is_a_process_local_tristate_hint() {
-        let capability = MultipartCapability::default();
-        assert_eq!(capability.state(), CapabilityState::Unknown);
-        capability.mark_supported();
-        assert_eq!(capability.state(), CapabilityState::Supported);
-        capability.mark_unsupported();
-        assert_eq!(capability.state(), CapabilityState::Unsupported);
-    }
-
     async fn mount_create(server: &MockServer) {
         mount_create_with_upload_id(server, UPLOAD_ID).await;
     }

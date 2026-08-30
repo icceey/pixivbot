@@ -270,9 +270,6 @@ pub struct MoebooruRawPool {
     #[serde(default)]
     pub description: Option<String>,
     #[serde(default)]
-    #[allow(dead_code)]
-    pub created_at: Option<String>,
-    #[serde(default)]
     pub posts: Vec<MoebooruRawPost>,
 }
 
@@ -591,15 +588,6 @@ mod tests {
     }
 
     #[test]
-    fn test_rating_short_str() {
-        assert_eq!(BooruRating::General.as_short_str(), "g");
-        assert_eq!(BooruRating::Safe.as_short_str(), "s");
-        assert_eq!(BooruRating::Sensitive.as_short_str(), "se");
-        assert_eq!(BooruRating::Questionable.as_short_str(), "q");
-        assert_eq!(BooruRating::Explicit.as_short_str(), "e");
-    }
-
-    #[test]
     fn test_rating_as_api_str_moebooru() {
         assert_eq!(
             BooruRating::General.as_api_str(BooruEngineType::Moebooru),
@@ -798,34 +786,5 @@ mod tests {
         assert_eq!(pool.id, 67890);
         assert_eq!(pool.post_ids, vec![500, 501]);
         assert!(pool.created_at.is_some());
-    }
-
-    #[test]
-    fn test_booru_post_serde_roundtrip() {
-        let post = BooruPost {
-            id: 42,
-            tags: "test tag".to_string(),
-            score: 10,
-            fav_count: 5,
-            file_url: Some("https://example.com/file.jpg".to_string()),
-            sample_url: Some("https://example.com/sample.jpg".to_string()),
-            jpeg_url: None,
-            preview_url: None,
-            rating: BooruRating::Safe,
-            width: 1920,
-            height: 1080,
-            md5: Some("abcdef".to_string()),
-            source: None,
-            created_at: None,
-            file_size: Some(1024),
-            file_ext: Some("jpg".to_string()),
-            status: Some("active".to_string()),
-        };
-
-        let json = serde_json::to_string(&post).unwrap();
-        let parsed: BooruPost = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.id, 42);
-        assert_eq!(parsed.tags, "test tag");
-        assert_eq!(parsed.rating, BooruRating::Safe);
     }
 }

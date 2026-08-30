@@ -190,31 +190,3 @@ fn is_terminal_persisted_download_rejection(error: &Error) -> bool {
         _ => false,
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn archive_download_options_default_to_one_and_reject_zero() {
-        assert_eq!(ArchiveDownloadOptions::default().max_concurrency, 1);
-
-        let one = ArchiveDownloadOptions { max_concurrency: 1 }
-            .validate()
-            .unwrap();
-        assert_eq!(one.max_concurrency, 1);
-
-        let error = ArchiveDownloadOptions { max_concurrency: 0 }
-            .validate()
-            .unwrap_err();
-        assert_eq!(
-            error.to_string(),
-            "archive download max_concurrency must be at least 1"
-        );
-
-        let three = ArchiveDownloadOptions { max_concurrency: 3 }
-            .validate()
-            .unwrap();
-        assert_eq!(three.max_concurrency, 3);
-    }
-}

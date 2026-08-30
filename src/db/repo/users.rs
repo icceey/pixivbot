@@ -56,16 +56,6 @@ impl Repo {
             .context("Failed to get admin users")
     }
 
-    #[allow(dead_code)]
-    pub async fn has_owner(&self) -> Result<bool> {
-        let count = users::Entity::find()
-            .filter(users::Column::Role.eq(UserRole::Owner))
-            .count(&self.db)
-            .await
-            .context("Failed to check for owner users")?;
-        Ok(count > 0)
-    }
-
     pub async fn create_user_with_auto_owner(
         &self,
         user_id: i64,
