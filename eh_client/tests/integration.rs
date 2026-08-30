@@ -2298,6 +2298,149 @@ async fn test_manifest_recovery_io_error_preserves_state_and_skips_archive_get()
 }
 
 #[tokio::test]
+async fn test_persisted_manifest_terminal_url_rejection_clears_multipart_state() {
+    for status in [403, 404] {
+        let server = MockServer::start().await;
+        let temp = tempfile::tempdir().unwrap();
+        let dest = temp.path().join(format!("archive-{status}.zip"));
+        let zip = stored_zip_with_payload(1024);
+        let parts_dir = seed_multipart_manifest(
+            &dest,
+            &archive_url(&server),
+            zip.len() as u64,
+            None,
+            None,
+            &[(0, 0, zip.len() as u64, &[])],
+        );
+        let scratch = dest.with_extension("zip.part");
+        let uploads_dir = dest.with_extension("zip.uploads");
+        std::fs::write(&scratch, b"stale assembly").unwrap();
+        std::fs::create_dir_all(&uploads_dir).unwrap();
+        std::fs::write(uploads_dir.join("upload-state.json"), b"upload state").unwrap();
+        Mock::given(method("GET"))
+            .and(path(TEST_ARCHIVE_PATH))
+            .respond_with(ResponseTemplate::new(status))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let resumed = client_at(&server)
+            .resume_archive_from_persisted_manifest(
+                &dest,
+                ArchiveDownloadOptions { max_concurrency: 1 },
+                None,
+            )
+            .await
+            .expect("terminal persisted URL rejection should allow a fresh archive preparation");
+
+        assert_eq!(resumed, None, "status {status}");
+        assert!(!parts_dir.exists(), "status {status}");
+        assert!(!scratch.exists(), "status {status}");
+        assert!(uploads_dir.exists(), "status {status}");
+    }
+}
+
+#[tokio::test]
+async fn test_persisted_manifest_transient_status_preserves_multipart_state() {
+    for status in [408, 429, 500] {
+        let server = MockServer::start().await;
+        let temp = tempfile::tempdir().unwrap();
+        let dest = temp.path().join(format!("archive-{status}.zip"));
+        let zip = stored_zip_with_payload(1024);
+        let parts_dir = seed_multipart_manifest(
+            &dest,
+            &archive_url(&server),
+            zip.len() as u64,
+            None,
+            None,
+            &[(0, 0, zip.len() as u64, &[])],
+        );
+        let manifest = parts_dir.join("manifest.json");
+        let part = parts_dir.join("part-0000000000000000");
+        Mock::given(method("GET"))
+            .and(path(TEST_ARCHIVE_PATH))
+            .respond_with(ResponseTemplate::new(status))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let error = client_at(&server)
+            .resume_archive_from_persisted_manifest(
+                &dest,
+                ArchiveDownloadOptions { max_concurrency: 1 },
+                None,
+            )
+            .await
+            .expect_err("transient persisted URL failure must remain recoverable");
+
+        assert!(matches!(error, eh_client::Error::Api { status: actual, .. } if actual == status));
+        assert!(manifest.is_file(), "status {status}");
+        assert!(part.is_file(), "status {status}");
+    }
+}
+
+#[tokio::test]
+async fn test_persisted_manifest_local_recovery_error_preserves_state() {
+    let server = MockServer::start().await;
+    let temp = tempfile::tempdir().unwrap();
+    let dest = temp.path().join("archive.zip");
+    let parts_dir = dest.with_extension("zip.parts");
+    let manifest_dir = parts_dir.join("manifest.json");
+    let sentinel = parts_dir.join("part-0000000000000000");
+    std::fs::create_dir_all(&manifest_dir).unwrap();
+    std::fs::write(&sentinel, b"partial archive").unwrap();
+
+    let error = client_at(&server)
+        .resume_archive_from_persisted_manifest(
+            &dest,
+            ArchiveDownloadOptions { max_concurrency: 1 },
+            None,
+        )
+        .await
+        .expect_err("local manifest recovery errors must not discard recoverable state");
+
+    assert!(matches!(error, eh_client::Error::Io(_)));
+    assert!(manifest_dir.is_dir());
+    assert!(sentinel.is_file());
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn test_persisted_manifest_successful_incompatible_range_restarts_sequentially() {
+    let server = MockServer::start().await;
+    let temp = tempfile::tempdir().unwrap();
+    let dest = temp.path().join("archive.zip");
+    let zip = stored_zip_with_payload(1024);
+    let parts_dir = seed_multipart_manifest(
+        &dest,
+        &archive_url(&server),
+        zip.len() as u64,
+        None,
+        None,
+        &[(0, 0, zip.len() as u64, &[])],
+    );
+    Mock::given(method("GET"))
+        .and(path(TEST_ARCHIVE_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(zip.clone()))
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let resumed = client_at(&server)
+        .resume_archive_from_persisted_manifest(
+            &dest,
+            ArchiveDownloadOptions { max_concurrency: 1 },
+            None,
+        )
+        .await
+        .expect("successful incompatible range response must fall back sequentially");
+
+    assert_eq!(resumed, Some(zip.len() as u64));
+    assert_eq!(std::fs::read(&dest).unwrap(), zip);
+    assert!(!parts_dir.exists());
+}
+
+#[tokio::test]
 async fn test_multipart_part_retries_from_durable_offset_after_truncated_body() {
     let server = MockServer::start().await;
     mount_archive_post_redirect(&server).await;

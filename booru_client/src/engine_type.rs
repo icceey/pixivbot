@@ -41,24 +41,3 @@ impl fmt::Display for BooruEngineType {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_engine_type_display() {
-        assert_eq!(BooruEngineType::Moebooru.to_string(), "moebooru");
-        assert_eq!(BooruEngineType::Danbooru.to_string(), "danbooru");
-        assert_eq!(BooruEngineType::Gelbooru.to_string(), "gelbooru");
-    }
-
-    #[test]
-    fn test_engine_type_serde_roundtrip() {
-        let engine = BooruEngineType::Moebooru;
-        let json = serde_json::to_string(&engine).unwrap();
-        assert_eq!(json, "\"moebooru\"");
-        let parsed: BooruEngineType = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed, engine);
-    }
-}

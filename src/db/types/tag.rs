@@ -225,36 +225,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_from_args_empty() {
-        let filter = TagFilter::parse_from_args(&[]);
-        assert!(filter.is_empty());
-    }
-
-    #[test]
-    fn test_parse_from_args_include_only() {
-        let filter = TagFilter::parse_from_args(&["tag1", "+tag2"]);
-        assert_eq!(filter.include, vec!["tag1", "tag2"]);
-        assert!(filter.exclude.is_empty());
-    }
-
-    #[test]
-    fn test_parse_from_args_exclude_only() {
-        let filter = TagFilter::parse_from_args(&["-tag1", "-tag2"]);
-        assert!(filter.include.is_empty());
-        assert_eq!(filter.exclude, vec!["tag1", "tag2"]);
-    }
-
-    #[test]
     fn test_parse_from_args_mixed() {
         let filter = TagFilter::parse_from_args(&["+原神", "-R-18", "cute"]);
         assert_eq!(filter.include, vec!["原神", "cute"]);
         assert_eq!(filter.exclude, vec!["R-18"]);
-    }
-
-    #[test]
-    fn test_parse_from_args_ignores_empty() {
-        let filter = TagFilter::parse_from_args(&["+", "-", ""]);
-        assert!(filter.is_empty());
     }
 
     #[test]

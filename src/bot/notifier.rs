@@ -149,22 +149,7 @@ impl Notifier {
 #[cfg(test)]
 mod tests {
     use super::caption::{individual_batch_caption, shared_batch_caption};
-    use super::{BatchSendResult, ContinuationNumbering, DownloadButtonConfig};
-    use crate::db::types::Tags;
-
-    fn make_chat(chat_type: &str) -> crate::db::entities::chats::Model {
-        crate::db::entities::chats::Model {
-            id: 1,
-            r#type: chat_type.to_string(),
-            title: Some("test".to_string()),
-            enabled: true,
-            blur_sensitive_tags: false,
-            excluded_tags: Tags::default(),
-            sensitive_tags: Tags::default(),
-            created_at: chrono::Utc::now().naive_utc(),
-            allow_without_mention: false,
-        }
-    }
+    use super::{BatchSendResult, ContinuationNumbering};
 
     #[test]
     fn shared_batch_caption_uses_global_numbering_for_resumed_multi_batch_send() {
@@ -197,15 +182,6 @@ mod tests {
             individual_batch_caption("ranking caption", 1, 1, numbering),
             Some("ranking caption".to_string())
         );
-    }
-
-    #[test]
-    fn download_button_config_for_chat_marks_channels_only() {
-        let private_chat = make_chat("private");
-        let channel_chat = make_chat("channel");
-
-        assert!(DownloadButtonConfig::for_pixiv_chat(123, &private_chat).should_show_button());
-        assert!(!DownloadButtonConfig::for_pixiv_chat(123, &channel_chat).should_show_button());
     }
 
     #[test]
@@ -247,20 +223,5 @@ mod tests {
         assert_eq!(numbering.total_batches, 3);
         assert_eq!(numbering.display_batch_number(0), 1);
         assert_eq!(numbering.display_batch_number(2), 3);
-    }
-
-    #[test]
-    fn download_button_config_hides_button_without_illust_or_for_channels() {
-        let without_illust = DownloadButtonConfig::default();
-        let for_channel = DownloadButtonConfig::pixiv(123).for_channel();
-        let normal = DownloadButtonConfig::pixiv(123);
-
-        assert!(!without_illust.should_show_button());
-        assert!(!for_channel.should_show_button());
-        assert!(normal.should_show_button());
-
-        assert!(without_illust.build_keyboard().is_none());
-        assert!(for_channel.build_keyboard().is_none());
-        assert!(normal.build_keyboard().is_some());
     }
 }

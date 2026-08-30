@@ -202,6 +202,10 @@ download_original_threshold = 1
 # background_download_concurrency = 2
 # background_download_max_attempts = 6
 # background_download_stale_sec = 3600
+# # Maximum concurrent Telegram delivery futures (default: 2; clamped to 1..=10).
+# # This controls delivery futures only; the existing Throttle<Bot> remains the
+# # Telegram rate-limit authority.
+# publish_concurrency = 2
 # # Max retry count for failed pushes (default: 3)
 # max_retry_count = 3
 # # 48h scan window for rating-filtered subscriptions (default: 48)

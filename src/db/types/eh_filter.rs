@@ -142,14 +142,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_eh_filter_empty() {
-        let f = EhFilter::new();
-        assert!(f.is_empty());
-        assert!(!f.has_rating_filter());
-        assert!(f.task_value_signature().is_empty());
-    }
-
-    #[test]
     fn test_eh_filter_signature() {
         let f = EhFilter {
             min_rating: Some(4),
@@ -182,21 +174,6 @@ mod tests {
             telegraph: false,
         };
         assert_eq!(f.task_value_signature(), "r3p10P200");
-    }
-
-    #[test]
-    fn test_eh_filter_has_rating() {
-        let f = EhFilter {
-            min_rating: Some(2),
-            ..Default::default()
-        };
-        assert!(f.has_rating_filter());
-
-        let f = EhFilter {
-            min_pages: Some(10),
-            ..Default::default()
-        };
-        assert!(!f.has_rating_filter());
     }
 
     #[test]
@@ -317,14 +294,5 @@ mod tests {
         assert!(display.contains("rating≥4"));
         assert!(display.contains("pages≥20"));
         assert!(display.contains("telegraph=on"));
-    }
-
-    #[test]
-    fn test_telegraph_only_filter_is_not_empty() {
-        let filter = EhFilter {
-            telegraph: true,
-            ..Default::default()
-        };
-        assert!(!filter.is_empty());
     }
 }

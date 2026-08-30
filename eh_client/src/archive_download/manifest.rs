@@ -190,6 +190,25 @@ pub(super) async fn recover_manifest(
     Ok(ManifestRecovery::Valid(manifest))
 }
 
+pub(super) async fn recover_persisted_download(
+    artifacts: &ArchiveArtifacts,
+) -> Result<Option<(String, u64)>> {
+    let bytes = match tokio::fs::read(ArchiveManifest::manifest_path(artifacts)).await {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let manifest: ArchiveManifest = match serde_json::from_slice(&bytes) {
+        Ok(manifest) => manifest,
+        Err(_) => return Ok(None),
+    };
+    let download_url = manifest.download_url.clone();
+    match recover_manifest(artifacts, &download_url).await? {
+        ManifestRecovery::Valid(manifest) => Ok(Some((download_url, manifest.total_len))),
+        ManifestRecovery::Invalid(_) => Ok(None),
+    }
+}
+
 async fn cleanup_unreferenced_parts(
     artifacts: &ArchiveArtifacts,
     manifest: &ArchiveManifest,

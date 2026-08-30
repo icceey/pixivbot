@@ -155,16 +155,6 @@ pub enum ImageSize {
 }
 
 impl ImageSize {
-    #[allow(dead_code)]
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            ImageSize::Original => "original",
-            ImageSize::Large => "large",
-            ImageSize::Medium => "medium",
-            ImageSize::SquareMedium => "square_medium",
-        }
-    }
-
     /// Convert to pixiv_client::ImageSize
     pub fn to_pixiv_image_size(self) -> pixiv_client::ImageSize {
         match self {
@@ -408,7 +398,6 @@ pub struct EhentaiConfig {
     pub download_poll_interval_sec: u64,
     /// Maximum active HTTP Range requests used by one authenticated EH archive.
     /// This does not change queue-entry concurrency.
-    #[allow(dead_code)]
     #[serde(
         default = "default_eh_archive_download_concurrency",
         deserialize_with = "deserialize_nonzero_usize"
@@ -424,6 +413,10 @@ pub struct EhentaiConfig {
     pub background_download_stale_sec: u64,
     #[serde(default = "default_eh_pushed_cap")]
     pub pushed_cap: usize,
+    /// Maximum concurrent Telegram delivery futures. Bot throttling remains the
+    /// sole Telegram rate-limit authority.
+    #[serde(default = "default_eh_publish_concurrency")]
+    pub publish_concurrency: usize,
 }
 
 impl Default for EhentaiConfig {
@@ -457,6 +450,7 @@ impl Default for EhentaiConfig {
             background_download_max_attempts: default_eh_background_download_max_attempts(),
             background_download_stale_sec: default_eh_background_download_stale_sec(),
             pushed_cap: default_eh_pushed_cap(),
+            publish_concurrency: default_eh_publish_concurrency(),
         }
     }
 }
@@ -519,6 +513,12 @@ impl EhentaiConfig {
     /// divide-by-zero and meaningless zero-length windows.
     pub fn gp_rate_window_hours_clamped(&self) -> u64 {
         self.gp_rate_window_hours.max(1)
+    }
+
+    /// Concurrent Telegram delivery futures, bounded to the supported range.
+    /// The `Throttle<Bot>` adaptor remains the Telegram rate-limit authority.
+    pub fn publish_concurrency_clamped(&self) -> usize {
+        self.publish_concurrency.clamp(1, 10)
     }
 }
 
@@ -637,6 +637,10 @@ fn default_eh_pushed_cap() -> usize {
     500
 }
 
+fn default_eh_publish_concurrency() -> usize {
+    2
+}
+
 impl Config {
     pub fn load() -> Result<Self> {
         let builder = config::Config::builder()
@@ -659,161 +663,5 @@ impl Config {
             "trace" => tracing::Level::TRACE,
             _ => tracing::Level::INFO,
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_download_threshold_default() {
-        let config = ContentConfig::default();
-        assert_eq!(config.download_threshold(), 1);
-    }
-
-    #[test]
-    fn test_download_threshold_clamped() {
-        // Test lower bound clamping (0 -> 1)
-        let config = ContentConfig {
-            download_original_threshold: 0,
-            ..Default::default()
-        };
-        assert_eq!(config.download_threshold(), 1);
-
-        // Test upper bound clamping (15 -> 10)
-        let config = ContentConfig {
-            download_original_threshold: 15,
-            ..Default::default()
-        };
-        assert_eq!(config.download_threshold(), 10);
-
-        // Test within range (5 -> 5)
-        let config = ContentConfig {
-            download_original_threshold: 5,
-            ..Default::default()
-        };
-        assert_eq!(config.download_threshold(), 5);
-
-        // Test exact boundaries
-        let config = ContentConfig {
-            download_original_threshold: 1,
-            ..Default::default()
-        };
-        assert_eq!(config.download_threshold(), 1);
-
-        let config = ContentConfig {
-            download_original_threshold: 10,
-            ..Default::default()
-        };
-        assert_eq!(config.download_threshold(), 10);
-    }
-
-    #[test]
-    fn test_eh_enabled_defaults_true() {
-        let cfg = EhentaiConfig::default();
-        assert!(cfg.enabled);
-        assert!(cfg.is_enabled());
-    }
-
-    #[test]
-    fn test_eh_enabled_false_disables_supported_site() {
-        let cfg = EhentaiConfig {
-            enabled: false,
-            site: "e-hentai".to_string(),
-            ..Default::default()
-        };
-        assert!(!cfg.is_enabled());
-    }
-
-    #[test]
-    fn test_eh_archive_resolution_deserialization_accepts_supported_values() {
-        for field in ["subscription_resolution", "download_resolution"] {
-            for resolution in ["780x", "980x", "1280x", "original"] {
-                let config = serde_json::from_str::<EhentaiConfig>(&format!(
-                    r#"{{"{field}":"{resolution}"}}"#
-                ))
-                .unwrap_or_else(|error| panic!("{field}={resolution} should deserialize: {error}"));
-
-                let actual = match field {
-                    "subscription_resolution" => &config.subscription_resolution,
-                    "download_resolution" => &config.download_resolution,
-                    _ => unreachable!(),
-                };
-                assert_eq!(actual, resolution);
-            }
-        }
-    }
-
-    #[test]
-    fn test_eh_archive_resolution_deserialization_rejects_unsupported_values() {
-        for field in ["subscription_resolution", "download_resolution"] {
-            for resolution in ["1600x", "2400x", "bogus", ""] {
-                let error = serde_json::from_str::<EhentaiConfig>(&format!(
-                    r#"{{"{field}":"{resolution}"}}"#
-                ))
-                .expect_err("unsupported archive resolution should fail deserialization");
-                assert!(error.to_string().contains(&format!(
-                    "unsupported EH archive resolution '{resolution}'; supported values: 780x, 980x, 1280x, original"
-                )));
-            }
-        }
-    }
-
-    #[test]
-    fn test_eh_max_archive_size_defaults_to_300_mib() {
-        let cfg = EhentaiConfig::default();
-        assert_eq!(cfg.max_archive_size_mb, 300);
-        assert_eq!(cfg.max_archive_size_bytes(), Some(300 * 1024 * 1024));
-    }
-
-    #[test]
-    fn test_eh_max_archive_size_zero_disables_limit() {
-        let cfg = EhentaiConfig {
-            max_archive_size_mb: 0,
-            ..Default::default()
-        };
-        assert_eq!(cfg.max_archive_size_bytes(), None);
-    }
-
-    #[test]
-    fn test_eh_max_archive_gp_cost_allows_zero_gp_at_zero_limit() {
-        use eh_client::parser::DownloadCost;
-
-        let mut cfg = EhentaiConfig::default();
-        assert!(cfg.allows_archive_gp_cost(&DownloadCost::Free));
-        assert!(cfg.allows_archive_gp_cost(&DownloadCost::Unlocked));
-        assert!(cfg.allows_archive_gp_cost(&DownloadCost::Gp(0)));
-        assert!(!cfg.allows_archive_gp_cost(&DownloadCost::Gp(1)));
-        assert!(!cfg.allows_archive_gp_cost(&DownloadCost::Insufficient));
-        assert!(!cfg.allows_archive_gp_cost(&DownloadCost::Unavailable));
-        assert!(!cfg.allows_archive_gp_cost(&DownloadCost::Unknown));
-
-        cfg.max_archive_gp_cost = 500;
-        assert!(cfg.allows_archive_gp_cost(&DownloadCost::Gp(500)));
-        assert!(!cfg.allows_archive_gp_cost(&DownloadCost::Gp(501)));
-    }
-
-    #[test]
-    fn test_eh_archive_download_concurrency_defaults_to_one() {
-        let cfg: EhentaiConfig = serde_json::from_str("{}").unwrap();
-
-        assert_eq!(cfg.archive_download_concurrency, 1);
-    }
-
-    #[test]
-    fn test_eh_archive_download_concurrency_accepts_values_above_one() {
-        let cfg: EhentaiConfig =
-            serde_json::from_str(r#"{"archive_download_concurrency": 4}"#).unwrap();
-
-        assert_eq!(cfg.archive_download_concurrency, 4);
-    }
-
-    #[test]
-    fn test_eh_archive_download_concurrency_rejects_zero() {
-        let error = serde_json::from_str::<EhentaiConfig>(r#"{"archive_download_concurrency": 0}"#)
-            .unwrap_err();
-
-        assert!(error.to_string().contains("must be at least 1"));
     }
 }

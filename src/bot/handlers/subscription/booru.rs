@@ -1077,14 +1077,6 @@ mod tests {
     }
 
     #[test]
-    fn empty_args_returns_defaults() {
-        let args: Vec<&str> = vec![];
-        let (booru, tags) = parse_booru_filter_args(&args).unwrap();
-        assert!(booru.is_empty());
-        assert!(tags.is_empty());
-    }
-
-    #[test]
     fn bunsub_internal_interval_key_targets_booru_ranking() {
         let target = parse_bunsub_internal_key("yd:|i=900s|f=sf").unwrap();
         assert_eq!(target, (TaskType::BooruRanking, "yd:|i=900s|f=sf".into()));

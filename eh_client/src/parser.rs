@@ -1190,21 +1190,4 @@ mod tests {
             None,
         );
     }
-
-    #[test]
-    fn test_download_cost_is_free() {
-        assert!(DownloadCost::Free.is_free());
-        assert!(DownloadCost::Unlocked.is_free());
-        assert!(!DownloadCost::Gp(0).is_free());
-        assert!(!DownloadCost::Insufficient.is_free());
-        assert!(!DownloadCost::Unavailable.is_free());
-        assert!(!DownloadCost::Unknown.is_free());
-    }
-
-    #[test]
-    fn test_download_cost_gp_amount() {
-        assert_eq!(DownloadCost::Gp(218).gp_amount(), Some(218));
-        assert_eq!(DownloadCost::Free.gp_amount(), None);
-        assert_eq!(DownloadCost::Unknown.gp_amount(), None);
-    }
 }

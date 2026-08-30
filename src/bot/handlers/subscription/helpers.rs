@@ -120,7 +120,10 @@ impl BotHandler {
 
         if task_type == TaskType::Ehentai {
             self.repo
-                .delete_eh_subscription_and_cancel_queue(subscription.id)
+                .delete_eh_subscription_and_cancel_queue(
+                    subscription.id,
+                    self.eh_config.send_archive,
+                )
                 .await
                 .context("Failed to delete EH subscription and cancel queued downloads")?;
         } else {

@@ -16,7 +16,7 @@ use assembly::assemble_parts;
 use coordinator::{MultipartCoordinator, MultipartOutcome};
 pub(crate) use http::archive_http_error;
 use initialization::{initialize_multipart, MultipartInitialization};
-use manifest::{recover_manifest, ManifestRecovery};
+use manifest::{recover_manifest, recover_persisted_download, ManifestRecovery};
 use sequential::download_sequential;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,6 +47,7 @@ pub(crate) async fn download_to_partial(
     download_url: &str,
     artifacts: &ArchiveArtifacts,
     options: ArchiveDownloadOptions,
+    resuming_persisted_manifest: bool,
 ) -> Result<()> {
     let options = options.validate()?;
     let outcome = if tokio::fs::try_exists(artifacts.parts_dir()).await? {
@@ -61,6 +62,7 @@ pub(crate) async fn download_to_partial(
                     manifest,
                     options.max_concurrency,
                     None,
+                    resuming_persisted_manifest,
                 )
                 .await?
                 .run()
@@ -101,6 +103,7 @@ pub(crate) async fn download_to_partial(
                     manifest,
                     options.max_concurrency,
                     Some(seed),
+                    false,
                 )
                 .await?
                 .run()
@@ -146,30 +149,44 @@ pub(crate) async fn download_to_partial(
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+pub(crate) async fn resume_persisted_download_to_partial(
+    http: &reqwest::Client,
+    cookies: &EhCookies,
+    artifacts: &ArchiveArtifacts,
+    options: ArchiveDownloadOptions,
+    max_size_bytes: Option<u64>,
+) -> Result<bool> {
+    let Some((download_url, total_len)) = recover_persisted_download(artifacts).await? else {
+        return Ok(false);
+    };
+    ensure_archive_size_under_limit(total_len, max_size_bytes)?;
+    match download_to_partial(http, cookies, &download_url, artifacts, options, true).await {
+        Ok(()) => Ok(true),
+        Err(error) if is_terminal_persisted_download_rejection(&error) => {
+            artifacts.remove_multipart_state().await?;
+            Ok(false)
+        }
+        Err(error) => Err(error),
+    }
+}
 
-    #[test]
-    fn archive_download_options_default_to_one_and_reject_zero() {
-        assert_eq!(ArchiveDownloadOptions::default().max_concurrency, 1);
+pub(crate) fn ensure_archive_size_under_limit(
+    total_len: u64,
+    max_size_bytes: Option<u64>,
+) -> Result<()> {
+    if let Some(limit) = max_size_bytes.filter(|limit| total_len > *limit) {
+        return Err(Error::Other(format!(
+            "persisted EH archive size {total_len} bytes exceeds configured {limit} byte limit"
+        )));
+    }
+    Ok(())
+}
 
-        let one = ArchiveDownloadOptions { max_concurrency: 1 }
-            .validate()
-            .unwrap();
-        assert_eq!(one.max_concurrency, 1);
-
-        let error = ArchiveDownloadOptions { max_concurrency: 0 }
-            .validate()
-            .unwrap_err();
-        assert_eq!(
-            error.to_string(),
-            "archive download max_concurrency must be at least 1"
-        );
-
-        let three = ArchiveDownloadOptions { max_concurrency: 3 }
-            .validate()
-            .unwrap();
-        assert_eq!(three.max_concurrency, 3);
+fn is_terminal_persisted_download_rejection(error: &Error) -> bool {
+    match error {
+        Error::Api { status, .. } => {
+            (400..500).contains(status) && *status != 408 && *status != 429
+        }
+        _ => false,
     }
 }

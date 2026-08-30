@@ -9,6 +9,7 @@ use crate::bot::link_handler::{
 };
 use crate::bot::notifier::ThrottledBot;
 use crate::bot::BotHandler;
+use crate::db::repo::eh_gallery_jobs::EhGalleryVariant;
 use anyhow::{Context, Result};
 use chrono::Local;
 use regex::Regex;
@@ -95,7 +96,17 @@ impl BotHandler {
                     Ok(m) if !m.is_empty() => m[0].title.clone(),
                     _ => format!("gallery_{}", gid),
                 };
-                if let Err(e) = self
+                let fingerprint = metadata
+                    .as_ref()
+                    .ok()
+                    .and_then(|galleries| galleries.first())
+                    .map(|gallery| gallery.source_fingerprint());
+                let variant = EhGalleryVariant::for_request(
+                    eh_client.is_logged_in(),
+                    crate::db::repo::eh_download_queue::SOURCE_DIRECT,
+                    self.eh_config.as_ref(),
+                );
+                match self
                     .repo
                     .enqueue_eh_download(
                         chat_id.0,
@@ -104,15 +115,26 @@ impl BotHandler {
                         &title,
                         false,
                         crate::db::repo::eh_download_queue::SOURCE_DIRECT,
+                        &variant,
+                        fingerprint.as_deref(),
+                        self.eh_config.send_archive,
                     )
                     .await
                 {
-                    error!("Failed to enqueue eh download from /download: {:#}", e);
-                    bot.send_message(chat_id, "❌ 加入 E-Hentai 下载队列失败")
-                        .await?;
-                } else {
-                    bot.send_message(chat_id, "⏳ 已加入 E-Hentai 下载队列")
-                        .await?;
+                    Ok(Some(_)) => {
+                        bot.send_message(chat_id, "⏳ 已加入 E-Hentai 下载队列")
+                            .await?;
+                    }
+                    Ok(None) => {
+                        error!("Direct EH enqueue from /download returned no delivery");
+                        bot.send_message(chat_id, "❌ 加入 E-Hentai 下载队列失败")
+                            .await?;
+                    }
+                    Err(e) => {
+                        error!("Failed to enqueue eh download from /download: {:#}", e);
+                        bot.send_message(chat_id, "❌ 加入 E-Hentai 下载队列失败")
+                            .await?;
+                    }
                 }
                 return Ok(());
             }

@@ -5,6 +5,7 @@ use crate::db::repo::eh_download_queue::{
     SOURCE_DIRECT, STATUS_CANCELED, STATUS_DONE, STATUS_DOWNLOADED, STATUS_DOWNLOADING,
     STATUS_FAILED, STATUS_PENDING, STATUS_PUBLISHING, STATUS_UPLOADED, STATUS_UPLOADING,
 };
+use crate::db::repo::eh_gallery_jobs::EhGalleryVariant;
 use crate::db::types::{EhFilter, EhTaskKey, TagFilter, TaskType};
 use crate::utils::args;
 use eh_client::EhCategory;
@@ -407,7 +408,13 @@ impl BotHandler {
         };
 
         // Enqueue download
-        if let Err(e) = self
+        let variant = EhGalleryVariant::for_request(
+            eh_client.is_logged_in(),
+            SOURCE_DIRECT,
+            self.eh_config.as_ref(),
+        );
+        let fingerprint = metadata.source_fingerprint();
+        match self
             .repo
             .enqueue_eh_download(
                 chat_id.0,
@@ -416,12 +423,23 @@ impl BotHandler {
                 &metadata.title,
                 telegraph,
                 SOURCE_DIRECT,
+                &variant,
+                Some(&fingerprint),
+                self.eh_config.send_archive,
             )
             .await
         {
-            error!("Failed to enqueue eh download: {:#}", e);
-            let _ = bot.send_message(chat_id, "❌ 加入下载队列失败").await;
-            return Ok(());
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                error!("Direct EH enqueue from /edl returned no delivery");
+                let _ = bot.send_message(chat_id, "❌ 加入下载队列失败").await;
+                return Ok(());
+            }
+            Err(e) => {
+                error!("Failed to enqueue eh download: {:#}", e);
+                let _ = bot.send_message(chat_id, "❌ 加入下载队列失败").await;
+                return Ok(());
+            }
         }
 
         // Delete status message
@@ -535,7 +553,13 @@ impl BotHandler {
         };
 
         // Enqueue download with telegraph=true (processor handles upload)
-        if let Err(e) = self
+        let variant = EhGalleryVariant::for_request(
+            eh_client.is_logged_in(),
+            SOURCE_DIRECT,
+            self.eh_config.as_ref(),
+        );
+        let fingerprint = metadata.source_fingerprint();
+        match self
             .repo
             .enqueue_eh_download(
                 chat_id.0,
@@ -544,12 +568,23 @@ impl BotHandler {
                 &metadata.title,
                 true, // always telegraph
                 SOURCE_DIRECT,
+                &variant,
+                Some(&fingerprint),
+                self.eh_config.send_archive,
             )
             .await
         {
-            error!("Failed to enqueue eh download: {:#}", e);
-            let _ = bot.send_message(chat_id, "❌ 加入下载队列失败").await;
-            return Ok(());
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                error!("Direct EH enqueue from /telegraph returned no delivery");
+                let _ = bot.send_message(chat_id, "❌ 加入下载队列失败").await;
+                return Ok(());
+            }
+            Err(e) => {
+                error!("Failed to enqueue eh download: {:#}", e);
+                let _ = bot.send_message(chat_id, "❌ 加入下载队列失败").await;
+                return Ok(());
+            }
         }
 
         // Delete status message

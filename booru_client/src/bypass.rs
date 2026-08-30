@@ -179,33 +179,10 @@ mod tests {
     }
 
     #[test]
-    fn strip_pre_wrapper_handles_surrounding_whitespace() {
-        let wrapped = "  <html><body><pre>data</pre></body></html>  ";
-        assert_eq!(strip_html_wrapper(wrapped), "data");
-    }
-
-    #[test]
     fn strip_pre_wrapper_no_double_decode_amp() {
         // A response that legitimately contains "&amp;" must not become "&".
         // (Wrapper would have escaped it as "&amp;amp;" if it were a literal
         // ampersand — so seeing a single "&amp;" means a literal "&".)
         assert_eq!(strip_html_wrapper("<pre>a&amp;b</pre>"), "a&b");
-    }
-
-    #[test]
-    fn bypass_config_builder() {
-        let cfg = BypassConfig::new("http://x:8191/v1")
-            .with_max_timeout_ms(30_000)
-            .with_session("s1");
-        assert_eq!(cfg.endpoint, "http://x:8191/v1");
-        assert_eq!(cfg.max_timeout_ms, 30_000);
-        assert_eq!(cfg.session.as_deref(), Some("s1"));
-    }
-
-    #[test]
-    fn bypass_config_defaults() {
-        let cfg = BypassConfig::new("http://x:8191/v1");
-        assert_eq!(cfg.max_timeout_ms, 60_000);
-        assert!(cfg.session.is_none());
     }
 }

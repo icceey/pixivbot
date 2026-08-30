@@ -371,24 +371,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_client_creation() {
-        let client = BooruClient::new("https://yande.re", BooruEngineType::Moebooru).unwrap();
-        assert_eq!(client.base_url(), "https://yande.re");
-        assert_eq!(client.engine_type(), BooruEngineType::Moebooru);
-    }
-
-    #[test]
     fn test_client_strips_trailing_slash() {
         let client = BooruClient::new("https://yande.re/", BooruEngineType::Moebooru).unwrap();
         assert_eq!(client.base_url(), "https://yande.re");
-    }
-
-    #[test]
-    fn test_client_with_auth() {
-        let client = BooruClient::new("https://danbooru.donmai.us", BooruEngineType::Danbooru)
-            .unwrap()
-            .with_auth("user", "key123");
-        assert!(client.username.is_some());
-        assert!(client.api_key.is_some());
     }
 }

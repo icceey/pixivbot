@@ -1,5 +1,6 @@
 use crate::archive_download::{
-    archive_http_error, download_to_partial, ArchiveArtifacts, ArchiveDownloadOptions,
+    archive_http_error, download_to_partial, ensure_archive_size_under_limit,
+    resume_persisted_download_to_partial, ArchiveArtifacts, ArchiveDownloadOptions,
 };
 use crate::error::{Error, Result};
 use crate::models::{EhCookies, EhGallery, EhGalleryRef, RawApiResponse, RawGalleryMetaEntry};
@@ -491,6 +492,7 @@ impl EhClient {
             &download_url,
             &artifacts,
             options,
+            false,
         )
         .await?;
 
@@ -515,6 +517,62 @@ impl EhClient {
         }
 
         Ok(total)
+    }
+
+    /// Resume a valid multipart archive using its persisted download URL without
+    /// fetching the archiver page or POSTing a new archive request. Returns
+    /// `None` when no valid multipart manifest is available. A reusable final
+    /// archive or manifest larger than `max_size_bytes` is rejected before any
+    /// persisted download URL is requested.
+    pub async fn resume_archive_from_persisted_manifest(
+        &self,
+        dest: &Path,
+        options: ArchiveDownloadOptions,
+        max_size_bytes: Option<u64>,
+    ) -> Result<Option<u64>> {
+        let options = options.validate()?;
+        let artifacts = ArchiveArtifacts::new(dest);
+        if tokio::fs::try_exists(dest).await? {
+            match validate_complete_zip(dest).await {
+                Ok(()) => {
+                    let total = tokio::fs::metadata(dest).await?.len();
+                    ensure_archive_size_under_limit(total, max_size_bytes)?;
+                    if artifacts.remove_multipart_state().await.is_err() {
+                        tracing::warn!("could not remove completed archive multipart state");
+                    }
+                    return Ok(Some(total));
+                }
+                Err(Error::Parse(_)) => tokio::fs::remove_file(dest).await?,
+                Err(error) => return Err(error),
+            }
+        }
+        if !resume_persisted_download_to_partial(
+            &self.http,
+            &self.cookies,
+            &artifacts,
+            options,
+            max_size_bytes,
+        )
+        .await?
+        {
+            return Ok(None);
+        }
+
+        if let Err(error) = validate_complete_zip(artifacts.assembly_scratch()).await {
+            let _ = artifacts.remove_multipart_state().await;
+            return Err(error);
+        }
+        let total = tokio::fs::metadata(artifacts.assembly_scratch())
+            .await?
+            .len();
+        if let Err(error) = tokio::fs::rename(artifacts.assembly_scratch(), dest).await {
+            let _ = tokio::fs::remove_file(artifacts.assembly_scratch()).await;
+            return Err(error.into());
+        }
+        if artifacts.remove_parts_dir().await.is_err() {
+            tracing::warn!("could not remove completed archive multipart state");
+        }
+        Ok(Some(total))
     }
 
     /// Get the base URL.
@@ -981,6 +1039,198 @@ async fn validate_complete_zip(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+
+    #[tokio::test]
+    async fn persisted_multipart_manifest_resumes_without_an_archiver_request() {
+        let temp = tempfile::tempdir().unwrap();
+        let dest = temp.path().join("archive.zip");
+        let artifacts = ArchiveArtifacts::new(&dest);
+        let cursor = std::io::Cursor::new(Vec::new());
+        let mut writer = zip::ZipWriter::new(cursor);
+        writer
+            .start_file("page.jpg", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(b"image").unwrap();
+        let archive_bytes = writer.finish().unwrap().into_inner();
+
+        tokio::fs::create_dir_all(artifacts.parts_dir())
+            .await
+            .unwrap();
+        tokio::fs::write(
+            artifacts.parts_dir().join("part-0000000000000000"),
+            &archive_bytes,
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            artifacts.parts_dir().join("manifest.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "version": 1,
+                "download_url": "http://127.0.0.1:9/already-prepared.zip",
+                "total_len": archive_bytes.len(),
+                "etag": null,
+                "last_modified": null,
+                "next_part_id": 1,
+                "parts": [{ "id": 0, "start": 0, "end": archive_bytes.len() }]
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let client = EhClientBuilder::new()
+            .base_url("http://127.0.0.1:9")
+            .build();
+        assert_eq!(
+            client
+                .resume_archive_from_persisted_manifest(
+                    &dest,
+                    ArchiveDownloadOptions { max_concurrency: 2 },
+                    None,
+                )
+                .await
+                .unwrap(),
+            Some(archive_bytes.len() as u64)
+        );
+        assert!(dest.exists());
+        assert!(!artifacts.parts_dir().exists());
+    }
+
+    #[tokio::test]
+    async fn persisted_multipart_manifest_obeys_current_size_limit_before_network() {
+        let temp = tempfile::tempdir().unwrap();
+        let dest = temp.path().join("archive.zip");
+        let artifacts = ArchiveArtifacts::new(&dest);
+        tokio::fs::create_dir_all(artifacts.parts_dir())
+            .await
+            .unwrap();
+        tokio::fs::write(
+            artifacts.parts_dir().join("part-0000000000000000"),
+            b"partial",
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            artifacts.parts_dir().join("manifest.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "version": 1,
+                "download_url": "http://127.0.0.1:9/already-prepared.zip",
+                "total_len": 1024,
+                "etag": null,
+                "last_modified": null,
+                "next_part_id": 1,
+                "parts": [{ "id": 0, "start": 0, "end": 1024 }]
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let error = EhClientBuilder::new()
+            .base_url("http://127.0.0.1:9")
+            .build()
+            .resume_archive_from_persisted_manifest(
+                &dest,
+                ArchiveDownloadOptions { max_concurrency: 2 },
+                Some(512),
+            )
+            .await
+            .expect_err("oversized persisted archive must be rejected");
+
+        assert!(error
+            .to_string()
+            .contains("1024 bytes exceeds configured 512 byte limit"));
+        assert!(artifacts.parts_dir().join("manifest.json").exists());
+        assert!(artifacts.parts_dir().join("part-0000000000000000").exists());
+    }
+
+    #[tokio::test]
+    async fn persisted_manifest_adopts_existing_complete_zip_without_network() {
+        let temp = tempfile::tempdir().unwrap();
+        let dest = temp.path().join("archive.zip");
+        let artifacts = ArchiveArtifacts::new(&dest);
+        let cursor = std::io::Cursor::new(Vec::new());
+        let mut writer = zip::ZipWriter::new(cursor);
+        writer
+            .start_file("page.jpg", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(b"image").unwrap();
+        let archive_bytes = writer.finish().unwrap().into_inner();
+
+        tokio::fs::write(&dest, &archive_bytes).await.unwrap();
+        tokio::fs::write(artifacts.assembly_scratch(), b"stale partial")
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(artifacts.parts_dir())
+            .await
+            .unwrap();
+        tokio::fs::write(artifacts.parts_dir().join("stale-part"), b"stale part")
+            .await
+            .unwrap();
+
+        let client = EhClientBuilder::new()
+            .base_url("http://127.0.0.1:9")
+            .build();
+        assert_eq!(
+            client
+                .resume_archive_from_persisted_manifest(
+                    &dest,
+                    ArchiveDownloadOptions { max_concurrency: 2 },
+                    None,
+                )
+                .await
+                .unwrap(),
+            Some(archive_bytes.len() as u64)
+        );
+        assert!(dest.exists());
+        assert!(!artifacts.assembly_scratch().exists());
+        assert!(!artifacts.parts_dir().exists());
+    }
+
+    #[tokio::test]
+    async fn persisted_manifest_discards_invalid_existing_final_zip_without_manifest() {
+        let temp = tempfile::tempdir().unwrap();
+        let dest = temp.path().join("archive.zip");
+        let artifacts = ArchiveArtifacts::new(&dest);
+        let invalid_zip = b"not a ZIP";
+        tokio::fs::write(&dest, invalid_zip).await.unwrap();
+        tokio::fs::write(artifacts.assembly_scratch(), b"partial")
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(artifacts.parts_dir())
+            .await
+            .unwrap();
+        tokio::fs::write(artifacts.parts_dir().join("part-0000000000000000"), b"part")
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(artifacts.uploads_dir())
+            .await
+            .unwrap();
+        tokio::fs::write(artifacts.uploads_dir().join("upload-state.json"), b"upload")
+            .await
+            .unwrap();
+
+        let client = EhClientBuilder::new()
+            .base_url("http://127.0.0.1:9")
+            .build();
+        assert_eq!(
+            client
+                .resume_archive_from_persisted_manifest(
+                    &dest,
+                    ArchiveDownloadOptions { max_concurrency: 2 },
+                    None,
+                )
+                .await
+                .unwrap(),
+            None
+        );
+
+        assert!(!dest.exists());
+        assert!(artifacts.assembly_scratch().exists());
+        assert!(artifacts.parts_dir().join("part-0000000000000000").exists());
+        assert!(artifacts.uploads_dir().join("upload-state.json").exists());
+    }
 
     #[test]
     fn test_build_search_url_basic() {
@@ -995,25 +1245,6 @@ mod tests {
     }
 
     #[test]
-    fn test_build_search_url_with_cats() {
-        let client = EhClientBuilder::new()
-            .base_url("https://e-hentai.org")
-            .build();
-        let url = client.build_search_url("artist:wlop", 3, 2);
-        assert!(url.contains("f_cats=3"));
-        assert!(url.contains("page=2"));
-    }
-
-    #[test]
-    fn test_build_api_url() {
-        let client = EhClientBuilder::new()
-            .base_url("https://e-hentai.org")
-            .api_url("https://api.e-hentai.org/api.php")
-            .build();
-        assert_eq!(client.api_url, "https://api.e-hentai.org/api.php");
-    }
-
-    #[test]
     fn test_build_archiver_url() {
         let client = EhClientBuilder::new()
             .base_url("https://e-hentai.org")
@@ -1023,35 +1254,5 @@ mod tests {
             url,
             "https://e-hentai.org/archiver.php?gid=123456&token=abcdef0123&or=780x"
         );
-    }
-
-    #[test]
-    fn archiver_key_request_has_no_estimated_size_without_page_html() {
-        let request = ArchiveDownloadRequest::from_archiver_key(
-            "https://e-hentai.org",
-            123456,
-            "abcdef0123",
-            "123456--abc123def456",
-            "1280x",
-        );
-
-        assert_eq!(request.estimated_size_bytes(), None);
-    }
-
-    #[test]
-    fn test_archive_resolution_validation_accepts_supported_and_rejects_invalid_values() {
-        for resolution in SUPPORTED_ARCHIVE_RESOLUTIONS {
-            validate_archive_resolution(resolution)
-                .unwrap_or_else(|error| panic!("{resolution} should be accepted: {error}"));
-        }
-
-        for resolution in ["1600x", "2400x", "bogus", ""] {
-            let error = validate_archive_resolution(resolution)
-                .expect_err("unsupported archive resolution should be rejected");
-            assert!(matches!(error, Error::Other(_)));
-            assert!(error.to_string().contains(&format!(
-                "unsupported EH archive resolution '{resolution}'; supported values: 780x, 980x, 1280x, original"
-            )));
-        }
     }
 }

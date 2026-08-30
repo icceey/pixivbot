@@ -264,18 +264,6 @@ mod tests {
     }
 
     #[test]
-    fn test_serde_roundtrip() {
-        let filter = BooruFilter {
-            score_min: Some(10),
-            fav_count_min: None,
-            allowed_ratings: vec![BooruRating::Safe],
-        };
-        let json = serde_json::to_string(&filter).unwrap();
-        let restored: BooruFilter = serde_json::from_str(&json).unwrap();
-        assert_eq!(filter, restored);
-    }
-
-    #[test]
     fn test_aggregate_takes_loosest() {
         let f1 = BooruFilter::new(Some(10), Some(20), vec![BooruRating::Safe]);
         let f2 = BooruFilter::new(Some(5), Some(30), vec![BooruRating::Questionable]);

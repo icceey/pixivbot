@@ -34,6 +34,7 @@ pub(super) struct MultipartCoordinator {
     samples_tx: mpsc::UnboundedSender<PartSampleEvent>,
     samples_rx: mpsc::UnboundedReceiver<PartSampleEvent>,
     max_concurrency: usize,
+    resuming_persisted_manifest: bool,
     initial_downloaded: u64,
     started_at: Instant,
 }
@@ -72,6 +73,7 @@ impl MultipartCoordinator {
             self.url.clone(),
             self.manifest.total_len,
             self.validator.clone(),
+            self.resuming_persisted_manifest,
             part,
             part_path,
             attempts_used,
@@ -277,6 +279,7 @@ mod tests {
             manifest,
             2,
             None,
+            false,
         )
         .await
         .unwrap();

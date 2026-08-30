@@ -62,6 +62,15 @@ pub struct EhGallery {
     pub tags: Vec<String>,
 }
 
+impl EhGallery {
+    pub fn source_fingerprint(&self) -> String {
+        format!(
+            "{}|{}|{}|{}",
+            self.posted, self.filecount, self.filesize, self.expunged
+        )
+    }
+}
+
 /// E-hentai gallery categories with their bitmask values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EhCategory {
@@ -233,5 +242,6 @@ mod tests {
         assert_eq!(g.posted, 1376143500);
         assert_eq!(g.filecount, 20);
         assert!((g.rating - 4.64).abs() < 0.001);
+        assert_eq!(g.source_fingerprint(), "1376143500|20|51210504|false");
     }
 }

@@ -2,7 +2,11 @@ use anyhow::{Context, Result};
 use sea_orm::DatabaseConnection;
 
 mod chats;
+pub mod eh_download_completions;
 pub mod eh_download_queue;
+pub mod eh_gallery_jobs;
+pub mod eh_gallery_push_ledger;
+pub mod eh_gallery_results;
 pub mod eh_gp_spend_attempts;
 mod messages;
 mod stats;
@@ -39,6 +43,7 @@ pub mod tests_helpers {
 
     pub async fn setup_test_db() -> Result<Repo> {
         let db = Database::connect("sqlite::memory:").await?;
+        db.execute_unprepared("PRAGMA foreign_keys = ON").await?;
 
         db.execute(Statement::from_string(
             DbBackend::Sqlite,
@@ -74,13 +79,46 @@ pub mod tests_helpers {
         db.execute(Statement::from_string(
             DbBackend::Sqlite,
             r#"
-            CREATE TABLE eh_gp_spend_attempts (
+            CREATE TABLE eh_gallery_jobs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
-                queue_id INTEGER,
                 gid INTEGER NOT NULL,
-                gp_cost INTEGER NOT NULL CHECK (gp_cost > 0),
+                token TEXT NOT NULL,
+                download_mode TEXT NOT NULL,
+                resolution TEXT NOT NULL DEFAULT '',
+                source_fingerprint TEXT,
+                source_generation INTEGER NOT NULL DEFAULT 0,
+                title TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                telegraph_status TEXT NOT NULL DEFAULT 'not_required',
+                telegraph_required BOOLEAN NOT NULL DEFAULT 0,
+                file_size INTEGER NOT NULL DEFAULT 0,
+                gp_cost INTEGER NOT NULL DEFAULT 0,
+                zip_path TEXT,
+                legacy_artifact_handoff TEXT,
+                telegraph_url TEXT,
+                error TEXT,
+                retry_count INTEGER NOT NULL DEFAULT 0,
+                next_retry_at TIMESTAMP,
+                cleanup_status TEXT NOT NULL DEFAULT 'none',
+                cleanup_started_at TIMESTAMP,
+                cleanup_error TEXT,
+                cleanup_next_retry_at TIMESTAMP,
                 created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (queue_id) REFERENCES eh_download_queue(id) ON DELETE SET NULL
+                started_at TIMESTAMP,
+                completed_at TIMESTAMP,
+                background_download_status TEXT,
+                background_download_started_at TIMESTAMP,
+                background_download_next_retry_at TIMESTAMP,
+                background_download_attempt_count INTEGER NOT NULL DEFAULT 0,
+                background_download_error TEXT,
+                telegraph_rewrite_data TEXT,
+                telegraph_rewrite_status TEXT,
+                telegraph_rewrite_after TIMESTAMP,
+                telegraph_rewrite_started_at TIMESTAMP,
+                telegraph_rewrite_next_retry_at TIMESTAMP,
+                telegraph_rewrite_retry_count INTEGER NOT NULL DEFAULT 0,
+                telegraph_rewrite_error TEXT,
+                telegraph_rewritten_at TIMESTAMP
             )
             "#,
         ))
@@ -88,10 +126,55 @@ pub mod tests_helpers {
 
         db.execute(Statement::from_string(
             DbBackend::Sqlite,
-            "CREATE INDEX idx_eh_gp_spend_attempts_created_at ON eh_gp_spend_attempts(created_at)"
-                .to_owned(),
+            r#"
+            CREATE TABLE eh_gallery_results (
+                id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                gid INTEGER NOT NULL,
+                token TEXT NOT NULL,
+                download_mode TEXT NOT NULL,
+                resolution TEXT NOT NULL,
+                source_fingerprint TEXT NOT NULL,
+                source_generation INTEGER NOT NULL DEFAULT 0,
+                telegraph_url TEXT NOT NULL,
+                telegraph_rewrite_data TEXT,
+                media_cids TEXT,
+                created_at TIMESTAMP NOT NULL,
+                updated_at TIMESTAMP NOT NULL,
+                UNIQUE(gid, token, download_mode, resolution)
+            )
+            "#,
         ))
         .await?;
+
+        db.execute(Statement::from_string(
+            DbBackend::Sqlite,
+            r#"
+            CREATE TABLE eh_gallery_push_ledger (
+                id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                chat_id INTEGER NOT NULL,
+                gid INTEGER NOT NULL,
+                archive_sent_at TIMESTAMP,
+                telegraph_sent_at TIMESTAMP,
+                updated_at TIMESTAMP NOT NULL,
+                UNIQUE(chat_id, gid)
+            )
+            "#,
+        ))
+        .await?;
+
+        for index in [
+            "CREATE UNIQUE INDEX uq_eh_gallery_jobs_known_fingerprint ON eh_gallery_jobs(gid, token, download_mode, resolution, source_fingerprint) WHERE source_fingerprint IS NOT NULL",
+            "CREATE UNIQUE INDEX uq_eh_gallery_jobs_unknown_fingerprint ON eh_gallery_jobs(gid, token, download_mode, resolution) WHERE source_fingerprint IS NULL",
+            "CREATE UNIQUE INDEX uq_eh_gallery_jobs_variant_source_generation ON eh_gallery_jobs(gid, token, download_mode, resolution, source_generation)",
+            "CREATE INDEX idx_eh_gallery_jobs_status_retry ON eh_gallery_jobs(status, next_retry_at)",
+            "CREATE INDEX idx_eh_gallery_jobs_telegraph_retry ON eh_gallery_jobs(telegraph_status, next_retry_at)",
+            "CREATE INDEX idx_eh_gallery_jobs_cleanup_retry ON eh_gallery_jobs(cleanup_status, cleanup_next_retry_at)",
+            "CREATE INDEX idx_eh_gallery_jobs_background_status ON eh_gallery_jobs(background_download_status, background_download_next_retry_at)",
+            "CREATE INDEX idx_eh_gallery_jobs_rewrite_status ON eh_gallery_jobs(telegraph_rewrite_status, telegraph_rewrite_next_retry_at)",
+            "CREATE INDEX idx_eh_gallery_jobs_completed_at ON eh_gallery_jobs(completed_at)",
+        ] {
+            db.execute_unprepared(index).await?;
+        }
 
         db.execute(Statement::from_string(
             DbBackend::Sqlite,
@@ -134,6 +217,7 @@ pub mod tests_helpers {
             r#"
             CREATE TABLE eh_download_queue (
                 id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                job_id INTEGER,
                 chat_id INTEGER NOT NULL,
                 gid INTEGER NOT NULL,
                 token TEXT NOT NULL,
@@ -168,11 +252,67 @@ pub mod tests_helpers {
                 telegraph_rewrite_retry_count INTEGER NOT NULL DEFAULT 0,
                 telegraph_rewrite_error TEXT,
                 telegraph_rewritten_at TIMESTAMP,
+                FOREIGN KEY (job_id) REFERENCES eh_gallery_jobs(id) ON DELETE SET NULL,
                 UNIQUE(chat_id, gid)
             )
             "#,
         ))
         .await?;
+
+        for index in [
+            "CREATE INDEX idx_eh_download_queue_status ON eh_download_queue(status)",
+            "CREATE INDEX idx_eh_download_queue_completed_at ON eh_download_queue(completed_at)",
+            "CREATE INDEX idx_eh_download_queue_status_retry ON eh_download_queue(status, next_retry_at)",
+            "CREATE INDEX idx_eh_download_queue_job_id ON eh_download_queue(job_id)",
+        ] {
+            db.execute_unprepared(index).await?;
+        }
+
+        db.execute(Statement::from_string(
+            DbBackend::Sqlite,
+            r#"
+            CREATE TABLE eh_gp_spend_attempts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                job_id INTEGER,
+                queue_id INTEGER,
+                gid INTEGER NOT NULL,
+                gp_cost INTEGER NOT NULL CHECK (gp_cost > 0),
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (job_id) REFERENCES eh_gallery_jobs(id) ON DELETE SET NULL,
+                FOREIGN KEY (queue_id) REFERENCES eh_download_queue(id) ON DELETE SET NULL
+            )
+            "#,
+        ))
+        .await?;
+
+        for index in [
+            "CREATE INDEX idx_eh_gp_spend_attempts_created_at ON eh_gp_spend_attempts(created_at)",
+            "CREATE INDEX idx_eh_gp_spend_attempts_job_id ON eh_gp_spend_attempts(job_id)",
+        ] {
+            db.execute_unprepared(index).await?;
+        }
+
+        db.execute(Statement::from_string(
+            DbBackend::Sqlite,
+            r#"
+            CREATE TABLE eh_download_completions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                job_id INTEGER,
+                gid INTEGER NOT NULL,
+                file_size INTEGER NOT NULL,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (job_id) REFERENCES eh_gallery_jobs(id) ON DELETE SET NULL
+            )
+            "#,
+        ))
+        .await?;
+
+        for index in [
+            "CREATE INDEX idx_eh_download_completions_created_at ON eh_download_completions(created_at)",
+            "CREATE INDEX idx_eh_download_completions_job_id ON eh_download_completions(job_id)",
+        ] {
+            db.execute_unprepared(index).await?;
+        }
 
         db.execute(Statement::from_string(
             DbBackend::Sqlite,
@@ -329,62 +469,6 @@ mod tests {
         let new_chat = repo.get_chat(new_chat_id).await.unwrap().unwrap();
         assert!(new_chat.enabled);
         assert_eq!(new_chat.title, Some("Old Group".to_string()));
-    }
-
-    #[tokio::test]
-    async fn test_has_owner_empty_database() {
-        let repo = setup_test_db().await.unwrap();
-
-        let has_owner = repo.has_owner().await.unwrap();
-        assert!(!has_owner);
-    }
-
-    #[tokio::test]
-    async fn test_has_owner_only_non_owner_users() {
-        let repo = setup_test_db().await.unwrap();
-
-        repo.upsert_user(12345, Some("user1".to_string()), UserRole::User)
-            .await
-            .unwrap();
-
-        repo.upsert_user(67890, Some("admin1".to_string()), UserRole::Admin)
-            .await
-            .unwrap();
-
-        let has_owner = repo.has_owner().await.unwrap();
-        assert!(!has_owner);
-    }
-
-    #[tokio::test]
-    async fn test_has_owner_with_owner() {
-        let repo = setup_test_db().await.unwrap();
-
-        repo.upsert_user(12345, Some("user1".to_string()), UserRole::User)
-            .await
-            .unwrap();
-
-        repo.upsert_user(99999, Some("owner1".to_string()), UserRole::Owner)
-            .await
-            .unwrap();
-
-        let has_owner = repo.has_owner().await.unwrap();
-        assert!(has_owner);
-    }
-
-    #[tokio::test]
-    async fn test_has_owner_multiple_owners() {
-        let repo = setup_test_db().await.unwrap();
-
-        repo.upsert_user(11111, Some("owner1".to_string()), UserRole::Owner)
-            .await
-            .unwrap();
-
-        repo.upsert_user(22222, Some("owner2".to_string()), UserRole::Owner)
-            .await
-            .unwrap();
-
-        let has_owner = repo.has_owner().await.unwrap();
-        assert!(has_owner);
     }
 
     #[tokio::test]

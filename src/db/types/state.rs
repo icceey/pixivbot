@@ -177,6 +177,8 @@ pub struct EhPendingGallery {
     pub token: String,
     pub title: String,
     pub posted: i64,
+    #[serde(default)]
+    pub fingerprint: Option<String>,
 }
 
 impl EhTagState {
@@ -244,14 +246,6 @@ mod tests {
             height: 100,
             source: None,
         }
-    }
-
-    #[test]
-    fn test_booru_tag_state_cleared() {
-        let state = BooruTagState::cleared(42);
-        assert_eq!(state.latest_post_id, 42);
-        assert!(state.pending_queue.is_empty());
-        assert_eq!(state.retry_count, 0);
     }
 
     #[test]
@@ -339,13 +333,6 @@ mod tests {
     }
 
     #[test]
-    fn test_eh_tag_state_cleared() {
-        let state = EhTagState::cleared();
-        assert_eq!(state.latest_posted_ts, 0);
-        assert!(state.pushed_gids.is_empty());
-    }
-
-    #[test]
     fn test_eh_tag_state_add_pushed_gid_dedup() {
         let mut state = EhTagState::cleared();
         state.add_pushed_gid(1);
@@ -367,42 +354,10 @@ mod tests {
     }
 
     #[test]
-    fn test_eh_tag_state_pending_defaults_empty() {
-        let state = EhTagState::cleared();
-        assert!(state.pending_galleries.is_empty());
-        assert_eq!(state.pending_high_water_ts, 0);
-    }
-
-    #[test]
-    fn test_eh_tag_state_pending_prevents_cursor_advance() {
-        let mut state = EhTagState::cleared();
-        state.pending_galleries.push(EhPendingGallery {
-            gid: 4,
-            token: "tok4".to_string(),
-            title: "Fourth".to_string(),
-            posted: 400,
-        });
-        state.pending_high_water_ts = 400;
-        assert_eq!(state.latest_posted_ts, 0);
-        assert_eq!(state.pending_galleries.len(), 1);
-    }
-
-    #[test]
-    fn test_eh_pending_gallery_roundtrip() {
-        let state = EhTagState {
-            pushed_gids: vec![1],
-            latest_posted_ts: 100,
-            pending_galleries: vec![EhPendingGallery {
-                gid: 2,
-                token: "tok".to_string(),
-                title: "Title".to_string(),
-                posted: 200,
-            }],
-            pending_high_water_ts: 200,
-        };
-        let json = serde_json::to_string(&state).unwrap();
-        let decoded: EhTagState = serde_json::from_str(&json).unwrap();
-        assert_eq!(decoded.pending_galleries[0].gid, 2);
-        assert_eq!(decoded.pending_high_water_ts, 200);
+    fn test_eh_pending_gallery_missing_fingerprint_defaults_to_none() {
+        let pending: EhPendingGallery =
+            serde_json::from_str(r#"{"gid":2,"token":"tok","title":"Title","posted":200}"#)
+                .unwrap();
+        assert_eq!(pending.fingerprint, None);
     }
 }

@@ -276,60 +276,8 @@ async fn main() -> Result<()> {
     let eh_telegraph_rewrite_enabled =
         telegraph_client.is_some() && eh_telegraph_rewrite_config.is_some();
 
-    // Reset stale EH entries before spawning workers (crash recovery for all stages)
-    if eh_client.is_some() {
-        if let Err(e) = repo.reset_stale_eh_downloads().await {
-            tracing::warn!("Failed to reset stale EH entries: {:#}", e);
-        }
-        if eh_telegraph_rewrite_enabled {
-            if let Err(e) = repo
-                .reset_stale_eh_telegraph_rewrites(
-                    config.ehentai.background_download_stale_sec as i64,
-                )
-                .await
-            {
-                tracing::warn!("Failed to reset stale EH Telegraph rewrites: {:#}", e);
-            }
-        }
-        if config.ehentai.background_download_enabled {
-            if let Err(e) = repo
-                .reset_stale_background_downloads(config.ehentai.background_download_stale_sec)
-                .await
-            {
-                tracing::warn!("Failed to reset stale EH background downloads: {:#}", e);
-            }
-        } else if let Err(e) = repo.release_background_downloads_to_main_queue().await {
-            tracing::warn!(
-                "Failed to release EH background downloads to main queue: {:#}",
-                e
-            );
-        }
-        match repo.cancel_legacy_eh_subscription_queue_entries().await {
-            Ok(count) if count > 0 => warn!(
-                "Canceled {} legacy EH subscription queue entries without owner tracking",
-                count
-            ),
-            Ok(_) => {}
-            Err(e) => tracing::warn!(
-                "Failed to cancel legacy EH subscription queue entries without owner tracking: {:#}",
-                e
-            ),
-        }
-        if telegraph_client.is_none() {
-            match repo.disable_eh_telegraph_for_unuploaded_entries().await {
-                Ok(count) if count > 0 => warn!(
-                    "Disabled Telegraph delivery for {} EH queue entries because no telegraph token is configured",
-                    count
-                ),
-                Ok(_) => {}
-                Err(e) => tracing::warn!(
-                    "Failed to disable unuploaded EH Telegraph entries without token: {:#}",
-                    e
-                ),
-            }
-        }
-    }
-
+    // The provider Abort capability must exist before startup takes ownership
+    // of orphaned or durable cleanup generations.
     let eh_image_uploader = if should_build_eh_image_uploader(
         eh_client.is_some(),
         telegraph_client.is_some(),
@@ -347,6 +295,80 @@ async fn main() -> Result<()> {
     } else {
         None
     };
+    let eh_cache_dir = std::path::PathBuf::from(&config.scheduler.cache_dir);
+
+    // Startup ownership order is strict: recover durable claims, preserve every
+    // persisted job family during orphan cleanup, drain due cleanup, then make
+    // configuration-specific state changes before spawning workers.
+    if eh_client.is_some() {
+        if let Err(e) = repo
+            .reset_stale_eh_shared_work(
+                config.ehentai.background_download_stale_sec,
+                config.ehentai.background_download_stale_sec as i64,
+            )
+            .await
+        {
+            tracing::warn!("Failed to reset stale shared EH work: {:#}", e);
+        }
+        if let Err(e) = repo
+            .reconcile_eh_shared_job_liveness(config.ehentai.send_archive)
+            .await
+        {
+            tracing::warn!("Failed to reconcile shared EH job liveness: {:#}", e);
+        }
+        if let Err(e) = repo
+            .handoff_legacy_eh_archive_artifacts(&eh_cache_dir.join("eh_cache"))
+            .await
+        {
+            tracing::warn!("Failed to hand off legacy EH archive families: {:#}", e);
+        }
+        if let Err(e) = repo
+            .cleanup_eh_cache_orphans(
+                &eh_cache_dir.join("eh_cache"),
+                eh_startup_abort_uploader.as_deref(),
+            )
+            .await
+        {
+            tracing::warn!(
+                "Failed to cleanup orphaned shared EH cache families: {:#}",
+                e
+            );
+        }
+        if let Err(e) = scheduler::drain_eh_job_cleanup_maintenance(
+            repo.as_ref(),
+            eh_startup_abort_uploader.as_deref(),
+            config.ehentai.download_poll_interval_sec as i64,
+            config.ehentai.send_archive,
+        )
+        .await
+        {
+            tracing::warn!("Failed to drain shared EH artifact cleanup: {:#}", e);
+        }
+        if !config.ehentai.background_download_enabled {
+            if let Err(e) = repo
+                .release_eh_job_background_downloads_to_main_queue()
+                .await
+            {
+                tracing::warn!(
+                    "Failed to release shared EH background downloads to main queue: {:#}",
+                    e
+                );
+            }
+        }
+        if telegraph_client.is_none() {
+            match repo.disable_eh_telegraph_for_unuploaded_jobs().await {
+                Ok(count) if count > 0 => warn!(
+                    "Disabled Telegraph upload requirement for {} shared EH jobs because no telegraph token is configured",
+                    count
+                ),
+                Ok(_) => {}
+                Err(e) => tracing::warn!(
+                    "Failed to disable unclaimed shared EH Telegraph jobs without token: {:#}",
+                    e
+                ),
+            }
+        }
+    }
 
     let eh_engine_handle = if let Some(ref eh_client) = eh_client {
         let eh_engine = scheduler::EhEngine::new(
@@ -363,8 +385,6 @@ async fn main() -> Result<()> {
     } else {
         None
     };
-
-    let eh_cache_dir = std::path::PathBuf::from(&config.scheduler.cache_dir);
 
     let eh_download_worker_handle = if let Some(ref eh_client) = eh_client {
         let worker = scheduler::EhDownloadWorker::new(
@@ -448,6 +468,7 @@ async fn main() -> Result<()> {
                 let worker = scheduler::EhTelegraphRewriteWorker::new(
                     repo.clone(),
                     std::sync::Arc::clone(telegraph),
+                    config.ehentai.send_archive,
                     std::sync::Arc::new(config.ehentai.clone()),
                 );
                 info!("✅ E-Hentai Telegraph rewrite worker initialized");
@@ -483,6 +504,7 @@ async fn main() -> Result<()> {
     let log_dir_for_bot = config.logging.dir.clone();
     let booru_registry_for_bot = booru_registry.clone();
     let eh_client_for_bot = eh_client.clone();
+    let eh_config_for_bot = std::sync::Arc::new(config.ehentai.clone());
     let has_telegraph_for_bot = telegraph_client.is_some();
     let bot_handle = tokio::spawn(async move {
         if let Err(e) = bot::run(
@@ -498,6 +520,7 @@ async fn main() -> Result<()> {
             log_dir_for_bot,
             booru_registry_for_bot,
             eh_client_for_bot,
+            eh_config_for_bot,
             has_telegraph_for_bot,
         )
         .await

@@ -1,11 +1,19 @@
 //! Integration tests for e-hentai DB layer: full download queue lifecycle,
 //! upsert_eh_subscription, and EhFilter/EhTaskKey roundtrip with DB.
 
+use crate::db::repo::eh_gallery_jobs::{
+    EhGalleryVariant, CLEANUP_STATUS_FAILED, DELIVERY_STATUS_FAILED, DELIVERY_STATUS_WAITING,
+    JOB_STATUS_DOWNLOADED, JOB_STATUS_DOWNLOADING, JOB_STATUS_FAILED, JOB_STATUS_PENDING,
+    JOB_STATUS_RETIRED, TELEGRAPH_STATUS_READY, TELEGRAPH_STATUS_UPLOADING,
+};
 use crate::db::repo::tests_helpers;
 use crate::db::types::{EhFilter, EhTagState, EhTaskKey, SubscriptionState, TagFilter, TaskType};
-use crate::db::{entities::eh_download_queue, repo::eh_download_queue::*};
+use crate::db::{
+    entities::{eh_download_queue, eh_gallery_jobs},
+    repo::eh_download_queue::*,
+};
 use chrono::{Duration, NaiveDate};
-use sea_orm::{ActiveModelTrait, Set};
+use sea_orm::{ActiveModelTrait, EntityTrait, Set};
 
 #[tokio::test]
 async fn test_eh_queue_status_snapshot_scopes_orders_and_selects_recent_terminal() {
@@ -18,26 +26,122 @@ async fn test_eh_queue_status_snapshot_scopes_orders_and_selects_recent_terminal
         .and_hms_opt(0, 0, 0)
         .unwrap();
 
-    for (gid, status, background_download_status, created_at_seconds) in [
-        (101, STATUS_PENDING, None, 1),
-        (102, STATUS_DOWNLOADING, None, 2),
-        (103, STATUS_DOWNLOADED, None, 3),
-        (104, STATUS_UPLOADING, None, 4),
-        (105, STATUS_UPLOADED, None, 5),
-        (106, STATUS_PUBLISHING, None, 6),
-        (107, STATUS_PENDING, Some(BACKGROUND_STATUS_PENDING), 7),
-        (108, STATUS_PENDING, Some(BACKGROUND_STATUS_RUNNING), 8),
+    for (
+        gid,
+        telegraph,
+        job_status,
+        telegraph_status,
+        background_download_status,
+        delivery_status,
+        created_at_seconds,
+    ) in [
+        (
+            101,
+            false,
+            JOB_STATUS_PENDING,
+            None,
+            None,
+            STATUS_WAITING,
+            1,
+        ),
+        (
+            102,
+            false,
+            JOB_STATUS_DOWNLOADING,
+            None,
+            None,
+            STATUS_WAITING,
+            2,
+        ),
+        (
+            103,
+            false,
+            JOB_STATUS_DOWNLOADED,
+            None,
+            None,
+            STATUS_WAITING,
+            3,
+        ),
+        (
+            104,
+            true,
+            JOB_STATUS_DOWNLOADED,
+            Some(TELEGRAPH_STATUS_UPLOADING),
+            None,
+            STATUS_WAITING,
+            4,
+        ),
+        (
+            105,
+            true,
+            JOB_STATUS_DOWNLOADED,
+            Some(TELEGRAPH_STATUS_READY),
+            None,
+            STATUS_WAITING,
+            5,
+        ),
+        (
+            106,
+            false,
+            JOB_STATUS_PENDING,
+            None,
+            None,
+            STATUS_PUBLISHING,
+            6,
+        ),
+        (
+            107,
+            false,
+            JOB_STATUS_PENDING,
+            None,
+            Some(BACKGROUND_STATUS_PENDING),
+            STATUS_WAITING,
+            7,
+        ),
+        (
+            108,
+            false,
+            JOB_STATUS_PENDING,
+            None,
+            Some(BACKGROUND_STATUS_RUNNING),
+            STATUS_WAITING,
+            8,
+        ),
     ] {
         let title = format!("Gallery {gid}");
         let model = repo
-            .enqueue_eh_download(CURRENT_CHAT_ID, gid, "token", &title, false, SOURCE_DIRECT)
+            .enqueue_eh_download(
+                CURRENT_CHAT_ID,
+                gid,
+                "token",
+                &title,
+                telegraph,
+                SOURCE_DIRECT,
+                &EhGalleryVariant::archive("1280x"),
+                None,
+                true,
+            )
             .await
-            .unwrap();
-        let mut active: eh_download_queue::ActiveModel = model.into();
-        active.status = Set(status.to_string());
-        active.created_at = Set(base + Duration::seconds(created_at_seconds));
-        active.background_download_status = Set(background_download_status.map(str::to_owned));
-        active.update(repo.db()).await.unwrap();
+            .unwrap()
+            .expect("delivery should be enqueued");
+        let job_id = model.job_id.unwrap();
+        let mut delivery: eh_download_queue::ActiveModel = model.into();
+        delivery.status = Set(delivery_status.to_string());
+        delivery.created_at = Set(base + Duration::seconds(created_at_seconds));
+        delivery.update(repo.db()).await.unwrap();
+
+        let mut job: eh_gallery_jobs::ActiveModel = eh_gallery_jobs::Entity::find_by_id(job_id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap()
+            .into();
+        job.status = Set(job_status.to_string());
+        if let Some(telegraph_status) = telegraph_status {
+            job.telegraph_status = Set(telegraph_status.to_string());
+        }
+        job.background_download_status = Set(background_download_status.map(str::to_owned));
+        job.update(repo.db()).await.unwrap();
     }
 
     for (gid, status, created_at_seconds, completed_at_seconds, error) in [
@@ -47,9 +151,20 @@ async fn test_eh_queue_status_snapshot_scopes_orders_and_selects_recent_terminal
     ] {
         let title = format!("Gallery {gid}");
         let model = repo
-            .enqueue_eh_download(CURRENT_CHAT_ID, gid, "token", &title, false, SOURCE_DIRECT)
+            .enqueue_eh_download(
+                CURRENT_CHAT_ID,
+                gid,
+                "token",
+                &title,
+                false,
+                SOURCE_DIRECT,
+                &EhGalleryVariant::archive("1280x"),
+                None,
+                true,
+            )
             .await
-            .unwrap();
+            .unwrap()
+            .expect("delivery should be enqueued");
         let mut active: eh_download_queue::ActiveModel = model.into();
         active.status = Set(status.to_string());
         active.created_at = Set(base + Duration::seconds(created_at_seconds));
@@ -66,9 +181,13 @@ async fn test_eh_queue_status_snapshot_scopes_orders_and_selects_recent_terminal
             "Foreign active",
             false,
             SOURCE_DIRECT,
+            &EhGalleryVariant::archive("1280x"),
+            None,
+            true,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .expect("delivery should be enqueued");
     let mut foreign_active: eh_download_queue::ActiveModel = foreign_active.into();
     foreign_active.created_at = Set(base);
     foreign_active.update(repo.db()).await.unwrap();
@@ -81,9 +200,13 @@ async fn test_eh_queue_status_snapshot_scopes_orders_and_selects_recent_terminal
             "Foreign terminal",
             false,
             SOURCE_DIRECT,
+            &EhGalleryVariant::archive("1280x"),
+            None,
+            true,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .expect("delivery should be enqueued");
     let mut foreign_terminal: eh_download_queue::ActiveModel = foreign_terminal.into();
     foreign_terminal.status = Set(STATUS_DONE.to_string());
     foreign_terminal.created_at = Set(base + Duration::seconds(100));
@@ -133,6 +256,155 @@ async fn test_eh_queue_status_snapshot_scopes_orders_and_selects_recent_terminal
     assert!(!snapshot.active.iter().any(|item| item.gid == 301));
     assert_ne!(recent_terminal.gid, 302);
     assert!(!format!("{snapshot:?}").contains("internal database secret"));
+}
+
+#[tokio::test]
+async fn estatus_joins_active_job_state_and_preserves_unbound_terminal_history() {
+    const CHAT_ID: i64 = -100;
+
+    let repo = tests_helpers::setup_test_db().await.unwrap();
+
+    let downloading = repo
+        .enqueue_eh_download(
+            CHAT_ID,
+            401,
+            "token-401",
+            "Downloading",
+            false,
+            SOURCE_DIRECT,
+            &EhGalleryVariant::archive("1280x"),
+            None,
+            true,
+        )
+        .await
+        .unwrap()
+        .expect("delivery should be enqueued");
+    let mut downloading_job: eh_gallery_jobs::ActiveModel =
+        eh_gallery_jobs::Entity::find_by_id(downloading.job_id.unwrap())
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap()
+            .into();
+    downloading_job.status = Set(JOB_STATUS_DOWNLOADING.to_string());
+    downloading_job.zip_path = Set(Some("C:/secret-path/private.zip".to_string()));
+    downloading_job.error = Set(Some("password=do-not-show".to_string()));
+    downloading_job.cleanup_error = Set(Some("provider abort internal detail".to_string()));
+    downloading_job.update(repo.db()).await.unwrap();
+
+    let uploading = repo
+        .enqueue_eh_download(
+            CHAT_ID,
+            402,
+            "token-402",
+            "Uploading",
+            true,
+            SOURCE_DIRECT,
+            &EhGalleryVariant::archive("1280x"),
+            None,
+            true,
+        )
+        .await
+        .unwrap()
+        .expect("delivery should be enqueued");
+    let mut uploading_job: eh_gallery_jobs::ActiveModel =
+        eh_gallery_jobs::Entity::find_by_id(uploading.job_id.unwrap())
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap()
+            .into();
+    uploading_job.status = Set(JOB_STATUS_DOWNLOADED.to_string());
+    uploading_job.telegraph_status = Set(TELEGRAPH_STATUS_UPLOADING.to_string());
+    uploading_job.update(repo.db()).await.unwrap();
+
+    let publishing = repo
+        .enqueue_eh_download(
+            CHAT_ID,
+            403,
+            "token-403",
+            "Publishing",
+            false,
+            SOURCE_DIRECT,
+            &EhGalleryVariant::archive("1280x"),
+            None,
+            true,
+        )
+        .await
+        .unwrap()
+        .expect("delivery should be enqueued");
+    let mut publishing_delivery: eh_download_queue::ActiveModel = publishing.into();
+    publishing_delivery.status = Set(STATUS_PUBLISHING.to_string());
+    publishing_delivery.update(repo.db()).await.unwrap();
+
+    let cleanup_pending = repo
+        .enqueue_eh_download(
+            CHAT_ID,
+            404,
+            "token-404",
+            "Cleanup pending",
+            false,
+            SOURCE_DIRECT,
+            &EhGalleryVariant::archive("1280x"),
+            None,
+            true,
+        )
+        .await
+        .unwrap()
+        .expect("delivery should be enqueued");
+    let mut cleanup_job: eh_gallery_jobs::ActiveModel =
+        eh_gallery_jobs::Entity::find_by_id(cleanup_pending.job_id.unwrap())
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap()
+            .into();
+    cleanup_job.status = Set(JOB_STATUS_RETIRED.to_string());
+    cleanup_job.cleanup_status = Set(CLEANUP_STATUS_FAILED.to_string());
+    cleanup_job.update(repo.db()).await.unwrap();
+
+    let terminal = repo
+        .enqueue_eh_download(
+            CHAT_ID,
+            405,
+            "token-405",
+            "Legacy failed",
+            false,
+            SOURCE_DIRECT,
+            &EhGalleryVariant::archive("1280x"),
+            None,
+            true,
+        )
+        .await
+        .unwrap()
+        .expect("delivery should be enqueued");
+    let mut terminal_delivery: eh_download_queue::ActiveModel = terminal.into();
+    terminal_delivery.job_id = Set(None);
+    terminal_delivery.status = Set(STATUS_FAILED.to_string());
+    terminal_delivery.error = Set(Some("password from legacy error".to_string()));
+    terminal_delivery.update(repo.db()).await.unwrap();
+
+    let snapshot = repo.get_eh_queue_snapshot(CHAT_ID).await.unwrap();
+
+    assert_eq!(
+        snapshot
+            .active
+            .iter()
+            .map(|item| (item.gid, item.status.as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            (401, STATUS_DOWNLOADING),
+            (402, STATUS_UPLOADING),
+            (403, STATUS_PUBLISHING),
+            (404, STATUS_PENDING),
+        ]
+    );
+    assert_eq!(snapshot.recent_terminal.as_ref().unwrap().gid, 405);
+
+    let output = format!("{snapshot:?}");
+    for secret in ["password", "C:/secret-path", "provider abort"] {
+        assert!(!output.contains(secret), "status output leaked {secret}");
+    }
 }
 
 #[tokio::test]
@@ -282,55 +554,108 @@ async fn test_eh_download_queue_full_lifecycle() {
 
     // Enqueue 3 downloads
     let m1 = repo
-        .enqueue_eh_download(-100, 100, "tok1", "Gallery 1", false, "subscription")
+        .enqueue_eh_download(
+            -100,
+            100,
+            "tok1",
+            "Gallery 1",
+            false,
+            "subscription",
+            &EhGalleryVariant::archive("1280x"),
+            None,
+            true,
+        )
         .await
-        .unwrap();
+        .unwrap()
+        .expect("delivery should be enqueued");
     let m2 = repo
-        .enqueue_eh_download(-100, 200, "tok2", "Gallery 2", true, "subscription")
+        .enqueue_eh_download(
+            -100,
+            200,
+            "tok2",
+            "Gallery 2",
+            true,
+            "subscription",
+            &EhGalleryVariant::archive("1280x"),
+            None,
+            true,
+        )
         .await
-        .unwrap();
+        .unwrap()
+        .expect("delivery should be enqueued");
     let m3 = repo
-        .enqueue_eh_download(-100, 300, "tok3", "Gallery 3", false, "direct")
+        .enqueue_eh_download(
+            -100,
+            300,
+            "tok3",
+            "Gallery 3",
+            false,
+            "direct",
+            &EhGalleryVariant::archive("1280x"),
+            None,
+            true,
+        )
         .await
-        .unwrap();
+        .unwrap()
+        .expect("delivery should be enqueued");
 
-    assert_eq!(m1.status, "pending");
+    assert_eq!(m1.status, DELIVERY_STATUS_WAITING);
     assert!(m2.telegraph);
     assert_eq!(m3.source, "direct");
 
-    // FIFO: get m1 first (download stage)
-    let next1 = repo.get_next_pending_eh_download().await.unwrap().unwrap();
-    assert_eq!(next1.id, m1.id);
-    assert_eq!(next1.status, "downloading");
+    // FIFO: claim the first shared job for normal download.
+    let next1 = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+    assert_eq!(next1.id, m1.job_id.unwrap());
+    assert_eq!(next1.status, JOB_STATUS_DOWNLOADING);
 
-    // Download m1
-    repo.mark_eh_download_downloaded(m1.id, 50000, "/tmp/100.zip", 0)
+    let downloaded = repo
+        .mark_eh_job_downloaded(
+            next1.id,
+            next1.started_at.unwrap(),
+            50000,
+            "/tmp/100.zip",
+            0,
+        )
         .await
         .unwrap();
+    assert_eq!(downloaded.status, JOB_STATUS_DOWNLOADED);
 
-    // Complete m1 (publish stage)
-    let pub1 = repo.get_next_for_publish().await.unwrap().unwrap();
-    assert_eq!(pub1.id, m1.id);
-    repo.mark_eh_download_done(m1.id, 50000).await.unwrap();
+    let next2 = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+    assert_eq!(next2.id, m2.job_id.unwrap());
 
-    // Get m2
-    let next2 = repo.get_next_pending_eh_download().await.unwrap().unwrap();
-    assert_eq!(next2.id, m2.id);
-
-    // Fail m2
-    repo.mark_eh_download_failed(m2.id, "network timeout")
+    let (failed, permanent) = repo
+        .schedule_eh_job_download_retry(next2.id, next2.started_at.unwrap(), "network timeout", 0)
         .await
         .unwrap();
+    assert!(permanent);
+    assert_eq!(failed.status, JOB_STATUS_FAILED);
 
-    // Get m3
-    let next3 = repo.get_next_pending_eh_download().await.unwrap().unwrap();
-    assert_eq!(next3.id, m3.id);
+    let next3 = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+    assert_eq!(next3.id, m3.job_id.unwrap());
 
-    // No more pending
-    let none = repo.get_next_pending_eh_download().await.unwrap();
+    let none = repo.get_next_eh_job_for_download().await.unwrap();
     assert!(none.is_none());
 
-    // Verify downloaded bytes (only m1 was done)
+    // Task 8 owns independent delivery publish/done state; Task 3 completes
+    // the shared download and append-only accounting only.
+    let first_delivery = eh_download_queue::Entity::find_by_id(m1.id)
+        .one(repo.db())
+        .await
+        .unwrap()
+        .unwrap();
+    let failed_delivery = eh_download_queue::Entity::find_by_id(m2.id)
+        .one(repo.db())
+        .await
+        .unwrap()
+        .unwrap();
+    let pending_delivery = eh_download_queue::Entity::find_by_id(m3.id)
+        .one(repo.db())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(first_delivery.status, DELIVERY_STATUS_WAITING);
+    assert_eq!(failed_delivery.status, DELIVERY_STATUS_FAILED);
+    assert_eq!(pending_delivery.status, DELIVERY_STATUS_WAITING);
     let bytes = repo.get_eh_downloaded_bytes_in_window(24).await.unwrap();
     assert_eq!(bytes, 50000);
 }
@@ -341,68 +666,99 @@ async fn test_eh_download_queue_fifo_ordering() {
 
     // Enqueue in order
     let m1 = repo
-        .enqueue_eh_download(-100, 1, "a", "A", false, "direct")
+        .enqueue_eh_download(
+            -100,
+            1,
+            "a",
+            "A",
+            false,
+            "direct",
+            &EhGalleryVariant::archive("1280x"),
+            None,
+            true,
+        )
         .await
-        .unwrap();
+        .unwrap()
+        .expect("delivery should be enqueued");
     let m2 = repo
-        .enqueue_eh_download(-100, 2, "b", "B", false, "direct")
+        .enqueue_eh_download(
+            -100,
+            2,
+            "b",
+            "B",
+            false,
+            "direct",
+            &EhGalleryVariant::archive("1280x"),
+            None,
+            true,
+        )
         .await
-        .unwrap();
+        .unwrap()
+        .expect("delivery should be enqueued");
     let m3 = repo
-        .enqueue_eh_download(-100, 3, "c", "C", false, "direct")
+        .enqueue_eh_download(
+            -100,
+            3,
+            "c",
+            "C",
+            false,
+            "direct",
+            &EhGalleryVariant::archive("1280x"),
+            None,
+            true,
+        )
+        .await
+        .unwrap()
+        .expect("delivery should be enqueued");
+
+    let next1 = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+    assert_eq!(next1.id, m1.job_id.unwrap());
+    repo.mark_eh_job_downloaded(next1.id, next1.started_at.unwrap(), 100, "/tmp/1.zip", 0)
         .await
         .unwrap();
 
-    // Should be FIFO (oldest first by created_at)
-    let next1 = repo.get_next_pending_eh_download().await.unwrap().unwrap();
-    assert_eq!(next1.id, m1.id);
-    repo.mark_eh_download_downloaded(m1.id, 100, "/tmp/1.zip", 0)
+    let next2 = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+    assert_eq!(next2.id, m2.job_id.unwrap());
+    repo.mark_eh_job_downloaded(next2.id, next2.started_at.unwrap(), 200, "/tmp/2.zip", 0)
         .await
         .unwrap();
-    let pub1 = repo.get_next_for_publish().await.unwrap().unwrap();
-    assert_eq!(pub1.id, m1.id);
-    repo.mark_eh_download_done(m1.id, 100).await.unwrap();
 
-    let next2 = repo.get_next_pending_eh_download().await.unwrap().unwrap();
-    assert_eq!(next2.id, m2.id);
-    repo.mark_eh_download_downloaded(m2.id, 200, "/tmp/2.zip", 0)
-        .await
-        .unwrap();
-    let pub2 = repo.get_next_for_publish().await.unwrap().unwrap();
-    assert_eq!(pub2.id, m2.id);
-    repo.mark_eh_download_done(m2.id, 200).await.unwrap();
-
-    let next3 = repo.get_next_pending_eh_download().await.unwrap().unwrap();
-    assert_eq!(next3.id, m3.id);
+    let next3 = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+    assert_eq!(next3.id, m3.job_id.unwrap());
 }
 
 #[tokio::test]
 async fn test_eh_download_queue_reset_stale_then_reprocess() {
     let repo = tests_helpers::setup_test_db().await.unwrap();
 
-    let m = repo
-        .enqueue_eh_download(-100, 1, "tok", "T", false, "direct")
+    let delivery = repo
+        .enqueue_eh_download(
+            -100,
+            1,
+            "tok",
+            "T",
+            false,
+            "direct",
+            &EhGalleryVariant::archive("1280x"),
+            None,
+            true,
+        )
+        .await
+        .unwrap()
+        .expect("delivery should be enqueued");
+
+    let first = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+    assert_eq!(first.id, delivery.job_id.unwrap());
+
+    let count = repo.reset_stale_eh_shared_work(3600, 3600).await.unwrap();
+    assert_eq!(count.downloads, 1);
+
+    let next = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+    assert_eq!(next.id, delivery.job_id.unwrap());
+
+    repo.mark_eh_job_downloaded(next.id, next.started_at.unwrap(), 1000, "/tmp/1.zip", 0)
         .await
         .unwrap();
-
-    // Mark as downloading (simulating a crash mid-download)
-    repo.get_next_pending_eh_download().await.unwrap();
-
-    // Reset stale
-    let count = repo.reset_stale_eh_downloads().await.unwrap();
-    assert_eq!(count, 1);
-
-    // Should be processable again
-    let next = repo.get_next_pending_eh_download().await.unwrap().unwrap();
-    assert_eq!(next.id, m.id);
-
-    // Complete through full pipeline
-    repo.mark_eh_download_downloaded(m.id, 1000, "/tmp/1.zip", 0)
-        .await
-        .unwrap();
-    let pub_next = repo.get_next_for_publish().await.unwrap().unwrap();
-    assert_eq!(pub_next.id, m.id);
-    repo.mark_eh_download_done(m.id, 1000).await.unwrap();
 
     let bytes = repo.get_eh_downloaded_bytes_in_window(24).await.unwrap();
     assert_eq!(bytes, 1000);
@@ -449,20 +805,34 @@ async fn test_eh_task_key_db_roundtrip() {
 async fn test_eh_download_queue_rate_limit_window() {
     let repo = tests_helpers::setup_test_db().await.unwrap();
 
-    // Complete 3 downloads through the full pipeline
+    // Complete 3 shared download generations.
     for i in 1..=3i64 {
-        let m = repo
-            .enqueue_eh_download(-100, i, "tok", "T", false, "direct")
+        let delivery = repo
+            .enqueue_eh_download(
+                -100,
+                i,
+                "tok",
+                "T",
+                false,
+                "direct",
+                &EhGalleryVariant::archive("1280x"),
+                None,
+                true,
+            )
             .await
-            .unwrap();
-        let c = repo.get_next_pending_eh_download().await.unwrap().unwrap();
-        assert_eq!(c.id, m.id);
-        repo.mark_eh_download_downloaded(m.id, i * 1000, &format!("/tmp/{}.zip", i), 0)
-            .await
-            .unwrap();
-        let p = repo.get_next_for_publish().await.unwrap().unwrap();
-        assert_eq!(p.id, m.id);
-        repo.mark_eh_download_done(m.id, i * 1000).await.unwrap();
+            .unwrap()
+            .expect("delivery should be enqueued");
+        let job = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        assert_eq!(job.id, delivery.job_id.unwrap());
+        repo.mark_eh_job_downloaded(
+            job.id,
+            job.started_at.unwrap(),
+            i * 1000,
+            &format!("/tmp/{i}.zip"),
+            0,
+        )
+        .await
+        .unwrap();
     }
 
     // 24h window should include all

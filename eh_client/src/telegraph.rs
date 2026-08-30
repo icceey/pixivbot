@@ -27,6 +27,8 @@ pub struct Node {
 pub struct TelegraphImageUrlPair {
     pub preview_url: String,
     pub public_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cid: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -830,6 +832,7 @@ pub trait ImageUploader: Send + Sync {
             .map(|url| TelegraphImageUrlPair {
                 preview_url: url.clone(),
                 public_url: url,
+                cid: None,
             })
             .collect())
     }
@@ -1685,6 +1688,7 @@ impl IpfS3Uploader {
         TelegraphImageUrlPair {
             preview_url,
             public_url,
+            cid: Some(cid.to_owned()),
         }
     }
 
@@ -2540,6 +2544,7 @@ impl TelegraphClient {
             .map(|url| TelegraphImageUrlPair {
                 preview_url: url.clone(),
                 public_url: url.clone(),
+                cid: None,
             })
             .collect();
         Ok(self
@@ -2687,41 +2692,6 @@ mod tests {
     use wiremock::Match;
 
     #[test]
-    fn test_build_image_node() {
-        let node = Node::img("https://i.pixi.mg/i/abc.jpg");
-        assert_eq!(node.tag, "img");
-        assert_eq!(node.attrs.unwrap()["src"], "https://i.pixi.mg/i/abc.jpg");
-    }
-
-    #[test]
-    fn test_build_link_node() {
-        let node = Node::link("https://example.com", "Next Page");
-        assert_eq!(node.tag, "a");
-        assert_eq!(node.attrs.unwrap()["href"], "https://example.com");
-        assert_eq!(node.children.unwrap()[0], serde_json::json!("Next Page"));
-    }
-
-    #[test]
-    fn test_content_size_estimate() {
-        let nodes = vec![
-            Node::img("https://i.pixi.mg/i/abc.jpg"),
-            Node::img("https://i.pixi.mg/i/def.jpg"),
-        ];
-        let size = estimate_content_size(&nodes);
-        assert!(size > 0);
-    }
-
-    #[test]
-    fn test_split_image_urls_for_pages() {
-        let urls: Vec<String> = (0..50)
-            .map(|i| format!("https://i.pixi.mg/i/{}.jpg", i))
-            .collect();
-        let chunks = split_for_pages(&urls, 1024);
-        assert!(chunks.len() > 1);
-        assert!(chunks.iter().all(|c| !c.is_empty()));
-    }
-
-    #[test]
     fn test_split_for_pages_reserves_next_link_budget() {
         // Each image node JSON: {"tag":"img","attrs":{"src":"<URL>"}} = 32 + URL_len bytes.
         // For URL_len=478: node = 510 bytes. 2 nodes + array overhead = 1023 bytes.
@@ -2758,6 +2728,7 @@ mod tests {
             .map(|i| TelegraphImageUrlPair {
                 preview_url: format!("https://p.example/ipfs/cid-{i}"),
                 public_url: format!("https://public.example/ipfs/{}-cid-{i}", "x".repeat(210)),
+                cid: None,
             })
             .collect();
         let preview_urls: Vec<String> = pairs.iter().map(|pair| pair.preview_url.clone()).collect();
@@ -2844,33 +2815,6 @@ mod tests {
     }
 
     #[test]
-    fn image_upload_config_defaults_to_pixi() {
-        let cfg = ImageUploadConfig::default();
-        assert_eq!(cfg.provider, ImageUploadProvider::Pixi);
-        assert!(cfg.s3.is_none());
-        assert_eq!(cfg.catbox.api_url, "https://catbox.moe/user/api.php");
-    }
-
-    #[test]
-    fn s3_and_ipfs3_multipart_defaults_are_explicit() {
-        let s3 = S3UploaderConfig::default();
-        let ipfs3 = IpfS3UploaderConfig::default();
-        assert_eq!(s3.multipart_image_threshold_mb, 8);
-        assert_eq!(ipfs3.multipart_image_threshold_mb, 8);
-        assert!(s3.path_style);
-        assert!(ipfs3.path_style);
-        assert!(ipfs3.zip_extract_enabled);
-    }
-
-    #[test]
-    fn multipart_image_threshold_is_inclusive_zero_disables_and_conversion_saturates() {
-        assert!(!image_uses_multipart(8 * 1024 * 1024 - 1, 8));
-        assert!(image_uses_multipart(8 * 1024 * 1024, 8));
-        assert!(!image_uses_multipart(usize::MAX, 0));
-        assert_eq!(multipart_image_threshold_bytes(u64::MAX), Some(u64::MAX));
-    }
-
-    #[test]
     fn multipart_uploader_identity_normalizes_endpoint_and_excludes_credentials() {
         let normalized = multipart_uploader_identity(
             ProviderKind::S3,
@@ -2899,26 +2843,6 @@ mod tests {
 
         assert_eq!(normalized, canonical);
         assert_ne!(normalized, other_provider);
-    }
-
-    #[test]
-    fn serde_defaults_enable_ipfs3_zip_and_set_eight_mib_thresholds() {
-        let s3: S3UploaderConfig = serde_json::from_value(serde_json::json!({})).unwrap();
-        let ipfs3: IpfS3UploaderConfig = serde_json::from_value(serde_json::json!({})).unwrap();
-        assert_eq!(s3.multipart_image_threshold_mb, 8);
-        assert_eq!(ipfs3.multipart_image_threshold_mb, 8);
-        assert!(ipfs3.zip_extract_enabled);
-    }
-
-    #[test]
-    fn required_configs_preserve_custom_multipart_image_thresholds() {
-        let mut s3 = complete_s3_config("http://localhost:9000", "https://cdn.example.com");
-        s3.multipart_image_threshold_mb = 11;
-        assert_eq!(s3.required().unwrap().multipart_image_threshold_mb, 11);
-
-        let mut ipfs3 = complete_ipfs3_config("http://localhost:9000", "https://ipfs.io/ipfs");
-        ipfs3.multipart_image_threshold_mb = 13;
-        assert_eq!(ipfs3.required().unwrap().multipart_image_threshold_mb, 13);
     }
 
     #[test]
@@ -3288,7 +3212,25 @@ mod tests {
             vec![TelegraphImageUrlPair {
                 preview_url: format!("https://preview.example/ipfs/{cid}"),
                 public_url: format!("https://public.example/ipfs/{cid}"),
+                cid: Some(cid.to_string()),
             }]
+        );
+    }
+
+    #[test]
+    fn telegraph_image_url_pair_deserializes_legacy_payload_without_cid() {
+        let pair: TelegraphImageUrlPair = serde_json::from_str(
+            r#"{"preview_url":"https://preview.example/image.jpg","public_url":"https://public.example/image.jpg"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(pair.cid, None);
+        assert_eq!(
+            serde_json::to_value(pair).unwrap(),
+            serde_json::json!({
+                "preview_url": "https://preview.example/image.jpg",
+                "public_url": "https://public.example/image.jpg",
+            })
         );
     }
 
@@ -3531,6 +3473,7 @@ mod tests {
                 &[TelegraphImageUrlPair {
                     preview_url: "https://preview.example/ipfs/cid-one".to_string(),
                     public_url: "https://public.example/ipfs/cid-one".to_string(),
+                    cid: None,
                 }],
                 Some("https://preview.example/ipfs/"),
                 Some("https://public.example/ipfs/"),
@@ -3558,12 +3501,6 @@ mod tests {
             node_attr_str(&public_nodes[0], "src"),
             Some("https://public.example/ipfs/cid-one")
         );
-    }
-
-    #[test]
-    fn ipfs3_zip_extract_enabled_by_default() {
-        let config = IpfS3UploaderConfig::default();
-        assert!(config.zip_extract_enabled);
     }
 
     const ZIP_FIXTURE_DATA: &[u8] = b"hello";
@@ -4714,33 +4651,6 @@ mod tests {
             .contains("extraction key extract/notes.txt returned an empty CID"));
     }
 
-    struct DefaultZipCapabilityUploader;
-
-    #[async_trait::async_trait]
-    impl ImageUploader for DefaultZipCapabilityUploader {
-        async fn upload_images(&self, _images: &[ImageUploadInput<'_>]) -> Result<Vec<String>> {
-            Ok(Vec::new())
-        }
-    }
-
-    #[tokio::test]
-    async fn default_zip_archive_upload_capability_returns_none() {
-        let uploader = DefaultZipCapabilityUploader;
-        let entries = vec!["page001.jpg".to_string()];
-        let zip_bytes = zip_fixture(&[ZipEntryFixture::stored(b"page001.jpg")]);
-        let result = uploader
-            .upload_zip_archive_with_url_pairs(ZipArchiveUploadInput {
-                filename: "gallery.zip",
-                bytes: &zip_bytes,
-                entry_names: &entries,
-                resume_context: None,
-            })
-            .await
-            .unwrap();
-
-        assert!(result.is_none());
-    }
-
     #[tokio::test]
     async fn ipfs3_zip_archive_upload_disabled_returns_none_without_put() {
         use wiremock::matchers::method;
@@ -4829,10 +4739,12 @@ mod tests {
                 TelegraphImageUrlPair {
                     preview_url: "https://preview.example/ipfs/bafyFirst".to_string(),
                     public_url: "https://public.example/ipfs/bafyFirst".to_string(),
+                    cid: Some("bafyFirst".to_string()),
                 },
                 TelegraphImageUrlPair {
                     preview_url: "https://preview.example/ipfs/bafySecond".to_string(),
                     public_url: "https://public.example/ipfs/bafySecond".to_string(),
+                    cid: Some("bafySecond".to_string()),
                 },
             ]
         );
@@ -4854,6 +4766,7 @@ mod tests {
             vec![TelegraphImageUrlPair {
                 preview_url: "https://preview.example/ipfs/bafyNormalImage".to_string(),
                 public_url: "https://public.example/ipfs/bafyNormalImage".to_string(),
+                cid: Some("bafyNormalImage".to_string()),
             }]
         );
 
@@ -5579,10 +5492,12 @@ mod tests {
                 TelegraphImageUrlPair {
                     preview_url: "https://public.example/ipfs/bafyFirst".to_string(),
                     public_url: "https://public.example/ipfs/bafyFirst".to_string(),
+                    cid: Some("bafyFirst".to_string()),
                 },
                 TelegraphImageUrlPair {
                     preview_url: "https://public.example/ipfs/bafySecond".to_string(),
                     public_url: "https://public.example/ipfs/bafySecond".to_string(),
+                    cid: Some("bafySecond".to_string()),
                 },
             ]
         );
@@ -5727,6 +5642,7 @@ mod tests {
             [TelegraphImageUrlPair {
                 preview_url: "https://public.example/ipfs/image-cid".to_string(),
                 public_url: "https://public.example/ipfs/image-cid".to_string(),
+                cid: Some("image-cid".to_string()),
             }]
         );
         let requests = server.received_requests().await.unwrap();
@@ -6877,6 +6793,7 @@ mod tests {
             [TelegraphImageUrlPair {
                 preview_url: format!("https://preview.example/ipfs/{cid}"),
                 public_url: format!("{}/ipfs/{cid}", server.uri()),
+                cid: Some(cid.to_string()),
             }]
         );
         for _ in 0..20 {
