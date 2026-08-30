@@ -439,12 +439,12 @@ async fn create_shared_gallery_job_schema_and_backfill(
                       AND queue.telegraph_rewritten_at IS NULL)",
         )
         .await?;
-    // Preserve already-completed download work: the most advanced active
-    // delivery row (download complete with a persisted ZIP, lowest id for
-    // stability) hands its archive result to the new shared job so the paid
-    // archive POST/GP is never repeated and orphan cleanup keeps seeing the
-    // artifact family as owned. Must run before the compatibility clearing
-    // UPDATE below strips the legacy result columns.
+    // Preserve one already-completed download per legacy artifact family. All
+    // resolution variants of a gallery used the same `{gid}_{token}.zip`
+    // family, so the most recent completed delivery is its only safe owner;
+    // sibling variants must redownload into their new job-specific families.
+    // Must run before the compatibility clearing UPDATE below strips the
+    // legacy result columns.
     manager
         .get_connection()
         .execute_unprepared(
@@ -456,7 +456,7 @@ async fn create_shared_gallery_job_schema_and_backfill(
                           WHERE winner.job_id = job.id \
                             AND winner.status IN ('downloaded', 'uploading', 'uploaded', 'publishing') \
                             AND winner.zip_path IS NOT NULL \
-                          ORDER BY winner.id \
+                          ORDER BY winner.completed_at DESC, winner.id DESC \
                           LIMIT 1\
                      ), \
                      file_size = (\
@@ -465,7 +465,7 @@ async fn create_shared_gallery_job_schema_and_backfill(
                           WHERE winner.job_id = job.id \
                             AND winner.status IN ('downloaded', 'uploading', 'uploaded', 'publishing') \
                             AND winner.zip_path IS NOT NULL \
-                          ORDER BY winner.id \
+                          ORDER BY winner.completed_at DESC, winner.id DESC \
                           LIMIT 1\
                      ), \
                      gp_cost = (\
@@ -474,7 +474,7 @@ async fn create_shared_gallery_job_schema_and_backfill(
                           WHERE winner.job_id = job.id \
                             AND winner.status IN ('downloaded', 'uploading', 'uploaded', 'publishing') \
                             AND winner.zip_path IS NOT NULL \
-                          ORDER BY winner.id \
+                          ORDER BY winner.completed_at DESC, winner.id DESC \
                           LIMIT 1\
                      ), \
                      completed_at = (\
@@ -483,11 +483,22 @@ async fn create_shared_gallery_job_schema_and_backfill(
                           WHERE winner.job_id = job.id \
                             AND winner.status IN ('downloaded', 'uploading', 'uploaded', 'publishing') \
                             AND winner.zip_path IS NOT NULL \
-                          ORDER BY winner.id \
+                          ORDER BY winner.completed_at DESC, winner.id DESC \
                           LIMIT 1\
                      ) \
                WHERE job.status = 'pending' \
                  AND job.download_mode = 'legacy' \
+                 AND job.id = (\
+                     SELECT owner.job_id \
+                       FROM eh_download_queue AS owner \
+                      WHERE owner.gid = job.gid \
+                        AND owner.token = job.token \
+                        AND owner.job_id IS NOT NULL \
+                        AND owner.status IN ('downloaded', 'uploading', 'uploaded', 'publishing') \
+                        AND owner.zip_path IS NOT NULL \
+                      ORDER BY owner.completed_at DESC, owner.id DESC \
+                      LIMIT 1\
+                 ) \
                  AND EXISTS (\
                      SELECT 1 \
                        FROM eh_download_queue AS winner \
@@ -570,6 +581,15 @@ async fn create_shared_gallery_job_schema_and_backfill(
                 SET legacy_artifact_handoff = 'conflict' \
               WHERE job.download_mode = 'legacy' \
                 AND job.status = 'pending' \
+                AND NOT EXISTS (\
+                    SELECT 1 \
+                      FROM eh_gallery_jobs AS owner \
+                     WHERE owner.gid = job.gid \
+                       AND owner.token = job.token \
+                       AND owner.download_mode = 'legacy' \
+                       AND owner.status = 'downloaded' \
+                       AND owner.zip_path IS NOT NULL\
+                ) \
                 AND (\
                     1 < (\
                         SELECT COUNT(DISTINCT active.job_id) \
@@ -614,6 +634,15 @@ async fn create_shared_gallery_job_schema_and_backfill(
               WHERE job.download_mode = 'legacy' \
                 AND job.status = 'pending' \
                 AND job.legacy_artifact_handoff IS NULL \
+                AND NOT EXISTS (\
+                    SELECT 1 \
+                      FROM eh_gallery_jobs AS owner \
+                     WHERE owner.gid = job.gid \
+                       AND owner.token = job.token \
+                       AND owner.download_mode = 'legacy' \
+                       AND owner.status = 'downloaded' \
+                       AND owner.zip_path IS NOT NULL\
+                ) \
                 AND job.id = (\
                     SELECT candidate.job_id \
                       FROM eh_download_queue AS candidate \

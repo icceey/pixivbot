@@ -304,6 +304,16 @@ fn eh_job_cleanup_is_none_filter(job_id: i32) -> SimpleExpr {
     )
 }
 
+fn eh_chat_has_no_publishing_delivery_filter() -> SimpleExpr {
+    eh_download_queue::Column::ChatId.not_in_subquery(
+        Query::select()
+            .column(eh_download_queue::Column::ChatId)
+            .from(eh_download_queue::Entity)
+            .and_where(eh_download_queue::Column::Status.eq(STATUS_PUBLISHING))
+            .to_owned(),
+    )
+}
+
 impl EhQueueStatusItem {
     fn from_delivery(model: eh_download_queue::Model) -> Self {
         Self {
@@ -1578,6 +1588,7 @@ impl Repo {
                 .find_also_related(eh_gallery_jobs::Entity)
                 .filter(eh_download_queue::Column::Status.eq(STATUS_WAITING))
                 .filter(eh_download_queue::Column::JobId.is_not_null())
+                .filter(eh_chat_has_no_publishing_delivery_filter())
                 .filter(
                     eh_download_queue::Column::NextRetryAt
                         .is_null()
@@ -1618,6 +1629,7 @@ impl Repo {
                 .filter(eh_download_queue::Column::JobId.eq(job.id))
                 .filter(eh_download_queue::Column::Status.eq(STATUS_WAITING))
                 .filter(claim_generation_filter(delivery.started_at))
+                .filter(eh_chat_has_no_publishing_delivery_filter())
                 .filter(
                     eh_download_queue::Column::NextRetryAt
                         .is_null()
@@ -3753,6 +3765,73 @@ mod tests {
             second_inspections.load(std::sync::atomic::Ordering::SeqCst),
             1,
             "each refill must read only its selected ready candidate"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_publish_selector_keeps_one_in_flight_delivery_per_chat() {
+        let repo = tests_helpers::setup_test_db().await.unwrap();
+        let mut deliveries = Vec::new();
+        for (chat_id, gid) in [(-100, 21_000), (-100, 21_001), (-200, 21_002)] {
+            let delivery = repo
+                .enqueue_eh_download(
+                    chat_id,
+                    gid,
+                    "token",
+                    "Ready",
+                    false,
+                    SOURCE_DIRECT,
+                    &EhGalleryVariant::archive("1280x"),
+                    None,
+                    true,
+                )
+                .await
+                .unwrap()
+                .expect("delivery should be enqueued");
+            eh_gallery_jobs::Entity::update_many()
+                .col_expr(
+                    eh_gallery_jobs::Column::Status,
+                    Expr::value(JOB_STATUS_DOWNLOADED),
+                )
+                .col_expr(
+                    eh_gallery_jobs::Column::ZipPath,
+                    Expr::value(Some(format!("/tmp/{gid}.zip"))),
+                )
+                .filter(eh_gallery_jobs::Column::Id.eq(delivery.job_id.unwrap()))
+                .exec(repo.db())
+                .await
+                .unwrap();
+            deliveries.push(delivery);
+        }
+
+        let first = repo
+            .get_next_eh_delivery_for_publish(true)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.delivery.id, deliveries[0].id);
+
+        let second = repo
+            .get_next_eh_delivery_for_publish(true)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            second.delivery.id, deliveries[2].id,
+            "another chat must receive the next publish slot"
+        );
+
+        repo.defer_eh_delivery_publish(first.delivery.id, 60)
+            .await
+            .unwrap();
+        let third = repo
+            .get_next_eh_delivery_for_publish(true)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            third.delivery.id, deliveries[1].id,
+            "the chat may claim its next delivery after the prior claim is released"
         );
     }
 

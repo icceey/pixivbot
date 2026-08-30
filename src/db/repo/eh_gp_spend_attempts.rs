@@ -1233,8 +1233,8 @@ mod tests {
                 telegraph_rewrite_retry_count, telegraph_rewrite_error, telegraph_rewritten_at\
              ) VALUES \
                 (1, 10, 101, 'token-101', 'Subscription first', 0, 'subscription', '1', NULL, 'pending', 0, 0, NULL, 0, '2026-08-01 00:00:00', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 0, NULL, NULL, NULL, NULL, NULL, NULL, 0, NULL, NULL), \
-                (2, 20, 101, 'token-101', 'Subscription second', 1, 'subscription', '2', '2', 'uploading', 123, 456, 'old error', 3, '2026-08-02 00:00:00', '2026-08-02 01:00:00', '2026-08-02 02:00:00', '/old/subscription.zip', 'https://old.example/subscription', '2026-08-02 03:00:00', '2026-08-02 04:00:00', NULL, 'running', '2026-08-02 05:00:00', '2026-08-02 06:00:00', 2, 'background error', 'rewrite data', 'rewriting', '2026-08-02 07:00:00', '2026-08-02 08:00:00', '2026-08-02 09:00:00', 4, 'rewrite error', '2026-08-02 10:00:00'), \
-                (3, 30, 101, 'token-101', 'Direct first', 1, 'direct', NULL, NULL, 'downloaded', 10, 20, 'direct error', 1, '2026-08-03 00:00:00', '2026-08-03 01:00:00', '2026-08-03 02:00:00', '/old/direct.zip', 'https://old.example/direct', '2026-08-03 03:00:00', NULL, '2026-08-03 04:00:00', 'pending', '2026-08-03 05:00:00', '2026-08-03 06:00:00', 1, 'direct background error', NULL, NULL, NULL, NULL, NULL, 0, NULL, NULL), \
+                (2, 20, 101, 'token-101', 'Subscription second', 1, 'subscription', '2', '2', 'uploading', 123, 456, 'old error', 3, '2026-08-02 00:00:00', '2026-08-02 01:00:00', '2026-08-02 02:00:00', '/old/shared.zip', 'https://old.example/subscription', '2026-08-02 03:00:00', '2026-08-02 04:00:00', NULL, 'running', '2026-08-02 05:00:00', '2026-08-02 06:00:00', 2, 'background error', 'rewrite data', 'rewriting', '2026-08-02 07:00:00', '2026-08-02 08:00:00', '2026-08-02 09:00:00', 4, 'rewrite error', '2026-08-02 10:00:00'), \
+                (3, 30, 101, 'token-101', 'Direct first', 1, 'direct', NULL, NULL, 'downloaded', 10, 20, 'direct error', 1, '2026-08-03 00:00:00', '2026-08-03 01:00:00', '2026-08-03 02:00:00', '/old/shared.zip', 'https://old.example/direct', '2026-08-03 03:00:00', NULL, '2026-08-03 04:00:00', 'pending', '2026-08-03 05:00:00', '2026-08-03 06:00:00', 1, 'direct background error', NULL, NULL, NULL, NULL, NULL, 0, NULL, NULL), \
                 (4, 40, 102, 'token-102', 'Other gallery', 0, 'subscription', '3', NULL, 'publishing', 0, 0, NULL, 0, '2026-08-04 00:00:00', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 0, NULL, NULL, NULL, NULL, NULL, NULL, 0, NULL, NULL), \
                 (5, 50, 101, 'token-101', 'Terminal history', 0, 'subscription', '4', NULL, 'done', 999, 0, 'terminal error', 9, '2026-08-05 00:00:00', '2026-08-05 01:00:00', '2026-08-05 02:00:00', '/terminal.zip', NULL, '2026-08-05 03:00:00', '2026-08-05 04:00:00', '2026-08-05 05:00:00', 'failed', '2026-08-05 06:00:00', '2026-08-05 07:00:00', 8, 'terminal background error', 'terminal rewrite', 'failed', '2026-08-05 08:00:00', '2026-08-05 09:00:00', '2026-08-05 10:00:00', 7, 'terminal rewrite error', '2026-08-05 11:00:00')",
         )
@@ -1245,7 +1245,7 @@ mod tests {
         let jobs = db
             .query_all(Statement::from_string(
                 DbBackend::Sqlite,
-                "SELECT gid, token, download_mode, resolution, title, status, telegraph_required, telegraph_status, created_at, zip_path, file_size, gp_cost, completed_at, telegraph_url, telegraph_rewrite_data, telegraph_rewrite_status, telegraph_rewrite_after, telegraph_rewrite_started_at, telegraph_rewrite_next_retry_at, telegraph_rewrite_retry_count, telegraph_rewrite_error, telegraph_rewritten_at FROM eh_gallery_jobs ORDER BY gid, resolution".to_owned(),
+                "SELECT gid, token, download_mode, resolution, title, status, telegraph_required, telegraph_status, created_at, zip_path, legacy_artifact_handoff, file_size, gp_cost, completed_at, telegraph_url, telegraph_rewrite_data, telegraph_rewrite_status, telegraph_rewrite_after, telegraph_rewrite_started_at, telegraph_rewrite_next_retry_at, telegraph_rewrite_retry_count, telegraph_rewrite_error, telegraph_rewritten_at FROM eh_gallery_jobs ORDER BY gid, resolution".to_owned(),
             ))
             .await?;
         assert_eq!(jobs.len(), 3);
@@ -1273,23 +1273,22 @@ mod tests {
         assert_eq!(jobs[2].try_get::<i64>("", "gid")?, 102);
         assert_eq!(jobs[2].try_get::<String>("", "resolution")?, "subscription");
 
-        // Gallery 101 subscription group: row 2 (`uploading`) carries the most
-        // advanced completed work, so its download result and Telegraph page
-        // must be preserved on the shared job instead of being redownloaded.
+        // Gallery 101 subscription group keeps its existing Telegraph page,
+        // but must not also inherit the shared legacy ZIP owned by the newer
+        // direct completion.
         assert_eq!(
             jobs[1].try_get::<String>("", "status")?,
-            "downloaded",
-            "subscription job must inherit the most advanced row's download result"
+            "pending",
+            "the non-owner variant must redownload its archive"
         );
+        assert_eq!(jobs[1].try_get::<Option<String>>("", "zip_path")?, None);
+        assert_eq!(jobs[1].try_get::<i64>("", "file_size")?, 0);
+        assert_eq!(jobs[1].try_get::<i64>("", "gp_cost")?, 0);
+        assert_eq!(jobs[1].try_get::<Option<String>>("", "completed_at")?, None);
         assert_eq!(
-            jobs[1].try_get::<Option<String>>("", "zip_path")?,
-            Some("/old/subscription.zip".to_owned())
-        );
-        assert_eq!(jobs[1].try_get::<i64>("", "file_size")?, 123);
-        assert_eq!(jobs[1].try_get::<i64>("", "gp_cost")?, 456);
-        assert_eq!(
-            jobs[1].try_get::<Option<String>>("", "completed_at")?,
-            Some("2026-08-02 02:00:00".to_owned())
+            jobs[1].try_get::<Option<String>>("", "legacy_artifact_handoff")?,
+            None,
+            "the non-owner must not move the owner's shared ZIP"
         );
         assert_eq!(
             jobs[1].try_get::<String>("", "telegraph_status")?,
@@ -1334,9 +1333,9 @@ mod tests {
             None
         );
 
-        // Gallery 101 direct group: row 3 (`downloaded`) completed its download,
-        // but Telegraph was never demanded unsent for this variant, so the
-        // direct job stays `not_required` with no URL.
+        // Gallery 101 direct group has the newest completion, so it exclusively
+        // owns the shared legacy ZIP. Telegraph was never demanded unsent for
+        // this variant, so the direct job stays `not_required` with no URL.
         assert_eq!(
             jobs[0].try_get::<String>("", "status")?,
             "downloaded",
@@ -1344,7 +1343,7 @@ mod tests {
         );
         assert_eq!(
             jobs[0].try_get::<Option<String>>("", "zip_path")?,
-            Some("/old/direct.zip".to_owned())
+            Some("/old/shared.zip".to_owned())
         );
         assert_eq!(jobs[0].try_get::<i64>("", "file_size")?, 10);
         assert_eq!(jobs[0].try_get::<i64>("", "gp_cost")?, 20);
@@ -1356,6 +1355,10 @@ mod tests {
             jobs[0].try_get::<Option<String>>("", "telegraph_url")?,
             None,
             "not_required jobs must not gain a Telegraph URL from siblings"
+        );
+        assert_eq!(
+            jobs[0].try_get::<Option<String>>("", "legacy_artifact_handoff")?,
+            None
         );
 
         // Gallery 102 subscription group: row 4 (`publishing`) has no zip
