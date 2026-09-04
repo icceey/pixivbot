@@ -23,6 +23,30 @@ use tracing::warn;
 
 use crate::db::entities::subscriptions;
 
+/// How many times a whole transaction is retried when SQLite reports
+/// lock contention that a fresh read snapshot could resolve.
+///
+/// WAL mode lets readers proceed while writers commit, but a deferred
+/// read→write transaction whose snapshot was invalidated by a concurrent
+/// commit fails with `SQLITE_BUSY` (5/517) regardless of `busy_timeout`:
+/// waiting cannot refresh a stale snapshot. Rolling back and re-running the
+/// transaction acquires a fresh snapshot, so bounded retries absorb the
+/// contention instead of failing the scheduler tick.
+const SQLITE_TRANSACTION_ATTEMPTS: usize = 3;
+
+/// Lock-contention errors that a full transaction retry can resolve. The
+/// CAS filters inside each transaction keep retries safe: a row changed by
+/// the contender is either claimed under its new generation or skipped.
+fn is_retryable_sqlite_lock_error(error: &anyhow::Error) -> bool {
+    let message = error
+        .chain()
+        .map(|cause| cause.to_string())
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+    message.contains("database is locked") || message.contains("database is busy")
+}
+
 /// Per-chat serialization for EH delivery mutations.
 ///
 /// The registry retains only weak references.  A returned guard owns the
@@ -192,6 +216,7 @@ pub struct EhDeliveryClaim {
 #[cfg(test)]
 tokio::task_local! {
     static EH_PUBLISH_CANDIDATE_INSPECTIONS: std::sync::Arc<std::sync::atomic::AtomicUsize>;
+    static EH_PUBLISH_CANDIDATE_GATE: Option<std::sync::Arc<EhPublishCandidateGate>>;
 }
 
 #[cfg(test)]
@@ -201,6 +226,44 @@ fn record_eh_publish_candidate_inspection() {
     });
 }
 
+/// Test-only double-fence between the publish candidate SELECT and the
+/// claiming UPDATE. The first suspended transaction blocks on `entered`
+/// (candidate selected, snapshot taken) and then on `release`, letting the
+/// test commit an interfering write between the two fences so the deferred
+/// write upgrade deterministically hits SQLITE_BUSY_SNAPSHOT (517). The gate
+/// fires once; retry attempts pass through so the fix can be observed.
+#[cfg(test)]
+pub(crate) struct EhPublishCandidateGate {
+    entered: tokio::sync::Barrier,
+    release: tokio::sync::Barrier,
+    armed: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(test)]
+impl EhPublishCandidateGate {
+    pub(crate) fn new() -> Self {
+        Self {
+            entered: tokio::sync::Barrier::new(2),
+            release: tokio::sync::Barrier::new(2),
+            armed: std::sync::atomic::AtomicBool::new(true),
+        }
+    }
+}
+
+#[cfg(test)]
+async fn await_eh_publish_candidate_gate() {
+    let gate = EH_PUBLISH_CANDIDATE_GATE
+        .try_with(|gate| gate.clone())
+        .ok()
+        .flatten();
+    let Some(gate) = gate else {
+        return;
+    };
+    if gate.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+        gate.entered.wait().await;
+        gate.release.wait().await;
+    }
+}
 fn eh_delivery_is_ready_for_publish(
     delivery: &eh_download_queue::Model,
     job: &eh_gallery_jobs::Model,
@@ -941,6 +1004,28 @@ impl Repo {
         subscription_id: i32,
         send_archive: bool,
     ) -> Result<()> {
+        for _ in 0..SQLITE_TRANSACTION_ATTEMPTS {
+            match self
+                .delete_eh_subscription_and_cancel_queue_once(subscription_id, send_archive)
+                .await
+            {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    if !is_retryable_sqlite_lock_error(&error) {
+                        return Err(error);
+                    }
+                }
+            }
+        }
+        self.delete_eh_subscription_and_cancel_queue_once(subscription_id, send_archive)
+            .await
+    }
+
+    async fn delete_eh_subscription_and_cancel_queue_once(
+        &self,
+        subscription_id: i32,
+        send_archive: bool,
+    ) -> Result<()> {
         let subscription = subscriptions::Entity::find_by_id(subscription_id)
             .one(&self.db)
             .await
@@ -1042,6 +1127,34 @@ impl Repo {
     }
 
     async fn cancel_eh_subscription_queue_entries_under_chat_locks(
+        &self,
+        subscription_id: i32,
+        send_archive: bool,
+    ) -> Result<u64> {
+        for _ in 0..SQLITE_TRANSACTION_ATTEMPTS {
+            match self
+                .cancel_eh_subscription_queue_entries_under_chat_locks_once(
+                    subscription_id,
+                    send_archive,
+                )
+                .await
+            {
+                Ok(changed) => return Ok(changed),
+                Err(error) => {
+                    if !is_retryable_sqlite_lock_error(&error) {
+                        return Err(error);
+                    }
+                }
+            }
+        }
+        self.cancel_eh_subscription_queue_entries_under_chat_locks_once(
+            subscription_id,
+            send_archive,
+        )
+        .await
+    }
+
+    async fn cancel_eh_subscription_queue_entries_under_chat_locks_once(
         &self,
         subscription_id: i32,
         send_archive: bool,
@@ -1207,6 +1320,29 @@ impl Repo {
     }
 
     async fn eh_download_has_live_owner_or_cancel(
+        &self,
+        id: i32,
+        expected_status: &str,
+        send_archive: bool,
+    ) -> Result<bool> {
+        for _ in 0..SQLITE_TRANSACTION_ATTEMPTS {
+            match self
+                .eh_download_has_live_owner_or_cancel_once(id, expected_status, send_archive)
+                .await
+            {
+                Ok(active) => return Ok(active),
+                Err(error) => {
+                    if !is_retryable_sqlite_lock_error(&error) {
+                        return Err(error);
+                    }
+                }
+            }
+        }
+        self.eh_download_has_live_owner_or_cancel_once(id, expected_status, send_archive)
+            .await
+    }
+
+    async fn eh_download_has_live_owner_or_cancel_once(
         &self,
         id: i32,
         expected_status: &str,
@@ -1467,6 +1603,27 @@ impl Repo {
         &self,
         send_archive: bool,
     ) -> Result<Option<EhDeliveryClaim>> {
+        for _ in 0..SQLITE_TRANSACTION_ATTEMPTS {
+            match self
+                .get_next_eh_delivery_for_publish_once(send_archive)
+                .await
+            {
+                Ok(outcome) => return Ok(outcome),
+                Err(error) => {
+                    if !is_retryable_sqlite_lock_error(&error) {
+                        return Err(error);
+                    }
+                }
+            }
+        }
+        self.get_next_eh_delivery_for_publish_once(send_archive)
+            .await
+    }
+
+    async fn get_next_eh_delivery_for_publish_once(
+        &self,
+        send_archive: bool,
+    ) -> Result<Option<EhDeliveryClaim>> {
         let now = Local::now().naive_local();
         let txn = self
             .db
@@ -1604,7 +1761,10 @@ impl Repo {
                 return Ok((None, committed_state_transition));
             };
             #[cfg(test)]
-            record_eh_publish_candidate_inspection();
+            {
+                record_eh_publish_candidate_inspection();
+                await_eh_publish_candidate_gate().await;
+            }
             debug_assert!(eh_delivery_is_ready_for_publish(
                 &delivery,
                 &job,
@@ -1784,6 +1944,30 @@ impl Repo {
         max_retry_count: u8,
         send_archive: bool,
     ) -> Result<(eh_download_queue::Model, bool)> {
+        for _ in 0..SQLITE_TRANSACTION_ATTEMPTS {
+            match self
+                .schedule_eh_delivery_retry_once(delivery_id, error, max_retry_count, send_archive)
+                .await
+            {
+                Ok(outcome) => return Ok(outcome),
+                Err(err) => {
+                    if !is_retryable_sqlite_lock_error(&err) {
+                        return Err(err);
+                    }
+                }
+            }
+        }
+        self.schedule_eh_delivery_retry_once(delivery_id, error, max_retry_count, send_archive)
+            .await
+    }
+
+    async fn schedule_eh_delivery_retry_once(
+        &self,
+        delivery_id: i32,
+        error: &str,
+        max_retry_count: u8,
+        send_archive: bool,
+    ) -> Result<(eh_download_queue::Model, bool)> {
         let txn = self
             .db
             .begin()
@@ -1886,6 +2070,20 @@ impl Repo {
     /// Persist the archive marker for one delivery immediately after Telegram
     /// accepts its document. The marker is deliberately delivery-local.
     pub async fn mark_eh_archive_delivery_sent(&self, delivery_id: i32) -> Result<()> {
+        for _ in 0..SQLITE_TRANSACTION_ATTEMPTS {
+            match self.mark_eh_archive_delivery_sent_once(delivery_id).await {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    if !is_retryable_sqlite_lock_error(&error) {
+                        return Err(error);
+                    }
+                }
+            }
+        }
+        self.mark_eh_archive_delivery_sent_once(delivery_id).await
+    }
+
+    async fn mark_eh_archive_delivery_sent_once(&self, delivery_id: i32) -> Result<()> {
         let txn = self
             .db
             .begin()
@@ -1942,6 +2140,29 @@ impl Repo {
     /// Finish only this delivery after all of its enabled/requested surfaces
     /// have durable sent markers.
     pub async fn mark_eh_delivery_done(
+        &self,
+        delivery_id: i32,
+        expected_job_id: i32,
+        send_archive: bool,
+    ) -> Result<eh_download_queue::Model> {
+        for _ in 0..SQLITE_TRANSACTION_ATTEMPTS {
+            match self
+                .mark_eh_delivery_done_once(delivery_id, expected_job_id, send_archive)
+                .await
+            {
+                Ok(delivery) => return Ok(delivery),
+                Err(error) => {
+                    if !is_retryable_sqlite_lock_error(&error) {
+                        return Err(error);
+                    }
+                }
+            }
+        }
+        self.mark_eh_delivery_done_once(delivery_id, expected_job_id, send_archive)
+            .await
+    }
+
+    async fn mark_eh_delivery_done_once(
         &self,
         delivery_id: i32,
         expected_job_id: i32,
@@ -2239,6 +2460,118 @@ mod tests {
             .count(repo.db())
             .await
             .unwrap()
+    }
+
+    /// Deferred read→write transactions on a WAL database deterministically
+    /// fail with SQLITE_BUSY_SNAPSHOT (517) when another connection commits
+    /// between the candidate SELECT and the claiming UPDATE. The publish
+    /// claim must absorb that error and retry the whole transaction.
+    #[tokio::test]
+    async fn publish_claim_retries_after_busy_snapshot_from_concurrent_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let (repo, outside) = setup_wal_file_db(&dir).await;
+
+        // Seed one ready archive delivery through the normal enqueue path.
+        let delivery = repo
+            .enqueue_eh_download(
+                -100,
+                90_001,
+                "busy-snapshot",
+                "Busy Snapshot",
+                false,
+                SOURCE_DIRECT,
+                &EhGalleryVariant::archive("1280x"),
+                None,
+                true,
+            )
+            .await
+            .unwrap()
+            .expect("delivery should be enqueued");
+        let download = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        repo.mark_eh_job_downloaded(
+            download.id,
+            download.started_at.unwrap(),
+            1,
+            "/tmp/busy-snapshot.zip",
+            0,
+        )
+        .await
+        .unwrap();
+
+        let gate = std::sync::Arc::new(super::EhPublishCandidateGate::new());
+        let inspections = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let claim_task = {
+            let repo = Repo::new(repo.db().clone());
+            let gate = gate.clone();
+            let inspections = inspections.clone();
+            tokio::spawn(async move {
+                EH_PUBLISH_CANDIDATE_INSPECTIONS
+                    .scope(inspections, async {
+                        EH_PUBLISH_CANDIDATE_GATE
+                            .scope(Some(gate), repo.get_next_eh_delivery_for_publish(true))
+                            .await
+                    })
+                    .await
+            })
+        };
+
+        // Fence 1: the candidate SELECT completed; the claim transaction is
+        // suspended before the claiming UPDATE with its WAL read snapshot.
+        gate.entered.wait().await;
+        // Interfering commit on the row the candidate scan read.
+        sea_orm::sqlx::query("UPDATE eh_download_queue SET error = 'interfered' WHERE id = ?")
+            .bind(delivery.id)
+            .execute(&outside)
+            .await
+            .unwrap();
+        // Fence 2: release the claim transaction; its UPDATE now upgrades a
+        // stale WAL snapshot and hits SQLITE_BUSY_SNAPSHOT instead of waiting.
+        gate.release.wait().await;
+
+        let claim = claim_task
+            .await
+            .unwrap()
+            .expect("claim must survive a busy snapshot and retry")
+            .expect("claim should succeed after retry");
+        assert_eq!(claim.delivery.id, delivery.id);
+        assert_eq!(claim.delivery.status, STATUS_PUBLISHING);
+        assert_eq!(
+            inspections.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the retry must run a fresh candidate scan"
+        );
+    }
+
+    async fn setup_wal_file_db(dir: &tempfile::TempDir) -> (Repo, sea_orm::sqlx::SqlitePool) {
+        let path = dir.path().join("wal-contention.db");
+        let url = format!("sqlite:{}?mode=rwc", path.display());
+        let repo = {
+            let db = crate::db::establish_connection(&url).await.unwrap();
+            db.execute_unprepared("PRAGMA foreign_keys = ON")
+                .await
+                .unwrap();
+            tests_helpers::create_schema(&db).await.unwrap();
+            let mode: String = sea_orm::sqlx::query_scalar("PRAGMA journal_mode")
+                .fetch_one(db.get_sqlite_connection_pool())
+                .await
+                .unwrap();
+            assert_eq!(mode.to_ascii_lowercase(), "wal");
+            Repo::new(db)
+        };
+        let outside = {
+            use sea_orm::sqlx::ConnectOptions as _;
+            use url::Url;
+            let url: Url = url.parse().unwrap();
+            let options = sea_orm::sqlx::sqlite::SqliteConnectOptions::from_url(&url)
+                .unwrap()
+                .busy_timeout(std::time::Duration::from_millis(200));
+            sea_orm::sqlx::sqlite::SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect_with(options)
+                .await
+                .unwrap()
+        };
+        (repo, outside)
     }
 
     #[tokio::test]
