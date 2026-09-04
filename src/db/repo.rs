@@ -39,12 +39,19 @@ impl Repo {
 pub mod tests_helpers {
     use super::Repo;
     use anyhow::Result;
-    use sea_orm::{ConnectionTrait, Database, DbBackend, Statement};
+    use sea_orm::{ConnectionTrait, Database, DatabaseConnection, DbBackend, Statement};
 
     pub async fn setup_test_db() -> Result<Repo> {
         let db = Database::connect("sqlite::memory:").await?;
         db.execute_unprepared("PRAGMA foreign_keys = ON").await?;
+        create_schema(&db).await?;
+        Ok(Repo::new(db))
+    }
 
+    /// Build the full repo schema on an arbitrary SQLite connection. WAL file
+    /// databases used by lock-contention tests share this DDL with the
+    /// in-memory default.
+    pub async fn create_schema(db: &DatabaseConnection) -> Result<()> {
         db.execute(Statement::from_string(
             DbBackend::Sqlite,
             r#"
@@ -329,7 +336,7 @@ pub mod tests_helpers {
         ))
         .await?;
 
-        Ok(Repo::new(db))
+        Ok(())
     }
 }
 
