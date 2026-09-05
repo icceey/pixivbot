@@ -153,7 +153,12 @@ mod tests {
 
     #[test]
     fn shared_batch_caption_uses_global_numbering_for_resumed_multi_batch_send() {
-        let numbering = ContinuationNumbering::new(2, 3);
+        let initial = ContinuationNumbering::for_item_count(23);
+        assert_eq!(
+            shared_batch_caption(Some("base"), 0, 0, initial),
+            Some("base".to_string())
+        );
+        let numbering = ContinuationNumbering::new(2, initial.total_batches);
 
         assert_eq!(
             shared_batch_caption(Some("base"), 0, 0, numbering),
@@ -193,35 +198,5 @@ mod tests {
         assert_eq!(result.first_message_id, None);
         assert!(result.is_complete_failure());
         assert!(!result.is_complete_success());
-    }
-
-    #[test]
-    fn batch_send_result_success_and_partial_flags_match_contents() {
-        let success = BatchSendResult {
-            succeeded_indices: vec![0, 1],
-            failed_indices: Vec::new(),
-            first_message_id: Some(42),
-        };
-        let partial = BatchSendResult {
-            succeeded_indices: vec![0],
-            failed_indices: vec![1],
-            first_message_id: Some(7),
-        };
-
-        assert!(success.is_complete_success());
-        assert!(!success.is_complete_failure());
-
-        assert!(!partial.is_complete_success());
-        assert!(!partial.is_complete_failure());
-    }
-
-    #[test]
-    fn continuation_numbering_for_item_count_uses_shared_batch_limit() {
-        let numbering = ContinuationNumbering::for_item_count(23);
-
-        assert_eq!(numbering.first_batch_number, 1);
-        assert_eq!(numbering.total_batches, 3);
-        assert_eq!(numbering.display_batch_number(0), 1);
-        assert_eq!(numbering.display_batch_number(2), 3);
     }
 }

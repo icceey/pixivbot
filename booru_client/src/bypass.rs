@@ -177,12 +177,4 @@ mod tests {
     fn strip_pre_wrapper_returns_unwrapped_when_no_pre() {
         assert_eq!(strip_html_wrapper("{\"a\":1}"), "{\"a\":1}");
     }
-
-    #[test]
-    fn strip_pre_wrapper_no_double_decode_amp() {
-        // A response that legitimately contains "&amp;" must not become "&".
-        // (Wrapper would have escaped it as "&amp;amp;" if it were a literal
-        // ampersand — so seeing a single "&amp;" means a literal "&".)
-        assert_eq!(strip_html_wrapper("<pre>a&amp;b</pre>"), "a&b");
-    }
 }

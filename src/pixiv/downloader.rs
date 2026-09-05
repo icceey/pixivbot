@@ -413,26 +413,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pixiv_urls_keep_pixiv_referer() {
-        assert_eq!(
-            download_referer("https://i.pximg.net/img-original/img/2026/01/01/00/00/00/1_p0.jpg"),
-            Some("https://app-api.pixiv.net/")
-        );
-    }
-
-    #[test]
-    fn non_pixiv_urls_do_not_use_pixiv_referer() {
-        assert_eq!(
-            download_referer("https://files.yande.re/sample/example.jpg"),
-            None
-        );
-        assert_eq!(download_referer("https://example.com/image.jpg"), None);
-        assert_eq!(download_referer("https://evilpximg.net/image.jpg"), None);
-    }
-
-    #[test]
-    fn invalid_urls_do_not_use_pixiv_referer() {
-        assert_eq!(download_referer("not a url"), None);
+    fn download_referer_is_limited_to_pixiv_image_hosts() {
+        for (url, expected) in [
+            (
+                "https://i.pximg.net/img-original/img/2026/01/01/00/00/00/1_p0.jpg",
+                Some("https://app-api.pixiv.net/"),
+            ),
+            ("https://example.com/image.jpg", None),
+            ("https://evilpximg.net/image.jpg", None),
+            ("not a url", None),
+        ] {
+            assert_eq!(download_referer(url), expected, "{url}");
+        }
     }
 
     /// Create a minimal PNG image in memory (2x2 pixels with given color)

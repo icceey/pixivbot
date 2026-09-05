@@ -653,131 +653,85 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_eh_galleries_finds_multiple_links() {
-        let text = "https://e-hentai.org/g/1/aaaaaaaaaa/ https://e-hentai.org/g/2/bbbbbbbbbb/";
-        let galleries = extract_eh_galleries_from_text(text);
-        assert_eq!(galleries.len(), 2);
-        assert_eq!(galleries[0], (1, "aaaaaaaaaa".to_string()));
-        assert_eq!(galleries[1], (2, "bbbbbbbbbb".to_string()));
+    fn gallery_extraction_validates_tokens_and_deduplicates_complete_references() {
+        for (input, expected) in [
+            (
+                "https://e-hentai.org/g/1/aaaaaaaaaa/ https://e-hentai.org/g/2/bbbbbbbbbb/",
+                vec![(1, "aaaaaaaaaa"), (2, "bbbbbbbbbb")],
+            ),
+            ("https://e-hentai.org/g/1/abc/", vec![]),
+            ("https://e-hentai.org/g/1/abcdefgh/", vec![(1, "abcdefgh")]),
+            (
+                "https://e-hentai.org/g/1/aaaaaaaaaa/ and https://e-hentai.org/g/1/aaaaaaaaaa/",
+                vec![(1, "aaaaaaaaaa")],
+            ),
+            (
+                "https://e-hentai.org/g/1/aaaaaaaaaa/ and https://e-hentai.org/g/1/bbbbbbbbbb/",
+                vec![(1, "aaaaaaaaaa"), (1, "bbbbbbbbbb")],
+            ),
+            (
+                "https://exhentai.org/g/99999/deadbeef00/",
+                vec![(99999, "deadbeef00")],
+            ),
+        ] {
+            let expected: Vec<_> = expected
+                .into_iter()
+                .map(|(gid, token)| (gid, token.to_string()))
+                .collect();
+            assert_eq!(extract_eh_galleries_from_text(input), expected, "{input}");
+        }
     }
 
     #[test]
-    fn test_extract_eh_galleries_rejects_short_tokens() {
-        // Token length < 8 should be rejected (matching parse_gallery_ref)
-        let text = "https://e-hentai.org/g/1/abc/";
-        let galleries = extract_eh_galleries_from_text(text);
-        assert!(galleries.is_empty());
-    }
-
-    #[test]
-    fn test_extract_eh_galleries_accepts_min_token_length() {
-        // Token length == 8 should be accepted
-        let text = "https://e-hentai.org/g/1/abcdefgh/";
-        let galleries = extract_eh_galleries_from_text(text);
-        assert_eq!(galleries.len(), 1);
-        assert_eq!(galleries[0], (1, "abcdefgh".to_string()));
-    }
-
-    #[test]
-    fn test_extract_eh_galleries_dedupes_same_gid() {
-        // Same (gid, token) appearing twice should be deduplicated
-        let text =
-            "https://e-hentai.org/g/1/aaaaaaaaaa/ and also https://e-hentai.org/g/1/aaaaaaaaaa/";
-        let galleries = extract_eh_galleries_from_text(text);
-        assert_eq!(galleries.len(), 1);
-        assert_eq!(galleries[0], (1, "aaaaaaaaaa".to_string()));
-    }
-
-    #[test]
-    fn test_extract_eh_galleries_same_gid_different_token_returns_both() {
-        // Same gid but different token — two distinct links
-        let text = "https://e-hentai.org/g/1/aaaaaaaaaa/ and https://e-hentai.org/g/1/bbbbbbbbbb/";
-        let galleries = extract_eh_galleries_from_text(text);
-        assert_eq!(galleries.len(), 2);
-        assert_eq!(galleries[0], (1, "aaaaaaaaaa".to_string()));
-        assert_eq!(galleries[1], (1, "bbbbbbbbbb".to_string()));
-    }
-
-    #[test]
-    fn test_extract_eh_galleries_args_take_precedence_over_reply() {
-        let args = "https://e-hentai.org/g/1/aaaaaaaaaa/";
+    fn explicit_download_arguments_take_precedence_over_reply() {
         let reply = Some("https://e-hentai.org/g/2/bbbbbbbbbb/");
-        let galleries = extract_eh_galleries_from_sources(args, reply);
-        assert_eq!(galleries, vec![(1, "aaaaaaaaaa".to_string())]);
+        for (args, expected) in [
+            (
+                "https://e-hentai.org/g/1/aaaaaaaaaa/",
+                vec![(1, "aaaaaaaaaa".to_string())],
+            ),
+            ("https://www.pixiv.net/artworks/123456789", vec![]),
+            ("   ", vec![(2, "bbbbbbbbbb".to_string())]),
+        ] {
+            assert_eq!(
+                extract_eh_galleries_from_sources(args, reply),
+                expected,
+                "{args}"
+            );
+        }
     }
 
     #[test]
-    fn test_extract_eh_galleries_pixiv_args_ignore_reply_eh() {
-        let args = "https://www.pixiv.net/artworks/123456789";
-        let reply = Some("https://e-hentai.org/g/2/bbbbbbbbbb/");
-        let galleries = extract_eh_galleries_from_sources(args, reply);
-        assert!(galleries.is_empty());
-    }
-
-    #[test]
-    fn test_extract_eh_galleries_args_eh_ignore_reply_duplicate() {
-        let args = "https://e-hentai.org/g/1/aaaaaaaaaa/";
-        let reply = Some("https://e-hentai.org/g/1/aaaaaaaaaa/");
-        let galleries = extract_eh_galleries_from_sources(args, reply);
-        assert_eq!(galleries, vec![(1, "aaaaaaaaaa".to_string())]);
-    }
-
-    #[test]
-    fn test_extract_eh_galleries_uses_reply_when_args_empty() {
-        let galleries =
-            extract_eh_galleries_from_sources("   ", Some("https://e-hentai.org/g/2/bbbbbbbbbb/"));
-        assert_eq!(galleries, vec![(2, "bbbbbbbbbb".to_string())]);
-    }
-
-    #[test]
-    fn test_classify_eh_download_input_rejects_distinct_multiple_links() {
-        let galleries = vec![(1, "aaaaaaaaaa".to_string()), (1, "bbbbbbbbbb".to_string())];
-        assert_eq!(
-            classify_eh_download_input(&galleries, false),
-            EhDownloadInput::Multiple
-        );
-    }
-
-    #[test]
-    fn test_classify_eh_download_input_rejects_mixed_targets() {
-        let galleries = vec![(1, "aaaaaaaaaa".to_string())];
-        assert_eq!(
-            classify_eh_download_input(&galleries, true),
-            EhDownloadInput::Mixed
-        );
-    }
-
-    #[test]
-    fn test_args_bare_pixiv_id_after_eh_url_is_mixed_target() {
-        let args = "https://e-hentai.org/g/1/aaaaaaaaaa/ 123456789";
-        assert!(args_have_bare_pixiv_ids_outside_eh_urls(args));
-        let galleries = extract_eh_galleries_from_sources(args, None);
-        assert_eq!(
-            classify_eh_download_input(&galleries, args_have_bare_pixiv_ids_outside_eh_urls(args),),
-            EhDownloadInput::Mixed
-        );
-    }
-
-    #[test]
-    fn test_args_eh_url_digits_do_not_count_as_bare_pixiv_id() {
-        let args = "https://e-hentai.org/g/123456789/aaaaaaaaaa/";
-        assert!(!args_have_bare_pixiv_ids_outside_eh_urls(args));
-    }
-
-    #[test]
-    fn test_classify_eh_download_input_accepts_single_eh_only() {
-        let galleries = vec![(1, "aaaaaaaaaa".to_string())];
-        assert_eq!(
-            classify_eh_download_input(&galleries, false),
-            EhDownloadInput::Single(1, "aaaaaaaaaa".to_string())
-        );
-    }
-
-    #[test]
-    fn test_extract_eh_galleries_exhentai_url() {
-        let text = "https://exhentai.org/g/99999/deadbeef00/";
-        let galleries = extract_eh_galleries_from_text(text);
-        assert_eq!(galleries.len(), 1);
-        assert_eq!(galleries[0], (99999, "deadbeef00".to_string()));
+    fn download_input_distinguishes_single_multiple_and_mixed_targets() {
+        for (input, other_targets, expected) in [
+            (
+                "https://e-hentai.org/g/1/aaaaaaaaaa/ https://e-hentai.org/g/1/bbbbbbbbbb/",
+                false,
+                EhDownloadInput::Multiple,
+            ),
+            (
+                "https://e-hentai.org/g/1/aaaaaaaaaa/",
+                true,
+                EhDownloadInput::Mixed,
+            ),
+            (
+                "https://e-hentai.org/g/1/aaaaaaaaaa/ 123456789",
+                false,
+                EhDownloadInput::Mixed,
+            ),
+            (
+                "https://e-hentai.org/g/123456789/aaaaaaaaaa/",
+                false,
+                EhDownloadInput::Single(123456789, "aaaaaaaaaa".into()),
+            ),
+        ] {
+            let galleries = extract_eh_galleries_from_sources(input, None);
+            let mixed = other_targets || args_have_bare_pixiv_ids_outside_eh_urls(input);
+            assert_eq!(
+                classify_eh_download_input(&galleries, mixed),
+                expected,
+                "{input}"
+            );
+        }
     }
 }

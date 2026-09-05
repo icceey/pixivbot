@@ -28,31 +28,12 @@ pub(crate) fn archive_http_error(error: reqwest::Error) -> Error {
 
 #[cfg(test)]
 mod tests {
-    use super::{archive_get, archive_http_error, is_ehentai_host};
+    use super::{archive_get, archive_http_error};
     use crate::error::Error;
     use crate::models::EhCookies;
     use reqwest::header::COOKIE;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
-
-    #[test]
-    fn is_ehentai_host_matches_only_exact_eh_domains() {
-        assert!(is_ehentai_host(
-            "https://e-hentai.org/archive/1/abc/file/0?start=1"
-        ));
-        assert!(is_ehentai_host(
-            "https://exhentai.org/archive/1/abc/file/0?start=1"
-        ));
-        assert!(!is_ehentai_host(
-            "https://sub.e-hentai.org/archive/1/abc/file/0?start=1"
-        ));
-        assert!(!is_ehentai_host(
-            "http://127.0.0.1/archive/1/abc/file/0?start=1"
-        ));
-        assert!(!is_ehentai_host(
-            "https://example.com/archive/1/abc/file/0?start=1"
-        ));
-    }
 
     #[test]
     fn archive_get_adds_cookies_only_for_eh_hosts() {
@@ -75,10 +56,14 @@ mod tests {
             );
         }
 
-        let request = archive_get(&http, &cookies, "https://example.com/archive/1")
-            .build()
-            .unwrap();
-        assert!(request.headers().get(COOKIE).is_none());
+        for url in [
+            "https://example.com/archive/1",
+            "https://sub.e-hentai.org/archive/1",
+            "http://127.0.0.1/archive/1",
+        ] {
+            let request = archive_get(&http, &cookies, url).build().unwrap();
+            assert!(request.headers().get(COOKIE).is_none(), "{url}");
+        }
     }
 
     #[tokio::test]

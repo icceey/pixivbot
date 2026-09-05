@@ -141,164 +141,108 @@ impl BooruTaskKey {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use booru_client::BooruRating;
 
-    fn filter_score() -> BooruFilter {
-        BooruFilter::new(Some(10), None, vec![])
-    }
-
-    fn filter_all() -> BooruFilter {
-        BooruFilter::new(Some(10), Some(5), vec![BooruRating::Safe])
+    #[test]
+    fn task_keys_encode_and_roundtrip_tag_and_ranking_modes() {
+        let score = BooruFilter::new(Some(10), None, vec![]);
+        let all = BooruFilter::new(Some(10), Some(5), vec![BooruRating::Safe]);
+        for (key, expected) in [
+            (
+                BooruTaskKey::new_tag("Konachan", "cat", &BooruFilter::default()),
+                "konachan:cat",
+            ),
+            (
+                BooruTaskKey::new_tag("konachan", "cat", &score),
+                "konachan:cat|f=s",
+            ),
+            (
+                BooruTaskKey::new_tag("konachan", "cat", &all),
+                "konachan:cat|f=sfr",
+            ),
+            (
+                BooruTaskKey::new_ranking(
+                    "konachan",
+                    "cat",
+                    BooruRankingMode::Orderby(OrderbyKind::Score),
+                    &BooruFilter::default(),
+                ),
+                "konachan:cat|o=score",
+            ),
+            (
+                BooruTaskKey::new_ranking(
+                    "konachan",
+                    "cat",
+                    BooruRankingMode::Orderby(OrderbyKind::Score),
+                    &score,
+                ),
+                "konachan:cat|o=score|f=s",
+            ),
+            (
+                BooruTaskKey::new_ranking(
+                    "konachan",
+                    "",
+                    BooruRankingMode::Popular(PopularScale::Day),
+                    &BooruFilter::default(),
+                ),
+                "konachan:|r=day",
+            ),
+            (
+                BooruTaskKey::new_ranking(
+                    "danbooru",
+                    "1girl",
+                    BooruRankingMode::Popular(PopularScale::Week),
+                    &all,
+                ),
+                "danbooru:1girl|r=week|f=sfr",
+            ),
+            (
+                BooruTaskKey::new_ranking(
+                    "konachan",
+                    "landscape",
+                    BooruRankingMode::Interval("3600s".into()),
+                    &BooruFilter::default(),
+                ),
+                "konachan:landscape|i=3600s",
+            ),
+        ] {
+            assert_eq!(key.to_task_value(), expected);
+            assert_eq!(BooruTaskKey::parse(expected), Some(key), "{expected}");
+        }
     }
 
     #[test]
-    fn tag_no_filter_plain_format() {
-        let k = BooruTaskKey::new_tag("Konachan", "cat", &BooruFilter::default());
-        assert_eq!(k.to_task_value(), "konachan:cat");
+    fn task_sharing_depends_on_filter_kinds_not_thresholds() {
+        for (filter, expected) in [
+            (BooruFilter::new(Some(10), None, vec![]), "konachan:cat|f=s"),
+            (BooruFilter::new(Some(50), None, vec![]), "konachan:cat|f=s"),
+            (BooruFilter::new(None, Some(10), vec![]), "konachan:cat|f=f"),
+        ] {
+            assert_eq!(
+                BooruTaskKey::new_tag("konachan", "cat", &filter).to_task_value(),
+                expected
+            );
+        }
     }
 
     #[test]
-    fn tag_with_score_filter_adds_sig() {
-        let k = BooruTaskKey::new_tag("konachan", "cat", &filter_score());
-        assert_eq!(k.to_task_value(), "konachan:cat|f=s");
-    }
-
-    #[test]
-    fn tag_with_all_filters_sorted_sig() {
-        let k = BooruTaskKey::new_tag("konachan", "cat", &filter_all());
-        assert_eq!(k.to_task_value(), "konachan:cat|f=sfr");
-    }
-
-    #[test]
-    fn same_filter_keys_different_values_produce_same_task_value() {
-        let f1 = BooruFilter::new(Some(10), None, vec![]);
-        let f2 = BooruFilter::new(Some(50), None, vec![]);
-        let k1 = BooruTaskKey::new_tag("konachan", "cat", &f1);
-        let k2 = BooruTaskKey::new_tag("konachan", "cat", &f2);
-        assert_eq!(k1.to_task_value(), k2.to_task_value());
-    }
-
-    #[test]
-    fn different_filter_keys_produce_different_task_values() {
-        let f_score = BooruFilter::new(Some(10), None, vec![]);
-        let f_fav = BooruFilter::new(None, Some(10), vec![]);
-        let k1 = BooruTaskKey::new_tag("konachan", "cat", &f_score);
-        let k2 = BooruTaskKey::new_tag("konachan", "cat", &f_fav);
-        assert_ne!(k1.to_task_value(), k2.to_task_value());
-    }
-
-    #[test]
-    fn ranking_orderby_score_format() {
-        let k = BooruTaskKey::new_ranking(
-            "konachan",
-            "cat",
-            BooruRankingMode::Orderby(OrderbyKind::Score),
-            &BooruFilter::default(),
-        );
-        assert_eq!(k.to_task_value(), "konachan:cat|o=score");
-    }
-
-    #[test]
-    fn ranking_popular_day_format() {
-        let k = BooruTaskKey::new_ranking(
-            "konachan",
-            "",
-            BooruRankingMode::Popular(PopularScale::Day),
-            &BooruFilter::default(),
-        );
-        assert_eq!(k.to_task_value(), "konachan:|r=day");
-    }
-
-    #[test]
-    fn ranking_interval_format() {
-        let k = BooruTaskKey::new_ranking(
-            "konachan",
-            "landscape",
-            BooruRankingMode::Interval("3600s".into()),
-            &BooruFilter::default(),
-        );
-        assert_eq!(k.to_task_value(), "konachan:landscape|i=3600s");
-    }
-
-    #[test]
-    fn ranking_with_filter_combines() {
-        let k = BooruTaskKey::new_ranking(
-            "konachan",
-            "cat",
-            BooruRankingMode::Orderby(OrderbyKind::Score),
-            &filter_score(),
-        );
-        assert_eq!(k.to_task_value(), "konachan:cat|o=score|f=s");
-    }
-
-    #[test]
-    fn parse_plain_tag() {
-        let k = BooruTaskKey::parse("konachan:cat").unwrap();
-        assert_eq!(k.site, "konachan");
-        assert_eq!(k.tags, "cat");
-        assert_eq!(k.filter_sig, "");
-        assert!(k.ranking.is_none());
-    }
-
-    #[test]
-    fn parse_tag_with_filter() {
-        let k = BooruTaskKey::parse("konachan:cat|f=sfr").unwrap();
-        assert_eq!(k.filter_sig, "sfr");
-        assert!(k.ranking.is_none());
-    }
-
-    #[test]
-    fn parse_ranking_orderby_with_filter() {
-        let k = BooruTaskKey::parse("konachan:cat|o=score|f=s").unwrap();
-        assert_eq!(k.tags, "cat");
-        assert_eq!(k.filter_sig, "s");
-        matches!(
-            k.ranking,
-            Some(BooruRankingMode::Orderby(OrderbyKind::Score))
-        );
-    }
-
-    #[test]
-    fn parse_ranking_interval() {
-        let k = BooruTaskKey::parse("konachan:|i=1800s").unwrap();
-        assert!(matches!(k.ranking, Some(BooruRankingMode::Interval(ref s)) if s == "1800s"));
-    }
-
-    #[test]
-    fn parse_ranking_interval_requires_valid_duration() {
-        assert!(BooruTaskKey::parse("konachan:|i=abc").is_none());
-        assert!(BooruTaskKey::parse("konachan:|i=0s").is_none());
-        assert!(BooruTaskKey::parse("konachan:|i=1h").is_none());
-        assert!(BooruTaskKey::parse("konachan:|i=60m").is_none());
-    }
-
-    #[test]
-    fn parse_roundtrip_preserves_all_fields() {
-        let original = BooruTaskKey::new_ranking(
-            "danbooru",
-            "1girl",
-            BooruRankingMode::Popular(PopularScale::Week),
-            &filter_all(),
-        );
-        let parsed = BooruTaskKey::parse(&original.to_task_value()).unwrap();
-        assert_eq!(parsed, original);
-    }
-
-    #[test]
-    fn parse_invalid_format_returns_none() {
-        assert!(BooruTaskKey::parse("nocolon").is_none());
-        assert!(BooruTaskKey::parse("site:tags|unknown=value").is_none());
-        assert!(BooruTaskKey::parse("site:tags|o=invalidmode").is_none());
-    }
-
-    #[test]
-    fn parse_rejects_duplicate_ranking_segments() {
-        // Two ranking modes — last would silently win, hiding malformed data.
-        assert!(BooruTaskKey::parse("site:|o=score|r=day").is_none());
-        assert!(BooruTaskKey::parse("site:|o=score|o=fav").is_none());
-        assert!(BooruTaskKey::parse("site:|i=1h|r=day").is_none());
-        assert!(BooruTaskKey::parse("site:|r=day|i=1h").is_none());
-        // Two filter sigs — should also reject.
-        assert!(BooruTaskKey::parse("site:tags|f=s|f=r").is_none());
+    fn parse_rejects_malformed_or_ambiguous_task_keys() {
+        for value in [
+            "nocolon",
+            "site:tags|unknown=value",
+            "site:tags|o=invalidmode",
+            "site:|i=abc",
+            "site:|i=0s",
+            "site:|i=1h",
+            "site:|i=60m",
+            "site:|o=score|r=day",
+            "site:|o=score|o=fav",
+            "site:|i=3600s|r=day",
+            "site:|r=day|i=3600s",
+            "site:tags|f=s|f=r",
+        ] {
+            assert!(BooruTaskKey::parse(value).is_none(), "{value}");
+        }
     }
 }

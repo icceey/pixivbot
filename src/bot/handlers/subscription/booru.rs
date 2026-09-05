@@ -1019,13 +1019,17 @@ mod tests {
 
     #[test]
     fn parse_filters_and_tags_split() {
-        let args = vec!["+good", "score>=50", "fav>=10", "rating=s,q", "-bad"];
+        let args = vec!["+good", "score>=50", "fav>=10", "rating=s,q,e", "-bad"];
         let (booru, tags) = parse_booru_filter_args(&args).unwrap();
         assert_eq!(booru.score_min, Some(50));
         assert_eq!(booru.fav_count_min, Some(10));
         assert_eq!(
             booru.allowed_ratings,
-            vec![BooruRating::Safe, BooruRating::Questionable]
+            vec![
+                BooruRating::Safe,
+                BooruRating::Questionable,
+                BooruRating::Explicit
+            ]
         );
         assert!(!tags.is_empty());
     }
@@ -1049,20 +1053,6 @@ mod tests {
         let result = parse_booru_filter_args(&args);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("rating"));
-    }
-
-    #[test]
-    fn multiple_ratings_parsed() {
-        let args = vec!["rating=s,q,e"];
-        let (booru, _) = parse_booru_filter_args(&args).unwrap();
-        assert_eq!(
-            booru.allowed_ratings,
-            vec![
-                BooruRating::Safe,
-                BooruRating::Questionable,
-                BooruRating::Explicit
-            ]
-        );
     }
 
     #[test]

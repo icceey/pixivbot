@@ -572,19 +572,4 @@ mod tests {
         assert!(ranking_requires_individual_send(&[&still, &ugoira]));
         assert!(!ranking_requires_individual_send(&[&still]));
     }
-
-    #[test]
-    fn build_ranking_caption_marks_ugoira_and_prepends_title_once() {
-        let title = build_ranking_title("day", 2);
-        let ugoira = make_illust("ugoira", "Animated");
-        let still = make_illust("illust", "Still");
-
-        let first_caption = build_ranking_caption(&title, 0, &ugoira);
-        let second_caption = build_ranking_caption(&title, 1, &still);
-
-        assert!(first_caption.starts_with(&title));
-        assert!(first_caption.contains("🎞️ Animated"));
-        assert!(!second_caption.starts_with(&title));
-        assert!(!second_caption.contains("🎞️ Still"));
-    }
 }

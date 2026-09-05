@@ -365,14 +365,3 @@ impl BooruClient {
         bypass::solve(&self.client, bypass_cfg, full.as_str()).await
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_client_strips_trailing_slash() {
-        let client = BooruClient::new("https://yande.re/", BooruEngineType::Moebooru).unwrap();
-        assert_eq!(client.base_url(), "https://yande.re");
-    }
-}

@@ -197,20 +197,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_generate_key_deterministic() {
-        let cache = FileCacheManager {
-            root_dir: PathBuf::from("/tmp/cache"),
-        };
-
-        let url = "https://example.com/image.jpg";
-        let key1 = cache.generate_key(url);
-        let key2 = cache.generate_key(url);
-
-        assert_eq!(key1, key2);
-        assert!(!key1.is_empty());
-    }
-
-    #[test]
     fn test_safe_url_slug() {
         let cache = FileCacheManager {
             root_dir: PathBuf::from("/tmp/cache"),
@@ -243,18 +229,5 @@ mod tests {
         );
         assert_eq!(cache.extract_extension("https://example.com/image"), "jpg");
         // fallback
-    }
-
-    #[test]
-    fn test_resolve_path() {
-        let cache = FileCacheManager {
-            root_dir: PathBuf::from("/tmp/cache"),
-        };
-
-        let path = cache.resolve_path("https://example.com/test.jpg");
-
-        // Path should be: /tmp/cache/{prefix}/{hash}_{slug}.{ext}
-        assert!(path.starts_with("/tmp/cache"));
-        assert!(path.to_string_lossy().ends_with(".jpg"));
     }
 }

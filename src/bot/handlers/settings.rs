@@ -595,21 +595,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_tags_input_mixed_commas() {
-        let result = parse_tags_input("tag1, tag2，tag3, tag4");
-        assert_eq!(result, vec!["tag1", "tag2", "tag3", "tag4"]);
-    }
-
-    #[test]
-    fn test_parse_tags_input_whitespace_only() {
-        let result = parse_tags_input("   ,   ,   ");
-        assert!(result.is_empty());
-    }
-
-    #[test]
-    fn test_parse_tags_input_duplicate_tags() {
-        // Note: This function does NOT deduplicate - just parses
-        let result = parse_tags_input("tag1, tag1, tag2");
-        assert_eq!(result, vec!["tag1", "tag1", "tag2"]);
+    fn tag_input_handles_mixed_separators_whitespace_and_duplicates() {
+        for (input, expected) in [
+            (
+                "tag1, tag2，tag3, tag4",
+                vec!["tag1", "tag2", "tag3", "tag4"],
+            ),
+            ("   ,   ,   ", vec![]),
+            ("tag1, tag1, tag2", vec!["tag1", "tag1", "tag2"]),
+        ] {
+            assert_eq!(parse_tags_input(input), expected, "{input}");
+        }
     }
 }

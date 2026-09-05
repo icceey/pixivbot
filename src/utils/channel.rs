@@ -290,45 +290,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_normalize_channel_id() {
-        // Positive input without prefix
-        assert_eq!(normalize_channel_id(123456), -100123456);
-        assert_eq!(normalize_channel_id(1234567890), -1001234567890);
-
-        // Negative input without -100 prefix
-        assert_eq!(normalize_channel_id(-123456), -100123456);
-        assert_eq!(normalize_channel_id(-1234567890), -1001234567890);
-
-        // Already has -100 prefix
-        assert_eq!(normalize_channel_id(-100123456), -100123456);
-        assert_eq!(normalize_channel_id(-1001234567890), -1001234567890);
-
-        // Positive with 100 prefix (rare but possible user input)
-        assert_eq!(normalize_channel_id(100123456), -100123456);
-        assert_eq!(normalize_channel_id(1001234567890), -1001234567890);
-    }
-
-    #[test]
-    fn test_channel_identifier_from_str_numeric() {
-        // Test positive ID normalization
-        let id: ChannelIdentifier = "123456".parse().unwrap();
-        match id {
-            ChannelIdentifier::Id(chat_id) => assert_eq!(chat_id.0, -100123456),
-            _ => panic!("Expected Id variant"),
-        }
-
-        // Test negative ID normalization
-        let id: ChannelIdentifier = "-123456".parse().unwrap();
-        match id {
-            ChannelIdentifier::Id(chat_id) => assert_eq!(chat_id.0, -100123456),
-            _ => panic!("Expected Id variant"),
-        }
-
-        // Test already normalized ID
-        let id: ChannelIdentifier = "-100123456".parse().unwrap();
-        match id {
-            ChannelIdentifier::Id(chat_id) => assert_eq!(chat_id.0, -100123456),
-            _ => panic!("Expected Id variant"),
+    fn numeric_channel_identifiers_normalize_the_telegram_prefix() {
+        for (input, expected) in [
+            ("123456", -100123456),
+            ("-123456", -100123456),
+            ("-100123456", -100123456),
+            ("100123456", -100123456),
+            ("1234567890", -1001234567890),
+            ("-1234567890", -1001234567890),
+            ("-1001234567890", -1001234567890),
+            ("1001234567890", -1001234567890),
+        ] {
+            let ChannelIdentifier::Id(id) = input.parse().unwrap() else {
+                panic!("expected numeric channel for {input}");
+            };
+            assert_eq!(id.0, expected, "{input}");
         }
     }
 

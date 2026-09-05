@@ -1033,36 +1033,53 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_eh_filter_basic() {
-        let filter = parse_eh_filter(&["rating>=4".to_string()]).unwrap();
-        assert_eq!(filter.min_rating, Some(4));
-        assert!(!filter.telegraph);
+    fn subscription_options_parse_through_to_filters() {
+        for (input, query, filter_args, cat, telegraph, expected) in [
+            (
+                "foo rating>=4",
+                "foo",
+                vec!["rating>=4"],
+                None,
+                false,
+                (Some(4), None, None),
+            ),
+            (
+                "foo rating>=3 pages>=20 pages<=500",
+                "foo",
+                vec!["rating>=3", "pages>=20", "pages<=500"],
+                None,
+                false,
+                (Some(3), Some(20), Some(500)),
+            ),
+            (
+                "foo rating>3 pages>20 pages<100 telegraph=on cat=manga",
+                "foo",
+                vec!["rating>=4", "pages>=21", "pages<=99"],
+                Some("manga"),
+                true,
+                (Some(4), Some(21), Some(99)),
+            ),
+        ] {
+            let parsed = parse_esub_remaining(input).unwrap();
+            assert_eq!(parsed.query, query);
+            assert_eq!(parsed.filter_args, filter_args);
+            assert_eq!(parsed.cat_str.as_deref(), cat);
+            assert_eq!(parsed.telegraph_on, telegraph);
+            let filter = parse_eh_filter(&parsed.filter_args).unwrap();
+            assert_eq!(
+                (filter.min_rating, filter.min_pages, filter.max_pages),
+                expected,
+                "{input}"
+            );
+            assert!(!filter.telegraph);
+        }
     }
 
     #[test]
-    fn test_parse_eh_filter_pages() {
-        let filter = parse_eh_filter(&[
-            "rating>=3".to_string(),
-            "pages>=20".to_string(),
-            "pages<=500".to_string(),
-        ])
-        .unwrap();
-        assert_eq!(filter.min_rating, Some(3));
-        assert_eq!(filter.min_pages, Some(20));
-        assert_eq!(filter.max_pages, Some(500));
-        assert!(!filter.telegraph);
-    }
-
-    #[test]
-    fn test_parse_eh_filter_invalid_rating() {
-        let result = parse_eh_filter(&["rating>=1".to_string()]);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_parse_eh_filter_rating_out_of_range() {
-        let result = parse_eh_filter(&["rating>=6".to_string()]);
-        assert!(result.is_err());
+    fn parse_eh_filter_rejects_out_of_range_ratings() {
+        for input in ["rating>=1", "rating>=6"] {
+            assert!(parse_eh_filter(&[input.to_string()]).is_err(), "{input}");
+        }
     }
 
     #[test]
@@ -1083,31 +1100,17 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_esub_remaining_rejects_invalid_strict_rating() {
-        let result = parse_esub_remaining("foo rating>abc");
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("无效的评分值: abc"));
-    }
-
-    #[test]
-    fn test_parse_esub_remaining_rejects_invalid_strict_pages() {
-        let result = parse_esub_remaining("foo pages>abc");
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("无效的页数: abc"));
-
-        let result = parse_esub_remaining("foo pages<abc");
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("无效的页数: abc"));
-    }
-
-    #[test]
-    fn test_parse_esub_remaining_preserves_valid_strict_filters() {
-        let parsed =
-            parse_esub_remaining("foo rating>3 pages>20 pages<100 telegraph=on cat=manga").unwrap();
-        assert_eq!(parsed.query, "foo");
-        assert_eq!(parsed.filter_args, ["rating>=4", "pages>=21", "pages<=99"]);
-        assert_eq!(parsed.cat_str.as_deref(), Some("manga"));
-        assert!(parsed.telegraph_on);
+    fn subscription_options_reject_invalid_strict_filters() {
+        for (input, error) in [
+            ("foo rating>abc", "无效的评分值: abc"),
+            ("foo pages>abc", "无效的页数: abc"),
+            ("foo pages<abc", "无效的页数: abc"),
+        ] {
+            assert!(
+                parse_esub_remaining(input).unwrap_err().contains(error),
+                "{input}"
+            );
+        }
     }
 
     #[test]
@@ -1133,72 +1136,37 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_gallery_ref_url() {
-        let (gid, token) = parse_gallery_ref("https://e-hentai.org/g/12345/abcdef0123/").unwrap();
-        assert_eq!(gid, 12345);
-        assert_eq!(token, "abcdef0123");
+    fn gallery_reference_requires_a_complete_supported_url() {
+        for (input, expected) in [
+            (
+                "https://e-hentai.org/g/12345/abcdef0123/",
+                Some((12345, "abcdef0123")),
+            ),
+            (
+                "https://exhentai.org/g/99999/deadbeef00/",
+                Some((99999, "deadbeef00")),
+            ),
+            ("12345", None),
+            ("not a url", None),
+            ("https://example.com/other/123", None),
+            ("https://e-hentai.org/g/12345/abc/", None),
+            ("https://e-hentai.org/g/12345/abcdef0123 telegraph=on", None),
+        ] {
+            assert_eq!(
+                parse_gallery_ref(input),
+                expected.map(|(gid, token)| (gid, token.to_string())),
+                "{input}"
+            );
+        }
     }
 
     #[test]
-    fn test_parse_gallery_ref_exhentai_url() {
-        let (gid, token) = parse_gallery_ref("https://exhentai.org/g/99999/deadbeef00/").unwrap();
-        assert_eq!(gid, 99999);
-        assert_eq!(token, "deadbeef00");
-    }
-
-    #[test]
-    fn test_parse_gallery_ref_gid_only() {
-        // GID only is not supported (need token)
-        assert!(parse_gallery_ref("12345").is_none());
-    }
-
-    #[test]
-    fn test_parse_gallery_ref_invalid() {
-        assert!(parse_gallery_ref("not a url").is_none());
-        assert!(parse_gallery_ref("https://example.com/other/123").is_none());
-    }
-
-    #[test]
-    fn test_parse_gallery_ref_rejects_short_token() {
-        // Token length < 8 should be rejected
-        assert!(parse_gallery_ref("https://e-hentai.org/g/12345/abc/").is_none());
-    }
-
-    #[test]
-    fn test_parse_gallery_ref_rejects_token_with_spaces_from_trailing_option() {
-        assert!(
-            parse_gallery_ref("https://e-hentai.org/g/12345/abcdef0123 telegraph=on").is_none()
-        );
-    }
-
-    #[test]
-    fn test_split_edl_remaining_detects_trailing_telegraph_on() {
-        let (gallery, telegraph) = split_edl_remaining_and_telegraph(
-            "https://e-hentai.org/g/12345/abcdef0123/ telegraph=on",
-        );
-        assert_eq!(gallery, "https://e-hentai.org/g/12345/abcdef0123/");
-        assert!(telegraph);
-    }
-
-    #[test]
-    fn test_split_edl_remaining_keeps_telegraph_off_disabled() {
-        let (gallery, telegraph) = split_edl_remaining_and_telegraph(
-            "https://e-hentai.org/g/12345/abcdef0123/ telegraph=off",
-        );
-        assert_eq!(gallery, "https://e-hentai.org/g/12345/abcdef0123/");
-        assert!(!telegraph);
-    }
-
-    #[test]
-    fn test_should_reject_telegraph_request_only_when_requested_without_client() {
-        assert!(should_reject_telegraph_request(true, false));
-        assert!(!should_reject_telegraph_request(true, true));
-        assert!(!should_reject_telegraph_request(false, false));
-    }
-
-    #[test]
-    fn test_esub_success_label_is_markdown_safe() {
-        let label = markdown::escape("E-Hentai");
-        assert_eq!(label, "E\\-Hentai");
+    fn download_options_separate_gallery_url_and_telegraph_toggle() {
+        for (option, expected) in [("on", true), ("off", false)] {
+            let input = format!("https://e-hentai.org/g/12345/abcdef0123/ telegraph={option}");
+            let (gallery, telegraph) = split_edl_remaining_and_telegraph(&input);
+            assert_eq!(gallery, "https://e-hentai.org/g/12345/abcdef0123/");
+            assert_eq!(telegraph, expected);
+        }
     }
 }

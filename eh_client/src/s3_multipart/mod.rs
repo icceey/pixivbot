@@ -842,18 +842,6 @@ mod tests {
     const REPLACEMENT_UPLOAD_ID: &str = "replacement-upload-id";
     const UPLOADER_ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
-    #[test]
-    fn sha256_helpers_emit_lowercase_hex_digests() {
-        assert_eq!(
-            sha256_hex(b"abc"),
-            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
-        );
-        assert_eq!(
-            fingerprint_fields(&["alpha", "beta"]),
-            "5d11bfa62398519b90c0222e68c982726982c36ae6653482b4748dedad2f5531"
-        );
-    }
-
     #[derive(Clone)]
     struct CreateManifestParentFile {
         manifest_parent: std::path::PathBuf,

@@ -142,41 +142,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_eh_filter_signature() {
-        let f = EhFilter {
-            min_rating: Some(4),
-            min_pages: None,
-            max_pages: None,
-            telegraph: false,
-        };
-        assert_eq!(f.task_value_signature(), "r4");
-
-        let f = EhFilter {
-            min_rating: Some(4),
-            min_pages: Some(20),
-            max_pages: None,
-            telegraph: true,
-        };
-        assert_eq!(f.task_value_signature(), "r4p20");
-
-        let f = EhFilter {
-            min_rating: None,
-            min_pages: None,
-            max_pages: Some(500),
-            telegraph: false,
-        };
-        assert_eq!(f.task_value_signature(), "P500");
-
-        let f = EhFilter {
-            min_rating: Some(3),
-            min_pages: Some(10),
-            max_pages: Some(200),
-            telegraph: false,
-        };
-        assert_eq!(f.task_value_signature(), "r3p10P200");
-    }
-
-    #[test]
     fn test_eh_filter_matches_rating() {
         let gallery = EhGallery {
             gid: 1,

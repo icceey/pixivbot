@@ -269,67 +269,45 @@ mod tests {
     }
 
     #[test]
-    fn test_booru_tag_state_with_retry_increment() {
-        let state = BooruTagState {
-            latest_post_id: 100,
-            pending_queue: vec![make_queued_post(1)],
-            retry_count: 2,
-            hot_posts: Vec::new(),
-        };
-        let retried = state.with_retry_increment();
-        assert_eq!(retried.latest_post_id, 100);
-        assert_eq!(retried.pending_queue.len(), 1);
-        assert_eq!(retried.retry_count, 3);
+    fn retry_increment_preserves_progress_and_saturates() {
+        for (retry_count, expected) in [(2, 3), (u8::MAX, u8::MAX)] {
+            let state = BooruTagState {
+                latest_post_id: 100,
+                pending_queue: vec![make_queued_post(1)],
+                retry_count,
+                hot_posts: Vec::new(),
+            };
+            let retried = state.with_retry_increment();
+            assert_eq!(retried.latest_post_id, 100);
+            assert_eq!(retried.pending_queue.len(), 1);
+            assert_eq!(retried.pending_queue[0].id, 1);
+            assert_eq!(retried.retry_count, expected);
+        }
     }
 
     #[test]
-    fn test_booru_tag_state_with_retry_increment_saturates() {
-        let state = BooruTagState {
-            latest_post_id: 100,
-            pending_queue: vec![make_queued_post(1)],
-            retry_count: u8::MAX,
-            hot_posts: Vec::new(),
-        };
-        let retried = state.with_retry_increment();
-        assert_eq!(retried.retry_count, u8::MAX);
-    }
-
-    #[test]
-    fn test_should_abandon_queue_retry_disabled() {
-        let state = BooruTagState {
-            latest_post_id: 100,
-            pending_queue: vec![make_queued_post(1)],
-            retry_count: 0,
-            hot_posts: Vec::new(),
-        };
-        // max_retry_count <= 0 means retry disabled
-        assert!(state.should_abandon_queue(0));
-        assert!(state.should_abandon_queue(-1));
-    }
-
-    #[test]
-    fn test_should_abandon_queue_retry_exhausted() {
-        let state = BooruTagState {
-            latest_post_id: 100,
-            pending_queue: vec![make_queued_post(1)],
-            retry_count: 3,
-            hot_posts: Vec::new(),
-        };
-        assert!(state.should_abandon_queue(3));
-        assert!(state.should_abandon_queue(2));
-        assert!(!state.should_abandon_queue(4));
-    }
-
-    #[test]
-    fn test_should_abandon_queue_retries_remaining() {
-        let state = BooruTagState {
-            latest_post_id: 100,
-            pending_queue: vec![make_queued_post(1)],
-            retry_count: 1,
-            hot_posts: Vec::new(),
-        };
-        assert!(!state.should_abandon_queue(3));
-        assert!(!state.should_abandon_queue(2));
+    fn queue_abandonment_follows_retry_budget() {
+        for (retry_count, limit, expected) in [
+            (0, 0, true),
+            (0, -1, true),
+            (3, 3, true),
+            (3, 2, true),
+            (3, 4, false),
+            (1, 3, false),
+            (1, 2, false),
+        ] {
+            let state = BooruTagState {
+                latest_post_id: 100,
+                pending_queue: vec![make_queued_post(1)],
+                retry_count,
+                hot_posts: Vec::new(),
+            };
+            assert_eq!(
+                state.should_abandon_queue(limit),
+                expected,
+                "retries={retry_count}, limit={limit}"
+            );
+        }
     }
 
     #[test]

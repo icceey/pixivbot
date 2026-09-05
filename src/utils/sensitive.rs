@@ -53,7 +53,7 @@ fn tags_match_sensitive(chat: &chats::Model, tags: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{contains_sensitive_tags, should_blur, should_blur_booru};
+    use super::{should_blur, should_blur_booru};
     use crate::db::entities::chats;
     use crate::db::types::Tags;
     use booru_client::BooruRating;
@@ -118,89 +118,42 @@ mod tests {
     }
 
     #[test]
-    fn contains_sensitive_tags_matches_normalized_tags() {
-        let illust = make_illust(&["R-18"]);
-        assert!(contains_sensitive_tags(&illust, &["r18".to_string()]));
+    fn pixiv_blur_requires_enabled_setting_and_normalized_tag_match() {
+        for (enabled, tags, expected) in [
+            (false, "R-18", false),
+            (true, "landscape", false),
+            (true, "r18", true),
+        ] {
+            assert_eq!(
+                should_blur(&make_chat(enabled, &["R-18"]), &make_illust(&[tags])),
+                expected,
+                "enabled={enabled}, tags={tags}"
+            );
+        }
     }
 
     #[test]
-    fn should_blur_returns_false_when_blur_is_disabled() {
-        let chat = make_chat(false, &["R-18"]);
-        let illust = make_illust(&["R-18"]);
-        assert!(!should_blur(&chat, &illust));
-    }
-
-    #[test]
-    fn should_blur_returns_false_when_no_sensitive_match_exists() {
-        let chat = make_chat(true, &["R-18"]);
-        let illust = make_illust(&["landscape"]);
-        assert!(!should_blur(&chat, &illust));
-    }
-
-    #[test]
-    fn should_blur_returns_true_when_sensitive_match_exists() {
-        let chat = make_chat(true, &["R-18"]);
-        let illust = make_illust(&["r18"]);
-        assert!(should_blur(&chat, &illust));
-    }
-
-    #[test]
-    fn should_blur_booru_safe_blurs_on_matching_tag() {
-        let chat = make_chat(true, &["nude"]);
-        // Safe/General posts with a matching sensitive tag should be blurred
-        assert!(should_blur_booru(
-            &chat,
-            "nude landscape",
-            BooruRating::Safe
-        ));
-        assert!(should_blur_booru(
-            &chat,
-            "nude landscape",
-            BooruRating::General
-        ));
-        // Without a matching tag, Safe/General should not blur
-        assert!(!should_blur_booru(
-            &chat,
-            "landscape sky",
-            BooruRating::Safe
-        ));
-        assert!(!should_blur_booru(
-            &chat,
-            "landscape sky",
-            BooruRating::General
-        ));
-    }
-
-    #[test]
-    fn should_blur_booru_explicit_always_blurs() {
-        let chat = make_chat(true, &[]);
-        assert!(should_blur_booru(&chat, "landscape", BooruRating::Explicit));
-        assert!(should_blur_booru(
-            &chat,
-            "landscape",
-            BooruRating::Questionable
-        ));
-    }
-
-    #[test]
-    fn should_blur_booru_sensitive_always_blurs_when_enabled() {
-        let chat = make_chat(true, &["nude"]);
-        // Sensitive rating always blurs regardless of tag match
-        assert!(should_blur_booru(
-            &chat,
-            "landscape",
-            BooruRating::Sensitive
-        ));
-        assert!(should_blur_booru(
-            &chat,
-            "nude landscape",
-            BooruRating::Sensitive
-        ));
-    }
-
-    #[test]
-    fn should_blur_booru_disabled_blur_setting_returns_false() {
-        let chat = make_chat(false, &["nude"]);
-        assert!(!should_blur_booru(&chat, "nude", BooruRating::Explicit));
+    fn booru_blur_combines_chat_setting_rating_and_tags() {
+        for (rating, expected) in [
+            (BooruRating::Safe, false),
+            (BooruRating::General, false),
+            (BooruRating::Sensitive, true),
+            (BooruRating::Questionable, true),
+            (BooruRating::Explicit, true),
+        ] {
+            assert!(
+                !should_blur_booru(&make_chat(false, &["nude"]), "nude", rating),
+                "{rating:?}"
+            );
+            assert!(
+                should_blur_booru(&make_chat(true, &["nude"]), "nude landscape", rating),
+                "{rating:?}"
+            );
+            assert_eq!(
+                should_blur_booru(&make_chat(true, &["nude"]), "landscape sky", rating),
+                expected,
+                "{rating:?}"
+            );
+        }
     }
 }

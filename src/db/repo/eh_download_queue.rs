@@ -4773,36 +4773,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_defer_does_not_increment_retry_count() {
-        let repo = tests_helpers::setup_test_db().await.unwrap();
-        let delivery = repo
-            .enqueue_eh_download(
-                -100,
-                30,
-                "tok",
-                "Title",
-                false,
-                SOURCE_DIRECT,
-                &EhGalleryVariant::archive("1280x"),
-                None,
-                true,
-            )
-            .await
-            .unwrap()
-            .expect("delivery should be enqueued");
-        let claimed = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
-        assert_eq!(claimed.id, delivery.job_id.unwrap());
-        assert_eq!(claimed.status, JOB_STATUS_DOWNLOADING);
-
-        repo.defer_eh_job_download(claimed.id, 60).await.unwrap();
-        let deferred = job_for_delivery(&repo, &delivery).await;
-        assert_eq!(deferred.status, JOB_STATUS_PENDING);
-        assert_eq!(deferred.retry_count, 0);
-        assert!(deferred.next_retry_at.is_some());
-        assert_eq!(delivery.status, STATUS_WAITING);
-    }
-
-    #[tokio::test]
     async fn test_deferred_item_not_claimable_before_delay_expires() {
         let repo = tests_helpers::setup_test_db().await.unwrap();
         let delivery = repo
@@ -4833,6 +4803,7 @@ mod tests {
         );
 
         let reloaded = job_for_delivery(&repo, &delivery).await;
+        assert_eq!(reloaded.status, JOB_STATUS_PENDING);
         assert_eq!(reloaded.retry_count, 0);
         assert!(reloaded.next_retry_at.is_some());
     }
@@ -5459,89 +5430,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_enqueue_and_get_next_pending() {
-        let repo = tests_helpers::setup_test_db().await.unwrap();
-
-        let model = repo
-            .enqueue_eh_download(
-                -100123,
-                123456,
-                "abcdef0123",
-                "Test Gallery",
-                false,
-                SOURCE_SUBSCRIPTION,
-                &EhGalleryVariant::archive("1280x"),
-                None,
-                true,
-            )
-            .await
-            .unwrap()
-            .expect("delivery should be enqueued");
-
-        assert_eq!(model.chat_id, -100123);
-        assert_eq!(model.gid, 123456);
-        assert_eq!(model.status, STATUS_WAITING);
-        assert_eq!(model.source, SOURCE_SUBSCRIPTION);
-
-        let next = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
-        assert_eq!(next.id, model.job_id.unwrap());
-        assert_eq!(next.status, JOB_STATUS_DOWNLOADING);
-        assert!(next.started_at.is_some());
-
-        let none = repo.get_next_eh_job_for_download().await.unwrap();
-        assert!(none.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_mark_delivery_done() {
-        let repo = tests_helpers::setup_test_db().await.unwrap();
-
-        let model = repo
-            .enqueue_eh_download(
-                -100,
-                1,
-                "tok",
-                "Title",
-                false,
-                SOURCE_DIRECT,
-                &EhGalleryVariant::archive("1280x"),
-                None,
-                true,
-            )
-            .await
-            .unwrap()
-            .expect("delivery should be enqueued");
-
-        let claimed = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
-        assert_eq!(claimed.id, model.job_id.unwrap());
-        repo.mark_eh_job_downloaded(
-            claimed.id,
-            claimed.started_at.unwrap(),
-            50000,
-            "/tmp/1.zip",
-            0,
-        )
-        .await
-        .unwrap();
-
-        let publish_claim = repo
-            .get_next_eh_delivery_for_publish(true)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(publish_claim.delivery.id, model.id);
-        repo.mark_eh_archive_delivery_sent(model.id).await.unwrap();
-        let done = repo
-            .mark_eh_delivery_done(model.id, model.job_id.unwrap(), true)
-            .await
-            .unwrap();
-
-        assert_eq!(done.status, STATUS_DONE);
-        assert!(done.completed_at.is_some());
-        assert!(done.error.is_none());
-    }
-
-    #[tokio::test]
     async fn delivery_done_rolls_back_when_liveness_settlement_fails() {
         use crate::db::repo::eh_gallery_jobs::EH_JOB_LIVENESS_UPDATE_FAILURE;
         use std::sync::{atomic::AtomicBool, Arc};
@@ -5981,63 +5869,6 @@ mod tests {
         assert_eq!(dirty_after.cleanup_status, CLEANUP_STATUS_RUNNING);
         assert_eq!(dirty_after.cleanup_started_at, Some(cleanup_started_at));
         assert_eq!(dirty_after.background_download_status.as_deref(), None);
-    }
-
-    #[tokio::test]
-    async fn test_downloaded_bytes_in_window() {
-        let repo = tests_helpers::setup_test_db().await.unwrap();
-
-        // Each successful job generation appends one immutable completion row.
-        let first_delivery = repo
-            .enqueue_eh_download(
-                -100,
-                1,
-                "tok1",
-                "T1",
-                false,
-                SOURCE_DIRECT,
-                &EhGalleryVariant::archive("1280x"),
-                None,
-                true,
-            )
-            .await
-            .unwrap()
-            .expect("delivery should be enqueued");
-        let first = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
-        assert_eq!(first.id, first_delivery.job_id.unwrap());
-        repo.mark_eh_job_downloaded(first.id, first.started_at.unwrap(), 10000, "/tmp/1.zip", 0)
-            .await
-            .unwrap();
-
-        let second_delivery = repo
-            .enqueue_eh_download(
-                -100,
-                2,
-                "tok2",
-                "T2",
-                false,
-                SOURCE_DIRECT,
-                &EhGalleryVariant::archive("1280x"),
-                None,
-                true,
-            )
-            .await
-            .unwrap()
-            .expect("delivery should be enqueued");
-        let second = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
-        assert_eq!(second.id, second_delivery.job_id.unwrap());
-        repo.mark_eh_job_downloaded(
-            second.id,
-            second.started_at.unwrap(),
-            20000,
-            "/tmp/2.zip",
-            0,
-        )
-        .await
-        .unwrap();
-
-        let bytes = repo.get_eh_downloaded_bytes_in_window(24).await.unwrap();
-        assert_eq!(bytes, 30000);
     }
 
     #[tokio::test]

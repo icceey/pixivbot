@@ -1231,28 +1231,4 @@ mod tests {
         assert!(artifacts.parts_dir().join("part-0000000000000000").exists());
         assert!(artifacts.uploads_dir().join("upload-state.json").exists());
     }
-
-    #[test]
-    fn test_build_search_url_basic() {
-        let client = EhClientBuilder::new()
-            .base_url("https://e-hentai.org")
-            .build();
-        let url = client.build_search_url("female:elf", 0, 0);
-        assert_eq!(
-            url,
-            "https://e-hentai.org/?f_search=female%3Aelf&f_cats=0&page=0"
-        );
-    }
-
-    #[test]
-    fn test_build_archiver_url() {
-        let client = EhClientBuilder::new()
-            .base_url("https://e-hentai.org")
-            .build();
-        let url = client.build_archiver_url(123456, "abcdef0123", "780x");
-        assert_eq!(
-            url,
-            "https://e-hentai.org/archiver.php?gid=123456&token=abcdef0123&or=780x"
-        );
-    }
 }

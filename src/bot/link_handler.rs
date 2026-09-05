@@ -123,35 +123,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_illust_link() {
-        let text = "看看这个作品 https://www.pixiv.net/artworks/126608911 很好看";
-        let links = parse_pixiv_links(text);
-        assert_eq!(links.len(), 1);
-        match &links[0] {
-            PixivLink::Illust(id) => assert_eq!(*id, 126608911),
-            _ => panic!("Expected Illust link"),
-        }
-    }
-
-    #[test]
-    fn test_parse_user_link() {
-        let text = "关注这个作者 https://www.pixiv.net/users/33611048";
-        let links = parse_pixiv_links(text);
-        assert_eq!(links.len(), 1);
-        match &links[0] {
-            PixivLink::User(id) => assert_eq!(*id, 33611048),
-            _ => panic!("Expected User link"),
-        }
-    }
-
-    #[test]
-    fn test_parse_multiple_links() {
-        let text = "作品: https://www.pixiv.net/artworks/123 作者: https://www.pixiv.net/users/456";
-        let links = parse_pixiv_links(text);
-        assert_eq!(links.len(), 2);
-    }
-
-    #[test]
     fn test_parse_mixed_links_preserves_appearance_order() {
         let text = "作者: https://www.pixiv.net/users/456 作品: https://www.pixiv.net/artworks/123 作者: https://www.pixiv.net/users/789";
         let links = parse_pixiv_links(text);

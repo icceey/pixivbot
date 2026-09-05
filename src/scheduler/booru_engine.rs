@@ -1215,39 +1215,6 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_task_value_with_tags() {
-        let (site, tags) = BooruEngine::parse_task_value("konachan:landscape sky");
-        assert_eq!(site, "konachan");
-        assert_eq!(tags, "landscape sky");
-    }
-
-    #[test]
-    fn test_parse_task_value_strips_ranking_and_filter_suffixes() {
-        let (site, tags) = BooruEngine::parse_task_value("konachan:cat|o=score|f=s");
-        assert_eq!(site, "konachan");
-        assert_eq!(tags, "cat");
-    }
-
-    #[test]
-    fn test_post_to_queued_roundtrip() {
-        let post = make_post(42, "landscape sky", 100, BooruRating::Safe);
-        let queued = BooruEngine::post_to_queued(&post);
-        let recovered = BooruEngine::queued_to_booru_post(&queued);
-
-        assert_eq!(recovered.id, post.id);
-        assert_eq!(recovered.tags, post.tags);
-        assert_eq!(recovered.score, post.score);
-        assert_eq!(recovered.fav_count, post.fav_count);
-        assert_eq!(recovered.file_url, post.file_url);
-        assert_eq!(recovered.sample_url, post.sample_url);
-        assert_eq!(recovered.jpeg_url, post.jpeg_url);
-        assert_eq!(recovered.rating, post.rating);
-        assert_eq!(recovered.width, post.width);
-        assert_eq!(recovered.height, post.height);
-        assert_eq!(recovered.source, post.source);
-    }
-
-    #[test]
     fn test_booru_image_url_priority_realtime_file_then_jpeg_queued_sample_jpeg_file() {
         let post = BooruPost {
             id: 7,

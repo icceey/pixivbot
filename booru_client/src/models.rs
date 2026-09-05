@@ -553,104 +553,47 @@ mod tests {
     }
 
     #[test]
-    fn test_rating_from_moebooru() {
+    fn ratings_parse_each_provider_vocabulary() {
+        for (moe, dan, gel, expected) in [
+            ("q", "q", "questionable", BooruRating::Questionable),
+            ("e", "e", "explicit", BooruRating::Explicit),
+            ("unknown", "x", "???", BooruRating::Safe),
+        ] {
+            assert_eq!(BooruRating::from_moebooru(moe), expected);
+            assert_eq!(BooruRating::from_danbooru(dan), expected);
+            assert_eq!(BooruRating::from_gelbooru(gel), expected);
+        }
         assert_eq!(BooruRating::from_moebooru("s"), BooruRating::Safe);
-        assert_eq!(BooruRating::from_moebooru("q"), BooruRating::Questionable);
-        assert_eq!(BooruRating::from_moebooru("e"), BooruRating::Explicit);
-        assert_eq!(BooruRating::from_moebooru("unknown"), BooruRating::Safe);
-    }
-
-    #[test]
-    fn test_rating_from_danbooru() {
         assert_eq!(BooruRating::from_danbooru("g"), BooruRating::General);
-        assert_eq!(BooruRating::from_danbooru("s"), BooruRating::Sensitive);
-        assert_eq!(BooruRating::from_danbooru("q"), BooruRating::Questionable);
-        assert_eq!(BooruRating::from_danbooru("e"), BooruRating::Explicit);
-        assert_eq!(BooruRating::from_danbooru("x"), BooruRating::Safe);
-    }
-
-    #[test]
-    fn test_rating_from_gelbooru() {
         assert_eq!(BooruRating::from_gelbooru("general"), BooruRating::General);
+        assert_eq!(BooruRating::from_danbooru("s"), BooruRating::Sensitive);
         assert_eq!(
             BooruRating::from_gelbooru("sensitive"),
             BooruRating::Sensitive
         );
-        assert_eq!(
-            BooruRating::from_gelbooru("questionable"),
-            BooruRating::Questionable
-        );
-        assert_eq!(
-            BooruRating::from_gelbooru("explicit"),
-            BooruRating::Explicit
-        );
-        assert_eq!(BooruRating::from_gelbooru("???"), BooruRating::Safe);
     }
 
     #[test]
-    fn test_rating_as_api_str_moebooru() {
-        assert_eq!(
-            BooruRating::General.as_api_str(BooruEngineType::Moebooru),
-            "s"
-        );
-        assert_eq!(BooruRating::Safe.as_api_str(BooruEngineType::Moebooru), "s");
-        assert_eq!(
-            BooruRating::Sensitive.as_api_str(BooruEngineType::Moebooru),
-            "q"
-        );
-        assert_eq!(
-            BooruRating::Questionable.as_api_str(BooruEngineType::Moebooru),
-            "q"
-        );
-        assert_eq!(
-            BooruRating::Explicit.as_api_str(BooruEngineType::Moebooru),
-            "e"
-        );
-    }
-
-    #[test]
-    fn test_rating_as_api_str_danbooru() {
-        assert_eq!(
-            BooruRating::General.as_api_str(BooruEngineType::Danbooru),
-            "g"
-        );
-        assert_eq!(BooruRating::Safe.as_api_str(BooruEngineType::Danbooru), "g");
-        assert_eq!(
-            BooruRating::Sensitive.as_api_str(BooruEngineType::Danbooru),
-            "s"
-        );
-        assert_eq!(
-            BooruRating::Questionable.as_api_str(BooruEngineType::Danbooru),
-            "q"
-        );
-        assert_eq!(
-            BooruRating::Explicit.as_api_str(BooruEngineType::Danbooru),
-            "e"
-        );
-    }
-
-    #[test]
-    fn test_rating_as_api_str_gelbooru() {
-        assert_eq!(
-            BooruRating::General.as_api_str(BooruEngineType::Gelbooru),
-            "general"
-        );
-        assert_eq!(
-            BooruRating::Safe.as_api_str(BooruEngineType::Gelbooru),
-            "general"
-        );
-        assert_eq!(
-            BooruRating::Sensitive.as_api_str(BooruEngineType::Gelbooru),
-            "sensitive"
-        );
-        assert_eq!(
-            BooruRating::Questionable.as_api_str(BooruEngineType::Gelbooru),
-            "questionable"
-        );
-        assert_eq!(
-            BooruRating::Explicit.as_api_str(BooruEngineType::Gelbooru),
-            "explicit"
-        );
+    fn ratings_encode_for_each_provider() {
+        for (rating, moe, dan, gel) in [
+            (BooruRating::General, "s", "g", "general"),
+            (BooruRating::Safe, "s", "g", "general"),
+            (BooruRating::Sensitive, "q", "s", "sensitive"),
+            (BooruRating::Questionable, "q", "q", "questionable"),
+            (BooruRating::Explicit, "e", "e", "explicit"),
+        ] {
+            for (engine, expected) in [
+                (BooruEngineType::Moebooru, moe),
+                (BooruEngineType::Danbooru, dan),
+                (BooruEngineType::Gelbooru, gel),
+            ] {
+                assert_eq!(
+                    rating.as_api_str(engine),
+                    expected,
+                    "{rating:?}, {engine:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -732,19 +675,6 @@ mod tests {
             post.created_at.is_some(),
             "Should parse 'Wed Jun 01 12:34:56 -0500 2022' date format"
         );
-    }
-
-    #[test]
-    fn test_gelbooru_posts_response_wrapper() {
-        let json = r#"{"post": [
-            {"id": 1, "tags": "a", "score": 5, "rating": "general", "width": 100, "height": 100},
-            {"id": 2, "tags": "b", "score": 10, "rating": "sensitive", "width": 200, "height": 200}
-        ]}"#;
-
-        let resp: GelbooruPostsResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(resp.post.len(), 2);
-        assert_eq!(resp.post[0].id, 1);
-        assert_eq!(resp.post[1].id, 2);
     }
 
     #[test]

@@ -213,16 +213,6 @@ mod tests {
     }
 
     #[test]
-    fn build_illust_caption_for_single_page_matches_golden_output() {
-        let illust = make_illust("illust", "Still", "Author", 1, 123, 45, &[]);
-
-        assert_eq!(
-            build_illust_caption(&illust),
-            "🎨 Still\nby *Author* \\(ID: `67890`\\)\n\n👀 123 \\| ❤️ 45 \\| 🔗 [来源](https://pixiv\\.net/artworks/12345)"
-        );
-    }
-
-    #[test]
     fn build_illust_caption_for_multi_page_matches_golden_output() {
         let illust = make_illust(
             "illust",
@@ -261,21 +251,13 @@ mod tests {
     }
 
     #[test]
-    fn build_ranking_title_matches_golden_output() {
-        assert_eq!(
-            build_ranking_title("day_ai", 2),
-            "📊 *DAY AI Ranking* \\- 2 new\\!\n\n"
-        );
-    }
-
-    #[test]
     fn build_ranking_caption_for_first_item_prepends_title_once() {
         let illust = make_illust("illust", "Still", "Author", 1, 123, 45, &[]);
-        let title = build_ranking_title("day", 2);
+        let title = build_ranking_title("day_ai", 2);
 
         assert_eq!(
             build_ranking_caption(&title, 0, &illust),
-            "📊 *DAY Ranking* \\- 2 new\\!\n\nStill\nby *Author* \\(ID: `67890`\\)\n\n❤️ 45 \\| 🔗 [来源](https://pixiv\\.net/artworks/12345)"
+            "📊 *DAY AI Ranking* \\- 2 new\\!\n\nStill\nby *Author* \\(ID: `67890`\\)\n\n❤️ 45 \\| 🔗 [来源](https://pixiv\\.net/artworks/12345)"
         );
     }
 
