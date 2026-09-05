@@ -7,6 +7,13 @@ updates:
       day: 'saturday'
       time: '04:00'
     open-pull-requests-limit: 10
+    ignore:
+      - dependency-name: 'sea-orm'
+        update-types:
+          - 'version-update:semver-major'
+      - dependency-name: 'sea-orm-migration'
+        update-types:
+          - 'version-update:semver-major'
     groups:
       all-dependencies:
         patterns:
