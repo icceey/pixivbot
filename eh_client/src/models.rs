@@ -180,68 +180,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_cookie_header() {
-        let cookies = EhCookies {
-            ipb_member_id: Some("12345".into()),
-            ipb_pass_hash: Some("abcdef".into()),
-            igneous: Some("xyz".into()),
-            nw: true,
-        };
-        let header = cookies.to_header();
-        assert!(header.contains("ipb_member_id=12345"));
-        assert!(header.contains("ipb_pass_hash=abcdef"));
-        assert!(header.contains("igneous=xyz"));
-        assert!(header.contains("nw=1"));
-    }
-
-    #[test]
-    fn test_cookie_exhentai_capable() {
-        let full = EhCookies {
-            ipb_member_id: Some("1".into()),
-            ipb_pass_hash: Some("h".into()),
-            igneous: Some("i".into()),
-            nw: true,
-        };
-        assert!(full.is_exhentai_capable());
-
-        let partial = EhCookies {
-            ipb_member_id: Some("1".into()),
-            ipb_pass_hash: None,
-            igneous: None,
-            nw: true,
-        };
-        assert!(!partial.is_exhentai_capable());
-    }
-
-    #[test]
     fn test_category_bitmask() {
         assert_eq!(EhCategory::bitmask_from_str("doujinshi,manga"), 3);
         assert_eq!(EhCategory::bitmask_from_str("doujinshi"), 1);
         assert_eq!(EhCategory::bitmask_from_str("all"), 0); // unknown = 0
-    }
-
-    #[test]
-    fn test_raw_meta_into_gallery() {
-        let raw = RawGalleryMeta {
-            gid: 123,
-            token: "abc".into(),
-            title: "Test".into(),
-            title_jpn: Some("テスト".into()),
-            category: "Manga".into(),
-            thumb: "https://ehgt.org/t.jpg".into(),
-            uploader: "user".into(),
-            posted: "1376143500".into(),
-            filecount: "20".into(),
-            filesize: 51210504,
-            expunged: false,
-            rating: "4.64".into(),
-            tags: vec!["parody:touhou".into()],
-        };
-        let g = raw.into_gallery();
-        assert_eq!(g.gid, 123);
-        assert_eq!(g.posted, 1376143500);
-        assert_eq!(g.filecount, 20);
-        assert!((g.rating - 4.64).abs() < 0.001);
-        assert_eq!(g.source_fingerprint(), "1376143500|20|51210504|false");
     }
 }

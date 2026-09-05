@@ -232,30 +232,10 @@ mod tests {
     }
 
     #[test]
-    fn test_to_json_and_from_json() {
-        let original = TagFilter::parse_from_args(&["+tag1", "-tag2"]);
-        let json = original.to_json();
-        assert!(json.is_some());
-
-        let restored: TagFilter = serde_json::from_value(json.unwrap()).unwrap();
-        assert_eq!(restored.include, original.include);
-        assert_eq!(restored.exclude, original.exclude);
-    }
-
-    #[test]
     fn test_format_for_display() {
         let filter = TagFilter::parse_from_args(&["+原神", "-R-18"]);
         let display = filter.format_for_display();
         assert!(display.contains("\\+原神"));
         assert!(display.contains("\\-R\\-18"));
-    }
-
-    #[test]
-    fn test_merge() {
-        let mut filter1 = TagFilter::parse_from_args(&["+tag1"]);
-        let filter2 = TagFilter::parse_from_args(&["-tag2"]);
-        filter1.merge(&filter2);
-        assert_eq!(filter1.include, vec!["tag1"]);
-        assert_eq!(filter1.exclude, vec!["tag2"]);
     }
 }

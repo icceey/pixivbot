@@ -124,6 +124,9 @@ async fn test_search_parses_results() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/"))
+        .and(query_param("f_search", "female:elf"))
+        .and(query_param("f_cats", "0"))
+        .and(query_param("page", "0"))
         .respond_with(ResponseTemplate::new(200).set_body_string(SEARCH_HTML))
         .mount(&server)
         .await;
@@ -181,6 +184,7 @@ async fn test_get_metadata_parses_json() {
     assert_eq!(g.posted, 1376143500);
     assert_eq!(g.filecount, 20);
     assert_eq!(g.filesize, 51210504);
+    assert_eq!(g.source_fingerprint(), "1376143500|20|51210504|false");
     assert!((g.rating - 4.64).abs() < 0.001);
     assert_eq!(g.tags.len(), 3);
 }

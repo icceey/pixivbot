@@ -67,73 +67,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn friendly_basic_units() {
-        assert_eq!(parse_duration("1h"), Some(chrono::Duration::hours(1)));
-        assert_eq!(parse_duration("30m"), Some(chrono::Duration::minutes(30)));
-        assert_eq!(parse_duration("1d"), Some(chrono::Duration::days(1)));
-        assert_eq!(parse_duration("45s"), Some(chrono::Duration::seconds(45)));
-    }
-
-    #[test]
-    fn friendly_compound() {
-        assert_eq!(
-            parse_duration("2h30m"),
-            Some(chrono::Duration::seconds(2 * 3600 + 30 * 60))
-        );
-        assert_eq!(
-            parse_duration("1d2h30m45s"),
-            Some(chrono::Duration::seconds(86_400 + 2 * 3600 + 30 * 60 + 45))
-        );
-    }
-
-    #[test]
-    fn rejects_invalid() {
-        assert_eq!(parse_duration(""), None);
-        assert_eq!(parse_duration("1"), None);
-        assert_eq!(parse_duration("h"), None);
-        assert_eq!(parse_duration("1x"), None);
-        assert_eq!(parse_duration("1h2"), None);
-        assert_eq!(parse_duration("abc"), None);
-        assert_eq!(parse_duration("0s"), None);
-    }
-
-    #[test]
-    fn whitespace_trimmed() {
-        assert_eq!(parse_duration("  1h  "), Some(chrono::Duration::hours(1)));
-    }
-
-    #[test]
-    fn duration_key_basic() {
-        assert_eq!(duration_to_key(chrono::Duration::hours(1)), "3600s");
-        assert_eq!(duration_to_key(chrono::Duration::minutes(30)), "1800s");
-        assert_eq!(duration_to_key(chrono::Duration::days(1)), "86400s");
-        assert_eq!(duration_to_key(chrono::Duration::seconds(45)), "45s");
-    }
-
-    #[test]
-    fn duration_key_roundtrip() {
-        for (input, expected_secs) in &[("1h", 3600i64), ("30m", 1800), ("1d", 86400)] {
-            let d = parse_duration(input).unwrap();
-            let stored = duration_to_key(d);
-            let recovered = parse_duration_key(&stored).unwrap();
-            assert_eq!(
-                recovered.num_seconds(),
-                *expected_secs,
-                "round-trip failed for input {input}"
-            );
+    fn friendly_durations_encode_and_roundtrip_as_seconds() {
+        for (input, seconds, key) in [
+            ("1h", 3600, "3600s"),
+            ("30m", 1800, "1800s"),
+            ("1d", 86400, "86400s"),
+            ("45s", 45, "45s"),
+            ("2h30m", 9000, "9000s"),
+            ("1d2h30m45s", 95445, "95445s"),
+            ("  1h  ", 3600, "3600s"),
+        ] {
+            let duration = chrono::Duration::seconds(seconds);
+            assert_eq!(parse_duration(input), Some(duration), "{input}");
+            assert_eq!(duration_to_key(duration), key);
+            assert_eq!(parse_duration_key(key), Some(duration), "{key}");
         }
     }
 
     #[test]
-    fn parse_duration_key_requires_seconds_suffix() {
-        assert_eq!(
-            parse_duration_key("3600s"),
-            Some(chrono::Duration::hours(1))
-        );
-        assert_eq!(parse_duration_key("1h"), None);
-        assert_eq!(parse_duration_key("60m"), None);
-        assert_eq!(parse_duration_key("0s"), None);
-        assert_eq!(parse_duration_key("060s"), None);
-        assert_eq!(parse_duration_key("abc"), None);
+    fn friendly_durations_reject_malformed_or_zero_values() {
+        for input in ["", "1", "h", "1x", "1h2", "abc", "0s"] {
+            assert_eq!(parse_duration(input), None, "{input}");
+        }
+    }
+
+    #[test]
+    fn stored_duration_keys_require_canonical_seconds() {
+        for key in ["1h", "60m", "0s", "060s", "abc"] {
+            assert_eq!(parse_duration_key(key), None, "{key}");
+        }
     }
 }

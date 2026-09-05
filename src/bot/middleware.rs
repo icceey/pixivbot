@@ -478,74 +478,45 @@ mod tests {
     use super::*;
     use teloxide::types::User;
 
-    // ========================================================================
-    // should_accept_command 测试
-    // ========================================================================
-
     #[test]
-    fn test_command_private_chat_always_accepted() {
-        // 私聊中，无论什么配置，命令都应该被接受
-        assert!(should_accept_command(true, true, false, true)); // 裸命令
-        assert!(should_accept_command(true, true, false, false)); // 带 @bot
-        assert!(should_accept_command(true, false, false, true));
-        assert!(should_accept_command(true, false, true, true));
-    }
-
-    #[test]
-    fn test_command_group_global_not_required() {
-        // 全局配置不需要 @bot 时，群组中所有命令都被接受
-        assert!(should_accept_command(false, false, false, true)); // 裸命令
-        assert!(should_accept_command(false, false, false, false)); // 带 @bot
-        assert!(should_accept_command(false, false, true, true)); // chat 设置被忽略
-    }
-
-    #[test]
-    fn test_command_group_global_required_chat_allows() {
-        // 全局要求 @bot，但 chat 允许不带 @bot
-        assert!(should_accept_command(false, true, true, true)); // 裸命令被接受
-        assert!(should_accept_command(false, true, true, false)); // 带 @bot 也被接受
-    }
-
-    #[test]
-    fn test_command_group_global_required_chat_not_allows() {
-        // 全局要求 @bot，chat 也不允许不带 @bot
-        assert!(!should_accept_command(false, true, false, true)); // 裸命令被过滤
-        assert!(should_accept_command(false, true, false, false)); // 带 @bot 被接受
-    }
-
-    // ========================================================================
-    // should_process_message 测试
-    // ========================================================================
-
-    #[test]
-    fn test_message_private_chat_always_processed() {
-        // 私聊中，消息都应该被处理
-        assert!(should_process_message(true, true, false, false, false));
-        assert!(should_process_message(true, true, false, true, false));
-        assert!(should_process_message(true, false, false, false, true));
-    }
-
-    #[test]
-    fn test_message_group_global_not_required() {
-        // 全局配置不需要 @bot 时，群组中所有消息都被处理
-        assert!(should_process_message(false, false, false, false, false));
-        assert!(should_process_message(false, false, false, true, false));
-        assert!(should_process_message(false, false, true, false, true));
-    }
-
-    #[test]
-    fn test_message_group_global_required_chat_allows() {
-        // 全局要求 @bot，但 chat 允许不带 @bot
-        assert!(should_process_message(false, true, true, false, false)); // 普通消息被处理
-        assert!(should_process_message(false, true, true, true, false)); // 回复消息也被处理
-    }
-
-    #[test]
-    fn test_message_group_global_required_chat_not_allows() {
-        // 全局要求 @bot，chat 也不允许不带 @bot
-        assert!(!should_process_message(false, true, false, false, false)); // 普通消息被忽略
-        assert!(should_process_message(false, true, false, true, false)); // 回复 bot 的消息被处理
-        assert!(should_process_message(false, true, false, false, true)); // @bot 的消息被处理
+    fn command_and_message_gating_follow_chat_mention_policy() {
+        for (private, require_mention, allow_without_mention, ordinary_allowed) in [
+            (true, true, false, true),
+            (true, false, false, true),
+            (true, false, true, true),
+            (false, false, false, true),
+            (false, false, true, true),
+            (false, true, true, true),
+            (false, true, false, false),
+        ] {
+            let context = (private, require_mention, allow_without_mention);
+            assert_eq!(
+                should_accept_command(private, require_mention, allow_without_mention, true),
+                ordinary_allowed,
+                "bare command: {context:?}"
+            );
+            assert!(
+                should_accept_command(private, require_mention, allow_without_mention, false),
+                "addressed command: {context:?}"
+            );
+            for (reply, mention, expected) in [
+                (false, false, ordinary_allowed),
+                (true, false, true),
+                (false, true, true),
+            ] {
+                assert_eq!(
+                    should_process_message(
+                        private,
+                        require_mention,
+                        allow_without_mention,
+                        reply,
+                        mention
+                    ),
+                    expected,
+                    "message: {context:?}, reply={reply}, mention={mention}"
+                );
+            }
+        }
     }
 
     #[test]

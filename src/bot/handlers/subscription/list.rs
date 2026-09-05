@@ -369,59 +369,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_list_callback_data_legacy_format() {
-        assert_eq!(
-            parse_list_callback_data("list:3"),
-            Some(ListPaginationAction::Page {
-                page: 3,
-                target_chat_id: None,
-                is_channel: false,
-            })
-        );
-    }
-
-    #[test]
-    fn test_parse_list_callback_data_channel_format() {
-        assert_eq!(
-            parse_list_callback_data("list:2:-1001234567890:1"),
-            Some(ListPaginationAction::Page {
-                page: 2,
-                target_chat_id: Some(ChatId(-1001234567890)),
-                is_channel: true,
-            })
-        );
-    }
-
-    #[test]
-    fn test_parse_list_callback_data_noop() {
-        assert_eq!(
-            parse_list_callback_data("list:noop"),
-            Some(ListPaginationAction::Noop)
-        );
-    }
-
-    #[test]
-    fn test_build_list_callback_data_encodes_context() {
-        assert_eq!(
-            build_list_callback_data(4, ChatId(-1001234567890), true),
-            "list:4:-1001234567890:1"
-        );
-    }
-
-    #[test]
-    fn test_eh_list_display_uses_markdown_escape() {
-        // E-Hentai task values should be escaped with markdown::escape,
-        // not just underscore replacement. The key difference:
-        // markdown::escape also escapes `-`, `.`, `!`, `=`, `|` etc.
-        let task_value = "e-hentai.org|test";
-        let escaped = markdown::escape(task_value);
-        // The old behavior (replace('_', "\\_")) would leave hyphens and dots unescaped
-        // markdown::escape must escape hyphens (used in E-Hentai domain names)
-        assert!(
-            escaped.contains("\\-"),
-            "hyphen should be escaped: {escaped}"
-        );
-        // Dots also escaped
-        assert!(escaped.contains("\\."), "dot should be escaped: {escaped}");
+    fn pagination_callbacks_preserve_chat_context() {
+        let channel = build_list_callback_data(4, ChatId(-1001234567890), true);
+        assert_eq!(channel, "list:4:-1001234567890:1");
+        for (data, expected) in [
+            (
+                "list:3",
+                ListPaginationAction::Page {
+                    page: 3,
+                    target_chat_id: None,
+                    is_channel: false,
+                },
+            ),
+            (
+                channel.as_str(),
+                ListPaginationAction::Page {
+                    page: 4,
+                    target_chat_id: Some(ChatId(-1001234567890)),
+                    is_channel: true,
+                },
+            ),
+            ("list:noop", ListPaginationAction::Noop),
+        ] {
+            assert_eq!(parse_list_callback_data(data), Some(expected), "{data}");
+        }
     }
 }

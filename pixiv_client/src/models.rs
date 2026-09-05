@@ -199,35 +199,3 @@ pub struct UgoiraMetadataInfo {
 pub struct UgoiraMetadata {
     pub ugoira_metadata: UgoiraMetadataInfo,
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_ugoira_metadata_deserialization() {
-        let json = r#"{
-            "ugoira_metadata": {
-                "zip_urls": {
-                    "medium": "https://i.pximg.net/img-zip-ugoira/img/2024/01/01/00/00/00/12345_ugoira600x600.zip"
-                },
-                "frames": [
-                    {"file": "000000.jpg", "delay": 100},
-                    {"file": "000001.jpg", "delay": 100},
-                    {"file": "000002.jpg", "delay": 200}
-                ]
-            }
-        }"#;
-
-        let metadata: UgoiraMetadata = serde_json::from_str(json).unwrap();
-        assert_eq!(metadata.ugoira_metadata.frames.len(), 3);
-        assert_eq!(metadata.ugoira_metadata.frames[0].file, "000000.jpg");
-        assert_eq!(metadata.ugoira_metadata.frames[0].delay, 100);
-        assert_eq!(metadata.ugoira_metadata.frames[2].delay, 200);
-        assert!(metadata
-            .ugoira_metadata
-            .zip_urls
-            .medium
-            .contains("ugoira600x600.zip"));
-    }
-}

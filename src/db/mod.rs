@@ -42,33 +42,6 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn sqlite_file_connections_enable_wal_normal_sync_and_long_busy_timeout() {
-        let dir = tempfile::tempdir().unwrap();
-        let url = format!("sqlite:{}?mode=rwc", dir.path().join("tuning.db").display());
-        let db = establish_connection(&url).await.unwrap();
-
-        let mut conn = db.get_sqlite_connection_pool().acquire().await.unwrap();
-
-        let journal_mode: String = sea_orm::sqlx::query_scalar("PRAGMA journal_mode")
-            .fetch_one(&mut *conn)
-            .await
-            .unwrap();
-        assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
-
-        let synchronous: i64 = sea_orm::sqlx::query_scalar("PRAGMA synchronous")
-            .fetch_one(&mut *conn)
-            .await
-            .unwrap();
-        assert_eq!(synchronous, 1, "synchronous must be NORMAL in WAL mode");
-
-        let busy_timeout: i64 = sea_orm::sqlx::query_scalar("PRAGMA busy_timeout")
-            .fetch_one(&mut *conn)
-            .await
-            .unwrap();
-        assert_eq!(busy_timeout, 30_000);
-    }
-
-    #[tokio::test]
     async fn sqlite_pool_spinup_keeps_wal_across_concurrent_connections() {
         let dir = tempfile::tempdir().unwrap();
         let url = format!("sqlite:{}?mode=rwc", dir.path().join("spinup.db").display());

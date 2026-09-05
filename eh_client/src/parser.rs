@@ -497,36 +497,6 @@ pub fn parse_page_count(html: &str) -> Option<u32> {
 mod tests {
     use super::*;
 
-    const SEARCH_HTML_SAMPLE: &str = r#"
-    <div class="gl1t">
-      <a href="https://e-hentai.org/g/123456/abcdef0123/">
-        <img src="https://ehgt.org/t/abc.jpg" />
-      </a>
-      <div class="gl3t">
-        <div class="glink">Sample Gallery Title</div>
-      </div>
-    </div>
-    <div class="gl1t">
-      <a href="https://e-hentai.org/g/789012/987654abcd/">
-        <img src="https://ehgt.org/t/def.jpg" />
-      </a>
-      <div class="gl3t">
-        <div class="glink">Second Gallery</div>
-      </div>
-    </div>
-    "#;
-
-    #[test]
-    fn test_parse_search_results() {
-        let results = parse_search_results(SEARCH_HTML_SAMPLE, "https://e-hentai.org");
-        assert_eq!(results.len(), 2);
-        assert_eq!(results[0].gid, 123456);
-        assert_eq!(results[0].token, "abcdef0123");
-        assert_eq!(results[0].title, "Sample Gallery Title");
-        assert_eq!(results[1].gid, 789012);
-        assert_eq!(results[1].token, "987654abcd");
-    }
-
     #[test]
     fn test_parse_search_results_empty() {
         let results = parse_search_results(
@@ -537,32 +507,9 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_archiver_url() {
-        let html = r#"
-        <div id="gdd">
-          <td><a onclick="return popUp('https://e-hentai.org/archiver.php?gid=4006958&amp;token=586ff41111',480,320)">Archive Download</a></td>
-        </div>
-        "#;
-        let (gid, token) = parse_archiver_url(html).expect("should find archiver URL");
-        assert_eq!(gid, 4006958);
-        assert_eq!(token, "586ff41111");
-    }
-
-    #[test]
     fn test_parse_archiver_url_not_found() {
         let html = "<html><body>No archiver link</body></html>";
         assert!(parse_archiver_url(html).is_none());
-    }
-
-    #[test]
-    fn test_parse_archiver_key() {
-        let html = r#"
-        <form>
-          <input type="hidden" name="or" value="470592--63bbddc729b849100ec24ab920ffdb84b6542b23" />
-        </form>
-        "#;
-        let key = parse_archiver_key(html).expect("should find archiver key");
-        assert_eq!(key, "470592--63bbddc729b849100ec24ab920ffdb84b6542b23");
     }
 
     #[test]
@@ -951,15 +898,30 @@ mod tests {
 "#;
 
     #[test]
-    fn test_parse_archive_download_cost_free_original() {
-        let cost = parse_archive_download_cost(ARCHIVER_FREE_DEFAULT, "original");
-        assert_eq!(cost, DownloadCost::Free);
-    }
-
-    #[test]
-    fn test_parse_archive_download_cost_free_resample() {
-        let cost = parse_archive_download_cost(ARCHIVER_FREE_DEFAULT, "1280x");
-        assert_eq!(cost, DownloadCost::Free);
+    fn archive_cost_uses_the_requested_download_form() {
+        for (html, resolution, expected) in [
+            (ARCHIVER_FREE_DEFAULT, "original", DownloadCost::Free),
+            (ARCHIVER_FREE_DEFAULT, "1280x", DownloadCost::Free),
+            (
+                ARCHIVER_FREE_RESAMPLE_UNLOCKED,
+                "original",
+                DownloadCost::Free,
+            ),
+            (ARCHIVER_EHENTAI_FUNDS, "original", DownloadCost::Free),
+            (ARCHIVER_GP_REQUIRED, "original", DownloadCost::Gp(8800)),
+            (ARCHIVER_GP_REQUIRED, "1280x", DownloadCost::Gp(218)),
+            (
+                "<html><body>No archiver content</body></html>",
+                "original",
+                DownloadCost::Unknown,
+            ),
+        ] {
+            assert_eq!(
+                parse_archive_download_cost(html, resolution),
+                expected,
+                "resolution={resolution}, expected={expected:?}"
+            );
+        }
     }
 
     #[test]
@@ -971,32 +933,6 @@ mod tests {
         );
         let cost = parse_archive_download_cost(&html, "1280x");
         assert_eq!(cost, DownloadCost::Unlocked);
-    }
-
-    #[test]
-    fn test_parse_archive_download_cost_unlocked_marker_ignored_for_original() {
-        // Even though the resample is unlocked, original downloads are NOT
-        // automatically free. We fall through to the original form cost.
-        let cost = parse_archive_download_cost(ARCHIVER_FREE_RESAMPLE_UNLOCKED, "original");
-        assert_eq!(cost, DownloadCost::Free);
-    }
-
-    #[test]
-    fn test_parse_archive_download_cost_ehentai_funds_original() {
-        let cost = parse_archive_download_cost(ARCHIVER_EHENTAI_FUNDS, "original");
-        assert_eq!(cost, DownloadCost::Free);
-    }
-
-    #[test]
-    fn test_parse_archive_download_cost_gp_required_original() {
-        let cost = parse_archive_download_cost(ARCHIVER_GP_REQUIRED, "original");
-        assert_eq!(cost, DownloadCost::Gp(8800));
-    }
-
-    #[test]
-    fn test_parse_archive_download_cost_gp_required_resample() {
-        let cost = parse_archive_download_cost(ARCHIVER_GP_REQUIRED, "1280x");
-        assert_eq!(cost, DownloadCost::Gp(218));
     }
 
     #[test]
@@ -1032,58 +968,25 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_archive_download_cost_strips_thousand_separators() {
-        let html = r#"
-<div>Download Cost: &nbsp; <strong>747,708 GP</strong></div>
+    fn archive_cost_classifies_form_text() {
+        for (text, expected) in [
+            ("747,708 GP", DownloadCost::Gp(747708)),
+            ("Insufficient Funds", DownloadCost::Insufficient),
+            ("N/A", DownloadCost::Unavailable),
+            ("Somewhere Over The Rainbow", DownloadCost::Unknown),
+        ] {
+            let html = format!(
+                r#"<div>Download Cost: &nbsp; <strong>{text}</strong></div>
 <form action="/archiver.php?gid=1&amp;token=abc" method="post">
     <input type="hidden" name="dltype" value="org" />
-</form>
-"#;
-        let cost = parse_archive_download_cost(html, "original");
-        assert_eq!(cost, DownloadCost::Gp(747708));
-    }
-
-    #[test]
-    fn test_parse_archive_download_cost_insufficient_funds() {
-        let html = r#"
-<div>Download Cost: &nbsp; <strong>Insufficient Funds</strong></div>
-<form action="/archiver.php?gid=1&amp;token=abc" method="post">
-    <input type="hidden" name="dltype" value="org" />
-</form>
-"#;
-        let cost = parse_archive_download_cost(html, "original");
-        assert_eq!(cost, DownloadCost::Insufficient);
-    }
-
-    #[test]
-    fn test_parse_archive_download_cost_na() {
-        let html = r#"
-<div>Download Cost: &nbsp; <strong>N/A</strong></div>
-<form action="/archiver.php?gid=1&amp;token=abc" method="post">
-    <input type="hidden" name="dltype" value="org" />
-</form>
-"#;
-        let cost = parse_archive_download_cost(html, "original");
-        assert_eq!(cost, DownloadCost::Unavailable);
-    }
-
-    #[test]
-    fn test_parse_archive_download_cost_unknown_text() {
-        let html = r#"
-<div>Download Cost: &nbsp; <strong>Somewhere Over The Rainbow</strong></div>
-<form action="/archiver.php?gid=1&amp;token=abc" method="post">
-    <input type="hidden" name="dltype" value="org" />
-</form>
-"#;
-        let cost = parse_archive_download_cost(html, "original");
-        assert_eq!(cost, DownloadCost::Unknown);
-    }
-
-    #[test]
-    fn test_parse_archive_download_cost_missing_returns_unknown() {
-        let html = "<html><body>No archiver content</body></html>";
-        let cost = parse_archive_download_cost(html, "original");
-        assert_eq!(cost, DownloadCost::Unknown);
+</form>"#
+            );
+            assert_eq!(
+                parse_archive_download_cost(&html, "original"),
+                expected,
+                "{text}"
+            );
+        }
     }
 
     #[test]

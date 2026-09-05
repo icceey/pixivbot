@@ -126,113 +126,90 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_no_filter() {
-        let filter = EhFilter::new();
-        let key = EhTaskKey::new("female:elf", 0, &filter);
-        assert_eq!(key.to_task_value(), "eh:female:elf");
+    fn task_keys_encode_and_roundtrip_queries_and_filters() {
+        for (query, categories, filter, expected) in [
+            ("female:elf", 0, EhFilter::new(), "eh:female:elf"),
+            ("artist:wlop", 3, EhFilter::new(), "eh:artist:wlop|c=3"),
+            (
+                "female:elf",
+                0,
+                EhFilter {
+                    max_pages: Some(500),
+                    ..Default::default()
+                },
+                "eh:female:elf|f=P500",
+            ),
+            (
+                "female:elf",
+                0,
+                EhFilter {
+                    min_rating: Some(4),
+                    ..Default::default()
+                },
+                "eh:female:elf|f=r4",
+            ),
+            (
+                "parody:touhou",
+                3,
+                EhFilter {
+                    min_rating: Some(4),
+                    min_pages: Some(20),
+                    telegraph: true,
+                    ..Default::default()
+                },
+                "eh:parody:touhou|c=3|f=r4p20",
+            ),
+            (
+                "female:elf cat:2",
+                7,
+                EhFilter {
+                    min_rating: Some(3),
+                    min_pages: Some(10),
+                    max_pages: Some(200),
+                    ..Default::default()
+                },
+                "eh:female:elf cat:2|c=7|f=r3p10P200",
+            ),
+            (
+                "foo|f=r3 100% ~bar",
+                2,
+                EhFilter {
+                    min_rating: Some(5),
+                    ..Default::default()
+                },
+                "ehq:foo%7Cf=r3 100%25 ~bar|c=2|f=r5",
+            ),
+        ] {
+            let key = EhTaskKey::new(query, categories, &filter);
+            assert_eq!(key.to_task_value(), expected);
+            assert_eq!(EhTaskKey::parse(expected), Some(key), "{expected}");
+        }
     }
 
     #[test]
-    fn test_with_cats() {
-        let filter = EhFilter::new();
-        let key = EhTaskKey::new("artist:wlop", 3, &filter);
-        assert_eq!(key.to_task_value(), "eh:artist:wlop|c=3");
+    fn parse_preserves_unescaped_persisted_queries() {
+        for query in ["female:elf", "foo%7Cbar", "~foo", "~foo%7Cbar"] {
+            let parsed = EhTaskKey::parse(&format!("eh:{query}|c=3|f=r4")).unwrap();
+            assert_eq!(
+                parsed,
+                EhTaskKey {
+                    query: query.into(),
+                    category_bitmask: 3,
+                    filter_sig: "r4".into()
+                }
+            );
+        }
     }
 
     #[test]
-    fn test_with_filter() {
-        let filter = EhFilter {
-            min_rating: Some(4),
-            ..Default::default()
-        };
-        let key = EhTaskKey::new("female:elf", 0, &filter);
-        assert_eq!(key.to_task_value(), "eh:female:elf|f=r4");
-    }
-
-    #[test]
-    fn test_with_cats_and_filter() {
-        let filter = EhFilter {
-            min_rating: Some(4),
-            min_pages: Some(20),
-            ..Default::default()
-        };
-        let key = EhTaskKey::new("parody:touhou", 3, &filter);
-        assert_eq!(key.to_task_value(), "eh:parody:touhou|c=3|f=r4p20");
-    }
-
-    #[test]
-    fn test_roundtrip() {
-        let filter = EhFilter {
-            min_rating: Some(3),
-            min_pages: Some(10),
-            max_pages: Some(200),
-            ..Default::default()
-        };
-        let key = EhTaskKey::new("female:elf cat:2", 7, &filter);
-        let value = key.to_task_value();
-        let parsed = EhTaskKey::parse(&value).unwrap();
-        assert_eq!(parsed.query, "female:elf cat:2");
-        assert_eq!(parsed.category_bitmask, 7);
-        assert_eq!(parsed.filter_sig, "r3p10P200");
-    }
-
-    #[test]
-    fn test_query_delimiters_are_encoded() {
-        let filter = EhFilter {
-            min_rating: Some(5),
-            ..Default::default()
-        };
-        let key = EhTaskKey::new("foo|f=r3 100% ~bar", 2, &filter);
-        let value = key.to_task_value();
-        assert_eq!(value, "ehq:foo%7Cf=r3 100%25 ~bar|c=2|f=r5");
-
-        let parsed = EhTaskKey::parse(&value).unwrap();
-        assert_eq!(parsed.query, "foo|f=r3 100% ~bar");
-        assert_eq!(parsed.category_bitmask, 2);
-        assert_eq!(parsed.filter_sig, "r5");
-    }
-
-    #[test]
-    fn test_parse_legacy_unescaped_query_still_works() {
-        let parsed = EhTaskKey::parse("eh:female:elf|c=3|f=r4").unwrap();
-        assert_eq!(parsed.query, "female:elf");
-        assert_eq!(parsed.category_bitmask, 3);
-        assert_eq!(parsed.filter_sig, "r4");
-    }
-
-    #[test]
-    fn test_parse_legacy_percent_text_is_not_decoded() {
-        let parsed = EhTaskKey::parse("eh:foo%7Cbar|f=r4").unwrap();
-        assert_eq!(parsed.query, "foo%7Cbar");
-        assert_eq!(parsed.filter_sig, "r4");
-    }
-
-    #[test]
-    fn test_parse_legacy_tilde_queries_are_not_decoded() {
-        let parsed = EhTaskKey::parse("eh:~foo|f=r4").unwrap();
-        assert_eq!(parsed.query, "~foo");
-        assert_eq!(parsed.filter_sig, "r4");
-
-        let parsed = EhTaskKey::parse("eh:~foo%7Cbar|f=r4").unwrap();
-        assert_eq!(parsed.query, "~foo%7Cbar");
-        assert_eq!(parsed.filter_sig, "r4");
-    }
-
-    #[test]
-    fn test_parse_invalid_prefix() {
-        assert!(EhTaskKey::parse("booru:konachan:cat").is_none());
-        assert!(EhTaskKey::parse("no_colon").is_none());
-    }
-
-    #[test]
-    fn test_parse_duplicate_c() {
-        let value = "eh:female:elf|c=1|c=2";
-        assert!(EhTaskKey::parse(value).is_none());
-    }
-
-    #[test]
-    fn test_parse_unknown_segment() {
-        let value = "eh:female:elf|x=1";
-        assert!(EhTaskKey::parse(value).is_none());
+    fn parse_rejects_malformed_or_ambiguous_task_keys() {
+        for value in [
+            "booru:konachan:cat",
+            "no_colon",
+            "eh:female:elf|c=1|c=2",
+            "eh:female:elf|x=1",
+        ] {
+            assert!(EhTaskKey::parse(value).is_none(), "{value}");
+        }
     }
 }

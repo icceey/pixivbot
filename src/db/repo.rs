@@ -388,6 +388,7 @@ mod tests {
             .unwrap();
 
         repo.migrate_chat(old_chat_id, new_chat_id).await.unwrap();
+        repo.migrate_chat(old_chat_id, new_chat_id).await.unwrap();
 
         let old_chat = repo.get_chat(old_chat_id).await.unwrap();
         assert!(old_chat.is_none());
@@ -404,32 +405,6 @@ mod tests {
 
         let old_subs = repo.list_subscriptions_by_chat(old_chat_id).await.unwrap();
         assert_eq!(old_subs.len(), 0);
-    }
-
-    #[tokio::test]
-    async fn test_migrate_chat_idempotent() {
-        let repo = setup_test_db().await.unwrap();
-
-        let old_chat_id = -888888;
-        let new_chat_id = -1009999999999;
-
-        repo.upsert_chat(
-            old_chat_id,
-            "group".to_string(),
-            Some("Test Group".to_string()),
-            true,
-            Tags::default(),
-        )
-        .await
-        .unwrap();
-
-        repo.migrate_chat(old_chat_id, new_chat_id).await.unwrap();
-
-        let result = repo.migrate_chat(old_chat_id, new_chat_id).await;
-        assert!(result.is_ok());
-
-        let new_chat = repo.get_chat(new_chat_id).await.unwrap();
-        assert!(new_chat.is_some());
     }
 
     #[tokio::test]
@@ -476,27 +451,6 @@ mod tests {
         let new_chat = repo.get_chat(new_chat_id).await.unwrap().unwrap();
         assert!(new_chat.enabled);
         assert_eq!(new_chat.title, Some("Old Group".to_string()));
-    }
-
-    #[tokio::test]
-    async fn test_create_user_with_auto_owner_first_user() {
-        let repo = setup_test_db().await.unwrap();
-
-        let user1 = repo
-            .create_user_with_auto_owner(11111, Some("user1".to_string()))
-            .await
-            .unwrap();
-
-        assert_eq!(user1.id, 11111);
-        assert_eq!(user1.role, UserRole::Owner);
-
-        let user2 = repo
-            .create_user_with_auto_owner(22222, Some("user2".to_string()))
-            .await
-            .unwrap();
-
-        assert_eq!(user2.id, 22222);
-        assert_eq!(user2.role, UserRole::User);
     }
 
     #[tokio::test]

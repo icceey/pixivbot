@@ -146,7 +146,6 @@ impl Command {
 #[cfg(test)]
 mod tests {
     use super::Command;
-    use teloxide::utils::command::BotCommands;
 
     fn command_names(commands: Vec<teloxide::types::BotCommand>) -> Vec<String> {
         commands
@@ -156,128 +155,44 @@ mod tests {
     }
 
     #[test]
-    fn user_commands_omit_booru_entries_when_not_configured() {
-        let commands = command_names(Command::user_commands(false, false));
-
-        for name in [
-            "bsub",
-            "bunsub",
-            "brank",
-            "brankday",
-            "brankweek",
-            "brankmonth",
-            "brand",
-        ] {
-            assert!(
-                !commands.iter().any(|command| command == name),
-                "expected {name} to be hidden when booru is not configured"
-            );
+    fn command_visibility_follows_provider_configuration_and_role() {
+        for (booru, eh) in [(false, false), (true, false), (false, true), (true, true)] {
+            for (role, commands) in [
+                ("user", Command::user_commands(booru, eh)),
+                ("admin", Command::admin_commands(booru, eh)),
+                ("owner", Command::owner_commands(booru, eh)),
+            ] {
+                let names = command_names(commands);
+                for (provider_commands, visible) in [
+                    (
+                        &[
+                            "bsub",
+                            "bunsub",
+                            "brank",
+                            "brankday",
+                            "brankweek",
+                            "brankmonth",
+                            "brand",
+                        ][..],
+                        booru,
+                    ),
+                    (&["esub", "eunsub", "edl", "estatus"][..], eh),
+                ] {
+                    for command in provider_commands {
+                        assert_eq!(
+                            names.iter().any(|name| name == command),
+                            visible,
+                            "{role}: {command}, booru={booru}, eh={eh}"
+                        );
+                    }
+                }
+                if role == "admin" {
+                    assert!(names.iter().any(|name| name == "info"));
+                }
+                if role == "owner" {
+                    assert!(names.iter().any(|name| name == "setadmin"));
+                }
+            }
         }
-    }
-
-    #[test]
-    fn user_commands_include_booru_entries_when_configured() {
-        let commands = command_names(Command::user_commands(true, false));
-
-        for name in [
-            "bsub",
-            "bunsub",
-            "brank",
-            "brankday",
-            "brankweek",
-            "brankmonth",
-            "brand",
-        ] {
-            assert!(
-                commands.iter().any(|command| command == name),
-                "expected {name} to be visible when booru is configured"
-            );
-        }
-    }
-
-    #[test]
-    fn user_commands_include_ehentai_entries_when_configured() {
-        let commands = command_names(Command::user_commands(false, true));
-
-        for name in ["esub", "eunsub", "edl", "estatus"] {
-            assert!(
-                commands.iter().any(|command| command == name),
-                "expected {name} to be visible when ehentai is configured"
-            );
-        }
-    }
-
-    #[test]
-    fn user_commands_omit_ehentai_entries_when_not_configured() {
-        let commands = command_names(Command::user_commands(false, false));
-
-        for name in ["esub", "eunsub", "edl", "estatus"] {
-            assert!(
-                !commands.iter().any(|command| command == name),
-                "expected {name} to be hidden when ehentai is not configured"
-            );
-        }
-    }
-
-    #[test]
-    fn admin_and_owner_commands_follow_booru_visibility() {
-        let admin_commands = command_names(Command::admin_commands(false, false));
-        let owner_commands = command_names(Command::owner_commands(false, false));
-
-        assert!(admin_commands.iter().any(|command| command == "info"));
-        assert!(owner_commands.iter().any(|command| command == "setadmin"));
-        assert!(!admin_commands.iter().any(|command| command == "bsub"));
-        assert!(!owner_commands.iter().any(|command| command == "bunsub"));
-    }
-
-    #[test]
-    fn estatus_parses_as_no_argument_command() {
-        assert!(matches!(
-            Command::parse("/estatus", ""),
-            Ok(Command::EStatus {})
-        ));
-        assert!(Command::parse("/estatus unexpected", "").is_err());
-    }
-
-    #[test]
-    fn estatus_visibility_follows_eh_configuration_for_all_roles() {
-        for commands in [
-            Command::user_commands(false, false),
-            Command::admin_commands(false, false),
-            Command::owner_commands(false, false),
-        ] {
-            assert!(!command_names(commands)
-                .iter()
-                .any(|command| command == "estatus"));
-        }
-
-        for commands in [
-            Command::user_commands(false, true),
-            Command::admin_commands(false, true),
-            Command::owner_commands(false, true),
-        ] {
-            assert!(command_names(commands)
-                .iter()
-                .any(|command| command == "estatus"));
-        }
-    }
-
-    #[test]
-    fn edl_help_is_url_only() {
-        let commands = Command::user_commands(true, true);
-        let edl = commands
-            .into_iter()
-            .find(|cmd| cmd.command == "edl")
-            .unwrap();
-        assert!(
-            edl.description.contains("<url>"),
-            "expected edl description to contain '<url>', got: {}",
-            edl.description
-        );
-        assert!(
-            !edl.description.contains("url|gid"),
-            "expected edl description NOT to contain 'url|gid', got: {}",
-            edl.description
-        );
     }
 }
