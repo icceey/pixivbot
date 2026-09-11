@@ -7,7 +7,6 @@ use sea_orm::{
     Statement,
 };
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[allow(clippy::too_many_arguments)]
 pub async fn upsert_eh_gallery_result_in_txn(
     txn: &DatabaseTransaction,

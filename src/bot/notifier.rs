@@ -42,7 +42,6 @@ impl Notifier {
     }
 
     /// 发送多张图片（共享文案）
-    #[allow(dead_code)]
     pub async fn notify_with_images(
         &self,
         chat_id: ChatId,

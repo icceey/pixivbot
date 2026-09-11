@@ -782,7 +782,7 @@ mod tests {
         let mut claimed_ids = Vec::new();
         for _ in 0..3 {
             claimed_ids.push(
-                repo.get_next_eh_job_for_download()
+                repo.claim_eh_job_for_download(true)
                     .await?
                     .expect("every released legacy job must be claimable")
                     .id,
@@ -1530,7 +1530,7 @@ mod tests {
         );
 
         let claimed = repo
-            .get_next_eh_job_for_download()
+            .claim_eh_job_for_download(true)
             .await?
             .expect("the adopted job must be claimable by a shared worker");
         assert_eq!(claimed.id, job.id);
@@ -1703,7 +1703,7 @@ mod tests {
             "a missing source must not strand conflict-marked jobs"
         );
         assert!(
-            repo.get_next_eh_job_for_download().await?.is_some(),
+            repo.claim_eh_job_for_download(true).await?.is_some(),
             "workers may resume ordinary work after the ambiguous source is gone"
         );
         Ok(())
@@ -1742,7 +1742,7 @@ mod tests {
             .expect("migration must create one shared job");
         assert_eq!(job.legacy_artifact_handoff, None);
         assert!(
-            repo.get_next_eh_job_for_download().await?.is_some(),
+            repo.claim_eh_job_for_download(true).await?.is_some(),
             "a harmless missing legacy family must not block a shared worker"
         );
         Ok(())
@@ -1799,7 +1799,7 @@ mod tests {
         assert!(legacy.assembly_scratch().exists());
         assert!(target.assembly_scratch().exists());
         assert!(
-            repo.get_next_eh_job_for_download().await?.is_none(),
+            repo.claim_eh_job_for_download(true).await?.is_none(),
             "a worker must not create a second download while source ownership is ambiguous"
         );
         Ok(())

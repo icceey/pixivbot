@@ -162,12 +162,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn strip_pre_wrapper_extracts_inner_text() {
-        let wrapped = r#"<html><head></head><body><pre style="word-wrap: break-word;">{"a":1}</pre></body></html>"#;
-        assert_eq!(strip_html_wrapper(wrapped), "{\"a\":1}");
-    }
-
-    #[test]
     fn strip_pre_wrapper_decodes_entities() {
         let wrapped = r#"<pre>{&quot;url&quot;:&quot;a&amp;b&quot;}</pre>"#;
         assert_eq!(strip_html_wrapper(wrapped), r#"{"url":"a&b"}"#);

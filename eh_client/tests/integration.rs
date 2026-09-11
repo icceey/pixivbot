@@ -91,14 +91,6 @@ const ARCHIVER_PAGE_HTML: &str = r#"
 </body></html>
 "#;
 
-const ARCHIVER_REDIRECT_HTML: &str = r#"
-<script type="text/javascript">
-function gotonext() {
-    document.location = "http://123.45.67.89/archive/123456/abcdef0123/abcdef0123/0?autostart=1";
-}
-</script>
-"#;
-
 fn metadata_json() -> serde_json::Value {
     serde_json::json!({
         "gmetadata": [{
@@ -300,31 +292,12 @@ async fn test_get_archiver_key_not_found() {
 async fn test_download_archive_full_flow() {
     let server = MockServer::start().await;
 
-    // Step 1: archiver.php returns HTML with JS redirect
-    Mock::given(method("POST"))
-        .and(path("/archiver.php"))
-        .respond_with(ResponseTemplate::new(200).set_body_string(ARCHIVER_REDIRECT_HTML))
-        .mount(&server)
-        .await;
-
-    // Step 2: the download URL returns ZIP bytes
     let zip_bytes = test_zip_bytes("image.jpg", b"fake_zip_content");
-    Mock::given(method("GET"))
-        .and(path("/archive/123456/abcdef0123/abcdef0123/0"))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(zip_bytes.clone()))
-        .mount(&server)
-        .await;
-
-    // BUT: the redirect URL is hardcoded to http://123.45.67.89/... in ARCHIVER_REDIRECT_HTML.
-    // We need the redirect URL to point to our mock server instead.
-    // Re-do with custom redirect HTML:
     let redirect_html = format!(
         r#"<script>document.location = "{}/archive/123456/abcdef0123/abcdef0123/0?autostart=1";</script>"#,
         server.uri()
     );
 
-    // Reset mocks and re-mount with correct redirect
-    server.reset().await;
     Mock::given(method("POST"))
         .and(path("/archiver.php"))
         .respond_with(ResponseTemplate::new(200).set_body_string(redirect_html))

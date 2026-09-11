@@ -1290,43 +1290,6 @@ mod tests {
         assert_eq!(deduped[0].tags, "first");
     }
 
-    /// Verifies that appending new IDs then deduplicating preserves insertion
-    /// order so that `trim_pushed` (which drops the front) removes the truly
-    /// oldest-pushed entries rather than the numerically lowest IDs.
-    ///
-    /// Failure mode of the old `sort_unstable() + dedup()` approach:
-    ///   existing=[10,30,50]  append 50(dup),200,5
-    ///   sort  → [5,10,30,50,50,200]
-    ///   dedup → [5,10,30,50,200]
-    ///   trim(4) drops front 1 → [10,30,50,200]  ← ID 5 (newest push) wrongly dropped
-    ///
-    /// Expected behavior with order-preserving dedup:
-    ///   existing=[10,30,50]  append 50(dup),200,5
-    ///   dedup (retain) → [10,30,50,200,5]
-    ///   trim(4) drops front 1 → [30,50,200,5]  ← ID 10 (oldest push) correctly dropped
-    #[test]
-    fn test_pushed_ids_dedup_preserves_insertion_order() {
-        let mut pushed_ids: Vec<u64> = vec![10, 30, 50]; // existing, in push order
-                                                         // New posts this tick: 50 is a duplicate, 200 and 5 are new
-        pushed_ids.push(50);
-        pushed_ids.push(200);
-        pushed_ids.push(5);
-
-        // Apply order-preserving dedup (the fix)
-        let mut seen = std::collections::HashSet::new();
-        pushed_ids.retain(|id| seen.insert(*id));
-
-        // Trim oldest (front) to cap 4
-        let cap = 4;
-        if pushed_ids.len() > cap {
-            let drop = pushed_ids.len() - cap;
-            pushed_ids.drain(0..drop);
-        }
-
-        // ID 10 (oldest push) should be removed; ID 5 (newest push, low ID) stays
-        assert_eq!(pushed_ids, vec![30, 50, 200, 5]);
-    }
-
     /// Regression: GC for `failed_attempts` must be keyed on the FULL current ranking,
     /// not just the truncated push batch. A post outside `MAX_RANKING_PUSH_PER_TICK`
     /// but still present in the filtered ranking should retain its counter.
@@ -1341,23 +1304,7 @@ mod tests {
         // Full filtered ranking: 10, 20, 30, 40, 50
         let full_ranking: HashSet<u64> = [10u64, 20, 30, 40, 50].iter().copied().collect();
 
-        // Push batch (truncated to first 4): 10, 20, 30, 40 — post 50 is NOT here
-        let push_batch: HashSet<u64> = [10u64, 20, 30, 40].iter().copied().collect();
-
-        // GC keyed on push_batch (old buggy approach) — post 50 counter is wrongly dropped
-        let mut old_result = failed_attempts.clone();
-        old_result.retain(|(id, _)| push_batch.contains(id));
-        assert!(
-            !old_result.iter().any(|(id, _)| *id == 50),
-            "old approach: post 50 counter is dropped (the bug)"
-        );
-
-        // GC keyed on full_ranking (correct approach) — post 50 counter is retained
         gc_failed_attempts(&mut failed_attempts, &full_ranking);
-        assert!(
-            failed_attempts.iter().any(|(id, _)| *id == 50),
-            "fix: post 50 counter retained because post is still in current ranking"
-        );
         assert_eq!(failed_attempts, vec![(20, 2), (50, 1)]);
     }
 }

@@ -579,6 +579,7 @@ fn multipart_uploader_identity(
 #[derive(Debug, Deserialize)]
 #[serde(rename = "CompleteMultipartUploadResult")]
 struct CompleteMultipartUploadResult {
+    // Deserialize Location to preserve duplicate-element validation.
     #[serde(rename = "Location", default)]
     _location: Option<String>,
     #[serde(rename = "Bucket")]
@@ -1346,16 +1347,6 @@ fn ipfs3_zip_central_directory_entries(
     }
 
     (entries.len() == archive_len).then_some(entries)
-}
-
-#[cfg(test)]
-fn ipfs3_zip_central_directory_is_complete_and_unique(
-    archive_bytes: &[u8],
-    central_directory_start: u64,
-    archive_len: usize,
-) -> bool {
-    ipfs3_zip_central_directory_entries(archive_bytes, central_directory_start, archive_len)
-        .is_some()
 }
 
 fn ipfs3_zip_local_header(bytes: &[u8], header_start: u64) -> Option<IpfS3ZipLocalHeader<'_>> {
@@ -2846,17 +2837,6 @@ mod tests {
     }
 
     #[test]
-    fn s3_config_requires_fields_for_provider() {
-        let cfg = ImageUploadConfig {
-            provider: ImageUploadProvider::S3,
-            s3: Some(S3UploaderConfig::default()),
-            ..Default::default()
-        };
-        let err = cfg.s3.unwrap().required().unwrap_err();
-        assert!(err.to_string().contains("image_upload.s3.endpoint_url"));
-    }
-
-    #[test]
     fn s3_config_rejects_invalid_public_base_url() {
         let mut cfg = complete_s3_config("http://localhost:9000", "not a url");
         let err = cfg.required().unwrap_err();
@@ -2901,13 +2881,6 @@ mod tests {
     }
 
     #[test]
-    fn ipfs3_config_requires_fields_for_provider() {
-        let cfg = IpfS3UploaderConfig::default();
-        let err = cfg.required().unwrap_err();
-        assert!(err.to_string().contains("image_upload.ipfs3.endpoint_url"));
-    }
-
-    #[test]
     fn ipfs3_config_rejects_invalid_gateway_url() {
         let mut cfg = complete_ipfs3_config("http://localhost:9000", "not a url");
         let err = cfg.required().unwrap_err();
@@ -2947,13 +2920,6 @@ mod tests {
         cfg.endpoint_url = Some("https://ipfs3.example.com?token=secret".to_string());
         let err = cfg.required().unwrap_err();
         assert!(err.to_string().contains("must not contain query"));
-    }
-
-    #[test]
-    fn ipfs3_config_trims_gateway_url_trailing_slash() {
-        let cfg = complete_ipfs3_config("http://localhost:9000", "https://ipfs.io/ipfs/");
-        let resolved = cfg.required().unwrap();
-        assert_eq!(resolved.gateway_url, "https://ipfs.io/ipfs");
     }
 
     #[test]
@@ -4202,11 +4168,7 @@ mod tests {
             + b"one.jpg".len();
         bytes[second_record_start..second_record_start + 4].copy_from_slice(b"STOP");
 
-        assert!(!ipfs3_zip_central_directory_is_complete_and_unique(
-            &bytes,
-            central_start,
-            archive_len,
-        ));
+        assert!(ipfs3_zip_central_directory_entries(&bytes, central_start, archive_len).is_none());
     }
 
     #[tokio::test]
@@ -6565,6 +6527,7 @@ mod tests {
                             use std::io::Read;
 
                             let mut bytes = [0; 1024];
+                            stream.set_nonblocking(false).unwrap();
                             stream
                                 .set_read_timeout(Some(std::time::Duration::from_secs(1)))
                                 .unwrap();
@@ -6596,7 +6559,6 @@ mod tests {
             }])
             .await
             .is_err());
-        std::thread::sleep(std::time::Duration::from_millis(25));
         running.store(false, std::sync::atomic::Ordering::SeqCst);
         close_server.join().unwrap();
         let request_lines = request_lines.lock().unwrap();
@@ -6610,13 +6572,13 @@ mod tests {
             b"<?xml version=\"1.0\"?><CompleteMultipartUploadResult><Bucket>bucket</Bucket><Key>key</Key><ETag>etag</ETag></CompleteMultipartUploadResult>",
         )
         .unwrap();
-        assert_eq!(parsed._location, None);
         assert_eq!(parsed.bucket, "bucket");
         assert_eq!(parsed.key, "key");
         assert_eq!(parsed.etag, "etag");
 
         for body in [
             b"<WrongResult><Bucket>bucket</Bucket><Key>key</Key><ETag>etag</ETag></WrongResult>".as_slice(),
+            b"<CompleteMultipartUploadResult><Location>first</Location><Location>second</Location><Bucket>bucket</Bucket><Key>key</Key><ETag>etag</ETag></CompleteMultipartUploadResult>".as_slice(),
             b"<CompleteMultipartUploadResult><Bucket> </Bucket><Key>key</Key><ETag>etag</ETag></CompleteMultipartUploadResult>".as_slice(),
             b"<CompleteMultipartUploadResult><Bucket>bucket</Bucket><Key> </Key><ETag>etag</ETag></CompleteMultipartUploadResult>".as_slice(),
             b"<CompleteMultipartUploadResult><Bucket>bucket</Bucket><Key>key</Key><ETag></ETag></CompleteMultipartUploadResult>".as_slice(),

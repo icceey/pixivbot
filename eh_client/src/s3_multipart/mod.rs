@@ -355,7 +355,7 @@ pub(crate) async fn upload_multipart(
                     }
                 }
             }
-            Err(failure @ list_parts::MultipartFailure::InvalidInventory(_)) => {
+            Err(failure @ list_parts::MultipartFailure::InvalidInventory) => {
                 replace_corrupt_session(
                     bucket,
                     &active,
@@ -587,9 +587,7 @@ async fn upload_part(
     list_parts::classify_response(MultipartOperation::UploadPart, status, &body)?;
     match etag {
         Some(etag) if !etag.trim().is_empty() => Ok(etag),
-        _ => Err(list_parts::MultipartFailure::Protocol(
-            "successful S3 multipart UploadPart response had no usable ETag".to_owned(),
-        )),
+        _ => Err(list_parts::MultipartFailure::Protocol),
     }
 }
 
@@ -1370,8 +1368,7 @@ mod tests {
             Some(list_parts::MultipartFailure::Service {
                 operation: MultipartOperation::Complete,
                 status: 200,
-                code: Some(ref code),
-            }) if code == "AccessDenied"
+            })
         ));
         let server = MockServer::start().await;
         mount_create(&server).await;
@@ -1875,7 +1872,6 @@ mod tests {
             list_parts::MultipartFailure::Unsupported {
                 operation: MultipartOperation::ListParts,
                 status: 405,
-                code: "NotImplemented".to_owned(),
             },
         )
         .await;
@@ -1910,7 +1906,6 @@ mod tests {
             list_parts::MultipartFailure::Unsupported {
                 operation: MultipartOperation::ListParts,
                 status: 405,
-                code: "NotImplemented".to_owned(),
             },
         )
         .await;
@@ -2898,10 +2893,6 @@ mod tests {
             .split_once('?')
             .map(|(path, _)| path)
             .and_then(|path| path.strip_prefix(&format!("/{BUCKET}/")))
-    }
-
-    fn list_parts_response(parts: &[(u32, String, u64)]) -> String {
-        list_parts_response_for(BUCKET, KEY, UPLOAD_ID, parts)
     }
 
     fn list_parts_response_for(

@@ -40,14 +40,6 @@ impl Validator {
         }
     }
 
-    #[cfg(test)]
-    pub(super) fn value(&self) -> &str {
-        match self {
-            Self::StrongEtag(value) | Self::LastModified(value) => value,
-            Self::None => "",
-        }
-    }
-
     fn apply_if_range(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         match self {
             Self::StrongEtag(value) | Self::LastModified(value) => request.header(IF_RANGE, value),
@@ -378,15 +370,12 @@ mod tests {
             Validator::from_manifest(&manifest(Some("\"v1\""), None)),
             Validator::from_manifest(&manifest(None, Some(LAST_MODIFIED_VALUE))),
         ] {
-            let header = match validator {
-                Validator::StrongEtag(_) => ETAG,
-                Validator::LastModified(_) => LAST_MODIFIED,
+            let (header, value) = match &validator {
+                Validator::StrongEtag(value) => (ETAG, value.as_str()),
+                Validator::LastModified(value) => (LAST_MODIFIED, value.as_str()),
                 Validator::None => unreachable!("manifest contains a validator"),
             };
-            let matching = headers(&[
-                (CONTENT_RANGE, "bytes 10-19/100"),
-                (header.clone(), validator.value()),
-            ]);
+            let matching = headers(&[(CONTENT_RANGE, "bytes 10-19/100"), (header.clone(), value)]);
             validate_part_response(
                 StatusCode::PARTIAL_CONTENT,
                 &matching,

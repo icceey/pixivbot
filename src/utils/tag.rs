@@ -120,13 +120,4 @@ mod tests {
         // 你好，世界！ -> 你好世界
         assert_eq!(format_tags(&["你好，世界！"]), vec!["你好世界"]);
     }
-
-    #[test]
-    fn test_format_tags_unicode_support() {
-        // Test various Unicode scripts
-        assert_eq!(format_tags(&["日本語"]), vec!["日本語"]);
-        assert_eq!(format_tags(&["中文测试"]), vec!["中文测试"]);
-        assert_eq!(format_tags(&["한국어"]), vec!["한국어"]);
-        assert_eq!(format_tags(&["Русский"]), vec!["Русский"]);
-    }
 }

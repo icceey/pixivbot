@@ -20,18 +20,16 @@ pub(super) enum MultipartFailure {
     Unsupported {
         operation: MultipartOperation,
         status: u16,
-        code: String,
     },
     NoSuchUpload {
         operation: MultipartOperation,
     },
-    InvalidInventory(String),
+    InvalidInventory,
     Service {
         operation: MultipartOperation,
         status: u16,
-        code: Option<String>,
     },
-    Protocol(String),
+    Protocol,
     Client(crate::Error),
 }
 
@@ -49,7 +47,7 @@ impl fmt::Debug for MultipartFailure {
                 .debug_struct("MultipartFailure::NoSuchUpload")
                 .field("operation", operation)
                 .finish(),
-            Self::InvalidInventory(_) => formatter
+            Self::InvalidInventory => formatter
                 .debug_tuple("MultipartFailure::InvalidInventory")
                 .field(&"redacted")
                 .finish(),
@@ -60,7 +58,7 @@ impl fmt::Debug for MultipartFailure {
                 .field("operation", operation)
                 .field("status", status)
                 .finish(),
-            Self::Protocol(_) => formatter
+            Self::Protocol => formatter
                 .debug_tuple("MultipartFailure::Protocol")
                 .field(&"redacted")
                 .finish(),
@@ -87,7 +85,7 @@ impl fmt::Display for MultipartFailure {
                     "S3 multipart {operation:?} upload no longer exists"
                 )
             }
-            Self::InvalidInventory(_) => {
+            Self::InvalidInventory => {
                 write!(formatter, "S3 multipart part inventory is invalid")
             }
             Self::Service {
@@ -96,7 +94,7 @@ impl fmt::Display for MultipartFailure {
                 formatter,
                 "S3 multipart {operation:?} service request failed (HTTP {status})"
             ),
-            Self::Protocol(_) => write!(formatter, "S3 multipart protocol response is invalid"),
+            Self::Protocol => write!(formatter, "S3 multipart protocol response is invalid"),
             Self::Client(_) => write!(formatter, "S3 multipart client request failed"),
         }
     }
@@ -141,19 +139,19 @@ pub(super) async fn list_all_parts(
         let page = parse_list_parts_result(&body)?;
 
         if page.bucket != bucket.name || page.key != key || page.upload_id != upload_id {
-            return Err(protocol_failure());
+            return Err(MultipartFailure::Protocol);
         }
         let pagination = validate_pagination(provider, &page, marker)?;
 
         for part in page.parts {
             if !(1..=MAX_PART_NUMBER).contains(&part.part_number) || part.etag.trim().is_empty() {
-                return Err(invalid_inventory_failure());
+                return Err(MultipartFailure::InvalidInventory);
             }
             if !seen_part_numbers.insert(part.part_number) {
-                return Err(invalid_inventory_failure());
+                return Err(MultipartFailure::InvalidInventory);
             }
             if part.part_number <= marker {
-                return Err(protocol_failure());
+                return Err(MultipartFailure::Protocol);
             }
             completed_parts.push(CompletedPart {
                 part_number: part.part_number,
@@ -183,11 +181,7 @@ pub(super) fn classify_response(
     if (200..300).contains(&status) {
         Ok(())
     } else {
-        Err(MultipartFailure::Service {
-            operation,
-            status,
-            code: None,
-        })
+        Err(MultipartFailure::Service { operation, status })
     }
 }
 
@@ -200,49 +194,33 @@ pub(super) fn classify_embedded_s3_error(
         return None;
     }
     if !has_only_root(body, b"Error") {
-        return Some(protocol_failure());
+        return Some(MultipartFailure::Protocol);
     }
 
     let error: S3ErrorBody = match quick_xml::de::from_reader(std::io::Cursor::new(body)) {
         Ok(error) => error,
-        Err(_) => return Some(protocol_failure()),
+        Err(_) => return Some(MultipartFailure::Protocol),
     };
     if error.code.trim().is_empty() || error.message.trim().is_empty() {
-        return Some(protocol_failure());
+        return Some(MultipartFailure::Protocol);
     }
 
     if status == 501
         && error.code == "NotImplemented"
         && is_canonical_not_implemented_operation(operation)
     {
-        return Some(MultipartFailure::Unsupported {
-            operation,
-            status,
-            code: error.code,
-        });
+        return Some(MultipartFailure::Unsupported { operation, status });
     }
     if (500..600).contains(&status) {
-        return Some(MultipartFailure::Service {
-            operation,
-            status,
-            code: Some(error.code),
-        });
+        return Some(MultipartFailure::Service { operation, status });
     }
     if error.code == "NoSuchUpload" {
         return Some(MultipartFailure::NoSuchUpload { operation });
     }
     if is_explicit_unsupported_operation(operation, status, &error.code) {
-        return Some(MultipartFailure::Unsupported {
-            operation,
-            status,
-            code: error.code,
-        });
+        return Some(MultipartFailure::Unsupported { operation, status });
     }
-    Some(MultipartFailure::Service {
-        operation,
-        status,
-        code: Some(error.code),
-    })
+    Some(MultipartFailure::Service { operation, status })
 }
 
 pub(super) fn classify_s3_error(
@@ -253,11 +231,7 @@ pub(super) fn classify_s3_error(
         s3::error::S3Error::HttpFailWithBody(status, body) => {
             match classify_response(operation, status, body.as_bytes()) {
                 Err(failure) => failure,
-                Ok(()) => MultipartFailure::Service {
-                    operation,
-                    status,
-                    code: None,
-                },
+                Ok(()) => MultipartFailure::Service { operation, status },
             }
         }
         s3::error::S3Error::Reqwest(error) => {
@@ -315,7 +289,7 @@ fn validate_pagination(
         ProviderKind::IpfS3 if pagination_fields_missing && requested_marker == 0 => {
             Ok(Pagination::CompleteInventory)
         }
-        ProviderKind::IpfS3 => Err(protocol_failure()),
+        ProviderKind::IpfS3 => Err(MultipartFailure::Protocol),
     }
 }
 
@@ -326,16 +300,18 @@ fn validate_standard_pagination(
     if page.part_number_marker != Some(requested_marker)
         || page.max_parts != Some(MAX_PARTS_PER_REQUEST)
     {
-        return Err(protocol_failure());
+        return Err(MultipartFailure::Protocol);
     }
 
-    if !page.is_truncated.ok_or_else(protocol_failure)? {
+    if !page.is_truncated.ok_or(MultipartFailure::Protocol)? {
         return Ok(Pagination::FinalPage);
     }
 
-    let next_marker = page.next_part_number_marker.ok_or_else(protocol_failure)?;
+    let next_marker = page
+        .next_part_number_marker
+        .ok_or(MultipartFailure::Protocol)?;
     if !(1..=MAX_PART_NUMBER).contains(&next_marker) || next_marker <= requested_marker {
-        return Err(protocol_failure());
+        return Err(MultipartFailure::Protocol);
     }
     Ok(Pagination::Truncated { next_marker })
 }
@@ -362,9 +338,9 @@ struct S3ErrorBody {
 
 fn parse_list_parts_result(body: &[u8]) -> Result<ListPartsResult, MultipartFailure> {
     if !has_only_root(body, b"ListPartsResult") {
-        return Err(protocol_failure());
+        return Err(MultipartFailure::Protocol);
     }
-    quick_xml::de::from_reader(std::io::Cursor::new(body)).map_err(|_| protocol_failure())
+    quick_xml::de::from_reader(std::io::Cursor::new(body)).map_err(|_| MultipartFailure::Protocol)
 }
 
 fn has_root(body: &[u8], expected: &[u8]) -> bool {
@@ -450,16 +426,6 @@ fn signed_url_has_decompress_query(signed_url: &str) -> bool {
         url.query_pairs()
             .any(|(name, _)| name.to_ascii_lowercase().starts_with("decompress-"))
     })
-}
-
-fn protocol_failure() -> MultipartFailure {
-    MultipartFailure::Protocol("S3 multipart response violated the ListParts protocol".to_owned())
-}
-
-fn invalid_inventory_failure() -> MultipartFailure {
-    MultipartFailure::InvalidInventory(
-        "S3 multipart response contained an invalid part inventory".to_owned(),
-    )
 }
 
 fn client_failure(operation: MultipartOperation) -> MultipartFailure {
@@ -833,8 +799,7 @@ mod tests {
                     MultipartFailure::Unsupported {
                         operation: actual_operation,
                         status: 405,
-                        code: actual_code,
-                    } if actual_operation == operation && actual_code == code
+                    } if actual_operation == operation
                 ));
             }
         }
@@ -853,7 +818,7 @@ mod tests {
             classify_response(MultipartOperation::ListParts, 405, b"not XML").unwrap_err();
         assert!(matches!(
             bare_405,
-            MultipartFailure::Service { code: None, .. }
+            MultipartFailure::Service { status: 405, .. }
         ));
         let access_denied = classify_response(
             MultipartOperation::ListParts,
@@ -863,11 +828,7 @@ mod tests {
         .unwrap_err();
         assert!(matches!(
             access_denied,
-            MultipartFailure::Service {
-                status: 403,
-                code: Some(ref code),
-                ..
-            } if code == "AccessDenied"
+            MultipartFailure::Service { status: 403, .. }
         ));
         let server_error = classify_response(
             MultipartOperation::ListParts,
@@ -877,11 +838,7 @@ mod tests {
         .unwrap_err();
         assert!(matches!(
             server_error,
-            MultipartFailure::Service {
-                status: 500,
-                code: Some(ref code),
-                ..
-            } if code == "NotImplemented"
+            MultipartFailure::Service { status: 500, .. }
         ));
         let no_such_upload = classify_response(
             MultipartOperation::ListParts,
@@ -908,7 +865,7 @@ mod tests {
                 200,
                 b"<Error><Code>NoSuchUpload</Code>",
             ),
-            Some(MultipartFailure::Protocol(_))
+            Some(MultipartFailure::Protocol)
         ));
         assert!(matches!(
             classify_s3_error(
@@ -938,8 +895,7 @@ mod tests {
                 MultipartFailure::Unsupported {
                     operation: actual_operation,
                     status: 501,
-                    code: actual_code,
-                } if actual_operation == operation && actual_code == "NotImplemented"
+                } if actual_operation == operation
             ));
         }
 
@@ -952,19 +908,14 @@ mod tests {
                 MultipartFailure::Service {
                     operation: actual_operation,
                     status: 501,
-                    code: Some(ref actual_code),
-                } if actual_operation == operation && actual_code == "NotImplemented"
+                } if actual_operation == operation
             ));
         }
 
         let bare = classify_response(MultipartOperation::ListParts, 501, b"not XML").unwrap_err();
         assert!(matches!(
             bare,
-            MultipartFailure::Service {
-                status: 501,
-                code: None,
-                ..
-            }
+            MultipartFailure::Service { status: 501, .. }
         ));
         let malformed = classify_response(
             MultipartOperation::ListParts,
@@ -972,7 +923,7 @@ mod tests {
             b"<Error><Code>NotImplemented</Code>",
         )
         .unwrap_err();
-        assert!(matches!(malformed, MultipartFailure::Protocol(_)));
+        assert!(matches!(malformed, MultipartFailure::Protocol));
 
         let server_error = classify_response(
             MultipartOperation::ListParts,
@@ -982,11 +933,7 @@ mod tests {
         .unwrap_err();
         assert!(matches!(
             server_error,
-            MultipartFailure::Service {
-                status: 500,
-                code: Some(ref code),
-                ..
-            } if code == "NotImplemented"
+            MultipartFailure::Service { status: 500, .. }
         ));
     }
 
@@ -1076,9 +1023,9 @@ mod tests {
 
     fn assert_failure_kind(failure: MultipartFailure, expected: FailureKind) {
         match expected {
-            FailureKind::Protocol => assert!(matches!(failure, MultipartFailure::Protocol(_))),
+            FailureKind::Protocol => assert!(matches!(failure, MultipartFailure::Protocol)),
             FailureKind::Inventory => {
-                assert!(matches!(failure, MultipartFailure::InvalidInventory(_)))
+                assert!(matches!(failure, MultipartFailure::InvalidInventory))
             }
         }
     }
