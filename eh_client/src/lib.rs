@@ -5,7 +5,6 @@ pub mod models;
 pub mod parser;
 pub mod telegraph;
 
-#[allow(dead_code)]
 mod s3_multipart;
 
 pub use archive_download::{ArchiveArtifacts, ArchiveDownloadOptions};

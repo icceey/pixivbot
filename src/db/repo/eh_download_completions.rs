@@ -79,7 +79,7 @@ mod tests {
             .await
             .unwrap()
             .expect("delivery should be enqueued");
-        let first_job = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        let first_job = repo.claim_eh_job_for_download(true).await.unwrap().unwrap();
         let first_started_at = first_job.started_at.unwrap();
         repo.mark_eh_job_downloaded(first_job.id, first_started_at, 100, "/tmp/first.zip", 0)
             .await
@@ -116,7 +116,7 @@ mod tests {
             .unwrap()
             .expect("delivery should be enqueued");
         assert_eq!(second_delivery.job_id, Some(first_job.id));
-        let second_job = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        let second_job = repo.claim_eh_job_for_download(true).await.unwrap().unwrap();
         assert_eq!(second_job.id, first_job.id);
         repo.mark_eh_job_downloaded(
             second_job.id,

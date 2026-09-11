@@ -143,7 +143,6 @@ impl Illust {
 }
 
 /// 作品详情响应
-#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct IllustDetail {
     pub illust: Illust,

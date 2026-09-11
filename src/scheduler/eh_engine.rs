@@ -45,18 +45,6 @@ const SLOW_DOWNLOAD_BYTES_PER_SEC: u64 = 1024 * 1024;
 
 static EH_GP_BUDGET_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
-#[cfg(test)]
-fn archive_artifacts_for_entry(
-    cache_dir: &std::path::Path,
-    entry: &eh_download_queue::Model,
-) -> ArchiveArtifacts {
-    ArchiveArtifacts::new(
-        cache_dir
-            .join("eh_cache")
-            .join(format!("{}_{}.zip", entry.gid, entry.token)),
-    )
-}
-
 fn archive_artifacts_for_job(
     cache_dir: &std::path::Path,
     job: &eh_gallery_jobs::Model,
@@ -65,37 +53,6 @@ fn archive_artifacts_for_job(
         &cache_dir.join("eh_cache"),
         job,
     ))
-}
-
-#[cfg(test)]
-async fn cleanup_archive_artifacts(cache_dir: &std::path::Path, entry: &eh_download_queue::Model) {
-    cleanup_archive_artifacts_for_gid(
-        cache_dir,
-        entry.gid,
-        archive_artifacts_for_entry(cache_dir, entry),
-    )
-    .await;
-}
-
-#[cfg(test)]
-async fn cleanup_archive_artifacts_for_gid(
-    _cache_dir: &std::path::Path,
-    gid: i64,
-    artifacts: ArchiveArtifacts,
-) {
-    if artifacts.uploads_dir().exists() {
-        warn!(
-            "Preserving EH archive artifacts with multipart upload state for gid={} because this cleanup path has no Abort uploader",
-            gid
-        );
-        return;
-    }
-    if let Err(e) = artifacts.remove_all().await {
-        warn!(
-            "Failed to delete EH archive artifacts for gid={}: {}",
-            gid, e
-        );
-    }
 }
 
 #[derive(Debug)]
@@ -517,7 +474,7 @@ impl EhBackgroundDownloadWorker {
         for _ in 0..concurrency {
             let Some(job) = self
                 .repo
-                .get_next_eh_job_for_background_download_with_policy(self.config.send_archive)
+                .claim_eh_job_for_background_download(self.config.send_archive)
                 .await?
             else {
                 break;
@@ -1005,13 +962,9 @@ impl EhEngine {
             .unwrap_or(0);
 
         // Fetch gallery refs from search
-        let refs = if agg_filter.has_rating_filter() {
-            self.fetch_galleries_48h(&key.query, key.category_bitmask, oldest_ts)
-                .await?
-        } else {
-            self.fetch_galleries_since(&key.query, key.category_bitmask, oldest_ts)
-                .await?
-        };
+        let refs = self
+            .fetch_gallery_refs(&key.query, key.category_bitmask)
+            .await?;
 
         if refs.is_empty() {
             for (sub, _) in &prepared_subs {
@@ -1074,11 +1027,10 @@ impl EhEngine {
     }
 
     /// Fetch gallery refs from search. Returns all refs found (up to MAX_FETCH_PAGES).
-    async fn fetch_galleries_since(
+    async fn fetch_gallery_refs(
         &self,
         query: &str,
         cats: u32,
-        _oldest_ts: i64,
     ) -> Result<Vec<eh_client::EhGalleryRef>> {
         let mut all_refs = Vec::new();
 
@@ -1106,16 +1058,6 @@ impl EhEngine {
         all_refs.retain(|r| seen_gids.insert(r.gid));
 
         Ok(all_refs)
-    }
-
-    /// 48h scan mode: same as normal mode — timestamp filtering done after metadata fetch.
-    async fn fetch_galleries_48h(
-        &self,
-        query: &str,
-        cats: u32,
-        _oldest_ts: i64,
-    ) -> Result<Vec<eh_client::EhGalleryRef>> {
-        self.fetch_galleries_since(query, cats, 0).await
     }
 
     fn telegraph_default(&self, sub_filter: Option<&EhFilter>) -> bool {
@@ -1511,7 +1453,7 @@ impl EhDownloadWorker {
 
         let job = self
             .repo
-            .get_next_eh_job_for_download_with_policy(self.config.send_archive)
+            .claim_eh_job_for_download(self.config.send_archive)
             .await?;
         let Some(job) = job else {
             return Ok(());
@@ -1894,27 +1836,7 @@ fn serialize_eh_gallery_media_cids(
 }
 
 impl EhUploadWorker {
-    #[cfg(test)]
     pub fn new(
-        repo: Arc<Repo>,
-        notifier: Notifier,
-        telegraph: Arc<TelegraphClient>,
-        image_uploader: Arc<dyn ImageUploader>,
-        rewrite_config: Option<IpfS3PreviewRewriteConfig>,
-        config: Arc<EhentaiConfig>,
-    ) -> Self {
-        Self::new_with_abort_uploader(
-            repo,
-            notifier,
-            telegraph,
-            image_uploader,
-            None,
-            rewrite_config,
-            config,
-        )
-    }
-
-    pub fn new_with_abort_uploader(
         repo: Arc<Repo>,
         notifier: Notifier,
         telegraph: Arc<TelegraphClient>,
@@ -2367,23 +2289,11 @@ struct EhPublishCompletionHook {
 }
 
 impl EhPublishWorker {
-    #[cfg(test)]
     pub fn new(
         repo: Arc<Repo>,
         notifier: Notifier,
         client: Arc<EhClient>,
         rewrite_delay_sec: Option<u64>,
-        config: Arc<EhentaiConfig>,
-    ) -> Self {
-        Self::new_with_abort_uploader(repo, notifier, client, rewrite_delay_sec, None, config)
-    }
-
-    pub fn new_with_abort_uploader(
-        repo: Arc<Repo>,
-        notifier: Notifier,
-        client: Arc<EhClient>,
-        rewrite_delay_sec: Option<u64>,
-        _abort_uploader: Option<Arc<dyn ImageUploader>>,
         config: Arc<EhentaiConfig>,
     ) -> Self {
         Self {
@@ -3043,36 +2953,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cleanup_archive_artifacts_preserves_upload_state_without_abort_capability() {
-        let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
-        let temp = tempfile::tempdir().unwrap();
-        let cache_dir = temp.path().join("cache");
-        let zip_path = cache_dir.join("eh_cache").join("880_cleanup-token.zip");
-        std::fs::create_dir_all(zip_path.parent().unwrap()).unwrap();
-        create_test_zip(&zip_path, 1);
-        let artifacts = seed_archive_artifact_family(&zip_path);
-        let entry = insert_queue_entry(
-            &repo,
-            -100,
-            880,
-            "cleanup-token",
-            "Cleanup",
-            false,
-            STATUS_DOWNLOADED,
-            Some(zip_path.to_str().unwrap()),
-            None,
-        )
-        .await;
-
-        cleanup_archive_artifacts(&cache_dir, &entry).await;
-
-        assert!(artifacts.final_zip().exists());
-        assert!(artifacts.assembly_scratch().exists());
-        assert!(artifacts.parts_dir().exists());
-        assert!(artifacts.uploads_dir().join("archive.json").exists());
-    }
-
-    #[tokio::test]
     async fn shared_zip_survives_first_delivery_and_is_removed_after_final_consumer() {
         let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
         let temp_dir = tempfile::tempdir().unwrap();
@@ -3170,7 +3050,7 @@ mod tests {
             .await
             .unwrap()
             .expect("delivery should be enqueued");
-        let downloaded = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        let downloaded = repo.claim_eh_job_for_download(true).await.unwrap().unwrap();
         repo.mark_eh_job_downloaded(
             downloaded.id,
             downloaded.started_at.unwrap(),
@@ -3235,7 +3115,11 @@ mod tests {
         assert!(failed.cleanup_next_retry_at.is_some());
         assert!(artifacts.final_zip().exists());
         assert!(artifacts.uploads_dir().join("archive.json").exists());
-        assert!(repo.get_next_eh_job_for_download().await.unwrap().is_none());
+        assert!(repo
+            .claim_eh_job_for_download(true)
+            .await
+            .unwrap()
+            .is_none());
 
         let successful_uploader = TerminalCleanupMockUploader::default();
         assert_eq!(
@@ -3246,7 +3130,7 @@ mod tests {
         );
         assert!(!artifacts.final_zip().exists());
         assert!(!artifacts.uploads_dir().exists());
-        let replacement = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        let replacement = repo.claim_eh_job_for_download(true).await.unwrap().unwrap();
         repo.mark_eh_job_downloaded(
             replacement.id,
             replacement.started_at.unwrap(),
@@ -3293,7 +3177,7 @@ mod tests {
             .await
             .unwrap()
             .expect("delivery should be enqueued");
-        let dirty_claim = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        let dirty_claim = repo.claim_eh_job_for_download(true).await.unwrap().unwrap();
         repo.mark_eh_job_downloaded(
             dirty_claim.id,
             dirty_claim.started_at.unwrap(),
@@ -3430,7 +3314,10 @@ mod tests {
         assert!(artifacts.final_zip().exists());
         assert!(artifacts.uploads_dir().join("archive.json").exists());
         assert!(
-            repo.get_next_eh_job_for_download().await.unwrap().is_none(),
+            repo.claim_eh_job_for_download(true)
+                .await
+                .unwrap()
+                .is_none(),
             "failed cleanup remains nonclaimable after unrelated jobs progress"
         );
     }
@@ -3458,7 +3345,7 @@ mod tests {
             .await
             .unwrap()
             .expect("delivery should be enqueued");
-        let download = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        let download = repo.claim_eh_job_for_download(true).await.unwrap().unwrap();
         repo.mark_eh_job_downloaded(
             download.id,
             download.started_at.unwrap(),
@@ -3520,7 +3407,11 @@ mod tests {
             .unwrap()
             .expect("delivery should be enqueued");
         assert_eq!(rebound.job_id, Some(upload.id));
-        assert!(repo.get_next_eh_job_for_download().await.unwrap().is_none());
+        assert!(repo
+            .claim_eh_job_for_download(true)
+            .await
+            .unwrap()
+            .is_none());
         assert!(repo
             .get_next_eh_delivery_for_publish(false)
             .await
@@ -3551,7 +3442,11 @@ mod tests {
         assert_eq!(failed.zip_path.as_deref(), zip_path.to_str());
         assert!(artifacts.final_zip().exists());
         assert!(artifacts.uploads_dir().exists());
-        assert!(repo.get_next_eh_job_for_download().await.unwrap().is_none());
+        assert!(repo
+            .claim_eh_job_for_download(true)
+            .await
+            .unwrap()
+            .is_none());
 
         let successful_uploader = TerminalCleanupMockUploader::default();
         assert_eq!(
@@ -3568,7 +3463,7 @@ mod tests {
         assert!(!artifacts.final_zip().exists());
         assert!(!artifacts.uploads_dir().exists());
         assert_eq!(
-            repo.get_next_eh_job_for_download()
+            repo.claim_eh_job_for_download(true)
                 .await
                 .unwrap()
                 .unwrap()
@@ -3598,7 +3493,7 @@ mod tests {
             .await
             .unwrap()
             .expect("delivery should be enqueued");
-        let claimed = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        let claimed = repo.claim_eh_job_for_download(true).await.unwrap().unwrap();
         let zip_path = archive_artifacts_for_job(temp_dir.path(), &claimed)
             .final_zip()
             .to_path_buf();
@@ -3670,7 +3565,11 @@ mod tests {
             .unwrap()
             .expect("delivery should be enqueued");
         assert_eq!(rebound.job_id, Some(claimed.id));
-        assert!(repo.get_next_eh_job_for_download().await.unwrap().is_none());
+        assert!(repo
+            .claim_eh_job_for_download(true)
+            .await
+            .unwrap()
+            .is_none());
 
         let uploader = TerminalCleanupMockUploader::default();
         assert_eq!(
@@ -3684,7 +3583,7 @@ mod tests {
         assert!(!artifacts.parts_dir().exists());
         assert!(!artifacts.uploads_dir().exists());
         assert_eq!(
-            repo.get_next_eh_job_for_download()
+            repo.claim_eh_job_for_download(true)
                 .await
                 .unwrap()
                 .unwrap()
@@ -3713,7 +3612,7 @@ mod tests {
             .await
             .unwrap()
             .expect("delivery should be enqueued");
-        let normal_claim = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        let normal_claim = repo.claim_eh_job_for_download(true).await.unwrap().unwrap();
         repo.schedule_eh_job_background_download(
             normal_claim.id,
             normal_claim.status.as_str(),
@@ -3722,7 +3621,7 @@ mod tests {
         .await
         .unwrap();
         let claimed = repo
-            .get_next_eh_job_for_background_download()
+            .claim_eh_job_for_background_download(true)
             .await
             .unwrap()
             .unwrap();
@@ -3802,7 +3701,7 @@ mod tests {
             .expect("delivery should be enqueued");
         assert_eq!(rebound.job_id, Some(claimed.id));
         assert!(repo
-            .get_next_eh_job_for_background_download()
+            .claim_eh_job_for_background_download(true)
             .await
             .unwrap()
             .is_none());
@@ -3819,7 +3718,7 @@ mod tests {
         assert!(!artifacts.parts_dir().exists());
         assert!(!artifacts.uploads_dir().exists());
         assert_eq!(
-            repo.get_next_eh_job_for_download()
+            repo.claim_eh_job_for_download(true)
                 .await
                 .unwrap()
                 .unwrap()
@@ -4833,7 +4732,7 @@ mod tests {
         engine.search_request_interval = Duration::ZERO;
         engine.tick().await.unwrap();
 
-        let claimed_download = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        let claimed_download = repo.claim_eh_job_for_download(true).await.unwrap().unwrap();
         assert!(claimed_download.telegraph_required);
         repo.mark_eh_job_downloaded(
             claimed_download.id,
@@ -4896,7 +4795,7 @@ mod tests {
         engine.search_request_interval = Duration::ZERO;
         engine.tick().await.unwrap();
 
-        let claimed_download = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        let claimed_download = repo.claim_eh_job_for_download(true).await.unwrap().unwrap();
         assert!(!claimed_download.telegraph_required);
         let downloaded = repo
             .mark_eh_job_downloaded(
@@ -6534,6 +6433,7 @@ mod tests {
             make_telegraph_client(&tg_server),
             make_image_uploader(&tg_server),
             None,
+            None,
             Arc::new(make_config()),
         );
         worker.tick().await.unwrap();
@@ -6584,6 +6484,7 @@ mod tests {
             make_notifier(&tg_server),
             make_telegraph_client(&tg_server),
             make_image_uploader(&tg_server),
+            None,
             None,
             Arc::new(make_config()),
         );
@@ -6636,6 +6537,7 @@ mod tests {
                 message: "simulated upload error".to_string(),
                 calls: std::sync::atomic::AtomicUsize::new(0),
             }),
+            None,
             None,
             Arc::new(make_config()),
         );
@@ -6858,6 +6760,7 @@ mod tests {
             make_notifier(&tg_server),
             make_telegraph_client(&tg_server),
             uploader.clone(),
+            None,
             Some(IpfS3PreviewRewriteConfig {
                 preview_gateway_url: "https://preview.example".to_string(),
                 public_gateway_url: "https://public.example".to_string(),
@@ -6970,6 +6873,7 @@ mod tests {
             make_notifier(&tg_server),
             make_telegraph_client(&tg_server),
             uploader.clone(),
+            None,
             None,
             Arc::new(make_config()),
         );
@@ -7357,6 +7261,7 @@ mod tests {
                 calls: std::sync::atomic::AtomicUsize::new(0),
             }),
             None,
+            None,
             Arc::new(config),
         );
 
@@ -7480,6 +7385,7 @@ mod tests {
             make_telegraph_client(&tg_server),
             uploader.clone(),
             None,
+            None,
             Arc::new(config),
         );
 
@@ -7564,6 +7470,7 @@ mod tests {
             make_telegraph_client(&tg_server),
             uploader.clone(),
             None,
+            None,
             Arc::new(make_config()),
         );
 
@@ -7629,7 +7536,7 @@ mod tests {
             ..Default::default()
         });
         let abort_uploader = Arc::new(TerminalCleanupMockUploader::default());
-        let worker = EhUploadWorker::new_with_abort_uploader(
+        let worker = EhUploadWorker::new(
             Arc::clone(&repo),
             make_notifier(&tg_server),
             make_telegraph_client(&tg_server),
@@ -7704,7 +7611,7 @@ mod tests {
         )
         .await;
         let abort_uploader = Arc::new(TerminalCleanupMockUploader::default());
-        let worker = EhUploadWorker::new_with_abort_uploader(
+        let worker = EhUploadWorker::new(
             Arc::clone(&repo),
             make_notifier(&tg_server),
             make_telegraph_client(&tg_server),
@@ -7763,6 +7670,7 @@ mod tests {
             make_notifier(&tg_server),
             make_telegraph_client(&tg_server),
             Arc::new(ZipFirstMockUploader::default()),
+            None,
             Some(IpfS3PreviewRewriteConfig {
                 preview_gateway_url: "https://preview.example".to_string(),
                 public_gateway_url: "https://public.example".to_string(),
@@ -7841,6 +7749,7 @@ mod tests {
             make_telegraph_client(&tg_server),
             uploader,
             None,
+            None,
             Arc::new(make_config()),
         );
 
@@ -7902,6 +7811,7 @@ mod tests {
             make_telegraph_client(&tg_server),
             make_image_uploader(&tg_server),
             None,
+            None,
             Arc::new(make_config()),
         );
 
@@ -7952,6 +7862,7 @@ mod tests {
             make_notifier(&tg_server),
             make_telegraph_client(&tg_server),
             uploader.clone(),
+            None,
             None,
             Arc::new(make_config()),
         );
@@ -8011,6 +7922,7 @@ mod tests {
             make_notifier(&tg_server),
             make_telegraph_client(&tg_server),
             uploader.clone(),
+            None,
             None,
             Arc::new(make_config()),
         );
@@ -8251,11 +8163,7 @@ mod tests {
             crate::db::repo::eh_gallery_jobs::DELIVERY_STATUS_WAITING
         );
 
-        let selected = repo
-            .get_next_eh_job_for_download_with_policy(true)
-            .await
-            .unwrap()
-            .unwrap();
+        let selected = repo.claim_eh_job_for_download(true).await.unwrap().unwrap();
         assert_eq!(selected.id, requested_job.id);
         assert_eq!(selected.resolution, "original");
     }
@@ -8282,7 +8190,7 @@ mod tests {
             .await
             .unwrap()
             .expect("old fingerprint delivery should be enqueued");
-        let old_job = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        let old_job = repo.claim_eh_job_for_download(true).await.unwrap().unwrap();
         repo.mark_eh_job_downloaded(
             old_job.id,
             old_job.started_at.unwrap(),
@@ -8361,7 +8269,7 @@ mod tests {
         assert!(rebound.archive_sent_at.is_some());
         assert!(rebound.telegraph_sent_at.is_none());
         assert_eq!(
-            repo.get_next_eh_job_for_download()
+            repo.claim_eh_job_for_download(true)
                 .await
                 .unwrap()
                 .unwrap()
@@ -8953,7 +8861,7 @@ mod tests {
         let entry = migrate_seeded_delivery_to_waiting(&repo, entry).await;
         let uploader = Arc::new(TerminalCleanupMockUploader::default());
 
-        let worker = EhUploadWorker::new_with_abort_uploader(
+        let worker = EhUploadWorker::new(
             Arc::clone(&repo),
             notifier,
             make_telegraph_client(&tg_server),
@@ -9049,7 +8957,7 @@ mod tests {
             fail_abort: true,
             ..Default::default()
         });
-        let worker = EhUploadWorker::new_with_abort_uploader(
+        let worker = EhUploadWorker::new(
             Arc::clone(&repo),
             notifier,
             make_telegraph_client(&tg_server),
@@ -9117,6 +9025,7 @@ mod tests {
             make_telegraph_client(&tg_server),
             Arc::new(TerminalCleanupMockUploader::default()),
             None,
+            None,
             Arc::new(config),
         );
 
@@ -9180,7 +9089,7 @@ mod tests {
         let entry = migrate_seeded_delivery_to_waiting(&repo, entry).await;
         let uploader = Arc::new(TerminalCleanupMockUploader::default());
 
-        let worker = EhUploadWorker::new_with_abort_uploader(
+        let worker = EhUploadWorker::new(
             Arc::clone(&repo),
             notifier,
             make_telegraph_client(&tg_server),
@@ -9256,7 +9165,7 @@ mod tests {
             fail_abort: true,
             ..Default::default()
         });
-        let worker = EhUploadWorker::new_with_abort_uploader(
+        let worker = EhUploadWorker::new(
             Arc::clone(&repo),
             notifier,
             make_telegraph_client(&tg_server),
@@ -9350,7 +9259,7 @@ mod tests {
         let uploader = Arc::new(ZipFirstMockUploader::default());
         let abort_uploader = Arc::new(TerminalCleanupMockUploader::default());
 
-        let worker = EhUploadWorker::new_with_abort_uploader(
+        let worker = EhUploadWorker::new(
             Arc::clone(&repo),
             make_notifier(&tg_server),
             make_telegraph_client(&tg_server),
@@ -9419,7 +9328,7 @@ mod tests {
             fail_abort: true,
             ..Default::default()
         });
-        let worker = EhUploadWorker::new_with_abort_uploader(
+        let worker = EhUploadWorker::new(
             Arc::clone(&repo),
             make_notifier(&tg_server),
             make_telegraph_client(&tg_server),
@@ -9485,6 +9394,7 @@ mod tests {
             make_telegraph_client(&tg_server),
             make_image_uploader(&tg_server),
             None,
+            None,
             config,
         );
         worker.tick().await.unwrap();
@@ -9532,6 +9442,7 @@ mod tests {
             notifier,
             make_telegraph_client(&tg_server),
             make_image_uploader(&tg_server),
+            None,
             None,
             config,
         );
@@ -9627,7 +9538,7 @@ mod tests {
             .await
             .unwrap()
             .expect("delivery should be enqueued");
-        let old_download = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        let old_download = repo.claim_eh_job_for_download(true).await.unwrap().unwrap();
         assert_eq!(old_download.id, initial.job_id.unwrap());
         repo.mark_eh_job_downloaded(
             old_download.id,
@@ -9761,7 +9672,7 @@ mod tests {
             crate::db::repo::eh_gallery_jobs::JOB_STATUS_RETIRED
         );
 
-        let new_download = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        let new_download = repo.claim_eh_job_for_download(true).await.unwrap().unwrap();
         assert_eq!(new_download.id, forced.job_id.unwrap());
         assert_eq!(new_download.resolution, "original");
         assert!(!new_download.telegraph_required);
@@ -10163,9 +10074,13 @@ mod tests {
             .await
             .unwrap()
             .is_none());
-        assert!(repo.get_next_eh_job_for_download().await.unwrap().is_none());
         assert!(repo
-            .get_next_eh_job_for_background_download()
+            .claim_eh_job_for_download(true)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(repo
+            .claim_eh_job_for_background_download(true)
             .await
             .unwrap()
             .is_none());
@@ -10209,7 +10124,7 @@ mod tests {
         .await
         .unwrap()
         .expect("delivery should be enqueued");
-        let download = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        let download = repo.claim_eh_job_for_download(true).await.unwrap().unwrap();
         let downloaded_generation = download.started_at.unwrap();
         repo.mark_eh_job_downloaded(
             download.id,
@@ -10307,7 +10222,7 @@ mod tests {
             .exec(repo.db())
             .await
             .unwrap();
-        let replacement_download = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        let replacement_download = repo.claim_eh_job_for_download(true).await.unwrap().unwrap();
         let replacement_generation = replacement_download.started_at.unwrap();
         assert!(replacement_generation > failed_upload_generation);
         create_test_zip(&zip_path, 1);
@@ -10413,7 +10328,7 @@ mod tests {
             .await
             .unwrap()
             .expect("delivery should be enqueued");
-        let claim = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        let claim = repo.claim_eh_job_for_download(true).await.unwrap().unwrap();
         repo.mark_eh_job_downloaded(
             claim.id,
             claim.started_at.unwrap(),
@@ -11095,7 +11010,7 @@ mod tests {
             .await
             .unwrap();
         let reclaimed = repo
-            .get_next_eh_job_for_background_download()
+            .claim_eh_job_for_background_download(true)
             .await
             .unwrap()
             .expect("preflight recovery must leave the job reclaimable");
@@ -12507,6 +12422,7 @@ mod tests {
             make_notifier(&telegram_server),
             make_telegraph_client(&telegram_server),
             uploader.clone(),
+            None,
             Some(IpfS3PreviewRewriteConfig {
                 preview_gateway_url: "https://preview.example".to_string(),
                 public_gateway_url: "https://public.example".to_string(),
@@ -12623,7 +12539,7 @@ mod tests {
         );
         assert!(reused_job.zip_path.is_none());
         assert!(repo
-            .get_next_eh_job_for_download_with_policy(false)
+            .claim_eh_job_for_download(false)
             .await
             .unwrap()
             .is_none());
@@ -12767,6 +12683,7 @@ mod tests {
             make_notifier(&telegram_server),
             make_telegraph_client(&telegram_server),
             uploader.clone(),
+            None,
             Some(IpfS3PreviewRewriteConfig {
                 preview_gateway_url: "https://preview.example".to_string(),
                 public_gateway_url: "https://public.example".to_string(),
@@ -12873,7 +12790,7 @@ mod tests {
             .expect("initial mixed subscription delivery");
         let first_source = temp.path().join("fallback-first.zip");
         create_test_zip(&first_source, 2);
-        let first_claim = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        let first_claim = repo.claim_eh_job_for_download(true).await.unwrap().unwrap();
         repo.mark_eh_job_downloaded(
             first_claim.id,
             first_claim.started_at.unwrap(),
@@ -12895,6 +12812,7 @@ mod tests {
             make_notifier(&telegram_server),
             make_telegraph_client(&telegram_server),
             failing_uploader.clone(),
+            None,
             None,
             Arc::new(failing_config),
         )
@@ -13000,7 +12918,7 @@ mod tests {
         assert!(later.telegraph_sent_at.is_none());
         let second_source = temp.path().join("fallback-second.zip");
         create_test_zip(&second_source, 2);
-        let later_claim = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        let later_claim = repo.claim_eh_job_for_download(true).await.unwrap().unwrap();
         repo.mark_eh_job_downloaded(
             later_claim.id,
             later_claim.started_at.unwrap(),
@@ -13017,6 +12935,7 @@ mod tests {
             make_notifier(&telegram_server),
             make_telegraph_client(&telegram_server),
             succeeding_uploader.clone(),
+            None,
             Some(IpfS3PreviewRewriteConfig {
                 preview_gateway_url: "https://preview.example".to_string(),
                 public_gateway_url: "https://public.example".to_string(),
@@ -13208,6 +13127,7 @@ mod tests {
             make_notifier(&telegram_server),
             make_telegraph_client(&telegram_server),
             Arc::new(ZipFirstMockUploader::default()),
+            None,
             Some(IpfS3PreviewRewriteConfig {
                 preview_gateway_url: "https://preview.example".to_string(),
                 public_gateway_url: "https://public.example".to_string(),
@@ -13314,6 +13234,7 @@ mod tests {
             make_notifier(&telegram_server),
             make_telegraph_client(&telegram_server),
             Arc::new(ZipFirstMockUploader::default()),
+            None,
             Some(IpfS3PreviewRewriteConfig {
                 preview_gateway_url: "https://preview.example".to_string(),
                 public_gateway_url: "https://public.example".to_string(),

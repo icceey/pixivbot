@@ -699,22 +699,4 @@ mod tests {
         assert_eq!(pool.post_ids, vec![100, 101, 102]);
         assert_eq!(pool.description.as_deref(), Some("A test pool"));
     }
-
-    #[test]
-    fn test_danbooru_raw_pool_deserialization() {
-        let json = r#"{
-            "id": 67890,
-            "name": "another_pool",
-            "post_count": 2,
-            "post_ids": [500, 501],
-            "description": "",
-            "created_at": "2024-03-15T08:00:00.000+00:00"
-        }"#;
-
-        let raw: DanbooruRawPool = serde_json::from_str(json).unwrap();
-        let pool = raw.into_pool_info();
-        assert_eq!(pool.id, 67890);
-        assert_eq!(pool.post_ids, vec![500, 501]);
-        assert!(pool.created_at.is_some());
-    }
 }

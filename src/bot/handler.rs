@@ -171,12 +171,9 @@ impl BotHandler {
             // E-Hentai commands (defined in handlers/subscription/ehentai.rs)
             Command::ESub(args) => self.handle_esub(bot, chat_id, user_id, args).await,
             Command::EUnsub(args) => self.handle_eunsub(bot, chat_id, user_id, args).await,
-            Command::EDl(args) => self.handle_edl(bot, msg, chat_id, user_id, args).await,
+            Command::EDl(args) => self.handle_edl(bot, msg, chat_id, args).await,
             Command::EStatus {} => self.handle_estatus(bot, chat_id).await,
-            Command::Telegraph(args) => {
-                self.handle_telegraph(bot, msg, chat_id, user_id, args)
-                    .await
-            }
+            Command::Telegraph(args) => self.handle_telegraph(bot, msg, chat_id, args).await,
 
             // Admin commands (require admin or owner role, defined in handlers/admin.rs)
             Command::EnableChat(args) if user_role.is_admin() => {

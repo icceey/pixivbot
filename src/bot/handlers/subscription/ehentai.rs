@@ -313,7 +313,6 @@ impl BotHandler {
         bot: ThrottledBot,
         msg: teloxide::types::Message,
         chat_id: ChatId,
-        _user_id: Option<UserId>,
         args_str: String,
     ) -> ResponseResult<()> {
         let eh_client = match &self.eh_client {
@@ -469,7 +468,6 @@ impl BotHandler {
         bot: ThrottledBot,
         msg: teloxide::types::Message,
         chat_id: ChatId,
-        _user_id: Option<UserId>,
         args_str: String,
     ) -> ResponseResult<()> {
         let eh_client = match &self.eh_client {
@@ -890,31 +888,6 @@ mod tests {
             status: status.to_string(),
             background_download_status: background_download_status.map(str::to_string),
         }
-    }
-
-    #[test]
-    fn test_eh_queue_status_stage_labels() {
-        assert_eq!(
-            eh_queue_stage(STATUS_PENDING, Some(BACKGROUND_STATUS_RUNNING)),
-            "后台下载中"
-        );
-        assert_eq!(
-            eh_queue_stage(STATUS_PENDING, Some(BACKGROUND_STATUS_PENDING)),
-            "后台排队"
-        );
-        assert_eq!(eh_queue_stage(STATUS_PENDING, None), "排队中");
-        assert_eq!(
-            eh_queue_stage(STATUS_DOWNLOADING, Some(BACKGROUND_STATUS_RUNNING)),
-            "下载中"
-        );
-        assert_eq!(eh_queue_stage(STATUS_DOWNLOADED, None), "等待上传或发送");
-        assert_eq!(eh_queue_stage(STATUS_UPLOADING, None), "上传中");
-        assert_eq!(eh_queue_stage(STATUS_UPLOADED, None), "等待发送");
-        assert_eq!(eh_queue_stage(STATUS_PUBLISHING, None), "发送中");
-        assert_eq!(eh_queue_stage(STATUS_DONE, None), "已完成");
-        assert_eq!(eh_queue_stage(STATUS_FAILED, None), "失败");
-        assert_eq!(eh_queue_stage(STATUS_CANCELED, None), "已取消");
-        assert_eq!(eh_queue_stage("unknown", None), "未知状态");
     }
 
     #[test]

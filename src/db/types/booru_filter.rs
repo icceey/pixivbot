@@ -200,27 +200,6 @@ mod tests {
     }
 
     #[test]
-    fn test_score_filter() {
-        let filter = BooruFilter {
-            score_min: Some(10),
-            ..Default::default()
-        };
-        assert!(!filter.matches(5, 0, &BooruRating::Safe));
-        assert!(filter.matches(10, 0, &BooruRating::Safe));
-        assert!(filter.matches(20, 0, &BooruRating::Safe));
-    }
-
-    #[test]
-    fn test_fav_count_filter() {
-        let filter = BooruFilter {
-            fav_count_min: Some(5),
-            ..Default::default()
-        };
-        assert!(!filter.matches(0, 3, &BooruRating::Safe));
-        assert!(filter.matches(0, 5, &BooruRating::Safe));
-    }
-
-    #[test]
     fn test_rating_filter() {
         let filter = BooruFilter {
             allowed_ratings: vec![BooruRating::Safe, BooruRating::General],

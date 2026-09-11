@@ -547,7 +547,7 @@ async fn test_eh_download_queue_full_lifecycle() {
     assert_eq!(m3.source, "direct");
 
     // FIFO: claim the first shared job for normal download.
-    let next1 = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+    let next1 = repo.claim_eh_job_for_download(true).await.unwrap().unwrap();
     assert_eq!(next1.id, m1.job_id.unwrap());
     assert_eq!(next1.status, JOB_STATUS_DOWNLOADING);
 
@@ -563,7 +563,7 @@ async fn test_eh_download_queue_full_lifecycle() {
         .unwrap();
     assert_eq!(downloaded.status, JOB_STATUS_DOWNLOADED);
 
-    let next2 = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+    let next2 = repo.claim_eh_job_for_download(true).await.unwrap().unwrap();
     assert_eq!(next2.id, m2.job_id.unwrap());
 
     let (failed, permanent) = repo
@@ -573,10 +573,10 @@ async fn test_eh_download_queue_full_lifecycle() {
     assert!(permanent);
     assert_eq!(failed.status, JOB_STATUS_FAILED);
 
-    let next3 = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+    let next3 = repo.claim_eh_job_for_download(true).await.unwrap().unwrap();
     assert_eq!(next3.id, m3.job_id.unwrap());
 
-    let none = repo.get_next_eh_job_for_download().await.unwrap();
+    let none = repo.claim_eh_job_for_download(true).await.unwrap();
     assert!(none.is_none());
 
     // Task 8 owns independent delivery publish/done state; Task 3 completes

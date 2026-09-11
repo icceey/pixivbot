@@ -8,6 +8,15 @@
 - H.264/ugoira encoder tests are behind `--features ffmpeg-codec`; only run them when the local FFmpeg has a working H.264 encoder.
 - Markdown-only docs can be verified with `git diff --check -- <path>`; do not run the full Rust CI for docs-only edits unless code or generated files changed.
 
+## Code Cleanup Constraints
+
+- Keep implementations direct: do not add speculative APIs, pass-through wrappers, unused parameters, no-op branches, or duplicate branches with identical behavior.
+- Do not keep retired business logic alive with tests, `#[cfg(test)]`, underscore names, or `#[allow(dead_code)]`. Genuine test fixtures, synchronization hooks, and fault injection may use `#[cfg(test)]`; obsolete production implementations may not.
+- Before declaring code dead, check references across all workspace crates, entrypoints, tests, scripts, and feature-gated builds. Account for trait/macro-generated use and public client APIs; absence of a call in one module is not sufficient evidence.
+- An unread field or parameter can still enforce a contract through deserialization, database schema, dependency injection, or resource lifetime. In particular, an optional deserialized field can reject duplicate or malformed input. Preserve these effects and document non-obvious reasons for retaining the declaration.
+- Remove confirmed dead implementations together with their exclusive tests, private helpers, mocks, imports, and stale comments. Do not retain compatibility wrappers or tests for a removed feature; tests of persisted formats that are still supported remain valid.
+- Cleanup must preserve accepted/rejected inputs, defaults, errors and formatting, operation order, and state transitions. Review the diff against the original behavior; passing tests alone does not establish equivalence. Use the checks above and remove any leftovers before delivery.
+
 ## Source Of Truth
 
 - Prefer executable files over prose when facts conflict: `Cargo.toml`, `rust-toolchain.toml`, `Makefile`, CI workflows, `Dockerfile`, and source code beat README-style summaries.
@@ -83,7 +92,12 @@
 
 ## Testing Notes
 
-- Add small colocated `#[cfg(test)]` tests for parsing, state transitions, caption/Markdown output, and repo behavior; several tests assert exact MarkdownV2 strings.
+- Add a test only for a concrete failure or behavior of real production code. Mocks may replace external boundaries, but the behavior under test must call the actual implementation; do not copy an algorithm into a test and assert that copy's result.
+- Do not add or retain tests that only check source text, file/symbol existence, function signatures, type fields, fixed configuration/constant values, trivial accessors, or data assignment. Serialization tests must protect an actual protocol or persistence contract, not merely a derived round trip or field presence.
+- Check existing coverage before adding a case. Extend an existing behavior test when appropriate, and remove redundant cases; do not disguise low-value assertions by renaming or combining them. Preserve distinct failure paths, boundary conditions, concurrency guarantees, and regression scenarios.
+- Do not create test-only constructors or business wrappers to preserve outdated call sites. Exercise the current production entrypoint with explicit inputs. Keep test setup limited to state and mocks that the test actually uses.
+- Synchronize concurrent tests on observable events or completion rather than arbitrary sleeps. Test servers must actually receive the intended request before asserting transport behavior; retries or longer waits must not mask a broken fixture.
+- Prefer small colocated `#[cfg(test)]` tests for parsing, state transitions, caption/Markdown output, and repo behavior that meet these criteria; several tests assert exact MarkdownV2 strings.
 - Link parser tests cover Pixiv ordering and booru engine-specific URL support; update them when changing supported URL forms.
 - `BooruTaskKey` tests cover task-value encoding and filter signatures; adjust tests when task sharing semantics change.
 - For config or access-control changes, prefer focused unit tests around parsing, role checks, middleware filters, or command visibility instead of broad integration tests.

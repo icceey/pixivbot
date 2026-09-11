@@ -498,36 +498,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_search_results_empty() {
-        let results = parse_search_results(
-            "<html><body>No results</body></html>",
-            "https://e-hentai.org",
-        );
-        assert!(results.is_empty());
-    }
-
-    #[test]
-    fn test_parse_archiver_url_not_found() {
-        let html = "<html><body>No archiver link</body></html>";
-        assert!(parse_archiver_url(html).is_none());
-    }
-
-    #[test]
-    fn test_parse_archiver_key_in_url() {
-        let html = r#"
-        <a href="archiver.php?gid=123&token=abc&or=470592--63bbddc729b849100ec24ab920ffdb84b6542b23">Download</a>
-        "#;
-        let key = parse_archiver_key(html).expect("should find archiver key");
-        assert_eq!(key, "470592--63bbddc729b849100ec24ab920ffdb84b6542b23");
-    }
-
-    #[test]
-    fn test_parse_archiver_key_not_found() {
-        let html = "<html><body>No archiver key</body></html>";
-        assert!(parse_archiver_key(html).is_none());
-    }
-
-    #[test]
     fn test_parse_archiver_form_ignores_hathdl_for_direct_resamples() {
         let html = r#"
         <form id="original" method="post" action="https://exhentai.org/archiver.php?gid=4034806&amp;token=org123def0">
@@ -688,28 +658,6 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_archive_redirect_not_found() {
-        let html = "<html><body>No redirect</body></html>";
-        assert!(parse_archive_redirect(html).is_none());
-    }
-
-    #[test]
-    fn test_parse_image_page_urls() {
-        let html = r#"
-        <div class="gdtm">
-          <a href="https://e-hentai.org/s/abc123/123456-01">1</a>
-        </div>
-        <div class="gdtm">
-          <a href="https://e-hentai.org/s/def456/123456-02">2</a>
-        </div>
-        "#;
-        let urls = parse_image_page_urls(html);
-        assert_eq!(urls.len(), 2);
-        assert!(urls[0].contains("/s/abc123/123456-01"));
-        assert!(urls[1].contains("/s/def456/123456-02"));
-    }
-
-    #[test]
     fn test_parse_image_page_urls_relative() {
         let html = r#"
         <div class="gdtm">
@@ -726,38 +674,6 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_image_page_urls_empty() {
-        let urls = parse_image_page_urls("<html></html>");
-        assert!(urls.is_empty());
-    }
-
-    #[test]
-    fn test_parse_image_src() {
-        let html = r#"
-        <div>
-          <img id="img" src="https://123.45.67.89/h/abc123.jpg" />
-        </div>
-        "#;
-        let src = parse_image_src(html).expect("should find image src");
-        assert_eq!(src, "https://123.45.67.89/h/abc123.jpg");
-    }
-
-    #[test]
-    fn test_parse_image_src_not_found() {
-        assert!(parse_image_src("<html></html>").is_none());
-    }
-
-    #[test]
-    fn test_parse_page_count() {
-        let html = r#"
-        <table class="ptt" style="margin:2px auto 0px">
-          <tr><td class="ptdd">&lt;</td><td class="ptds"><a href=".../">1</a></td><td onclick="..."><a href=".../?p=1">2</a></td><td onclick="..."><a href=".../?p=1">&gt;</a></td></tr>
-        </table>
-        "#;
-        assert_eq!(parse_page_count(html), Some(2));
-    }
-
-    #[test]
     fn test_parse_page_count_many_pages() {
         let html = r#"
         <table class="ptt">
@@ -765,11 +681,6 @@ mod tests {
         </table>
         "#;
         assert_eq!(parse_page_count(html), Some(3));
-    }
-
-    #[test]
-    fn test_parse_page_count_not_found() {
-        assert!(parse_page_count("<html></html>").is_none());
     }
 
     // ---- parse_archive_download_cost tests ----

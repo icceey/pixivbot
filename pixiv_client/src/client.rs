@@ -176,7 +176,6 @@ impl PixivClient {
     }
 
     /// 获取作品详情
-    #[allow(dead_code)]
     pub async fn illust_detail(&self, illust_id: u64) -> Result<IllustDetail> {
         let params = vec![("illust_id", illust_id.to_string())];
         self.get("/v1/illust/detail", &params).await

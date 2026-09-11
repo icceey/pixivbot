@@ -95,7 +95,6 @@ impl EhGalleryVariant {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) async fn try_apply_cached_eh_result_in_txn(
     txn: &DatabaseTransaction,
     job_id: i32,
@@ -407,11 +406,6 @@ fn maybe_fail_eh_job_liveness_update() -> Result<()> {
     {
         anyhow::bail!("injected shared EH job liveness update failure");
     }
-    Ok(())
-}
-
-#[cfg(not(test))]
-fn maybe_fail_eh_job_liveness_update() -> Result<()> {
     Ok(())
 }
 
@@ -1402,24 +1396,17 @@ impl Repo {
 }
 
 impl Repo {
-    /// Claim the next normal shared-gallery download job. Recent work remains
-    /// FIFO while older work remains LIFO, matching the pre-sharing queue lane.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub async fn get_next_eh_job_for_download(&self) -> Result<Option<eh_gallery_jobs::Model>> {
-        self.get_next_eh_job_for_download_with_policy(true).await
-    }
-
     /// Claim the next normal shared-gallery download job with the configured
     /// archive publish policy applied to every bound delivery.
-    pub async fn get_next_eh_job_for_download_with_policy(
+    pub async fn claim_eh_job_for_download(
         &self,
         send_archive: bool,
     ) -> Result<Option<eh_gallery_jobs::Model>> {
-        self.get_next_eh_job_for_download_at(Local::now().naive_local(), send_archive)
+        self.claim_eh_job_for_download_at(Local::now().naive_local(), send_archive)
             .await
     }
 
-    async fn get_next_eh_job_for_download_at(
+    async fn claim_eh_job_for_download_at(
         &self,
         now: DateTime,
         send_archive: bool,
@@ -3419,27 +3406,17 @@ impl Repo {
             .context("Shared EH gallery job disappeared after background handoff")
     }
 
-    /// Claim the next background-owned shared-gallery job. Its ordering matches
-    /// the normal lane: recent jobs are FIFO and older jobs are LIFO.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub async fn get_next_eh_job_for_background_download(
-        &self,
-    ) -> Result<Option<eh_gallery_jobs::Model>> {
-        self.get_next_eh_job_for_background_download_with_policy(true)
-            .await
-    }
-
     /// Claim the next background-owned shared-gallery download job with the
     /// configured archive publish policy applied to every bound delivery.
-    pub async fn get_next_eh_job_for_background_download_with_policy(
+    pub async fn claim_eh_job_for_background_download(
         &self,
         send_archive: bool,
     ) -> Result<Option<eh_gallery_jobs::Model>> {
-        self.get_next_eh_job_for_background_download_at(Local::now().naive_local(), send_archive)
+        self.claim_eh_job_for_background_download_at(Local::now().naive_local(), send_archive)
             .await
     }
 
-    async fn get_next_eh_job_for_background_download_at(
+    async fn claim_eh_job_for_background_download_at(
         &self,
         now: DateTime,
         send_archive: bool,
@@ -4072,7 +4049,6 @@ impl Repo {
     /// This method deliberately performs no filesystem work. Active rewrite
     /// payload is preserved; terminal rewrite payload may be discarded while
     /// cleanup execution remains a later, separately claimed maintenance step.
-    #[allow(dead_code)] // Task 6/9 workers call this public liveness boundary.
     pub async fn evaluate_eh_job_liveness(
         &self,
         job_id: i32,
@@ -4222,6 +4198,7 @@ impl Repo {
                 update = update.filter(no_active_eh_delivery_filter(job_id));
             }
 
+            #[cfg(test)]
             maybe_fail_eh_job_liveness_update()?;
             let result = update
                 .exec(txn)
@@ -5707,12 +5684,12 @@ mod tests {
         );
         assert!(job.zip_path.is_none());
         assert!(repo
-            .get_next_eh_job_for_download_with_policy(false)
+            .claim_eh_job_for_download(false)
             .await
             .unwrap()
             .is_none());
         assert!(repo
-            .get_next_eh_job_for_background_download_with_policy(false)
+            .claim_eh_job_for_background_download(false)
             .await
             .unwrap()
             .is_none());
@@ -5763,7 +5740,7 @@ mod tests {
         assert_eq!(pending.status, JOB_STATUS_PENDING);
         assert_eq!(pending.telegraph_status, TELEGRAPH_STATUS_READY);
 
-        let download = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        let download = repo.claim_eh_job_for_download(true).await.unwrap().unwrap();
         assert_eq!(download.id, pending.id);
         let completed = repo
             .mark_eh_job_downloaded(
@@ -5818,7 +5795,7 @@ mod tests {
         assert_eq!(pending.status, JOB_STATUS_PENDING);
         assert_eq!(pending.telegraph_status, TELEGRAPH_STATUS_NOT_REQUIRED);
 
-        let download = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        let download = repo.claim_eh_job_for_download(true).await.unwrap().unwrap();
         let downloaded = repo
             .mark_eh_job_downloaded(
                 download.id,
@@ -5962,7 +5939,7 @@ mod tests {
         let second_b_job = load_eh_job(&repo, second_b.job_id.unwrap()).await;
         assert_eq!(second_b_job.source_generation, 2);
         let download_b = repo
-            .get_next_eh_job_for_download()
+            .claim_eh_job_for_download(true)
             .await
             .unwrap()
             .expect("B should be the only claimable generation");
@@ -6017,7 +5994,7 @@ mod tests {
         );
 
         let download_a = repo
-            .get_next_eh_job_for_download()
+            .claim_eh_job_for_download(true)
             .await
             .unwrap()
             .expect("reactivated A should be claimable");
@@ -6101,12 +6078,12 @@ mod tests {
         assert_eq!(newer_job.source_generation, 2);
 
         let first_download = repo
-            .get_next_eh_job_for_download()
+            .claim_eh_job_for_download(true)
             .await
             .unwrap()
             .expect("one generation should be claimable");
         let second_download = repo
-            .get_next_eh_job_for_download()
+            .claim_eh_job_for_download(true)
             .await
             .unwrap()
             .expect("the other generation should also be claimable");
@@ -6296,7 +6273,7 @@ mod tests {
             .await
             .unwrap()
             .expect("first generation should be enqueued");
-        let download = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        let download = repo.claim_eh_job_for_download(true).await.unwrap().unwrap();
         repo.mark_eh_job_downloaded(
             download.id,
             download.started_at.unwrap(),
@@ -6373,7 +6350,7 @@ mod tests {
             .await
             .unwrap()
             .expect("first subscription generation should be enqueued");
-        let old_job = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        let old_job = repo.claim_eh_job_for_download(true).await.unwrap().unwrap();
         repo.mark_eh_job_downloaded(
             old_job.id,
             old_job.started_at.unwrap(),
@@ -6465,7 +6442,7 @@ mod tests {
             old_job.id
         );
         assert_eq!(
-            repo.get_next_eh_job_for_download()
+            repo.claim_eh_job_for_download(true)
                 .await
                 .unwrap()
                 .unwrap()
@@ -6494,7 +6471,7 @@ mod tests {
             .await
             .unwrap()
             .expect("first subscription generation should be enqueued");
-        let old_job = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        let old_job = repo.claim_eh_job_for_download(true).await.unwrap().unwrap();
         repo.mark_eh_job_downloaded(
             old_job.id,
             old_job.started_at.unwrap(),
@@ -6592,7 +6569,7 @@ mod tests {
             .await
             .unwrap()
             .expect("normal generation should be enqueued");
-        let normal_claim = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        let normal_claim = repo.claim_eh_job_for_download(true).await.unwrap().unwrap();
         assert_eq!(normal_claim.id, normal_a.job_id.unwrap());
         let normal_b = repo
             .enqueue_eh_download(
@@ -6650,7 +6627,7 @@ mod tests {
             .await
             .unwrap();
         let background_claim = repo
-            .get_next_eh_job_for_background_download()
+            .claim_eh_job_for_background_download(true)
             .await
             .unwrap()
             .unwrap();
@@ -6727,7 +6704,7 @@ mod tests {
             None,
         )
         .await;
-        let download = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        let download = repo.claim_eh_job_for_download(true).await.unwrap().unwrap();
         repo.mark_eh_job_downloaded(
             download.id,
             download.started_at.unwrap(),
@@ -6796,7 +6773,7 @@ mod tests {
             Some("{\"pages\":[]}"),
         )
         .await;
-        let normal_claim = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        let normal_claim = repo.claim_eh_job_for_download(true).await.unwrap().unwrap();
         let normal_generation = normal_claim.started_at.unwrap();
         repo.enqueue_eh_download(
             -18105,
@@ -6850,7 +6827,7 @@ mod tests {
             Some("{\"pages\":[]}"),
         )
         .await;
-        let normal_claim = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        let normal_claim = repo.claim_eh_job_for_download(true).await.unwrap().unwrap();
         repo.schedule_eh_job_background_download(
             normal_claim.id,
             normal_claim.status.as_str(),
@@ -6859,7 +6836,7 @@ mod tests {
         .await
         .unwrap();
         let background_claim = repo
-            .get_next_eh_job_for_background_download()
+            .claim_eh_job_for_background_download(true)
             .await
             .unwrap()
             .unwrap();
@@ -6925,7 +6902,7 @@ mod tests {
             .unwrap()
             .expect("delivery should be enqueued");
         let download = repo
-            .get_next_eh_job_for_download_with_policy(false)
+            .claim_eh_job_for_download(false)
             .await
             .unwrap()
             .unwrap();
@@ -7049,7 +7026,7 @@ mod tests {
         assert_eq!(job.telegraph_status, TELEGRAPH_STATUS_NOT_REQUIRED);
         assert!(job.telegraph_url.is_none());
         assert_eq!(
-            repo.get_next_eh_job_for_download()
+            repo.claim_eh_job_for_download(true)
                 .await
                 .unwrap()
                 .unwrap()
@@ -7078,7 +7055,7 @@ mod tests {
             .await
             .unwrap()
             .expect("delivery should be enqueued");
-        let claimed_download = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        let claimed_download = repo.claim_eh_job_for_download(true).await.unwrap().unwrap();
         repo.mark_eh_job_downloaded(
             claimed_download.id,
             claimed_download.started_at.unwrap(),
@@ -7208,7 +7185,7 @@ mod tests {
             .await
             .unwrap()
             .expect("delivery should be enqueued");
-        let download = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        let download = repo.claim_eh_job_for_download(true).await.unwrap().unwrap();
         repo.mark_eh_job_downloaded(
             download.id,
             download.started_at.unwrap(),
@@ -7297,7 +7274,7 @@ mod tests {
             .await
             .unwrap()
             .expect("delivery should be enqueued");
-        let download = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        let download = repo.claim_eh_job_for_download(true).await.unwrap().unwrap();
         repo.mark_eh_job_downloaded(
             download.id,
             download.started_at.unwrap(),
@@ -7388,7 +7365,7 @@ mod tests {
             .await
             .unwrap()
             .expect("delivery should be enqueued");
-        let download = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        let download = repo.claim_eh_job_for_download(true).await.unwrap().unwrap();
         repo.mark_eh_job_downloaded(
             download.id,
             download.started_at.unwrap(),
@@ -7479,7 +7456,7 @@ mod tests {
             .await
             .unwrap()
             .expect("delivery should be enqueued");
-        let download = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        let download = repo.claim_eh_job_for_download(true).await.unwrap().unwrap();
         repo.mark_eh_job_downloaded(
             download.id,
             download.started_at.unwrap(),
@@ -7579,7 +7556,7 @@ mod tests {
             .await
             .unwrap()
             .expect("delivery should be enqueued");
-        let download = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        let download = repo.claim_eh_job_for_download(true).await.unwrap().unwrap();
         repo.mark_eh_job_downloaded(
             download.id,
             download.started_at.unwrap(),
@@ -7705,7 +7682,7 @@ mod tests {
             .await
             .unwrap()
             .expect("delivery should be enqueued");
-        let download = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        let download = repo.claim_eh_job_for_download(true).await.unwrap().unwrap();
         repo.mark_eh_job_downloaded(
             download.id,
             download.started_at.unwrap(),
@@ -7754,7 +7731,11 @@ mod tests {
             .unwrap();
         assert_eq!(active.status, DELIVERY_STATUS_PUBLISHING);
         assert!(active.archive_sent_at.is_none());
-        assert!(repo.get_next_eh_job_for_download().await.unwrap().is_none());
+        assert!(repo
+            .claim_eh_job_for_download(true)
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
@@ -7777,7 +7758,7 @@ mod tests {
             .unwrap()
             .expect("delivery should be enqueued");
         let download = repo
-            .get_next_eh_job_for_download_with_policy(false)
+            .claim_eh_job_for_download(false)
             .await
             .unwrap()
             .unwrap();
@@ -7860,12 +7841,12 @@ mod tests {
         assert_eq!(publish.delivery.id, late.id);
         assert_eq!(publish.job.telegraph_url, expected_rewrite.telegraph_url);
         assert!(repo
-            .get_next_eh_job_for_download_with_policy(false)
+            .claim_eh_job_for_download(false)
             .await
             .unwrap()
             .is_none());
         assert!(repo
-            .get_next_eh_job_for_background_download_with_policy(false)
+            .claim_eh_job_for_background_download(false)
             .await
             .unwrap()
             .is_none());
@@ -7891,7 +7872,7 @@ mod tests {
             .unwrap()
             .expect("delivery should be enqueued");
         let download = repo
-            .get_next_eh_job_for_download_with_policy(false)
+            .claim_eh_job_for_download(false)
             .await
             .unwrap()
             .unwrap();
@@ -7998,7 +7979,7 @@ mod tests {
         assert_eq!(cached.telegraph_url, "https://telegra.ph/old-cache");
 
         let fresh_download = repo
-            .get_next_eh_job_for_download_with_policy(false)
+            .claim_eh_job_for_download(false)
             .await
             .unwrap()
             .unwrap();
@@ -8039,7 +8020,7 @@ mod tests {
             .await
             .unwrap()
             .expect("delivery should be enqueued");
-        let download = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        let download = repo.claim_eh_job_for_download(true).await.unwrap().unwrap();
         repo.mark_eh_job_downloaded(
             download.id,
             download.started_at.unwrap(),
@@ -8161,7 +8142,7 @@ mod tests {
             rebound.id
         );
         assert_eq!(
-            repo.get_next_eh_job_for_download()
+            repo.claim_eh_job_for_download(true)
                 .await
                 .unwrap()
                 .unwrap()
@@ -8189,7 +8170,7 @@ mod tests {
             .await
             .unwrap()
             .expect("delivery should be enqueued");
-        let download = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        let download = repo.claim_eh_job_for_download(true).await.unwrap().unwrap();
         repo.mark_eh_job_downloaded(
             download.id,
             download.started_at.unwrap(),
@@ -8279,7 +8260,7 @@ mod tests {
         assert!(reactivated.next_retry_at.is_none());
 
         let redownload = repo
-            .get_next_eh_job_for_download_with_policy(false)
+            .claim_eh_job_for_download(false)
             .await
             .unwrap()
             .unwrap();
@@ -8340,7 +8321,7 @@ mod tests {
             .expect("delivery should be enqueued");
 
         let normal = repo
-            .get_next_eh_job_for_download_with_policy(false)
+            .claim_eh_job_for_download(false)
             .await
             .unwrap()
             .unwrap();
@@ -8414,7 +8395,7 @@ mod tests {
         .unwrap();
 
         let background = repo
-            .get_next_eh_job_for_background_download_with_policy(false)
+            .claim_eh_job_for_background_download(false)
             .await
             .unwrap()
             .unwrap();
@@ -8454,7 +8435,9 @@ mod tests {
             .exec(repo.db())
             .await
             .unwrap();
-        repo.mark_eh_archive_sent(delivery.id).await.unwrap();
+        repo.mark_eh_archive_delivery_sent(delivery.id)
+            .await
+            .unwrap();
         repo.mark_eh_telegraph_delivery_sent(delivery.id, job.id, Some(0))
             .await
             .unwrap();
@@ -8584,7 +8567,7 @@ mod tests {
         assert!(recovered.background_download_status.is_none());
         assert_telegraph_rewrite_state_preserved(&cleaned, &recovered);
         assert_eq!(
-            repo.get_next_eh_job_for_download_with_policy(true)
+            repo.claim_eh_job_for_download(true)
                 .await
                 .unwrap()
                 .unwrap()
@@ -8658,7 +8641,9 @@ mod tests {
             .exec(repo.db())
             .await
             .unwrap();
-        repo.mark_eh_archive_sent(delivery.id).await.unwrap();
+        repo.mark_eh_archive_delivery_sent(delivery.id)
+            .await
+            .unwrap();
         repo.mark_eh_telegraph_delivery_sent(delivery.id, job.id, Some(0))
             .await
             .unwrap();
@@ -8746,7 +8731,7 @@ mod tests {
         assert_eq!(recovered.started_at, terminal.started_at);
         assert_telegraph_rewrite_state_preserved(&terminal, &recovered);
         assert_eq!(
-            repo.get_next_eh_job_for_download_with_policy(true)
+            repo.claim_eh_job_for_download(true)
                 .await
                 .unwrap()
                 .unwrap()
@@ -8774,11 +8759,7 @@ mod tests {
             .await
             .unwrap()
             .expect("delivery should be enqueued");
-        let claim = repo
-            .get_next_eh_job_for_download_with_policy(true)
-            .await
-            .unwrap()
-            .unwrap();
+        let claim = repo.claim_eh_job_for_download(true).await.unwrap().unwrap();
         let rewrite =
             set_active_telegraph_rewrite(&repo, claim.id, TELEGRAPH_REWRITE_STATUS_PENDING).await;
         eh_download_queue::Entity::update_many()
@@ -8853,16 +8834,12 @@ mod tests {
             .await
             .unwrap()
             .expect("delivery should be enqueued");
-        let normal = repo
-            .get_next_eh_job_for_download_with_policy(true)
-            .await
-            .unwrap()
-            .unwrap();
+        let normal = repo.claim_eh_job_for_download(true).await.unwrap().unwrap();
         repo.schedule_eh_job_background_download(normal.id, &normal.status, "test handoff")
             .await
             .unwrap();
         let claim = repo
-            .get_next_eh_job_for_background_download_with_policy(true)
+            .claim_eh_job_for_background_download(true)
             .await
             .unwrap()
             .unwrap();
@@ -8935,7 +8912,7 @@ mod tests {
             .await
             .unwrap()
             .expect("delivery should be enqueued");
-        let download = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        let download = repo.claim_eh_job_for_download(true).await.unwrap().unwrap();
         repo.mark_eh_job_downloaded(
             download.id,
             download.started_at.unwrap(),
@@ -8985,7 +8962,7 @@ mod tests {
         .await
         .unwrap()
         .expect("delivery should be enqueued");
-        let download = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        let download = repo.claim_eh_job_for_download(true).await.unwrap().unwrap();
         repo.mark_eh_job_downloaded(
             download.id,
             download.started_at.unwrap(),
@@ -9054,7 +9031,7 @@ mod tests {
             .await
             .unwrap()
             .expect("delivery should be enqueued");
-        let download = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        let download = repo.claim_eh_job_for_download(true).await.unwrap().unwrap();
         let downloaded_generation = download.started_at.unwrap();
         repo.mark_eh_job_downloaded(
             download.id,
@@ -9121,7 +9098,11 @@ mod tests {
         assert_eq!(restarted.retry_count, 0);
         assert!(restarted.next_retry_at.is_none());
         assert_eq!(restarted.started_at, Some(failed_upload_generation));
-        assert!(repo.get_next_eh_job_for_download().await.unwrap().is_none());
+        assert!(repo
+            .claim_eh_job_for_download(true)
+            .await
+            .unwrap()
+            .is_none());
         let resumed_upload = repo.get_next_eh_job_for_upload().await.unwrap().unwrap();
         assert_eq!(resumed_upload.id, download.id);
         assert!(resumed_upload.started_at.unwrap() > failed_upload_generation);
@@ -9138,7 +9119,7 @@ mod tests {
             .await
             .unwrap()
             .expect("delivery should be enqueued");
-        let download = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        let download = repo.claim_eh_job_for_download(true).await.unwrap().unwrap();
         repo.mark_eh_job_downloaded(
             download.id,
             download.started_at.unwrap(),
@@ -9217,7 +9198,11 @@ mod tests {
             .unwrap()
             .expect("delivery should be enqueued");
         assert_eq!(rebound.job_id, Some(upload.id));
-        assert!(repo.get_next_eh_job_for_download().await.unwrap().is_none());
+        assert!(repo
+            .claim_eh_job_for_download(true)
+            .await
+            .unwrap()
+            .is_none());
 
         let cleanup = repo.get_next_eh_job_for_cleanup().await.unwrap().unwrap();
         assert!(repo
@@ -9229,7 +9214,11 @@ mod tests {
             )
             .await
             .unwrap());
-        assert!(repo.get_next_eh_job_for_download().await.unwrap().is_none());
+        assert!(repo
+            .claim_eh_job_for_download(true)
+            .await
+            .unwrap()
+            .is_none());
 
         let retry_cleanup = repo.get_next_eh_job_for_cleanup().await.unwrap().unwrap();
         assert_eq!(
@@ -9243,7 +9232,7 @@ mod tests {
             Some(EhCleanupFinalizeOutcome::ReactivatedPending)
         );
         assert_eq!(
-            repo.get_next_eh_job_for_download()
+            repo.claim_eh_job_for_download(true)
                 .await
                 .unwrap()
                 .unwrap()
@@ -9271,7 +9260,7 @@ mod tests {
             .await
             .unwrap()
             .expect("delivery should be enqueued");
-        let download = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        let download = repo.claim_eh_job_for_download(true).await.unwrap().unwrap();
         repo.mark_eh_job_downloaded(
             download.id,
             download.started_at.unwrap(),
@@ -9341,7 +9330,7 @@ mod tests {
             .exec(repo.db())
             .await
             .unwrap();
-        let redownload = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        let redownload = repo.claim_eh_job_for_download(true).await.unwrap().unwrap();
         assert_eq!(redownload.id, download.id);
         repo.mark_eh_job_downloaded(
             redownload.id,
@@ -9399,9 +9388,13 @@ mod tests {
         );
         // Neither the normal nor the background source selector ever claims the
         // failed job again.
-        assert!(repo.get_next_eh_job_for_download().await.unwrap().is_none());
         assert!(repo
-            .get_next_eh_job_for_background_download()
+            .claim_eh_job_for_download(true)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(repo
+            .claim_eh_job_for_background_download(true)
             .await
             .unwrap()
             .is_none());
@@ -9702,7 +9695,7 @@ mod tests {
             .await
             .unwrap()
             .expect("delivery should be enqueued");
-        let download = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        let download = repo.claim_eh_job_for_download(true).await.unwrap().unwrap();
         repo.mark_eh_job_downloaded(
             download.id,
             download.started_at.unwrap(),
@@ -9745,7 +9738,7 @@ mod tests {
         .await
         .unwrap()
         .expect("delivery should be enqueued");
-        let download = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        let download = repo.claim_eh_job_for_download(true).await.unwrap().unwrap();
         repo.mark_eh_job_downloaded(
             download.id,
             download.started_at.unwrap(),
@@ -9788,15 +9781,15 @@ mod tests {
             .unwrap()
             .expect("delivery should be enqueued");
         let job_id = delivery.job_id.unwrap();
-        let claimed = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        let claimed = repo.claim_eh_job_for_download(true).await.unwrap().unwrap();
         assert_eq!(claimed.id, job_id);
         repo.schedule_eh_job_background_download(job_id, JOB_STATUS_DOWNLOADING, "slow")
             .await
             .unwrap();
 
         let (main, background) = tokio::join!(
-            repo.get_next_eh_job_for_download(),
-            repo.get_next_eh_job_for_background_download(),
+            repo.claim_eh_job_for_download(true),
+            repo.claim_eh_job_for_background_download(true),
         );
         assert!(main.unwrap().is_none());
         let background = background.unwrap().unwrap();
@@ -9821,7 +9814,7 @@ mod tests {
             1
         );
         assert_eq!(
-            repo.get_next_eh_job_for_background_download()
+            repo.claim_eh_job_for_background_download(true)
                 .await
                 .unwrap()
                 .unwrap()
@@ -9849,7 +9842,7 @@ mod tests {
             .await
             .unwrap()
             .expect("delivery should be enqueued");
-        let claim = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        let claim = repo.claim_eh_job_for_download(true).await.unwrap().unwrap();
         eh_download_queue::Entity::update_many()
             .col_expr(
                 eh_download_queue::Column::Status,
@@ -9909,7 +9902,7 @@ mod tests {
             .await
             .unwrap()
             .expect("delivery should be enqueued");
-        let normal_claim = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        let normal_claim = repo.claim_eh_job_for_download(true).await.unwrap().unwrap();
         repo.schedule_eh_job_background_download(
             normal_claim.id,
             normal_claim.status.as_str(),
@@ -9918,7 +9911,7 @@ mod tests {
         .await
         .unwrap();
         let claim = repo
-            .get_next_eh_job_for_background_download()
+            .claim_eh_job_for_background_download(true)
             .await
             .unwrap()
             .unwrap();
@@ -9978,12 +9971,12 @@ mod tests {
             .unwrap()
             .expect("delivery should be enqueued");
         let job_id = delivery.job_id.unwrap();
-        let normal_claim = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        let normal_claim = repo.claim_eh_job_for_download(true).await.unwrap().unwrap();
         repo.schedule_eh_job_background_download(job_id, normal_claim.status.as_str(), "slow")
             .await
             .unwrap();
         let first_claim = repo
-            .get_next_eh_job_for_background_download()
+            .claim_eh_job_for_background_download(true)
             .await
             .unwrap()
             .unwrap();
@@ -10007,7 +10000,7 @@ mod tests {
             1
         );
         let replacement_claim = repo
-            .get_next_eh_job_for_background_download()
+            .claim_eh_job_for_background_download(true)
             .await
             .unwrap()
             .unwrap();
@@ -10043,12 +10036,12 @@ mod tests {
             .unwrap()
             .expect("delivery should be enqueued");
         let job_id = delivery.job_id.unwrap();
-        let normal_claim = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        let normal_claim = repo.claim_eh_job_for_download(true).await.unwrap().unwrap();
         repo.schedule_eh_job_background_download(job_id, normal_claim.status.as_str(), "slow")
             .await
             .unwrap();
         let first_claim = repo
-            .get_next_eh_job_for_background_download()
+            .claim_eh_job_for_background_download(true)
             .await
             .unwrap()
             .unwrap();
@@ -10076,7 +10069,7 @@ mod tests {
             .await
             .unwrap();
         let replacement_claim = repo
-            .get_next_eh_job_for_background_download()
+            .claim_eh_job_for_background_download(true)
             .await
             .unwrap()
             .unwrap();
@@ -10111,7 +10104,7 @@ mod tests {
         .unwrap()
         .expect("delivery should be enqueued");
 
-        let first_claim = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        let first_claim = repo.claim_eh_job_for_download(true).await.unwrap().unwrap();
         let first_started_at = first_claim.started_at.unwrap();
         assert_eq!(
             repo.reset_stale_eh_shared_work(3600, 3600)
@@ -10120,7 +10113,7 @@ mod tests {
                 .downloads,
             1
         );
-        let second_claim = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        let second_claim = repo.claim_eh_job_for_download(true).await.unwrap().unwrap();
         assert_eq!(second_claim.id, first_claim.id);
         assert!(second_claim.started_at.unwrap() > first_started_at);
 
@@ -10162,9 +10155,9 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        let first_claim = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        let first_claim = repo.claim_eh_job_for_download(true).await.unwrap().unwrap();
         repo.defer_eh_job_download(first_claim.id, 0).await.unwrap();
-        let second_claim = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        let second_claim = repo.claim_eh_job_for_download(true).await.unwrap().unwrap();
         eh_gallery_jobs::Entity::update_many()
             .col_expr(
                 eh_gallery_jobs::Column::Status,
@@ -10216,7 +10209,7 @@ mod tests {
             .await
             .unwrap()
             .expect("delivery should be enqueued");
-        let downloaded = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        let downloaded = repo.claim_eh_job_for_download(true).await.unwrap().unwrap();
         repo.mark_eh_job_downloaded(
             downloaded.id,
             downloaded.started_at.unwrap(),
@@ -10255,7 +10248,11 @@ mod tests {
             .unwrap()
             .expect("delivery should be enqueued");
         assert_eq!(rebound.job_id, Some(downloaded.id));
-        assert!(repo.get_next_eh_job_for_download().await.unwrap().is_none());
+        assert!(repo
+            .claim_eh_job_for_download(true)
+            .await
+            .unwrap()
+            .is_none());
 
         let cleanup = repo.get_next_eh_job_for_cleanup().await.unwrap().unwrap();
         let generation = cleanup.cleanup_started_at.unwrap();
@@ -10263,7 +10260,11 @@ mod tests {
             .record_eh_job_cleanup_failure(cleanup.id, generation, "Abort failed", 0)
             .await
             .unwrap());
-        assert!(repo.get_next_eh_job_for_download().await.unwrap().is_none());
+        assert!(repo
+            .claim_eh_job_for_download(true)
+            .await
+            .unwrap()
+            .is_none());
 
         let retry = repo.get_next_eh_job_for_cleanup().await.unwrap().unwrap();
         assert_eq!(
@@ -10272,7 +10273,7 @@ mod tests {
                 .unwrap(),
             Some(EhCleanupFinalizeOutcome::ReactivatedPending)
         );
-        let replacement = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        let replacement = repo.claim_eh_job_for_download(true).await.unwrap().unwrap();
         repo.mark_eh_job_downloaded(
             replacement.id,
             replacement.started_at.unwrap(),
@@ -10534,7 +10535,7 @@ mod tests {
             .await
             .unwrap()
             .expect("delivery should be enqueued");
-        let download = repo.get_next_eh_job_for_download().await.unwrap().unwrap();
+        let download = repo.claim_eh_job_for_download(true).await.unwrap().unwrap();
         repo.mark_eh_job_downloaded(
             download.id,
             download.started_at.unwrap(),
@@ -10750,7 +10751,7 @@ mod tests {
         assert!(reenqueued.telegraph_rewrite_error.is_none());
         assert!(reenqueued.telegraph_rewritten_at.is_none());
         assert_eq!(
-            repo.get_next_eh_job_for_download()
+            repo.claim_eh_job_for_download(true)
                 .await
                 .unwrap()
                 .unwrap()
