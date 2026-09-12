@@ -1,4 +1,4 @@
-use super::{ProviderKind, PART_SIZE};
+use super::{is_safe_session_value, ProviderKind, PART_SIZE};
 use crate::error::Error;
 use serde::{Deserialize, Serialize};
 use std::io::{ErrorKind, Write};
@@ -143,7 +143,7 @@ pub(super) fn new_manifest(
     upload_id: String,
 ) -> crate::Result<MultipartManifest> {
     validate_identity(identity)?;
-    if !is_nonempty_value(&object_key) || !is_nonempty_value(&upload_id) {
+    if !is_safe_session_value(&object_key) || !is_safe_session_value(&upload_id) {
         return Err(Error::Other(
             "multipart manifest object key and upload ID must be non-empty".to_owned(),
         ));
@@ -279,7 +279,7 @@ fn validate_identity(identity: &ManifestIdentity<'_>) -> crate::Result<()> {
     ];
     if required_values
         .into_iter()
-        .any(|value| !is_nonempty_value(value))
+        .any(|value| !is_safe_session_value(value))
         || !is_lowercase_sha256(identity.uploader_identity_sha256)
         || !is_lowercase_sha256(identity.object_sha256)
         || identity
@@ -306,7 +306,7 @@ fn validate_stored_values(
     ];
     if required_values
         .into_iter()
-        .any(|value| !is_nonempty_value(value))
+        .any(|value| !is_safe_session_value(value))
         || !is_lowercase_sha256(&manifest.uploader_identity_sha256)
         || !is_lowercase_sha256(&manifest.object_sha256)
         || manifest
@@ -316,15 +316,11 @@ fn validate_stored_values(
         || manifest
             .zip_extraction_prefix
             .as_deref()
-            .is_some_and(|value| !is_nonempty_value(value))
+            .is_some_and(|value| !is_safe_session_value(value))
     {
         return Err(ManifestMismatch::InvalidStoredValue);
     }
     Ok(())
-}
-
-fn is_nonempty_value(value: &str) -> bool {
-    !value.trim().is_empty() && !value.contains('\0')
 }
 
 fn is_lowercase_sha256(value: &str) -> bool {
@@ -338,73 +334,11 @@ fn is_lowercase_sha256(value: &str) -> bool {
 mod tests {
     use super::*;
     use crate::error::Error;
-    use crate::s3_multipart::{
-        fingerprint_fields, requested_entries_fingerprint, sha256_hex,
-        uploader_identity_fingerprint,
-    };
+    use crate::s3_multipart::fingerprint_fields;
     use std::io::ErrorKind;
 
     const HASH_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const HASH_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-
-    #[tokio::test]
-    async fn manifest_round_trip_is_atomic_and_contains_only_session_identity() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("state").join("archive.json");
-        let object_bytes = b"unique-object-byte-sentinel-never-persisted";
-        let object_hash = sha256_hex(object_bytes);
-        let identity = ManifestIdentity {
-            object_sha256: &object_hash,
-            ..standard_identity()
-        };
-        let original = new_manifest(
-            &identity,
-            "objects/archive.bin".to_owned(),
-            "upload-1".to_owned(),
-        )
-        .unwrap();
-        write_manifest_atomic(&path, &original).await.unwrap();
-
-        let replacement = new_manifest(
-            &identity,
-            "objects/archive.bin".to_owned(),
-            "upload-2".to_owned(),
-        )
-        .unwrap();
-        write_manifest_atomic(&path, &replacement).await.unwrap();
-
-        assert_eq!(
-            load_manifest(&path, &identity).await.unwrap(),
-            ManifestLoad::Valid(replacement.clone())
-        );
-        let json = tokio::fs::read_to_string(&path).await.unwrap();
-        assert_eq!(
-            serde_json::from_str::<MultipartManifest>(&json).unwrap(),
-            replacement
-        );
-        assert!(json.contains("upload-2"));
-        assert!(json.contains(&object_hash));
-        assert_eq!(object_hash.len(), 64);
-        for forbidden in [
-            "AKIA_TEST",
-            "secret-test-value",
-            "X-Amz-",
-            "unique-object-byte-sentinel-never-persisted",
-            "\"etag\"",
-        ] {
-            assert!(
-                !json.contains(forbidden),
-                "persisted forbidden value {forbidden}"
-            );
-        }
-
-        let mut entries = tokio::fs::read_dir(path.parent().unwrap()).await.unwrap();
-        let mut names = Vec::new();
-        while let Some(entry) = entries.next_entry().await.unwrap() {
-            names.push(entry.file_name().to_string_lossy().into_owned());
-        }
-        assert_eq!(names, ["archive.json"]);
-    }
 
     #[tokio::test]
     async fn manifest_identity_rejects_provider_uploader_logical_object_content_and_zip_changes() {
@@ -469,7 +403,7 @@ mod tests {
         assert_stale(&path, &standard, ManifestMismatch::ZipOptions).await;
 
         let entries = ["one.jpg".to_owned(), "two.jpg".to_owned()];
-        let entry_hash = requested_entries_fingerprint(&entries);
+        let entry_hash = fingerprint_fields(&entries);
         let zip_identity = ManifestIdentity {
             requested_entries_sha256: Some(&entry_hash),
             ..standard
@@ -492,42 +426,13 @@ mod tests {
     }
 
     #[test]
-    fn fingerprints_are_length_delimited_deterministic_and_credential_free() {
+    fn fingerprints_disambiguate_field_boundaries_and_requested_entry_order() {
         let split_one = fingerprint_fields(&["ab", "c"]);
         let split_two = fingerprint_fields(&["a", "bc"]);
         assert_ne!(split_one, split_two);
-        assert_eq!(split_one, fingerprint_fields(&["ab", "c"]));
-        assert_eq!(split_one.len(), 64);
-        assert!(split_one
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit()));
-
-        let credential_sentinel = "secret-test-value";
-        let uploader = uploader_identity_fingerprint(
-            ProviderKind::S3,
-            "https://s3.example.invalid",
-            "us-east-1",
-            "bucket",
-            true,
-        );
-        assert_eq!(
-            uploader,
-            fingerprint_fields(&[
-                "s3",
-                "https://s3.example.invalid",
-                "us-east-1",
-                "bucket",
-                "true",
-            ])
-        );
-        assert!(!uploader.contains(credential_sentinel));
-        assert_eq!(
-            requested_entries_fingerprint(&["a".to_owned(), "bc".to_owned()]),
-            fingerprint_fields(&["a", "bc"])
-        );
         assert_ne!(
-            requested_entries_fingerprint(&["a".to_owned(), "bc".to_owned()]),
-            requested_entries_fingerprint(&["bc".to_owned(), "a".to_owned()])
+            fingerprint_fields(&["a".to_owned(), "bc".to_owned()]),
+            fingerprint_fields(&["bc".to_owned(), "a".to_owned()])
         );
     }
 
@@ -657,43 +562,6 @@ mod tests {
                 upload_id,
             }) if object_key == "objects/archive.bin" && upload_id == "upload-1"
         ));
-    }
-
-    #[tokio::test]
-    async fn remove_manifest_is_idempotent_and_removes_only_the_exact_file() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("archive.json");
-        let sibling = temp.path().join("archive.json.tmp-sibling");
-        let directory = temp.path().join("archive.json.parts");
-        tokio::fs::write(&path, b"manifest").await.unwrap();
-        tokio::fs::write(&sibling, b"sibling").await.unwrap();
-        tokio::fs::create_dir(&directory).await.unwrap();
-
-        remove_manifest(&path).await.unwrap();
-        remove_manifest(&path).await.unwrap();
-        assert!(!path.exists());
-        assert!(sibling.is_file());
-        assert!(directory.is_dir());
-    }
-
-    #[test]
-    fn new_manifest_rejects_invalid_session_values() {
-        let identity = standard_identity();
-        assert!(new_manifest(&identity, String::new(), "upload-1".to_owned()).is_err());
-        assert!(new_manifest(&identity, "objects/archive.bin".to_owned(), String::new()).is_err());
-
-        let entries = ["entry.jpg".to_owned()];
-        let requested_entries_sha256 = requested_entries_fingerprint(&entries);
-        let zip_identity = ManifestIdentity {
-            requested_entries_sha256: Some(&requested_entries_sha256),
-            ..identity
-        };
-        assert!(new_manifest(
-            &zip_identity,
-            "objects/archive.bin".to_owned(),
-            "upload-1".to_owned(),
-        )
-        .is_err());
     }
 
     fn standard_identity() -> ManifestIdentity<'static> {

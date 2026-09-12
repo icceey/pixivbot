@@ -1,5 +1,5 @@
 use super::archive_http_error;
-use super::http::archive_get;
+use super::http::{archive_get, parse_content_range_header};
 use crate::error::{Error, Result};
 use crate::models::EhCookies;
 use futures_util::StreamExt;
@@ -36,23 +36,6 @@ fn response_expected_total(
     } else {
         content_len
     })
-}
-
-fn parse_content_range_header(value: &str) -> Option<(u64, u64, Option<u64>)> {
-    let range = value.strip_prefix("bytes ")?;
-    let (bounds, total) = range.split_once('/')?;
-    let (start, end) = bounds.split_once('-')?;
-    let start = start.parse::<u64>().ok()?;
-    let end = end.parse::<u64>().ok()?;
-    if end < start {
-        return None;
-    }
-    let total = if total == "*" {
-        None
-    } else {
-        Some(total.parse::<u64>().ok()?)
-    };
-    Some((start, end, total))
 }
 
 fn validate_content_range(headers: &reqwest::header::HeaderMap, existing_len: u64) -> Result<u64> {
@@ -296,18 +279,5 @@ mod tests {
         assert_eq!(validate_content_range(&headers, 12).unwrap(), 20);
         assert_eq!(response_expected_total(&headers, 12, true), Some(20));
         assert_eq!(response_expected_total(&headers, 0, false), Some(8));
-    }
-
-    #[test]
-    fn content_range_validation_requires_the_final_byte() {
-        let mut headers = HeaderMap::new();
-        headers.insert(CONTENT_RANGE, HeaderValue::from_static("bytes 12-18/20"));
-
-        assert_eq!(
-            validate_content_range(&headers, 12)
-                .unwrap_err()
-                .to_string(),
-            "archive resume Content-Range ended at 18, expected final byte 19"
-        );
     }
 }

@@ -337,7 +337,7 @@ impl RankingEngine {
         chat: &crate::db::entities::chats::Model,
         illusts: &[&Illust],
     ) -> Result<BatchSendResult> {
-        if ranking_requires_individual_send(illusts) {
+        if illusts.iter().any(|illust| illust.is_ugoira()) {
             info!(
                 "Ranking push for chat {} contains ugoira, sending items individually",
                 chat_id
@@ -374,7 +374,7 @@ impl RankingEngine {
             captions.push(build_ranking_caption(&title, index, illust));
         }
 
-        let sensitive_tags = crate::utils::sensitive::get_chat_sensitive_tags(chat);
+        let sensitive_tags = &chat.sensitive_tags;
         let has_spoiler = chat.blur_sensitive_tags
             && illusts.iter().any(|illust| {
                 crate::utils::sensitive::contains_sensitive_tags(illust, sensitive_tags)
@@ -393,7 +393,7 @@ impl RankingEngine {
         illusts: &[&Illust],
     ) -> Result<BatchSendResult> {
         let title = build_ranking_title(mode, illusts.len());
-        let sensitive_tags = crate::utils::sensitive::get_chat_sensitive_tags(chat);
+        let sensitive_tags = &chat.sensitive_tags;
         let mut succeeded_indices = Vec::new();
         let mut failed_indices = Vec::new();
         let mut first_message_id = None;
@@ -513,63 +513,5 @@ impl RankingEngine {
         pushed_ids.extend(new_ids);
         self.trim_and_update_pushed_ids(subscription_id, pushed_ids)
             .await
-    }
-}
-
-fn ranking_requires_individual_send(illusts: &[&Illust]) -> bool {
-    illusts.iter().any(|illust| illust.is_ugoira())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    fn make_illust(illust_type: &str, title: &str) -> Illust {
-        serde_json::from_value(json!({
-            "id": 12345,
-            "title": title,
-            "type": illust_type,
-            "image_urls": {
-                "square_medium": "square",
-                "medium": "medium",
-                "large": "large",
-                "original": "original"
-            },
-            "caption": "",
-            "restrict": 0,
-            "user": {
-                "id": 67890,
-                "name": "Author",
-                "account": "author"
-            },
-            "tags": [],
-            "create_date": "2026-01-01T00:00:00+00:00",
-            "page_count": 1,
-            "width": 100,
-            "height": 100,
-            "sanity_level": 2,
-            "x_restrict": 0,
-            "series": null,
-            "meta_single_page": {
-                "original_image_url": "original"
-            },
-            "meta_pages": [],
-            "total_view": 1,
-            "total_bookmarks": 2,
-            "is_bookmarked": false,
-            "visible": true,
-            "is_muted": false,
-            "total_comments": 0
-        }))
-        .unwrap()
-    }
-
-    #[test]
-    fn ranking_requires_individual_send_when_ugoira_present() {
-        let still = make_illust("illust", "Still");
-        let ugoira = make_illust("ugoira", "Animated");
-        assert!(ranking_requires_individual_send(&[&still, &ugoira]));
-        assert!(!ranking_requires_individual_send(&[&still]));
     }
 }

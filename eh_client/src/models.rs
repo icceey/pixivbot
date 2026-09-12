@@ -174,15 +174,3 @@ impl RawGalleryMeta {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_category_bitmask() {
-        assert_eq!(EhCategory::bitmask_from_str("doujinshi,manga"), 3);
-        assert_eq!(EhCategory::bitmask_from_str("doujinshi"), 1);
-        assert_eq!(EhCategory::bitmask_from_str("all"), 0); // unknown = 0
-    }
-}

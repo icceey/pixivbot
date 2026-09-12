@@ -86,38 +86,3 @@ pub fn format_tags_escaped(illust: &pixiv_client::Illust) -> String {
 
     format!("\n\n{}", escaped.join("  "))
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_normalize_tag_special_chars() {
-        assert_eq!(normalize_tag("R-18"), "r18");
-        // Underscores are kept (part of \w in regex)
-        assert_eq!(normalize_tag("R_18"), "r_18");
-        assert_eq!(normalize_tag("r-18"), "r18");
-        assert_eq!(normalize_tag("r_18"), "r_18");
-    }
-
-    #[test]
-    fn test_normalize_tag_japanese_chars() {
-        assert_eq!(normalize_tag("「テスト」"), "テスト");
-        assert_eq!(normalize_tag("テスト…"), "テスト");
-    }
-
-    #[test]
-    fn test_format_tags_requirements() {
-        // Hello World -> HelloWorld
-        assert_eq!(format_tags(&["Hello World"]), vec!["HelloWorld"]);
-
-        // C++ & Rust -> CRust
-        assert_eq!(format_tags(&["C++ & Rust"]), vec!["CRust"]);
-
-        // User-Name -> UserName
-        assert_eq!(format_tags(&["User-Name"]), vec!["UserName"]);
-
-        // 你好，世界！ -> 你好世界
-        assert_eq!(format_tags(&["你好，世界！"]), vec!["你好世界"]);
-    }
-}

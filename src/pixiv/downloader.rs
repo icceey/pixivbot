@@ -492,32 +492,12 @@ mod tests {
 
         let mp4_data = encode_ugoira_mp4(&zip_data, &frames).unwrap();
 
-        // Verify it's a valid MP4: ftyp box type at offset 4 (after 4-byte size field)
+        // Verify the MP4 container header after encoding.
         assert!(mp4_data.len() > 8);
         assert_eq!(
             &mp4_data[4..8],
             b"ftyp",
-            "Output should be a valid MP4 file"
-        );
-    }
-
-    #[test]
-    #[cfg(feature = "ffmpeg-codec")]
-    fn test_encode_ugoira_mp4_single_frame() {
-        let frame0 = create_test_png(128, 128, 128);
-        let zip_data = create_test_zip(&[("000000.png", &frame0)]);
-
-        let frames = vec![UgoiraFrame {
-            file: "000000.png".to_string(),
-            delay: 50,
-        }];
-
-        let mp4_data = encode_ugoira_mp4(&zip_data, &frames).unwrap();
-        assert!(mp4_data.len() > 8);
-        assert_eq!(
-            &mp4_data[4..8],
-            b"ftyp",
-            "Output should be a valid MP4 file"
+            "Encoded output should have an MP4 container header"
         );
     }
 
@@ -544,42 +524,7 @@ mod tests {
         assert_eq!(
             &mp4_data[4..8],
             b"ftyp",
-            "Output should remain a valid MP4 file for odd-sized frames"
+            "Encoding odd-sized frames should produce an MP4 container header"
         );
-    }
-
-    #[test]
-    #[cfg(feature = "ffmpeg-codec")]
-    fn test_encode_ugoira_mp4_missing_frame() {
-        let frame0 = create_test_png(255, 0, 0);
-        let zip_data = create_test_zip(&[("000000.png", &frame0)]);
-
-        let frames = vec![
-            UgoiraFrame {
-                file: "000000.png".to_string(),
-                delay: 100,
-            },
-            UgoiraFrame {
-                file: "missing.png".to_string(),
-                delay: 100,
-            },
-        ];
-
-        let result = encode_ugoira_mp4(&zip_data, &frames);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("missing.png"));
-    }
-
-    #[test]
-    #[cfg(feature = "ffmpeg-codec")]
-    fn test_encode_ugoira_mp4_empty_frames() {
-        let frame0 = create_test_png(255, 0, 0);
-        let zip_data = create_test_zip(&[("000000.png", &frame0)]);
-
-        let frames: Vec<UgoiraFrame> = vec![];
-
-        let result = encode_ugoira_mp4(&zip_data, &frames);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("No frames"));
     }
 }

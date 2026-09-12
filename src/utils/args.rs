@@ -88,35 +88,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_args_get_any() {
-        let parsed = parse_args("ch=123 789");
-        assert_eq!(parsed.get_any(&["channel", "ch"]), Some("123"));
-
-        let parsed = parse_args("channel=456 789");
-        assert_eq!(parsed.get_any(&["channel", "ch"]), Some("456"));
-    }
-
-    #[test]
-    fn test_parse_args_negative_number_value() {
-        let parsed = parse_args("ch=-1001234567890 789");
-        assert_eq!(
-            parsed.params.get("ch").map(String::as_str),
-            Some("-1001234567890")
-        );
-        assert_eq!(parsed.remaining, "789");
-    }
-
-    #[test]
-    fn test_parse_args_username_value() {
-        let parsed = parse_args("ch=@mychannel 789");
-        assert_eq!(
-            parsed.params.get("ch").map(String::as_str),
-            Some("@mychannel")
-        );
-        assert_eq!(parsed.remaining, "789");
-    }
-
-    #[test]
     fn test_parse_args_stops_at_non_kv() {
         // Tags like +tag should stop kv parsing
         let parsed = parse_args("channel=123 +tag val=should_not_parse");

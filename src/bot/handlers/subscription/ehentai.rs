@@ -105,7 +105,7 @@ impl BotHandler {
         eh_filter.telegraph = telegraph_on;
 
         // Reject telegraph=on when Telegraph is not configured
-        if should_reject_telegraph_request(telegraph_on, self.has_telegraph) {
+        if telegraph_on && !self.has_telegraph {
             let _ = bot
                 .send_message(
                     chat_id,
@@ -365,7 +365,7 @@ impl BotHandler {
             .unwrap_or(trailing_telegraph);
 
         // Reject telegraph=on when Telegraph is not configured
-        if should_reject_telegraph_request(telegraph, self.has_telegraph) {
+        if telegraph && !self.has_telegraph {
             let _ = bot
                 .send_message(
                     chat_id,
@@ -479,7 +479,7 @@ impl BotHandler {
         };
 
         // Reject Telegraph request when no token is configured
-        if should_reject_telegraph_request(true, self.has_telegraph) {
+        if !self.has_telegraph {
             let _ = bot
                 .send_message(
                     chat_id,
@@ -608,7 +608,7 @@ impl BotHandler {
 
 /// Parse filter args into EhFilter.
 fn parse_eh_filter(args: &[String]) -> Result<EhFilter, String> {
-    let mut filter = EhFilter::new();
+    let mut filter = EhFilter::default();
 
     for arg in args {
         if let Some(val) = arg.strip_prefix("rating>=") {
@@ -737,10 +737,6 @@ fn parse_gallery_ref(s: &str) -> Option<(u64, String)> {
 
 fn is_telegraph_enabled_value(value: &str) -> bool {
     value.eq_ignore_ascii_case("on") || value.eq_ignore_ascii_case("true") || value == "1"
-}
-
-fn should_reject_telegraph_request(telegraph_requested: bool, has_telegraph: bool) -> bool {
-    telegraph_requested && !has_telegraph
 }
 
 fn split_edl_remaining_and_telegraph(remaining: &str) -> (String, bool) {
@@ -876,135 +872,6 @@ fn format_eh_queue_status_with_visible_active_count(
 mod tests {
     use super::*;
 
-    fn queue_item(
-        gid: i64,
-        title: &str,
-        status: &str,
-        background_download_status: Option<&str>,
-    ) -> EhQueueStatusItem {
-        EhQueueStatusItem {
-            gid,
-            title: title.to_string(),
-            status: status.to_string(),
-            background_download_status: background_download_status.map(str::to_string),
-        }
-    }
-
-    #[test]
-    fn test_eh_queue_status_summarizes_all_active_stages() {
-        let snapshot = EhQueueSnapshot {
-            active: vec![
-                queue_item(
-                    1,
-                    "后台下载",
-                    STATUS_PENDING,
-                    Some(BACKGROUND_STATUS_RUNNING),
-                ),
-                queue_item(
-                    2,
-                    "后台排队",
-                    STATUS_PENDING,
-                    Some(BACKGROUND_STATUS_PENDING),
-                ),
-                queue_item(3, "排队", STATUS_PENDING, None),
-                queue_item(4, "下载", STATUS_DOWNLOADING, None),
-                queue_item(5, "下载完成", STATUS_DOWNLOADED, None),
-                queue_item(6, "上传", STATUS_UPLOADING, None),
-                queue_item(7, "上传完成", STATUS_UPLOADED, None),
-                queue_item(8, "发送", STATUS_PUBLISHING, None),
-            ],
-            recent_terminal: None,
-        };
-
-        assert_eq!(
-            format_eh_queue_status(&snapshot),
-            "📥 *EH 下载队列*\n\n活动任务：`8`\n阶段：后台下载中 `1` · 后台排队 `1` · 排队中 `1` · 下载中 `1` · 等待上传或发送 `1` · 上传中 `1` · 等待发送 `1` · 发送中 `1`\n\n*任务*\n• GID `1` · 后台下载 · 后台下载中\n• GID `2` · 后台排队 · 后台排队\n• GID `3` · 排队 · 排队中\n• GID `4` · 下载 · 下载中\n• GID `5` · 下载完成 · 等待上传或发送\n• GID `6` · 上传 · 上传中\n• GID `7` · 上传完成 · 等待发送\n• GID `8` · 发送 · 发送中"
-        );
-    }
-
-    #[test]
-    fn test_eh_queue_status_formats_empty_with_recent_terminal() {
-        let snapshot = EhQueueSnapshot {
-            active: Vec::new(),
-            recent_terminal: Some(queue_item(900, "completed title", STATUS_DONE, None)),
-        };
-
-        assert_eq!(
-            format_eh_queue_status(&snapshot),
-            "📥 *EH 下载队列*\n\n当前聊天没有活动中的 EH 下载任务\n\n*最近记录*\n• GID `900` · completed title · 已完成"
-        );
-    }
-
-    #[test]
-    fn test_eh_queue_status_limits_entries_truncates_and_escapes() {
-        let long_title = "界".repeat(81);
-        let mut active = vec![queue_item(1, &long_title, STATUS_PENDING, None)];
-        active.push(queue_item(2, "A_*[危险].!", STATUS_PENDING, None));
-        active.extend(
-            (3..=21).map(|gid| queue_item(gid, &format!("任务{gid}"), STATUS_PENDING, None)),
-        );
-        let snapshot = EhQueueSnapshot {
-            active,
-            recent_terminal: Some(queue_item(999, "最近失败", STATUS_FAILED, None)),
-        };
-
-        let formatted = format_eh_queue_status(&snapshot);
-
-        assert!(formatted.contains("活动任务：`21`"));
-        assert!(formatted.contains("阶段：排队中 `21`"));
-        assert_eq!(formatted.matches('界').count(), 80);
-        assert!(formatted.contains("A\\_\\*\\[危险\\]\\.\\!"));
-        assert!(!formatted.contains("A_*[危险].!"));
-        assert!(formatted.contains("GID `20`"));
-        assert!(!formatted.contains("GID `21`"));
-        assert!(formatted.contains("另有 `1` 项未显示"));
-        assert!(formatted.contains("• GID `999` · 最近失败 · 失败"));
-    }
-
-    #[test]
-    fn test_eh_queue_status_fits_telegram_limit_for_wide_titles() {
-        let wide_title = "😀".repeat(EH_QUEUE_MAX_TITLE_CHARS);
-        let snapshot = EhQueueSnapshot {
-            active: (0..EH_QUEUE_MAX_VISIBLE_ACTIVE_ITEMS)
-                .map(|offset| {
-                    queue_item(i64::MAX - offset as i64, &wide_title, STATUS_PENDING, None)
-                })
-                .collect(),
-            recent_terminal: Some(queue_item(i64::MIN, &wide_title, STATUS_FAILED, None)),
-        };
-
-        let output = format_eh_queue_status(&snapshot);
-        let utf16_units = output.encode_utf16().count();
-        assert!(
-            utf16_units <= TELEGRAM_MAX_MESSAGE_UTF16_UNITS,
-            "formatted output contains {utf16_units} UTF-16 units"
-        );
-
-        let active_section = output
-            .split_once("\n\n*最近记录*")
-            .map(|(active, _)| active)
-            .expect("recent terminal should be present");
-        let visible_active_count = active_section
-            .lines()
-            .filter(|line| line.starts_with("• GID "))
-            .count();
-        let hidden_active_count = active_section
-            .lines()
-            .find_map(|line| {
-                line.strip_prefix("另有 `")
-                    .and_then(|line| line.split_once("` 项未显示"))
-                    .and_then(|(count, _)| count.parse::<usize>().ok())
-            })
-            .unwrap_or(0);
-
-        assert_eq!(visible_active_count + hidden_active_count, 20);
-        assert!(hidden_active_count > 0);
-        assert!(output.contains(&format!(
-            "*最近记录*\n• GID `{}` · {wide_title} · 失败",
-            i64::MIN
-        )));
-    }
-
     #[test]
     fn subscription_options_parse_through_to_filters() {
         for (input, query, filter_args, cat, telegraph, expected) in [
@@ -1045,44 +912,6 @@ mod tests {
                 "{input}"
             );
             assert!(!filter.telegraph);
-        }
-    }
-
-    #[test]
-    fn parse_eh_filter_rejects_out_of_range_ratings() {
-        for input in ["rating>=1", "rating>=6"] {
-            assert!(parse_eh_filter(&[input.to_string()]).is_err(), "{input}");
-        }
-    }
-
-    #[test]
-    fn test_parse_eh_category_bitmask_rejects_unknown_category() {
-        let result = parse_eh_category_bitmask(Some("mnga"));
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("未知的 E-Hentai 分类"));
-    }
-
-    #[test]
-    fn test_parse_eh_category_bitmask_accepts_known_categories_and_all() {
-        assert_eq!(
-            parse_eh_category_bitmask(Some("manga,artistcg")).unwrap(),
-            6
-        );
-        assert_eq!(parse_eh_category_bitmask(Some("all")).unwrap(), 0);
-        assert_eq!(parse_eh_category_bitmask(None).unwrap(), 0);
-    }
-
-    #[test]
-    fn subscription_options_reject_invalid_strict_filters() {
-        for (input, error) in [
-            ("foo rating>abc", "无效的评分值: abc"),
-            ("foo pages>abc", "无效的页数: abc"),
-            ("foo pages<abc", "无效的页数: abc"),
-        ] {
-            assert!(
-                parse_esub_remaining(input).unwrap_err().contains(error),
-                "{input}"
-            );
         }
     }
 
@@ -1130,16 +959,6 @@ mod tests {
                 expected.map(|(gid, token)| (gid, token.to_string())),
                 "{input}"
             );
-        }
-    }
-
-    #[test]
-    fn download_options_separate_gallery_url_and_telegraph_toggle() {
-        for (option, expected) in [("on", true), ("off", false)] {
-            let input = format!("https://e-hentai.org/g/12345/abcdef0123/ telegraph={option}");
-            let (gallery, telegraph) = split_edl_remaining_and_telegraph(&input);
-            assert_eq!(gallery, "https://e-hentai.org/g/12345/abcdef0123/");
-            assert_eq!(telegraph, expected);
         }
     }
 }

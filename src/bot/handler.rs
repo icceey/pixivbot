@@ -103,7 +103,7 @@ impl BotHandler {
         );
 
         // Route command to appropriate handler
-        self.dispatch_command(bot, msg, chat_id, cmd, ctx.user_role())
+        self.dispatch_command(bot, msg, chat_id, cmd, &ctx.user.role)
             .await
     }
 

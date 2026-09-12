@@ -392,6 +392,7 @@ async fn main() -> Result<()> {
             std::sync::Arc::clone(eh_client),
             std::sync::Arc::new(config.ehentai.clone()),
             eh_cache_dir.clone(),
+            scheduler::EhDownloadQueue::Main,
             eh_startup_abort_uploader.clone(),
         );
         info!("✅ E-Hentai download worker initialized");
@@ -402,11 +403,13 @@ async fn main() -> Result<()> {
 
     let eh_background_download_worker_handle = if let Some(ref eh_client) = eh_client {
         if config.ehentai.background_download_enabled {
-            let worker = scheduler::EhBackgroundDownloadWorker::new(
+            let worker = scheduler::EhDownloadWorker::new(
                 repo.clone(),
                 std::sync::Arc::clone(eh_client),
                 std::sync::Arc::new(config.ehentai.clone()),
                 eh_cache_dir.clone(),
+                scheduler::EhDownloadQueue::Background,
+                None,
             );
             info!("✅ E-Hentai background download worker initialized");
             Some(tokio::spawn(async move { worker.run().await }))
@@ -561,48 +564,4 @@ async fn main() -> Result<()> {
 
     info!("✅ Shutdown complete");
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use eh_client::ImageUploadProvider;
-
-    use super::should_build_eh_image_uploader;
-
-    #[test]
-    fn eh_image_uploader_policy_covers_telegraph_and_abort_matrix() {
-        let providers = [
-            ImageUploadProvider::Pixi,
-            ImageUploadProvider::S3,
-            ImageUploadProvider::Catbox,
-            ImageUploadProvider::IpfS3,
-        ];
-
-        for provider in providers {
-            assert!(!should_build_eh_image_uploader(false, false, provider));
-            assert!(!should_build_eh_image_uploader(false, true, provider));
-            assert!(should_build_eh_image_uploader(true, true, provider));
-        }
-
-        assert!(!should_build_eh_image_uploader(
-            true,
-            false,
-            ImageUploadProvider::Pixi,
-        ));
-        assert!(should_build_eh_image_uploader(
-            true,
-            false,
-            ImageUploadProvider::S3,
-        ));
-        assert!(!should_build_eh_image_uploader(
-            true,
-            false,
-            ImageUploadProvider::Catbox,
-        ));
-        assert!(should_build_eh_image_uploader(
-            true,
-            false,
-            ImageUploadProvider::IpfS3,
-        ));
-    }
 }

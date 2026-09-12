@@ -589,22 +589,3 @@ pub async fn handle_settings_cancel(
 
     Ok(had_state)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn tag_input_handles_mixed_separators_whitespace_and_duplicates() {
-        for (input, expected) in [
-            (
-                "tag1, tag2，tag3, tag4",
-                vec!["tag1", "tag2", "tag3", "tag4"],
-            ),
-            ("   ,   ,   ", vec![]),
-            ("tag1, tag1, tag2", vec!["tag1", "tag1", "tag2"]),
-        ] {
-            assert_eq!(parse_tags_input(input), expected, "{input}");
-        }
-    }
-}

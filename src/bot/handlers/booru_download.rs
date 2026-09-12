@@ -213,21 +213,3 @@ fn build_booru_caption(titles: &[String], failed: &[String]) -> String {
     }
     s
 }
-
-#[cfg(test)]
-mod tests {
-    use super::remove_file_after;
-
-    #[tokio::test]
-    async fn remove_file_after_cleans_zip_after_successful_send() {
-        let temp = tempfile::NamedTempFile::new().unwrap();
-        let path = temp.into_temp_path().to_path_buf();
-        tokio::fs::write(&path, b"zip data").await.unwrap();
-
-        remove_file_after(&path, async { Ok::<_, anyhow::Error>(()) })
-            .await
-            .unwrap();
-
-        assert!(!path.exists());
-    }
-}

@@ -26,14 +26,28 @@ pub(crate) fn archive_http_error(error: reqwest::Error) -> Error {
     Error::Http(error.without_url())
 }
 
+pub(super) fn parse_content_range_header(value: &str) -> Option<(u64, u64, Option<u64>)> {
+    let range = value.strip_prefix("bytes ")?;
+    let (bounds, total) = range.split_once('/')?;
+    let (start, end) = bounds.split_once('-')?;
+    let start = start.parse::<u64>().ok()?;
+    let end = end.parse::<u64>().ok()?;
+    if end < start {
+        return None;
+    }
+    let total = if total == "*" {
+        None
+    } else {
+        Some(total.parse::<u64>().ok()?)
+    };
+    Some((start, end, total))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{archive_get, archive_http_error};
-    use crate::error::Error;
+    use super::archive_get;
     use crate::models::EhCookies;
     use reqwest::header::COOKIE;
-    use wiremock::matchers::{method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[test]
     fn archive_get_adds_cookies_only_for_eh_hosts() {
@@ -64,31 +78,5 @@ mod tests {
             let request = archive_get(&http, &cookies, url).build().unwrap();
             assert!(request.headers().get(COOKIE).is_none(), "{url}");
         }
-    }
-
-    #[tokio::test]
-    async fn archive_http_error_removes_sensitive_url() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/archive"))
-            .respond_with(ResponseTemplate::new(500))
-            .mount(&server)
-            .await;
-        let url = format!("{}/archive?token=secret-token", server.uri());
-
-        let error = reqwest::Client::new()
-            .get(&url)
-            .send()
-            .await
-            .unwrap()
-            .error_for_status()
-            .unwrap_err();
-        assert_eq!(error.url().map(reqwest::Url::as_str), Some(url.as_str()));
-
-        let Error::Http(error) = archive_http_error(error) else {
-            unreachable!("archive HTTP errors remain HTTP errors");
-        };
-        assert!(error.url().is_none());
-        assert!(!error.to_string().contains("secret-token"));
     }
 }

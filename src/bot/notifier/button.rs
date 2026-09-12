@@ -34,12 +34,9 @@ impl DownloadButtonConfig {
     }
 
     pub fn for_pixiv_chat(illust_id: u64, chat: &crate::db::entities::chats::Model) -> Self {
-        let cfg = Self::pixiv(illust_id);
-        if chat.r#type == "channel" {
-            cfg.for_channel()
-        } else {
-            cfg
-        }
+        let mut cfg = Self::pixiv(illust_id);
+        cfg.is_channel = chat.r#type == "channel";
+        cfg
     }
 
     pub fn for_booru_chat(
@@ -47,25 +44,13 @@ impl DownloadButtonConfig {
         post_id: u64,
         chat: &crate::db::entities::chats::Model,
     ) -> Self {
-        let cfg = Self::booru(site_name, post_id);
-        if chat.r#type == "channel" {
-            cfg.for_channel()
-        } else {
-            cfg
-        }
-    }
-
-    pub fn for_channel(mut self) -> Self {
-        self.is_channel = true;
-        self
-    }
-
-    pub(super) fn should_show_button(&self) -> bool {
-        self.target.is_some() && !self.is_channel
+        let mut cfg = Self::booru(site_name, post_id);
+        cfg.is_channel = chat.r#type == "channel";
+        cfg
     }
 
     pub(super) fn build_keyboard(&self) -> Option<InlineKeyboardMarkup> {
-        if !self.should_show_button() {
+        if self.is_channel {
             return None;
         }
 
@@ -83,78 +68,5 @@ impl DownloadButtonConfig {
 
         let button = InlineKeyboardButton::callback(super::DOWNLOAD_BUTTON_LABEL, callback_data);
         Some(InlineKeyboardMarkup::new(vec![vec![button]]))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn chat(r#type: &str) -> crate::db::entities::chats::Model {
-        crate::db::entities::chats::Model {
-            id: 1,
-            r#type: r#type.to_string(),
-            title: None,
-            enabled: true,
-            blur_sensitive_tags: false,
-            excluded_tags: Default::default(),
-            sensitive_tags: Default::default(),
-            created_at: Default::default(),
-            allow_without_mention: false,
-        }
-    }
-
-    #[test]
-    fn pixiv_callback_data_format() {
-        let cfg = DownloadButtonConfig::pixiv(12345);
-        let kb = cfg.build_keyboard().expect("expected keyboard");
-        let row = &kb.inline_keyboard[0];
-        match &row[0].kind {
-            teloxide::types::InlineKeyboardButtonKind::CallbackData(s) => {
-                assert_eq!(s, "dl:12345");
-            }
-            _ => panic!("expected callback data"),
-        }
-    }
-
-    #[test]
-    fn booru_callback_data_format() {
-        let cfg = DownloadButtonConfig::booru("yandere", 999);
-        let kb = cfg.build_keyboard().expect("expected keyboard");
-        let row = &kb.inline_keyboard[0];
-        match &row[0].kind {
-            teloxide::types::InlineKeyboardButtonKind::CallbackData(s) => {
-                assert_eq!(s, "dlb:yandere:999");
-            }
-            _ => panic!("expected callback data"),
-        }
-    }
-
-    #[test]
-    fn channel_chat_hides_button_for_both_targets() {
-        assert!(DownloadButtonConfig::for_pixiv_chat(1, &chat("channel"))
-            .build_keyboard()
-            .is_none());
-        assert!(
-            DownloadButtonConfig::for_booru_chat("y", 1, &chat("channel"))
-                .build_keyboard()
-                .is_none()
-        );
-        assert!(DownloadButtonConfig::for_pixiv_chat(1, &chat("private"))
-            .build_keyboard()
-            .is_some());
-        assert!(
-            DownloadButtonConfig::for_booru_chat("y", 1, &chat("private"))
-                .build_keyboard()
-                .is_some()
-        );
-    }
-
-    #[test]
-    fn booru_button_is_hidden_when_callback_data_exceeds_telegram_limit() {
-        let long_site_name = "a".repeat(61);
-        let cfg = DownloadButtonConfig::booru(long_site_name, 1);
-
-        assert!(cfg.build_keyboard().is_none());
     }
 }

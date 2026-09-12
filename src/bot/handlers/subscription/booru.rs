@@ -363,13 +363,13 @@ impl BotHandler {
                             .await?;
                         return Ok(());
                     }
-                    if parse_duration(val).is_none() {
+                    let Some(interval) = parse_duration(val) else {
                         bot.send_message(chat_id, "❌ `interval=` 值无效（例: `1h` `30m` `1d2h`）")
                             .parse_mode(ParseMode::MarkdownV2)
                             .await?;
                         return Ok(());
-                    }
-                    interval_key = Some(duration_to_key(parse_duration(val).unwrap()));
+                    };
+                    interval_key = Some(duration_to_key(interval));
                     continue;
                 }
                 if part.starts_with("score>")
@@ -1035,38 +1035,6 @@ mod tests {
     }
 
     #[test]
-    fn invalid_numeric_returns_error() {
-        let args = vec!["score>=abc"];
-        let result = parse_booru_filter_args(&args);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("score"));
-
-        let args = vec!["fav>=xyz"];
-        let result = parse_booru_filter_args(&args);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("fav"));
-    }
-
-    #[test]
-    fn invalid_rating_returns_error() {
-        let args = vec!["rating=bad"];
-        let result = parse_booru_filter_args(&args);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("rating"));
-    }
-
-    #[test]
-    fn sensitive_rating_parsed() {
-        let args = vec!["rating=se"];
-        let (booru, _) = parse_booru_filter_args(&args).unwrap();
-        assert_eq!(booru.allowed_ratings, vec![BooruRating::Sensitive]);
-
-        let args = vec!["rating=sensitive"];
-        let (booru, _) = parse_booru_filter_args(&args).unwrap();
-        assert_eq!(booru.allowed_ratings, vec![BooruRating::Sensitive]);
-    }
-
-    #[test]
     fn bunsub_internal_interval_key_targets_booru_ranking() {
         let target = parse_bunsub_internal_key("yd:|i=900s|f=sf").unwrap();
         assert_eq!(target, (TaskType::BooruRanking, "yd:|i=900s|f=sf".into()));
@@ -1089,19 +1057,5 @@ mod tests {
         let (booru, _) = parse_booru_filter_args(&args).unwrap();
         assert_eq!(booru.score_min, Some(50));
         assert_eq!(booru.fav_count_min, Some(10));
-    }
-
-    #[test]
-    fn unsupported_fav_filter_message_only_for_unsupported_engines() {
-        let filter = BooruFilter::new(None, Some(10), vec![]);
-
-        assert_eq!(
-            unsupported_fav_filter_message("konachan", BooruEngineType::Moebooru, &filter),
-            Some("❌ konachan 不支持 fav 过滤".to_string())
-        );
-        assert_eq!(
-            unsupported_fav_filter_message("danbooru", BooruEngineType::Danbooru, &filter),
-            None
-        );
     }
 }

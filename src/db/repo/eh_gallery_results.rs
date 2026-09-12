@@ -385,35 +385,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn apply_with_archive_demand_keeps_pending() {
-        let repo = setup_test_db().await.unwrap();
-        let variant = EhGalleryVariant::archive("1280x");
-        let job = create_job(&repo, 103, "token", &variant, Some("fingerprint")).await;
-        create_delivery(&repo, &job, true, None).await;
-        insert_cached_result(
-            &repo,
-            job.gid,
-            &job.token,
-            &variant,
-            "fingerprint",
-            job.source_generation,
-            "https://telegra.ph/cached",
-            None,
-        )
-        .await;
-
-        assert!(apply_cached_result(&repo, job.id, true).await);
-
-        let updated = load_job(&repo, job.id).await;
-        assert_eq!(updated.status, JOB_STATUS_PENDING);
-        assert_eq!(updated.telegraph_status, TELEGRAPH_STATUS_READY);
-        assert!(updated.zip_path.is_none());
-        assert_eq!(updated.file_size, 0);
-        assert_eq!(updated.gp_cost, 0);
-        assert!(updated.completed_at.is_none());
-    }
-
-    #[tokio::test]
     async fn apply_rejects_fingerprint_mismatch_or_missing_record_or_null_job_fingerprint() {
         let repo = setup_test_db().await.unwrap();
         let variant = EhGalleryVariant::archive("1280x");

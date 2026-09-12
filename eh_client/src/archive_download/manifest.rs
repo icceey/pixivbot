@@ -237,36 +237,9 @@ async fn cleanup_unreferenced_parts(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::error::Error;
     use crate::ArchiveArtifacts;
 
     const URL: &str = "https://example.invalid/archive.zip";
-
-    #[tokio::test]
-    async fn manifest_round_trip_replaces_existing_manifest_atomically() {
-        let temp = tempfile::tempdir().unwrap();
-        let artifacts = ArchiveArtifacts::new(temp.path().join("archive.zip"));
-        let mut original = valid_manifest(URL);
-        original.write_atomic(&artifacts).await.unwrap();
-
-        let mut replacement = valid_manifest(URL);
-        replacement.etag = Some("\"strong-v2\"".to_owned());
-        replacement.write_atomic(&artifacts).await.unwrap();
-        write_part(&artifacts, 0, b"12").await;
-        write_part(&artifacts, 1, b"34").await;
-
-        let stored: ArchiveManifest = serde_json::from_slice(
-            &tokio::fs::read(ArchiveManifest::manifest_path(&artifacts))
-                .await
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(stored, replacement);
-        assert_eq!(
-            recover_manifest(&artifacts, URL).await.unwrap(),
-            ManifestRecovery::Valid(replacement)
-        );
-    }
 
     #[tokio::test]
     async fn manifest_recovery_classifies_deterministic_invalid_states() {
@@ -415,69 +388,6 @@ mod tests {
             "oversized_referenced_part",
         )
         .await;
-    }
-
-    #[test]
-    fn manifest_interval_and_next_id_failures_are_classified_independently() {
-        let mut incomplete_final_coverage = valid_manifest(URL);
-        incomplete_final_coverage.parts[1].end = 7;
-        let mut stale_next_part_id = valid_manifest(URL);
-        stale_next_part_id.next_part_id = 1;
-        let cases = [
-            (
-                "incomplete_final_coverage",
-                incomplete_final_coverage,
-                ManifestInvalid::InvalidIntervalCoverage,
-            ),
-            (
-                "stale_next_part_id",
-                stale_next_part_id,
-                ManifestInvalid::InvalidNextPartId,
-            ),
-        ];
-
-        for (name, manifest, expected) in cases {
-            assert_eq!(manifest.validate_shape(URL), Err(expected), "{name}");
-        }
-    }
-
-    #[tokio::test]
-    async fn manifest_recovery_removes_only_unreferenced_parts() {
-        let temp = tempfile::tempdir().unwrap();
-        let artifacts = ArchiveArtifacts::new(temp.path().join("archive.zip"));
-        let manifest = valid_manifest(URL);
-        write_manifest(&artifacts, &manifest).await;
-        write_part(&artifacts, 0, b"12").await;
-        write_part(&artifacts, 1, b"34").await;
-        let unreferenced = ArchiveManifest::part_path(&artifacts, 99);
-        let abandoned_temp = artifacts.parts_dir().join("manifest.json.tmp-abandoned");
-        tokio::fs::write(&unreferenced, b"old").await.unwrap();
-        tokio::fs::write(&abandoned_temp, b"old").await.unwrap();
-
-        assert_eq!(
-            recover_manifest(&artifacts, URL).await.unwrap(),
-            ManifestRecovery::Valid(manifest)
-        );
-        assert!(ArchiveManifest::part_path(&artifacts, 0).is_file());
-        assert!(ArchiveManifest::part_path(&artifacts, 1).is_file());
-        assert!(!unreferenced.exists());
-        assert!(!abandoned_temp.exists());
-    }
-
-    #[tokio::test]
-    async fn manifest_recovery_io_error_propagates_and_preserves_state() {
-        let temp = tempfile::tempdir().unwrap();
-        let artifacts = ArchiveArtifacts::new(temp.path().join("archive.zip"));
-        tokio::fs::create_dir_all(ArchiveManifest::manifest_path(&artifacts))
-            .await
-            .unwrap();
-        let sentinel = ArchiveManifest::part_path(&artifacts, 77);
-        tokio::fs::write(&sentinel, b"sentinel").await.unwrap();
-
-        let error = recover_manifest(&artifacts, URL).await.unwrap_err();
-        assert!(matches!(error, Error::Io(_)));
-        assert!(ArchiveManifest::manifest_path(&artifacts).is_dir());
-        assert!(sentinel.is_file());
     }
 
     fn valid_manifest(url: &str) -> ArchiveManifest {

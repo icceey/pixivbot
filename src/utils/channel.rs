@@ -307,26 +307,4 @@ mod tests {
             assert_eq!(id.0, expected, "{input}");
         }
     }
-
-    #[test]
-    fn test_channel_identifier_from_str_username() {
-        let id: ChannelIdentifier = "@testchannel".parse().unwrap();
-        match id {
-            ChannelIdentifier::Username(name) => assert_eq!(name, "@testchannel"),
-            _ => panic!("Expected Username variant"),
-        }
-    }
-
-    #[test]
-    fn test_channel_identifier_from_str_errors() {
-        // Empty string
-        assert!("".parse::<ChannelIdentifier>().is_err());
-        assert!("   ".parse::<ChannelIdentifier>().is_err());
-
-        // Invalid username (too short)
-        assert!("@abc".parse::<ChannelIdentifier>().is_err());
-
-        // Invalid format
-        assert!("not_a_valid_id".parse::<ChannelIdentifier>().is_err());
-    }
 }

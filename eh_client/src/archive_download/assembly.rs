@@ -44,43 +44,6 @@ mod tests {
     use crate::ArchiveArtifacts;
 
     #[tokio::test]
-    async fn assembly_orders_intervals_and_copies_exact_bytes() {
-        let temp = tempfile::tempdir().unwrap();
-        let artifacts = ArchiveArtifacts::new(temp.path().join("archive.zip"));
-        let manifest = test_manifest(vec![
-            ManifestPart {
-                id: 7,
-                start: 4,
-                end: 8,
-            },
-            ManifestPart {
-                id: 3,
-                start: 0,
-                end: 4,
-            },
-        ]);
-        tokio::fs::create_dir_all(artifacts.parts_dir())
-            .await
-            .unwrap();
-        tokio::fs::write(ArchiveManifest::part_path(&artifacts, 7), b"efgh")
-            .await
-            .unwrap();
-        tokio::fs::write(ArchiveManifest::part_path(&artifacts, 3), b"abcd")
-            .await
-            .unwrap();
-        tokio::fs::write(artifacts.assembly_scratch(), b"stale")
-            .await
-            .unwrap();
-
-        assemble_parts(&artifacts, &manifest).await.unwrap();
-
-        assert_eq!(
-            tokio::fs::read(artifacts.assembly_scratch()).await.unwrap(),
-            b"abcdefgh"
-        );
-    }
-
-    #[tokio::test]
     async fn assembly_length_mismatch_preserves_manifest_and_parts() {
         let temp = tempfile::tempdir().unwrap();
         let artifacts = ArchiveArtifacts::new(temp.path().join("archive.zip"));

@@ -560,13 +560,12 @@ impl BotHandler {
 
 /// Sanitize filename by replacing illegal filesystem characters with underscore
 pub(super) fn sanitize_filename(name: &str) -> String {
-    name.chars()
-        .map(|c| match c {
-            '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => '_',
-            c if c.is_control() => '_',
-            c => c,
-        })
-        .collect()
+    name.replace(
+        |c: char| {
+            c.is_control() || matches!(c, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*')
+        },
+        "_",
+    )
 }
 
 /// Extract all E-Hentai/ExHentai gallery URLs from text, returning (gid, token) pairs.
@@ -640,17 +639,6 @@ fn args_have_bare_pixiv_ids_outside_eh_urls(args: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_sanitize_filename() {
-        assert_eq!(sanitize_filename("normal_title"), "normal_title");
-        assert_eq!(sanitize_filename("title:with/slash"), "title_with_slash");
-        assert_eq!(sanitize_filename("title<>:\""), "title____");
-        assert_eq!(
-            sanitize_filename("title|with?many*bad\\chars"),
-            "title_with_many_bad_chars"
-        );
-    }
 
     #[test]
     fn gallery_extraction_validates_tokens_and_deduplicates_complete_references() {

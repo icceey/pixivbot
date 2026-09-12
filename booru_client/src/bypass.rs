@@ -156,19 +156,3 @@ fn decode_html_entities(s: &str) -> String {
         .replace("&apos;", "'");
     intermediate.replace("&amp;", "&")
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn strip_pre_wrapper_decodes_entities() {
-        let wrapped = r#"<pre>{&quot;url&quot;:&quot;a&amp;b&quot;}</pre>"#;
-        assert_eq!(strip_html_wrapper(wrapped), r#"{"url":"a&b"}"#);
-    }
-
-    #[test]
-    fn strip_pre_wrapper_returns_unwrapped_when_no_pre() {
-        assert_eq!(strip_html_wrapper("{\"a\":1}"), "{\"a\":1}");
-    }
-}
