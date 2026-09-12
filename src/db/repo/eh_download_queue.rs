@@ -1773,13 +1773,49 @@ impl Repo {
                 .entry(artifacts.final_zip().to_path_buf())
                 .or_insert(artifacts);
         }
+        if artifact_families.is_empty() {
+            return Ok(());
+        }
 
         let mut owned_final_zips: HashSet<std::path::PathBuf> = HashSet::new();
-        let job_artifacts = eh_gallery_jobs::Entity::find()
+        let mut job_artifacts: HashMap<_, _> = eh_gallery_jobs::Entity::find()
+            .filter(
+                eh_gallery_jobs::Column::Status
+                    .ne(JOB_STATUS_RETIRED)
+                    .or(eh_gallery_jobs::Column::CleanupStatus.ne(CLEANUP_STATUS_NONE))
+                    .or(eh_gallery_jobs::Column::ZipPath.is_not_null())
+                    .or(eh_gallery_jobs::Column::LegacyArtifactHandoff.is_not_null()),
+            )
             .all(&self.db)
             .await
-            .context("Failed to fetch shared EH jobs for cache cleanup")?;
-        for job in job_artifacts {
+            .context("Failed to fetch shared EH jobs for cache cleanup")?
+            .into_iter()
+            .map(|job| (job.id, job))
+            .collect();
+
+        // Both current and legacy artifact names start with the gallery ID.
+        // Only inspect clean retired jobs for galleries actually in the cache;
+        // their deterministic paths still need protection against reactivation.
+        let cached_gids: Vec<i64> = artifact_families
+            .keys()
+            .filter_map(|path| path.file_name()?.to_str()?.split_once('_')?.0.parse().ok())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        for gids in cached_gids.chunks(500) {
+            // A retired job may reactivate after the first query. Look up all
+            // matching jobs here so no owner can fall between status filters.
+            job_artifacts.extend(
+                eh_gallery_jobs::Entity::find()
+                    .filter(eh_gallery_jobs::Column::Gid.is_in(gids.iter().copied()))
+                    .all(&self.db)
+                    .await
+                    .context("Failed to fetch EH jobs with cached artifacts")?
+                    .into_iter()
+                    .map(|job| (job.id, job)),
+            );
+        }
+        for job in job_artifacts.into_values() {
             if let Some(zip_path) = job.zip_path.as_deref() {
                 owned_final_zips.insert(std::path::PathBuf::from(zip_path));
             }
