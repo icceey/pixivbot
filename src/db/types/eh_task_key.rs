@@ -128,8 +128,8 @@ mod tests {
     #[test]
     fn task_keys_encode_and_roundtrip_queries_and_filters() {
         for (query, categories, filter, expected) in [
-            ("female:elf", 0, EhFilter::new(), "eh:female:elf"),
-            ("artist:wlop", 3, EhFilter::new(), "eh:artist:wlop|c=3"),
+            ("female:elf", 0, EhFilter::default(), "eh:female:elf"),
+            ("artist:wlop", 3, EhFilter::default(), "eh:artist:wlop|c=3"),
             (
                 "female:elf",
                 0,

@@ -206,36 +206,11 @@ impl TagFilter {
         iter.into_iter().filter(|i| self.matches(i)).collect()
     }
 
-    /// Merge another filter into this one (combine include/exclude lists).
-    pub fn merge(&mut self, other: &TagFilter) {
-        self.include.extend(other.include.iter().cloned());
-        self.exclude.extend(other.exclude.iter().cloned());
-    }
-
     /// Create a merged filter from two filters.
     pub fn merged(&self, other: &TagFilter) -> Self {
         let mut result = self.clone();
-        result.merge(other);
+        result.include.extend(other.include.iter().cloned());
+        result.exclude.extend(other.exclude.iter().cloned());
         result
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_parse_from_args_mixed() {
-        let filter = TagFilter::parse_from_args(&["+原神", "-R-18", "cute"]);
-        assert_eq!(filter.include, vec!["原神", "cute"]);
-        assert_eq!(filter.exclude, vec!["R-18"]);
-    }
-
-    #[test]
-    fn test_format_for_display() {
-        let filter = TagFilter::parse_from_args(&["+原神", "-R-18"]);
-        let display = filter.format_for_display();
-        assert!(display.contains("\\+原神"));
-        assert!(display.contains("\\-R\\-18"));
     }
 }

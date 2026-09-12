@@ -61,6 +61,7 @@ impl Repo {
 #[cfg(test)]
 mod tests {
     use crate::db::entities::{eh_download_completions, eh_download_queue, eh_gallery_jobs};
+    use crate::db::repo::eh_gallery_jobs::EhDownloadQueue::Main;
     use crate::db::repo::eh_gallery_jobs::{
         EhGalleryVariant, CLEANUP_STATUS_NONE, DELIVERY_STATUS_DONE, JOB_STATUS_RETIRED,
     };
@@ -79,11 +80,22 @@ mod tests {
             .await
             .unwrap()
             .expect("delivery should be enqueued");
-        let first_job = repo.claim_eh_job_for_download(true).await.unwrap().unwrap();
-        let first_started_at = first_job.started_at.unwrap();
-        repo.mark_eh_job_downloaded(first_job.id, first_started_at, 100, "/tmp/first.zip", 0)
+        let first_job = repo
+            .claim_eh_download_job(Main, true)
             .await
+            .unwrap()
             .unwrap();
+        let first_started_at = first_job.started_at.unwrap();
+        repo.mark_eh_job_downloaded(
+            Main,
+            first_job.id,
+            first_started_at,
+            100,
+            "/tmp/first.zip",
+            0,
+        )
+        .await
+        .unwrap();
 
         eh_download_queue::Entity::update_many()
             .col_expr(
@@ -116,9 +128,14 @@ mod tests {
             .unwrap()
             .expect("delivery should be enqueued");
         assert_eq!(second_delivery.job_id, Some(first_job.id));
-        let second_job = repo.claim_eh_job_for_download(true).await.unwrap().unwrap();
+        let second_job = repo
+            .claim_eh_download_job(Main, true)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(second_job.id, first_job.id);
         repo.mark_eh_job_downloaded(
+            Main,
             second_job.id,
             second_job.started_at.unwrap(),
             250,

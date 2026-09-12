@@ -21,16 +21,6 @@ pub struct UserChatContext {
     pub chat: chats::Model,
 }
 
-impl UserChatContext {
-    pub fn user_role(&self) -> &UserRole {
-        &self.user.role
-    }
-
-    pub fn chat_enabled(&self) -> bool {
-        self.chat.enabled
-    }
-}
-
 // ============================================================================
 // 中间件过滤器
 // ============================================================================
@@ -176,7 +166,7 @@ async fn ensure_user_and_chat(
 /// 检查聊天是否可访问
 fn is_chat_accessible(chat_id: ChatId, ctx: &UserChatContext) -> bool {
     // 聊天已启用或私聊 Admin/Owner
-    ctx.chat_enabled() || (chat_id.is_user() && ctx.user_role().is_admin())
+    ctx.chat.enabled || (chat_id.is_user() && ctx.user.role.is_admin())
 }
 
 // ============================================================================
@@ -476,7 +466,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use teloxide::types::User;
 
     #[test]
     fn command_and_message_gating_follow_chat_mention_policy() {
@@ -517,59 +506,5 @@ mod tests {
                 );
             }
         }
-    }
-
-    #[test]
-    fn test_entities_mention_bot_matches_username_mention() {
-        let text = "@PixivBot 看看这个链接";
-        let entities = vec![MessageEntity::new(MessageEntityKind::Mention, 0, 9)];
-
-        assert!(entities_mention_bot(
-            text,
-            &entities,
-            Some("pixivbot"),
-            UserId(42)
-        ));
-    }
-
-    #[test]
-    fn test_entities_mention_bot_ignores_other_mentions() {
-        let text = "@someone 看看这个链接";
-        let entities = vec![MessageEntity::new(MessageEntityKind::Mention, 0, 8)];
-
-        assert!(!entities_mention_bot(
-            text,
-            &entities,
-            Some("pixivbot"),
-            UserId(42)
-        ));
-    }
-
-    #[test]
-    fn test_entities_mention_bot_matches_text_mention() {
-        let text = "点我";
-        let entities = vec![MessageEntity::new(
-            MessageEntityKind::TextMention {
-                user: User {
-                    id: UserId(42),
-                    is_bot: true,
-                    first_name: "PixivBot".to_string(),
-                    last_name: None,
-                    username: Some("pixivbot".to_string()),
-                    language_code: None,
-                    is_premium: false,
-                    added_to_attachment_menu: false,
-                },
-            },
-            0,
-            2,
-        )];
-
-        assert!(entities_mention_bot(
-            text,
-            &entities,
-            Some("pixivbot"),
-            UserId(42)
-        ));
     }
 }

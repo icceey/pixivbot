@@ -4,11 +4,6 @@ use booru_client::BooruRating;
 use pixiv_client::Illust;
 use std::collections::HashSet;
 
-/// Get sensitive tags list from chat settings
-pub fn get_chat_sensitive_tags(chat: &chats::Model) -> &[String] {
-    &chat.sensitive_tags
-}
-
 /// Check if illust contains any sensitive tags (normalized match, case-insensitive)
 pub fn contains_sensitive_tags(illust: &Illust, sensitive_tags: &[String]) -> bool {
     let illust_tags: Vec<String> = illust
@@ -28,7 +23,7 @@ pub fn contains_sensitive_tags(illust: &Illust, sensitive_tags: &[String]) -> bo
 }
 
 pub fn should_blur(chat: &chats::Model, illust: &Illust) -> bool {
-    chat.blur_sensitive_tags && contains_sensitive_tags(illust, get_chat_sensitive_tags(chat))
+    chat.blur_sensitive_tags && contains_sensitive_tags(illust, &chat.sensitive_tags)
 }
 
 pub fn should_blur_booru(chat: &chats::Model, tags: &str, rating: BooruRating) -> bool {
@@ -42,7 +37,8 @@ pub fn should_blur_booru(chat: &chats::Model, tags: &str, rating: BooruRating) -
 }
 
 fn tags_match_sensitive(chat: &chats::Model, tags: &str) -> bool {
-    let sensitive_set: HashSet<String> = get_chat_sensitive_tags(chat)
+    let sensitive_set: HashSet<String> = chat
+        .sensitive_tags
         .iter()
         .map(|s| normalize_tag(s))
         .collect();

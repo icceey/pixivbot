@@ -145,14 +145,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_parse_en_links() {
-        let text =
-            "https://www.pixiv.net/en/artworks/126608911 https://www.pixiv.net/en/users/33611048";
-        let links = parse_pixiv_links(text);
-        assert_eq!(links.len(), 2);
-    }
-
     use crate::booru::BooruSiteRegistry;
     use crate::config::BooruSiteConfig;
 

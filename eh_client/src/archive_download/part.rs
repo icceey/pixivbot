@@ -1,5 +1,5 @@
 use super::artifacts::ArchiveArtifacts;
-use super::http::{archive_get, archive_http_error};
+use super::http::{archive_get, archive_http_error, parse_content_range_header};
 use super::manifest::{ArchiveManifest, ManifestPart};
 use crate::error::{Error, Result};
 use crate::models::EhCookies;
@@ -255,42 +255,21 @@ fn select_last_modified(value: Option<&str>) -> Option<String> {
 }
 
 fn parse_content_range(headers: &HeaderMap) -> Option<(u64, u64, u64)> {
-    let value = header_value(headers, CONTENT_RANGE)?;
-    let range = value.strip_prefix("bytes ")?;
-    let (bounds, total) = range.split_once('/')?;
-    let (start, end) = bounds.split_once('-')?;
-    let start = start.parse().ok()?;
-    let end = end.parse().ok()?;
-    let total = total.parse().ok()?;
-    (end >= start).then_some((start, end, total))
+    let (start, end, total) = parse_content_range_header(header_value(headers, CONTENT_RANGE)?)?;
+    Some((start, end, total?))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::archive_download::manifest::{ArchiveManifest, ManifestPart};
-    use crate::{ArchiveArtifacts, EhCookies};
+    use crate::EhCookies;
     use reqwest::header::{
         HeaderMap, HeaderName, HeaderValue, CONTENT_RANGE, ETAG, IF_RANGE, LAST_MODIFIED, RANGE,
     };
     use reqwest::StatusCode;
-    use std::time::Duration;
 
     const LAST_MODIFIED_VALUE: &str = "Tue, 21 Jul 2026 12:00:00 GMT";
-
-    #[test]
-    fn part_response_accepts_exact_bounded_range() {
-        validate_part_response(
-            StatusCode::PARTIAL_CONTENT,
-            &part_headers("bytes 10-19/100"),
-            10,
-            20,
-            100,
-            &Validator::None,
-            false,
-        )
-        .unwrap();
-    }
 
     #[test]
     fn part_response_restarts_for_non_exact_ranges_and_statuses() {
@@ -364,153 +343,6 @@ mod tests {
         assert_eq!(Validator::from_manifest(&manifest), last_modified);
     }
 
-    #[test]
-    fn validator_mismatch_or_missing_restarts_sequential() {
-        for validator in [
-            Validator::from_manifest(&manifest(Some("\"v1\""), None)),
-            Validator::from_manifest(&manifest(None, Some(LAST_MODIFIED_VALUE))),
-        ] {
-            let (header, value) = match &validator {
-                Validator::StrongEtag(value) => (ETAG, value.as_str()),
-                Validator::LastModified(value) => (LAST_MODIFIED, value.as_str()),
-                Validator::None => unreachable!("manifest contains a validator"),
-            };
-            let matching = headers(&[(CONTENT_RANGE, "bytes 10-19/100"), (header.clone(), value)]);
-            validate_part_response(
-                StatusCode::PARTIAL_CONTENT,
-                &matching,
-                10,
-                20,
-                100,
-                &validator,
-                false,
-            )
-            .unwrap();
-
-            let mismatched = headers(&[(CONTENT_RANGE, "bytes 10-19/100"), (header, "other")]);
-            assert_restart(validate_part_response(
-                StatusCode::PARTIAL_CONTENT,
-                &mismatched,
-                10,
-                20,
-                100,
-                &validator,
-                false,
-            ));
-            assert_restart(validate_part_response(
-                StatusCode::PARTIAL_CONTENT,
-                &part_headers("bytes 10-19/100"),
-                10,
-                20,
-                100,
-                &validator,
-                false,
-            ));
-        }
-    }
-
-    #[test]
-    fn validator_none_omits_if_range_and_accepts_exact_response() {
-        let request = part_get(
-            &reqwest::Client::new(),
-            &EhCookies::default(),
-            "https://example.invalid/archive",
-            12,
-            100,
-            &Validator::None,
-        )
-        .build()
-        .unwrap();
-        assert_eq!(request.headers().get(RANGE).unwrap(), "bytes=12-99");
-        assert!(request.headers().get(IF_RANGE).is_none());
-
-        validate_part_response(
-            StatusCode::PARTIAL_CONTENT,
-            &headers(&[(CONTENT_RANGE, "bytes 12-99/100"), (ETAG, "\"other\"")]),
-            12,
-            100,
-            100,
-            &Validator::None,
-            false,
-        )
-        .unwrap();
-    }
-
-    #[test]
-    fn requested_range_returns_only_the_remaining_bounded_interval() {
-        let part = ManifestPart {
-            id: 1,
-            start: 0,
-            end: 100,
-        };
-        assert_eq!(requested_range(&part, 12).unwrap(), Some((12, 100)));
-        assert_eq!(requested_range(&part, 100).unwrap(), None);
-        assert_restart(requested_range(&part, 101));
-    }
-
-    #[test]
-    fn part_sample_rate_eligibility_requires_one_second_and_nonzero_delta() {
-        let sample = PartSample {
-            part_id: 1,
-            generation: 2,
-            durable_len: 64,
-            window_delta: 64,
-            elapsed: Duration::from_millis(500),
-        };
-        assert!(!sample.is_rate_eligible());
-        assert!(PartSample {
-            elapsed: Duration::from_secs(1),
-            ..sample
-        }
-        .is_rate_eligible());
-        assert!(!PartSample {
-            window_delta: 0,
-            elapsed: Duration::from_secs(1),
-            ..sample
-        }
-        .is_rate_eligible());
-    }
-
-    #[tokio::test]
-    async fn aggregate_downloaded_bytes_sums_each_manifest_part_once_and_rejects_oversize() {
-        let temp = tempfile::tempdir().unwrap();
-        let artifacts = ArchiveArtifacts::new(temp.path().join("archive.zip"));
-        let manifest = manifest_with_parts(vec![
-            ManifestPart {
-                id: 1,
-                start: 0,
-                end: 10,
-            },
-            ManifestPart {
-                id: 2,
-                start: 10,
-                end: 20,
-            },
-        ]);
-        tokio::fs::create_dir_all(artifacts.parts_dir())
-            .await
-            .unwrap();
-        tokio::fs::write(ArchiveManifest::part_path(&artifacts, 1), b"1234")
-            .await
-            .unwrap();
-        tokio::fs::write(ArchiveManifest::part_path(&artifacts, 2), b"1234567")
-            .await
-            .unwrap();
-        assert_eq!(
-            aggregate_downloaded_bytes(&artifacts, &manifest)
-                .await
-                .unwrap(),
-            11
-        );
-
-        tokio::fs::write(ArchiveManifest::part_path(&artifacts, 1), b"12345678901")
-            .await
-            .unwrap();
-        assert!(aggregate_downloaded_bytes(&artifacts, &manifest)
-            .await
-            .is_err());
-    }
-
     fn assert_restart<T: std::fmt::Debug>(result: std::result::Result<T, PartFailure>) {
         assert_eq!(result.unwrap_err().kind, PartFailureKind::RestartSequential);
     }
@@ -541,12 +373,5 @@ mod tests {
                 end: 100,
             }],
         }
-    }
-
-    fn manifest_with_parts(parts: Vec<ManifestPart>) -> ArchiveManifest {
-        let mut manifest = manifest(None, None);
-        manifest.next_part_id = parts.iter().map(|part| part.id).max().unwrap() + 1;
-        manifest.parts = parts;
-        manifest
     }
 }

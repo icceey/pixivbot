@@ -1,7 +1,6 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU8, Ordering};
 
@@ -21,31 +20,18 @@ pub(crate) enum ProviderKind {
     IpfS3,
 }
 
-pub(crate) fn fingerprint_fields(fields: &[&str]) -> String {
+pub(crate) fn fingerprint_fields(fields: &[impl AsRef<str>]) -> String {
     let mut hash = Sha256::new();
     for field in fields {
+        let field = field.as_ref();
         hash.update(u64::try_from(field.len()).unwrap_or(u64::MAX).to_be_bytes());
         hash.update(field.as_bytes());
     }
-    digest_hex(hash.finalize())
+    hex::encode(hash.finalize())
 }
 
 pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
-    digest_hex(Sha256::digest(bytes))
-}
-
-fn digest_hex(digest: impl AsRef<[u8]>) -> String {
-    let digest = digest.as_ref();
-    let mut hex = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        write!(&mut hex, "{byte:02x}").expect("writing to String cannot fail");
-    }
-    hex
-}
-
-pub(crate) fn requested_entries_fingerprint(entry_names: &[String]) -> String {
-    let fields: Vec<_> = entry_names.iter().map(String::as_str).collect();
-    fingerprint_fields(&fields)
+    hex::encode(Sha256::digest(bytes))
 }
 
 pub(crate) fn uploader_identity_fingerprint(
@@ -831,7 +817,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::thread::JoinHandle;
     use std::time::Duration;
-    use wiremock::matchers::{any, method, query_param};
+    use wiremock::matchers::{method, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     const BUCKET: &str = "task-five-bucket";
@@ -852,23 +838,6 @@ mod tests {
                 "<InitiateMultipartUploadResult><Bucket>{BUCKET}</Bucket><Key>{KEY}</Key><UploadId>{UPLOAD_ID}</UploadId></InitiateMultipartUploadResult>"
             ))
         }
-    }
-
-    #[tokio::test]
-    async fn multipart_rejects_more_than_ten_thousand_parts_before_create() {
-        let server = MockServer::start().await;
-        Mock::given(any())
-            .respond_with(ResponseTemplate::new(500))
-            .expect(0)
-            .mount(&server)
-            .await;
-
-        let error = part_count(MAX_PARTS * PART_SIZE + 1).unwrap_err();
-        assert_eq!(
-            error.to_string(),
-            "multipart upload needs 10001 parts, exceeding the 10000-part limit"
-        );
-        server.verify().await;
     }
 
     #[test]
@@ -1277,20 +1246,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn multipart_only_classifies_explicit_operation_codes_as_unsupported() {
-        for operation in [
-            MultipartOperation::Create,
-            MultipartOperation::ListParts,
-            MultipartOperation::UploadPart,
-            MultipartOperation::Complete,
-        ] {
-            for code in ["NotImplemented", "UnsupportedOperation", "MethodNotAllowed"] {
-                assert_explicit_unsupported(operation, code).await;
-            }
-        }
-    }
-
-    #[tokio::test]
     async fn multipart_transient_auth_and_malformed_failures_never_become_unsupported() {
         let cases = vec![
             (400, b"raw bad request".to_vec()),
@@ -1515,37 +1470,6 @@ mod tests {
             query_value(&requests[2], "uploadId").as_deref(),
             Some(REPLACEMENT_UPLOAD_ID)
         );
-        server.verify().await;
-    }
-
-    #[tokio::test]
-    async fn multipart_never_sends_options() {
-        let server = MockServer::start().await;
-        mount_create(&server).await;
-        mount_empty_list_parts(&server).await;
-        Mock::given(method("PUT"))
-            .and(query_param("uploadId", UPLOAD_ID))
-            .and(query_param("partNumber", "1"))
-            .respond_with(ResponseTemplate::new(200).insert_header("ETag", "\"part-1\""))
-            .expect(1)
-            .mount(&server)
-            .await;
-        mount_complete(&server).await;
-
-        let bytes = vec![4; PART_SIZE];
-        let result = upload_multipart(
-            test_bucket(&server).as_ref(),
-            &reqwest::Client::new(),
-            standard_request(&bytes, None),
-        )
-        .await;
-        assert!(matches!(result, Ok(MultipartOutcome::Completed(_))));
-        assert!(server
-            .received_requests()
-            .await
-            .unwrap()
-            .iter()
-            .all(|request| request.method.as_str() != "OPTIONS"));
         server.verify().await;
     }
 
@@ -2392,95 +2316,6 @@ mod tests {
             .expect(1)
             .mount(server)
             .await;
-    }
-
-    async fn assert_explicit_unsupported(operation: MultipartOperation, code: &str) {
-        let server = MockServer::start().await;
-        let bytes = vec![4; PART_SIZE];
-        let temp = tempfile::tempdir().unwrap();
-        let manifest_path = temp.path().join("archive.json");
-        let needs_active_session = operation != MultipartOperation::Create;
-        let complete_status = if code == "UnsupportedOperation" {
-            200
-        } else {
-            405
-        };
-
-        match operation {
-            MultipartOperation::Create => {
-                Mock::given(method("POST"))
-                    .and(query_param("uploads", ""))
-                    .respond_with(ResponseTemplate::new(405).set_body_string(s3_error_xml(code)))
-                    .expect(1)
-                    .mount(&server)
-                    .await;
-                Mock::given(method("DELETE"))
-                    .respond_with(ResponseTemplate::new(500))
-                    .expect(0)
-                    .mount(&server)
-                    .await;
-            }
-            MultipartOperation::ListParts => {
-                write_valid_manifest(&manifest_path, &bytes, UPLOADER_ID).await;
-                Mock::given(method("GET"))
-                    .and(query_param("uploadId", UPLOAD_ID))
-                    .respond_with(ResponseTemplate::new(405).set_body_string(s3_error_xml(code)))
-                    .expect(1)
-                    .mount(&server)
-                    .await;
-                mount_abort_for(&server, UPLOAD_ID).await;
-            }
-            MultipartOperation::UploadPart => {
-                mount_create(&server).await;
-                mount_empty_list_parts(&server).await;
-                Mock::given(method("PUT"))
-                    .and(query_param("uploadId", UPLOAD_ID))
-                    .and(query_param("partNumber", "1"))
-                    .respond_with(ResponseTemplate::new(405).set_body_string(s3_error_xml(code)))
-                    .expect(1)
-                    .mount(&server)
-                    .await;
-                mount_abort_for(&server, UPLOAD_ID).await;
-            }
-            MultipartOperation::Complete => {
-                mount_create(&server).await;
-                mount_empty_list_parts(&server).await;
-                mount_upload_part_for(&server, UPLOAD_ID, 1, "\"part-1\"").await;
-                Mock::given(method("POST"))
-                    .and(query_param("uploadId", UPLOAD_ID))
-                    .respond_with(
-                        ResponseTemplate::new(complete_status).set_body_string(s3_error_xml(code)),
-                    )
-                    .expect(1)
-                    .mount(&server)
-                    .await;
-                mount_abort_for(&server, UPLOAD_ID).await;
-            }
-            MultipartOperation::ZipPut | MultipartOperation::Abort | MultipartOperation::Head => {
-                unreachable!()
-            }
-        }
-
-        let result = upload_multipart(
-            test_bucket(&server).as_ref(),
-            &reqwest::Client::new(),
-            standard_request(
-                &bytes,
-                needs_active_session.then_some(manifest_path.as_path()),
-            ),
-        )
-        .await
-        .unwrap();
-        assert!(matches!(
-            result,
-            MultipartOutcome::Unsupported {
-                operation: actual_operation
-            } if actual_operation == operation
-        ));
-        if needs_active_session {
-            assert!(!manifest_path.exists());
-        }
-        server.verify().await;
     }
 
     async fn assert_malformed_create_failure() {

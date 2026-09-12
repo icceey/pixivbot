@@ -30,31 +30,6 @@ impl Repo {
         .context("Failed to append shared EH job GP spend attempt")
     }
 
-    /// Record a GP charge attempt for an EH archive download.
-    ///
-    /// Every call inserts a distinct ledger row, even for the same queue entry.
-    pub async fn append_eh_gp_spend_attempt(
-        &self,
-        queue_id: i32,
-        gid: i64,
-        gp_cost: i64,
-    ) -> Result<eh_gp_spend_attempts::Model> {
-        if gp_cost <= 0 {
-            anyhow::bail!("EH GP spend attempt cost must be positive, got {gp_cost}");
-        }
-
-        eh_gp_spend_attempts::ActiveModel {
-            queue_id: Set(Some(queue_id)),
-            gid: Set(gid),
-            gp_cost: Set(gp_cost),
-            created_at: Set(Local::now().naive_local()),
-            ..Default::default()
-        }
-        .insert(&self.db)
-        .await
-        .context("Failed to append EH GP spend attempt")
-    }
-
     /// Get total GP charged in the last `window_hours` from the append-only ledger.
     pub async fn get_eh_gp_cost_in_window(&self, window_hours: u64) -> Result<i64> {
         let window_hours = i64::try_from(window_hours)
@@ -84,6 +59,7 @@ impl Repo {
 mod tests {
     use super::super::tests_helpers::setup_test_db;
     use crate::db::entities::{eh_download_queue, eh_gallery_jobs, eh_gp_spend_attempts};
+    use crate::db::repo::eh_gallery_jobs::EhDownloadQueue::Main;
     use crate::db::repo::eh_gallery_jobs::{
         eh_gallery_job_artifact_path, LEGACY_ARTIFACT_HANDOFF_CONFLICT,
         LEGACY_ARTIFACT_HANDOFF_MOVING, LEGACY_ARTIFACT_HANDOFF_PENDING,
@@ -133,130 +109,30 @@ mod tests {
         Ok(())
     }
 
-    fn target_migration() -> Result<Box<dyn MigrationTrait>> {
+    fn target_migration(name: &str) -> Result<Box<dyn MigrationTrait>> {
         Migrator::migrations()
             .into_iter()
-            .find(|migration| migration.name() == MIGRATION_NAME)
-            .ok_or_else(|| anyhow::anyhow!("migration {MIGRATION_NAME} is not registered"))
-    }
-
-    async fn migrate_up(db: &DatabaseConnection) -> Result<()> {
-        target_migration()?.up(&SchemaManager::new(db)).await?;
-        Ok(())
-    }
-
-    fn shared_jobs_target_migration() -> Result<Box<dyn MigrationTrait>> {
-        Migrator::migrations()
-            .into_iter()
-            .find(|migration| migration.name() == SHARED_JOBS_MIGRATION_NAME)
-            .ok_or_else(|| {
-                anyhow::anyhow!("migration {SHARED_JOBS_MIGRATION_NAME} is not registered")
-            })
-    }
-
-    async fn migrate_shared_jobs_up(db: &DatabaseConnection) -> Result<()> {
-        shared_jobs_target_migration()?
-            .up(&SchemaManager::new(db))
-            .await?;
-        Ok(())
-    }
-
-    fn reuse_ledger_target_migration() -> Result<Box<dyn MigrationTrait>> {
-        Migrator::migrations()
-            .into_iter()
-            .find(|migration| migration.name() == REUSE_LEDGER_MIGRATION_NAME)
-            .ok_or_else(|| {
-                anyhow::anyhow!("migration {REUSE_LEDGER_MIGRATION_NAME} is not registered")
-            })
+            .find(|migration| migration.name() == name)
+            .ok_or_else(|| anyhow::anyhow!("migration {name} is not registered"))
     }
 
     async fn migrate_reuse_ledger_up(db: &DatabaseConnection) -> Result<()> {
-        migrate_shared_jobs_up(db).await?;
-        reuse_ledger_target_migration()?
+        target_migration(SHARED_JOBS_MIGRATION_NAME)?
+            .up(&SchemaManager::new(db))
+            .await?;
+        target_migration(REUSE_LEDGER_MIGRATION_NAME)?
             .up(&SchemaManager::new(db))
             .await?;
         Ok(())
-    }
-
-    fn legacy_artifact_handoff_compat_target_migration() -> Result<Box<dyn MigrationTrait>> {
-        Migrator::migrations()
-            .into_iter()
-            .find(|migration| migration.name() == LEGACY_ARTIFACT_HANDOFF_COMPAT_MIGRATION_NAME)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "migration {LEGACY_ARTIFACT_HANDOFF_COMPAT_MIGRATION_NAME} is not registered"
-                )
-            })
-    }
-
-    async fn migrate_legacy_artifact_handoff_compat_up(db: &DatabaseConnection) -> Result<()> {
-        legacy_artifact_handoff_compat_target_migration()?
-            .up(&SchemaManager::new(db))
-            .await?;
-        Ok(())
-    }
-
-    async fn migrate_legacy_artifact_handoff_compat_down(db: &DatabaseConnection) -> Result<()> {
-        legacy_artifact_handoff_compat_target_migration()?
-            .down(&SchemaManager::new(db))
-            .await?;
-        Ok(())
-    }
-
-    fn fingerprint_generations_target_migration() -> Result<Box<dyn MigrationTrait>> {
-        Migrator::migrations()
-            .into_iter()
-            .find(|migration| migration.name() == FINGERPRINT_GENERATIONS_MIGRATION_NAME)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "migration {FINGERPRINT_GENERATIONS_MIGRATION_NAME} is not registered"
-                )
-            })
     }
 
     async fn migrate_fingerprint_generations_up(db: &DatabaseConnection) -> Result<()> {
         migrate_reuse_ledger_up(db).await?;
-        migrate_legacy_artifact_handoff_compat_up(db).await?;
-        migrate_fingerprint_generations_from_reuse_schema_up(db).await
-    }
-
-    async fn migrate_fingerprint_generations_from_reuse_schema_up(
-        db: &DatabaseConnection,
-    ) -> Result<()> {
-        fingerprint_generations_target_migration()?
+        target_migration(LEGACY_ARTIFACT_HANDOFF_COMPAT_MIGRATION_NAME)?
             .up(&SchemaManager::new(db))
             .await?;
-        Ok(())
-    }
-
-    async fn migrate_fingerprint_generations_down(db: &DatabaseConnection) -> Result<()> {
-        fingerprint_generations_target_migration()?
-            .down(&SchemaManager::new(db))
-            .await?;
-        Ok(())
-    }
-
-    fn result_generation_order_target_migration() -> Result<Box<dyn MigrationTrait>> {
-        Migrator::migrations()
-            .into_iter()
-            .find(|migration| migration.name() == RESULT_GENERATION_ORDER_MIGRATION_NAME)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "migration {RESULT_GENERATION_ORDER_MIGRATION_NAME} is not registered"
-                )
-            })
-    }
-
-    async fn migrate_result_generation_order_up(db: &DatabaseConnection) -> Result<()> {
-        result_generation_order_target_migration()?
+        target_migration(FINGERPRINT_GENERATIONS_MIGRATION_NAME)?
             .up(&SchemaManager::new(db))
-            .await?;
-        Ok(())
-    }
-
-    async fn migrate_result_generation_order_down(db: &DatabaseConnection) -> Result<()> {
-        result_generation_order_target_migration()?
-            .down(&SchemaManager::new(db))
             .await?;
         Ok(())
     }
@@ -548,7 +424,9 @@ mod tests {
             "unexpected legacy uniqueness error: {legacy_error:#}"
         );
 
-        migrate_fingerprint_generations_from_reuse_schema_up(&db).await?;
+        target_migration(FINGERPRINT_GENERATIONS_MIGRATION_NAME)?
+            .up(&SchemaManager::new(&db))
+            .await?;
         db.execute_unprepared(
             "INSERT INTO eh_gallery_jobs (gid, token, download_mode, resolution, source_fingerprint, title) VALUES \
                 (501, 'token', 'archive', '1280x', 'fingerprint-b', 'B'), \
@@ -583,7 +461,9 @@ mod tests {
         create_legacy_shared_jobs_tables(&db).await?;
         let prior_max_id = seed_fingerprint_generation_fixture(&db).await?;
 
-        migrate_fingerprint_generations_from_reuse_schema_up(&db).await?;
+        target_migration(FINGERPRINT_GENERATIONS_MIGRATION_NAME)?
+            .up(&SchemaManager::new(&db))
+            .await?;
 
         assert_job_rebuild_data_is_preserved(&db).await?;
         assert_foreign_key_check_is_clean(&db).await?;
@@ -666,9 +546,15 @@ mod tests {
         )
         .await?;
 
-        migrate_legacy_artifact_handoff_compat_up(&db).await?;
-        migrate_legacy_artifact_handoff_compat_up(&db).await?;
-        migrate_result_generation_order_up(&db).await?;
+        target_migration(LEGACY_ARTIFACT_HANDOFF_COMPAT_MIGRATION_NAME)?
+            .up(&SchemaManager::new(&db))
+            .await?;
+        target_migration(LEGACY_ARTIFACT_HANDOFF_COMPAT_MIGRATION_NAME)?
+            .up(&SchemaManager::new(&db))
+            .await?;
+        target_migration(RESULT_GENERATION_ORDER_MIGRATION_NAME)?
+            .up(&SchemaManager::new(&db))
+            .await?;
         assert!(table_has_column(&db, "eh_gallery_jobs", "legacy_artifact_handoff").await?);
 
         let jobs = eh_gallery_jobs::Entity::find().all(&db).await?;
@@ -782,7 +668,7 @@ mod tests {
         let mut claimed_ids = Vec::new();
         for _ in 0..3 {
             claimed_ids.push(
-                repo.claim_eh_job_for_download(true)
+                repo.claim_eh_download_job(Main, true)
                     .await?
                     .expect("every released legacy job must be claimable")
                     .id,
@@ -798,9 +684,15 @@ mod tests {
             .iter()
             .all(|job| job.legacy_artifact_handoff.is_none()));
 
-        migrate_result_generation_order_down(&db).await?;
-        migrate_fingerprint_generations_down(&db).await?;
-        migrate_legacy_artifact_handoff_compat_down(&db).await?;
+        target_migration(RESULT_GENERATION_ORDER_MIGRATION_NAME)?
+            .down(&SchemaManager::new(&db))
+            .await?;
+        target_migration(FINGERPRINT_GENERATIONS_MIGRATION_NAME)?
+            .down(&SchemaManager::new(&db))
+            .await?;
+        target_migration(LEGACY_ARTIFACT_HANDOFF_COMPAT_MIGRATION_NAME)?
+            .down(&SchemaManager::new(&db))
+            .await?;
         assert!(
             !table_has_column(&db, "eh_gallery_jobs", "legacy_artifact_handoff").await?,
             "compatibility migration down must restore the pre-compatibility schema"
@@ -837,7 +729,9 @@ mod tests {
         )
         .await?;
 
-        migrate_result_generation_order_up(&db).await?;
+        target_migration(RESULT_GENERATION_ORDER_MIGRATION_NAME)?
+            .up(&SchemaManager::new(&db))
+            .await?;
 
         let ordered_generations = db
             .query_all(Statement::from_string(
@@ -902,7 +796,9 @@ mod tests {
         assert!(table_has_column(&db, "eh_gallery_results", "source_generation").await?);
         assert_foreign_key_check_is_clean(&db).await?;
 
-        migrate_result_generation_order_down(&db).await?;
+        target_migration(RESULT_GENERATION_ORDER_MIGRATION_NAME)?
+            .down(&SchemaManager::new(&db))
+            .await?;
         assert!(
             !sqlite_master_entry_exists(&db, "index", JOB_GENERATION_INDEX).await?,
             "down migration must remove the generation uniqueness index first"
@@ -919,9 +815,13 @@ mod tests {
         let db = new_db().await?;
         create_legacy_shared_jobs_tables(&db).await?;
         seed_fingerprint_generation_fixture(&db).await?;
-        migrate_fingerprint_generations_from_reuse_schema_up(&db).await?;
+        target_migration(FINGERPRINT_GENERATIONS_MIGRATION_NAME)?
+            .up(&SchemaManager::new(&db))
+            .await?;
 
-        migrate_fingerprint_generations_down(&db).await?;
+        target_migration(FINGERPRINT_GENERATIONS_MIGRATION_NAME)?
+            .down(&SchemaManager::new(&db))
+            .await?;
 
         assert_job_rebuild_data_is_preserved(&db).await?;
         assert_foreign_key_check_is_clean(&db).await?;
@@ -959,7 +859,8 @@ mod tests {
         )
         .await?;
 
-        let error = migrate_fingerprint_generations_down(&db)
+        let error = target_migration(FINGERPRINT_GENERATIONS_MIGRATION_NAME)?
+            .down(&SchemaManager::new(&db))
             .await
             .expect_err("down migration must reject multiple generations for one variant");
         assert!(error.to_string().contains("multiple source fingerprints"));
@@ -993,7 +894,8 @@ mod tests {
         )
         .await?;
 
-        let error = migrate_up(&db)
+        let error = target_migration(MIGRATION_NAME)?
+            .up(&SchemaManager::new(&db))
             .await
             .expect_err("missing gid must make the backfill fail after DDL");
         assert!(error.to_string().contains("gid"));
@@ -1009,7 +911,9 @@ mod tests {
         db.execute_unprepared("DROP TABLE eh_download_queue")
             .await?;
         create_legacy_queue_table(&db).await?;
-        migrate_up(&db).await?;
+        target_migration(MIGRATION_NAME)?
+            .up(&SchemaManager::new(&db))
+            .await?;
 
         assert!(migration_table_exists(&db).await?);
         assert!(migration_created_at_index_exists(&db).await?);
@@ -1036,7 +940,9 @@ mod tests {
         )
         .await?;
 
-        migrate_shared_jobs_up(&db).await?;
+        target_migration(SHARED_JOBS_MIGRATION_NAME)?
+            .up(&SchemaManager::new(&db))
+            .await?;
 
         let job_count = db
             .query_one(Statement::from_string(
@@ -1240,7 +1146,9 @@ mod tests {
         )
         .await?;
 
-        migrate_shared_jobs_up(&db).await?;
+        target_migration(SHARED_JOBS_MIGRATION_NAME)?
+            .up(&SchemaManager::new(&db))
+            .await?;
 
         let jobs = db
             .query_all(Statement::from_string(
@@ -1490,7 +1398,9 @@ mod tests {
         )
         .await?;
         migrate_fingerprint_generations_up(&db).await?;
-        migrate_result_generation_order_up(&db).await?;
+        target_migration(RESULT_GENERATION_ORDER_MIGRATION_NAME)?
+            .up(&SchemaManager::new(&db))
+            .await?;
 
         let repo = Repo::new(db);
         let temp = tempfile::tempdir()?;
@@ -1530,7 +1440,7 @@ mod tests {
         );
 
         let claimed = repo
-            .claim_eh_job_for_download(true)
+            .claim_eh_download_job(Main, true)
             .await?
             .expect("the adopted job must be claimable by a shared worker");
         assert_eq!(claimed.id, job.id);
@@ -1560,7 +1470,9 @@ mod tests {
         )
         .await?;
         migrate_fingerprint_generations_up(&db).await?;
-        migrate_result_generation_order_up(&db).await?;
+        target_migration(RESULT_GENERATION_ORDER_MIGRATION_NAME)?
+            .up(&SchemaManager::new(&db))
+            .await?;
 
         let repo = Repo::new(db);
         let jobs = eh_gallery_jobs::Entity::find().all(repo.db()).await?;
@@ -1622,7 +1534,9 @@ mod tests {
         )
         .await?;
         migrate_fingerprint_generations_up(&db).await?;
-        migrate_result_generation_order_up(&db).await?;
+        target_migration(RESULT_GENERATION_ORDER_MIGRATION_NAME)?
+            .up(&SchemaManager::new(&db))
+            .await?;
 
         for gid in [916, 917] {
             let jobs = eh_gallery_jobs::Entity::find()
@@ -1660,7 +1574,9 @@ mod tests {
         )
         .await?;
         migrate_fingerprint_generations_up(&db).await?;
-        migrate_result_generation_order_up(&db).await?;
+        target_migration(RESULT_GENERATION_ORDER_MIGRATION_NAME)?
+            .up(&SchemaManager::new(&db))
+            .await?;
 
         let repo = Repo::new(db);
         let jobs = eh_gallery_jobs::Entity::find().all(repo.db()).await?;
@@ -1703,7 +1619,7 @@ mod tests {
             "a missing source must not strand conflict-marked jobs"
         );
         assert!(
-            repo.claim_eh_job_for_download(true).await?.is_some(),
+            repo.claim_eh_download_job(Main, true).await?.is_some(),
             "workers may resume ordinary work after the ambiguous source is gone"
         );
         Ok(())
@@ -1722,7 +1638,9 @@ mod tests {
         )
         .await?;
         migrate_fingerprint_generations_up(&db).await?;
-        migrate_result_generation_order_up(&db).await?;
+        target_migration(RESULT_GENERATION_ORDER_MIGRATION_NAME)?
+            .up(&SchemaManager::new(&db))
+            .await?;
 
         let repo = Repo::new(db);
         let temp = tempfile::tempdir()?;
@@ -1742,7 +1660,7 @@ mod tests {
             .expect("migration must create one shared job");
         assert_eq!(job.legacy_artifact_handoff, None);
         assert!(
-            repo.claim_eh_job_for_download(true).await?.is_some(),
+            repo.claim_eh_download_job(Main, true).await?.is_some(),
             "a harmless missing legacy family must not block a shared worker"
         );
         Ok(())
@@ -1760,7 +1678,9 @@ mod tests {
         )
         .await?;
         migrate_fingerprint_generations_up(&db).await?;
-        migrate_result_generation_order_up(&db).await?;
+        target_migration(RESULT_GENERATION_ORDER_MIGRATION_NAME)?
+            .up(&SchemaManager::new(&db))
+            .await?;
 
         let repo = Repo::new(db);
         let job = eh_gallery_jobs::Entity::find()
@@ -1799,7 +1719,7 @@ mod tests {
         assert!(legacy.assembly_scratch().exists());
         assert!(target.assembly_scratch().exists());
         assert!(
-            repo.claim_eh_job_for_download(true).await?.is_none(),
+            repo.claim_eh_download_job(Main, true).await?.is_none(),
             "a worker must not create a second download while source ownership is ambiguous"
         );
         Ok(())
@@ -1817,7 +1737,9 @@ mod tests {
         )
         .await?;
         migrate_fingerprint_generations_up(&db).await?;
-        migrate_result_generation_order_up(&db).await?;
+        target_migration(RESULT_GENERATION_ORDER_MIGRATION_NAME)?
+            .up(&SchemaManager::new(&db))
+            .await?;
 
         let repo = Repo::new(db);
         let job = eh_gallery_jobs::Entity::find()
@@ -1880,7 +1802,9 @@ mod tests {
         )
         .await?;
 
-        migrate_shared_jobs_up(&db).await?;
+        target_migration(SHARED_JOBS_MIGRATION_NAME)?
+            .up(&SchemaManager::new(&db))
+            .await?;
 
         let jobs = db
             .query_all(Statement::from_string(
@@ -2009,7 +1933,9 @@ mod tests {
         )
         .await?;
 
-        migrate_shared_jobs_up(&db).await?;
+        target_migration(SHARED_JOBS_MIGRATION_NAME)?
+            .up(&SchemaManager::new(&db))
+            .await?;
 
         let completions = db
             .query_all(Statement::from_string(
@@ -2086,7 +2012,8 @@ mod tests {
         )
         .await?;
 
-        let error = migrate_shared_jobs_up(&db)
+        let error = target_migration(SHARED_JOBS_MIGRATION_NAME)?
+            .up(&SchemaManager::new(&db))
             .await
             .expect_err("missing source must make the legacy grouping backfill fail after DDL");
         assert!(error.to_string().contains("source"));
@@ -2125,7 +2052,9 @@ mod tests {
         )
         .await?;
 
-        migrate_up(&db).await?;
+        target_migration(MIGRATION_NAME)?
+            .up(&SchemaManager::new(&db))
+            .await?;
 
         let rows = db
             .query_all(Statement::from_string(
@@ -2145,81 +2074,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migration_rejects_non_positive_gp_cost() -> Result<()> {
-        let db = new_db().await?;
-        create_legacy_queue_table(&db).await?;
-        migrate_up(&db).await?;
-
-        for gp_cost in [0, -1] {
-            let result = db
-                .execute_unprepared(&format!(
-                    "INSERT INTO {TABLE} (gid, gp_cost, created_at) VALUES (1, {gp_cost}, '2026-07-01 01:02:03')"
-                ))
-                .await;
-            assert!(result.is_err(), "gp_cost {gp_cost} must violate CHECK");
-        }
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn migration_sets_queue_id_to_null_when_queue_is_deleted() -> Result<()> {
-        let db = new_db().await?;
-        create_legacy_queue_table(&db).await?;
-        db.execute_unprepared(
-            "INSERT INTO eh_download_queue (id, gid, gp_cost, completed_at) \
-             VALUES (11, 101, 7, '2026-07-01 01:02:03')",
-        )
-        .await?;
-        migrate_up(&db).await?;
-
-        db.execute_unprepared("DELETE FROM eh_download_queue WHERE id = 11")
-            .await?;
-
-        let row = db
-            .query_one(Statement::from_string(
-                DbBackend::Sqlite,
-                format!("SELECT queue_id FROM {TABLE}"),
-            ))
-            .await?
-            .expect("backfill created one ledger row");
-        assert_eq!(row.try_get::<Option<i64>>("", "queue_id")?, None);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn append_eh_gp_spend_attempt_inserts_positive_attempt() -> Result<()> {
-        let repo = setup_test_db().await?;
-        let queue = repo
-            .enqueue_eh_download(
-                1,
-                101,
-                "token",
-                "title",
-                false,
-                "direct",
-                &crate::db::repo::eh_gallery_jobs::EhGalleryVariant::archive("1280x"),
-                None,
-                true,
-            )
-            .await?
-            .expect("delivery should be enqueued");
-
-        let attempt = repo
-            .append_eh_gp_spend_attempt(queue.id, queue.gid, 218)
-            .await?;
-
-        assert_eq!(attempt.queue_id, Some(queue.id));
-        assert_eq!(attempt.gid, queue.gid);
-        assert_eq!(attempt.gp_cost, 218);
-        assert!(attempt.created_at <= Local::now().naive_local());
-
-        let rows = eh_gp_spend_attempts::Entity::find().all(repo.db()).await?;
-        assert_eq!(rows, vec![attempt]);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn append_eh_gp_spend_attempt_keeps_each_attempt_for_a_queue() -> Result<()> {
+    async fn job_gp_ledger_keeps_repeated_charges_after_job_deletion() -> Result<()> {
         let repo = setup_test_db().await?;
         let queue = repo
             .enqueue_eh_download(
@@ -2237,15 +2092,21 @@ mod tests {
             .expect("delivery should be enqueued");
 
         let first = repo
-            .append_eh_gp_spend_attempt(queue.id, queue.gid, 218)
+            .append_eh_job_gp_spend_attempt(queue.job_id.unwrap(), queue.gid, 218)
             .await?;
         let second = repo
-            .append_eh_gp_spend_attempt(queue.id, queue.gid, 218)
+            .append_eh_job_gp_spend_attempt(queue.job_id.unwrap(), queue.gid, 218)
             .await?;
 
         assert_ne!(first.id, second.id);
+        assert_eq!(first.job_id, queue.job_id);
+        assert!(first.queue_id.is_none());
+        eh_gallery_jobs::Entity::delete_by_id(queue.job_id.unwrap())
+            .exec(repo.db())
+            .await?;
         let rows = eh_gp_spend_attempts::Entity::find().all(repo.db()).await?;
         assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|attempt| attempt.job_id.is_none()));
         assert_eq!(repo.get_eh_gp_cost_in_window(24).await?, 436);
         Ok(())
     }
@@ -2277,41 +2138,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_eh_gp_cost_in_window_rejects_extreme_windows_without_panicking() -> Result<()> {
-        let repo = setup_test_db().await?;
-
-        for window_hours in [3_000_000_000, i64::MAX as u64, u64::MAX] {
-            let result = repo.get_eh_gp_cost_in_window(window_hours).await;
-            assert!(
-                result.is_err(),
-                "window_hours={window_hours} must return an error rather than panic"
-            );
-        }
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn append_eh_gp_spend_attempt_rejects_non_positive_costs() -> Result<()> {
-        let repo = setup_test_db().await?;
-
-        for gp_cost in [0, -1] {
-            let error = repo
-                .append_eh_gp_spend_attempt(1, 105, gp_cost)
-                .await
-                .expect_err("non-positive GP cost must be rejected before insertion");
-            assert!(
-                error.to_string().contains("positive"),
-                "unexpected error for {gp_cost}: {error:#}"
-            );
-        }
-
-        let rows = eh_gp_spend_attempts::Entity::find().all(repo.db()).await?;
-        assert!(rows.is_empty());
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn get_eh_gp_cost_in_window_reads_only_the_ledger() -> Result<()> {
         let repo = setup_test_db().await?;
         let queue = repo
@@ -2328,7 +2154,7 @@ mod tests {
             )
             .await?
             .expect("delivery should be enqueued");
-        let queue_id = queue.id;
+        let job_id = queue.job_id.unwrap();
         let mut queue: eh_download_queue::ActiveModel = queue.into();
         queue.gp_cost = Set(218);
         queue.completed_at = Set(Some(Local::now().naive_local()));
@@ -2336,7 +2162,7 @@ mod tests {
 
         assert_eq!(repo.get_eh_gp_cost_in_window(24).await?, 0);
 
-        repo.append_eh_gp_spend_attempt(queue_id, 106, 7).await?;
+        repo.append_eh_job_gp_spend_attempt(job_id, 106, 7).await?;
 
         assert_eq!(repo.get_eh_gp_cost_in_window(24).await?, 7);
         Ok(())

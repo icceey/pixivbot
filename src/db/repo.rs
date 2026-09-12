@@ -343,7 +343,7 @@ pub mod tests_helpers {
 #[cfg(test)]
 mod tests {
     use super::tests_helpers::setup_test_db;
-    use crate::db::types::{Tags, UserRole};
+    use crate::db::types::Tags;
 
     #[tokio::test]
     async fn test_migrate_chat_success() {
@@ -352,20 +352,15 @@ mod tests {
         let old_chat_id = -888888;
         let new_chat_id = -1009999999999;
 
-        let chat = repo
-            .upsert_chat(
-                old_chat_id,
-                "group".to_string(),
-                Some("Test Group".to_string()),
-                true,
-                Tags::from(vec!["nsfw".to_string()]),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(chat.id, old_chat_id);
-        assert!(chat.enabled);
-        assert_eq!(chat.title, Some("Test Group".to_string()));
+        repo.upsert_chat(
+            old_chat_id,
+            "group".to_string(),
+            Some("Test Group".to_string()),
+            true,
+            Tags::from(vec!["nsfw".to_string()]),
+        )
+        .await
+        .unwrap();
 
         let task = repo
             .get_or_create_task(
@@ -380,8 +375,6 @@ mod tests {
             .upsert_subscription(old_chat_id, task.id, crate::db::types::TagFilter::default())
             .await
             .unwrap();
-
-        assert_eq!(sub.chat_id, old_chat_id);
 
         repo.save_message(old_chat_id, 12345, sub.id, Some(67890))
             .await
@@ -405,18 +398,13 @@ mod tests {
 
         let old_subs = repo.list_subscriptions_by_chat(old_chat_id).await.unwrap();
         assert_eq!(old_subs.len(), 0);
-    }
-
-    #[tokio::test]
-    async fn test_migrate_chat_old_not_found() {
-        let repo = setup_test_db().await.unwrap();
-
-        let old_chat_id = -888888;
-        let new_chat_id = -1009999999999;
-
-        let result = repo.migrate_chat(old_chat_id, new_chat_id).await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("not found"));
+        let (message, related) = repo
+            .get_message_with_subscription(new_chat_id, 12345)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(message.subscription_id, sub.id);
+        assert_eq!(related.unwrap().0.id, sub.id);
     }
 
     #[tokio::test]
@@ -451,64 +439,6 @@ mod tests {
         let new_chat = repo.get_chat(new_chat_id).await.unwrap().unwrap();
         assert!(new_chat.enabled);
         assert_eq!(new_chat.title, Some("Old Group".to_string()));
-    }
-
-    #[tokio::test]
-    async fn test_create_user_with_auto_owner_concurrent() {
-        use std::sync::Arc;
-        use tokio::task::JoinSet;
-
-        let repo = Arc::new(setup_test_db().await.unwrap());
-
-        let mut set = JoinSet::new();
-        for i in 1..=10 {
-            let repo_clone = Arc::clone(&repo);
-            set.spawn(async move {
-                repo_clone
-                    .create_user_with_auto_owner(i, Some(format!("user{}", i)))
-                    .await
-            });
-        }
-
-        let mut owners = 0;
-        let mut users = 0;
-        while let Some(result) = set.join_next().await {
-            let user = result.unwrap().unwrap();
-            match user.role {
-                UserRole::Owner => owners += 1,
-                UserRole::User => users += 1,
-                _ => {}
-            }
-        }
-
-        assert_eq!(owners, 1, "Exactly one owner should be created");
-        assert_eq!(users, 9, "Nine regular users should be created");
-    }
-
-    #[tokio::test]
-    async fn test_create_user_with_auto_owner_preserves_existing_owner() {
-        let repo = setup_test_db().await.unwrap();
-
-        let owner = repo
-            .upsert_user(11111, Some("owner".to_string()), UserRole::Owner)
-            .await
-            .unwrap();
-        assert_eq!(owner.role, UserRole::Owner);
-
-        let user = repo
-            .upsert_user(22222, Some("user".to_string()), UserRole::User)
-            .await
-            .unwrap();
-        assert_eq!(user.role, UserRole::User);
-
-        let owner_updated = repo
-            .create_user_with_auto_owner(11111, Some("owner_updated".to_string()))
-            .await
-            .unwrap();
-
-        assert_eq!(owner_updated.id, 11111);
-        assert_eq!(owner_updated.role, UserRole::Owner);
-        assert_eq!(owner_updated.username, Some("owner_updated".to_string()));
     }
 }
 

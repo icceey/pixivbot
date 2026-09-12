@@ -125,7 +125,7 @@ fn build_handler_tree(
         .chain(middleware::filter_user_chat())
         .filter(|cmd: Command, ctx: UserChatContext| {
             // 仅当用户是管理员且命令是 EnableChat 或 DisableChat 时处理
-            ctx.user_role().is_admin()
+            ctx.user.role.is_admin()
                 && matches!(cmd, Command::EnableChat(_) | Command::DisableChat(_))
         })
         .endpoint(handle_command);

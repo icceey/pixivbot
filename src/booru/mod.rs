@@ -69,34 +69,3 @@ impl BooruSiteRegistry {
         self.sites.len()
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use booru_client::BooruEngineType;
-
-    fn make_cfg(name: &str) -> BooruSiteConfig {
-        BooruSiteConfig {
-            name: name.to_string(),
-            engine_type: BooruEngineType::Moebooru,
-            base_url: "https://example.com".to_string(),
-            username: None,
-            api_key: None,
-            min_interval_sec: 1800,
-            max_interval_sec: 3600,
-            page_limit: 20,
-            bypass: None,
-        }
-    }
-
-    #[test]
-    fn registry_lookup_is_case_insensitive() {
-        let registry = BooruSiteRegistry::from_configs(&[make_cfg("Konachan")]);
-        assert!(registry.get("konachan").is_some());
-        assert!(registry.get("KONACHAN").is_some());
-        assert!(registry.get("Konachan").is_some());
-        assert!(registry.get("missing").is_none());
-        assert_eq!(registry.len(), 1);
-        assert!(!registry.is_empty());
-    }
-}

@@ -1,7 +1,7 @@
 # E-Hentai archiver.php Page Reference
 
 Source: real captures provided by user (2026-07-18). Used by `eh_client/parser.rs`
-and `src/scheduler/eh_engine.rs` to gate archive size and GP-spending downloads.
+and `src/scheduler/eh_engine/download.rs` to gate archive size and GP-spending downloads.
 
 ## Page Structure (consistent across all 4 samples)
 

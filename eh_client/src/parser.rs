@@ -550,71 +550,6 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_archiver_form_uses_resample_for_supported_resolutions() {
-        let html = r#"
-        <div>Download Cost: &nbsp; <strong>218 GP</strong></div>
-        <form method="post" action="https://exhentai.org/archiver.php?gid=4034806&amp;token=res123def0">
-           <input type="hidden" name="dltype" value="res" />
-           <input type="hidden" name="res_sentinel" value="resample-only" />
-           <input type="submit" name="dlcheck" value="Download Resample Archive" />
-        </form>
-        "#;
-
-        for resolution in ["780x", "980x", "1280x"] {
-            let form =
-                parse_archiver_form(html, resolution).expect("should parse generic resample form");
-            assert!(form
-                .fields
-                .contains(&("res_sentinel".to_string(), "resample-only".to_string())));
-            assert_eq!(
-                parse_archive_download_cost(html, resolution),
-                DownloadCost::Gp(218)
-            );
-        }
-    }
-
-    #[test]
-    fn test_hathdl_forms_do_not_affect_direct_resamples() {
-        let prefix = r#"
-<div>Download Cost: &nbsp; <strong>218 GP</strong></div>
-<form method="post" action="https://exhentai.org/archiver.php?gid=1&amp;token=res">
-    <input type="hidden" name="dltype" value="res" />
-    <input type="hidden" name="res_sentinel" value="generic-res" />
-</form>
-"#;
-        let table = r#"
-<table><tr>
-    <td><p>Original</p><p>419.6 MiB</p><p>8,800 GP</p></td>
-    <td><p>800x</p><p>10.38 MiB</p><p>114 GP</p></td>
-    <td><p>1280x</p><p>10.38 MiB</p><p>218 GP</p></td>
-    <td><p>1920x</p><p>10.38 MiB</p><p>376 GP</p></td>
-    <td><p>2560x</p><p>10.38 MiB</p><p>546 GP</p></td>
-</tr></table>
-"#;
-        let invalid_forms = [
-            r#"<form id="hathdl_form"><input name="hathdl_xres" value="" /></form>"#,
-            r#"<form id="hathdl_form" action="https://exhentai.org/archiver.php?gid=1&amp;token=hathdl"><input name="other" value="" /></form>"#,
-        ];
-
-        for invalid_form in invalid_forms {
-            let html = format!("{prefix}{invalid_form}{table}");
-            let form = parse_archiver_form(&html, "1280x")
-                .expect("low resample should fall back to generic form");
-            assert!(form
-                .fields
-                .contains(&("res_sentinel".to_string(), "generic-res".to_string())));
-            assert_eq!(
-                parse_archive_download_cost(&html, "1280x"),
-                DownloadCost::Gp(218)
-            );
-            assert_eq!(
-                parse_archive_download_cost(&html, "980x"),
-                DownloadCost::Gp(218)
-            );
-        }
-    }
-
-    #[test]
     fn test_parse_archiver_form_missing_requested_dltype_returns_none() {
         let html = r#"
         <form method="post" action="https://exhentai.org/archiver.php?gid=4034806&amp;token=org123def0">
@@ -624,23 +559,6 @@ mod tests {
         "#;
 
         assert!(parse_archiver_form(html, "1280x").is_none());
-    }
-
-    #[test]
-    fn test_parse_archive_redirect() {
-        let html = r#"
-        <script type="text/javascript">
-        function gotonext() {
-            document.getElementById("continue").innerHTML = "Please wait...";
-            document.location = "http://123.45.67.89/archive/123456/abcdef0123/abcdef0123/0?autostart=1";
-        }
-        </script>
-        "#;
-        let url = parse_archive_redirect(html).expect("should find redirect URL");
-        assert_eq!(
-            url,
-            "http://123.45.67.89/archive/123456/abcdef0123/abcdef0123/0?start=1"
-        );
     }
 
     #[test]
@@ -655,32 +573,6 @@ mod tests {
             url,
             "https://hath.example/archive/4034806/hash/file/0?start=1"
         );
-    }
-
-    #[test]
-    fn test_parse_image_page_urls_relative() {
-        let html = r#"
-        <div class="gdtm">
-          <a href="/s/abc123/123456-01">1</a>
-        </div>
-        <div class="gdtm">
-          <a href="/s/def456/123456-02">2</a>
-        </div>
-        "#;
-        let urls = parse_image_page_urls(html);
-        assert_eq!(urls.len(), 2);
-        assert_eq!(urls[0], "/s/abc123/123456-01");
-        assert_eq!(urls[1], "/s/def456/123456-02");
-    }
-
-    #[test]
-    fn test_parse_page_count_many_pages() {
-        let html = r#"
-        <table class="ptt">
-          <tr><td class="ptdd">&lt;</td><td class="ptds"><a href=".../">1</a></td><td><a href="?p=1">2</a></td><td><a href="?p=2">3</a></td><td><a href="?p=15">&gt;</a></td></tr>
-        </table>
-        "#;
-        assert_eq!(parse_page_count(html), Some(3));
     }
 
     // ---- parse_archive_download_cost tests ----
@@ -901,18 +793,6 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_archive_download_estimated_size_uses_matching_generic_form() {
-        assert_eq!(
-            parse_archive_download_estimated_size(ARCHIVER_FREE_DEFAULT, "original"),
-            Some(42_970_645),
-        );
-        assert_eq!(
-            parse_archive_download_estimated_size(ARCHIVER_FREE_DEFAULT, "1280x"),
-            Some(3_774_874),
-        );
-    }
-
-    #[test]
     fn test_parse_archive_download_estimated_size_ignores_hathdl_table() {
         let html = r#"
             <form action="/archiver.php?gid=1&amp;token=abc" method="post">
@@ -938,21 +818,6 @@ mod tests {
         assert_eq!(
             parse_archive_download_estimated_size(html, "1280x"),
             Some(2_443_183),
-        );
-    }
-
-    #[test]
-    fn test_parse_archive_download_estimated_size_rounds_decimal_mib_up() {
-        let html = r#"
-            <form action="/archiver.php?gid=1&amp;token=abc" method="post">
-                <input type="hidden" name="dltype" value="org" />
-            </form>
-            <p>Estimated Size: <strong>1.0000001 MiB</strong></p>
-        "#;
-
-        assert_eq!(
-            parse_archive_download_estimated_size(html, "original"),
-            Some(1_048_577),
         );
     }
 

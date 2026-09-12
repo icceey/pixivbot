@@ -133,6 +133,21 @@ mod tests {
         assert_eq!(runtime.split_input().cursor, 253);
         assert_eq!(runtime.ewma, Some(91.0));
         assert!(runtime.has_stable_sample);
+        assert_eq!(
+            apply_part_sample(
+                &mut runtime,
+                PartSample {
+                    durable_len: 153,
+                    window_delta: 0,
+                    elapsed: Duration::from_secs(1),
+                    ..short
+                }
+            )
+            .unwrap(),
+            SampleDisposition::Reconciled
+        );
+        assert_eq!(runtime.downloaded, 153);
+        assert_eq!(runtime.ewma, Some(91.0));
     }
 
     #[test]

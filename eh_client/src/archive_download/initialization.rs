@@ -1,5 +1,5 @@
 use super::artifacts::ArchiveArtifacts;
-use super::http::{archive_get, archive_http_error};
+use super::http::{archive_get, archive_http_error, parse_content_range_header};
 use super::manifest::{ArchiveManifest, ManifestPart};
 use super::part::{select_validator, SeedResponse};
 use crate::error::Result;
@@ -76,13 +76,9 @@ async fn create_initial_state(
 }
 
 fn initial_content_range_total(headers: &reqwest::header::HeaderMap) -> Option<u64> {
-    let value = headers.get(CONTENT_RANGE)?.to_str().ok()?;
-    let range = value.strip_prefix("bytes ")?;
-    let (bounds, total) = range.split_once('/')?;
-    let (start, end) = bounds.split_once('-')?;
-    let start = start.parse::<u64>().ok()?;
-    let end = end.parse::<u64>().ok()?;
-    let total = total.parse::<u64>().ok()?;
+    let (start, end, total) =
+        parse_content_range_header(headers.get(CONTENT_RANGE)?.to_str().ok()?)?;
+    let total = total?;
     (start == 0 && total != 0 && end.checked_add(1) == Some(total)).then_some(total)
 }
 

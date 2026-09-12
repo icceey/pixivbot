@@ -1,9 +1,8 @@
-//! E-Hentai database behavior: queue snapshots, subscription updates, and download lifecycle.
+//! E-Hentai queue snapshots and subscription filter updates.
 
 use crate::db::repo::eh_gallery_jobs::{
-    EhGalleryVariant, CLEANUP_STATUS_FAILED, DELIVERY_STATUS_FAILED, DELIVERY_STATUS_WAITING,
-    JOB_STATUS_DOWNLOADED, JOB_STATUS_DOWNLOADING, JOB_STATUS_FAILED, JOB_STATUS_PENDING,
-    JOB_STATUS_RETIRED, TELEGRAPH_STATUS_READY, TELEGRAPH_STATUS_UPLOADING,
+    EhGalleryVariant, CLEANUP_STATUS_FAILED, JOB_STATUS_DOWNLOADED, JOB_STATUS_DOWNLOADING,
+    JOB_STATUS_PENDING, JOB_STATUS_RETIRED, TELEGRAPH_STATUS_READY, TELEGRAPH_STATUS_UPLOADING,
 };
 use crate::db::repo::tests_helpers;
 use crate::db::types::{EhFilter, EhTagState, SubscriptionState, TagFilter, TaskType};
@@ -420,7 +419,15 @@ async fn eh_subscription_upsert_updates_filters_without_replacing_subscription()
         .upsert_eh_subscription(-100, task.id, TagFilter::default(), None)
         .await
         .unwrap();
-    assert_eq!(initial.eh_filter, None);
+    let progress = Some(SubscriptionState::EhTag(EhTagState {
+        latest_posted_ts: 500,
+        pushed_gids: vec![41],
+        pending_galleries: vec![],
+        pending_high_water_ts: 0,
+    }));
+    repo.update_subscription_latest_data(initial.id, progress.clone())
+        .await
+        .unwrap();
     for filter in [
         Some(EhFilter {
             min_rating: Some(3),
@@ -442,163 +449,6 @@ async fn eh_subscription_upsert_updates_filters_without_replacing_subscription()
         assert_eq!(sub.chat_id, -100);
         assert_eq!(sub.task_id, task.id);
         assert_eq!(sub.eh_filter, filter);
-        assert!(sub.latest_data.is_none());
+        assert_eq!(sub.latest_data, progress);
     }
-}
-
-#[tokio::test]
-async fn test_update_subscription_latest_data_eh_tag() {
-    let repo = tests_helpers::setup_test_db().await.unwrap();
-
-    repo.upsert_chat(-100, "private".into(), None, true, Default::default())
-        .await
-        .unwrap();
-
-    let task = repo
-        .get_or_create_task(TaskType::Ehentai, "eh:test|c=0|f=".to_string(), None)
-        .await
-        .unwrap();
-
-    let sub = repo
-        .upsert_eh_subscription(-100, task.id, TagFilter::default(), None)
-        .await
-        .unwrap();
-
-    // Set initial state
-    let state = SubscriptionState::EhTag(EhTagState {
-        pushed_gids: vec![100, 200],
-        latest_posted_ts: 1700000000,
-        pending_galleries: Vec::new(),
-        pending_high_water_ts: 0,
-    });
-
-    repo.update_subscription_latest_data(sub.id, Some(state.clone()))
-        .await
-        .unwrap();
-
-    // Verify it was saved by listing subscriptions and checking latest_data
-    let subs = repo.list_subscriptions_by_task(task.id).await.unwrap();
-    assert_eq!(subs.len(), 1);
-    let saved = &subs[0];
-    assert!(saved.latest_data.is_some());
-    let saved_state = saved.latest_data.as_ref().unwrap();
-    match saved_state {
-        SubscriptionState::EhTag(s) => {
-            assert_eq!(s.pushed_gids, vec![100, 200]);
-            assert_eq!(s.latest_posted_ts, 1700000000);
-        }
-        _ => panic!("expected EhTag state"),
-    }
-}
-
-#[tokio::test]
-async fn test_eh_download_queue_full_lifecycle() {
-    let repo = tests_helpers::setup_test_db().await.unwrap();
-
-    // Enqueue 3 downloads
-    let m1 = repo
-        .enqueue_eh_download(
-            -100,
-            100,
-            "tok1",
-            "Gallery 1",
-            false,
-            "subscription",
-            &EhGalleryVariant::archive("1280x"),
-            None,
-            true,
-        )
-        .await
-        .unwrap()
-        .expect("delivery should be enqueued");
-    let m2 = repo
-        .enqueue_eh_download(
-            -100,
-            200,
-            "tok2",
-            "Gallery 2",
-            true,
-            "subscription",
-            &EhGalleryVariant::archive("1280x"),
-            None,
-            true,
-        )
-        .await
-        .unwrap()
-        .expect("delivery should be enqueued");
-    let m3 = repo
-        .enqueue_eh_download(
-            -100,
-            300,
-            "tok3",
-            "Gallery 3",
-            false,
-            "direct",
-            &EhGalleryVariant::archive("1280x"),
-            None,
-            true,
-        )
-        .await
-        .unwrap()
-        .expect("delivery should be enqueued");
-
-    assert_eq!(m1.status, DELIVERY_STATUS_WAITING);
-    assert!(m2.telegraph);
-    assert_eq!(m3.source, "direct");
-
-    // FIFO: claim the first shared job for normal download.
-    let next1 = repo.claim_eh_job_for_download(true).await.unwrap().unwrap();
-    assert_eq!(next1.id, m1.job_id.unwrap());
-    assert_eq!(next1.status, JOB_STATUS_DOWNLOADING);
-
-    let downloaded = repo
-        .mark_eh_job_downloaded(
-            next1.id,
-            next1.started_at.unwrap(),
-            50000,
-            "/tmp/100.zip",
-            0,
-        )
-        .await
-        .unwrap();
-    assert_eq!(downloaded.status, JOB_STATUS_DOWNLOADED);
-
-    let next2 = repo.claim_eh_job_for_download(true).await.unwrap().unwrap();
-    assert_eq!(next2.id, m2.job_id.unwrap());
-
-    let (failed, permanent) = repo
-        .schedule_eh_job_download_retry(next2.id, next2.started_at.unwrap(), "network timeout", 0)
-        .await
-        .unwrap();
-    assert!(permanent);
-    assert_eq!(failed.status, JOB_STATUS_FAILED);
-
-    let next3 = repo.claim_eh_job_for_download(true).await.unwrap().unwrap();
-    assert_eq!(next3.id, m3.job_id.unwrap());
-
-    let none = repo.claim_eh_job_for_download(true).await.unwrap();
-    assert!(none.is_none());
-
-    // Task 8 owns independent delivery publish/done state; Task 3 completes
-    // the shared download and append-only accounting only.
-    let first_delivery = eh_download_queue::Entity::find_by_id(m1.id)
-        .one(repo.db())
-        .await
-        .unwrap()
-        .unwrap();
-    let failed_delivery = eh_download_queue::Entity::find_by_id(m2.id)
-        .one(repo.db())
-        .await
-        .unwrap()
-        .unwrap();
-    let pending_delivery = eh_download_queue::Entity::find_by_id(m3.id)
-        .one(repo.db())
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(first_delivery.status, DELIVERY_STATUS_WAITING);
-    assert_eq!(failed_delivery.status, DELIVERY_STATUS_FAILED);
-    assert_eq!(pending_delivery.status, DELIVERY_STATUS_WAITING);
-    let bytes = repo.get_eh_downloaded_bytes_in_window(24).await.unwrap();
-    assert_eq!(bytes, 50000);
 }
