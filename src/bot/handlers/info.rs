@@ -71,6 +71,8 @@ impl BotHandler {
    \- `\+tag`: 仅包含带有此标签的作品
    \- `\-tag`: 排除带有此标签的作品
    \- 示例: `/subrank day \+原神`
+   \- 排除 AI 生成作品: `/subrank day \-AI生成`
+   \- 也可在 /settings 的排除标签或敏感标签中添加 `AI生成`
 
 🗑 `/unsub <author_id,...>`
    取消订阅作者

@@ -62,6 +62,9 @@ pub struct Illust {
     pub height: u32,
     pub sanity_level: u32,
     pub x_restrict: u32,
+    /// AI 属性：0 未指定，1 非 AI 生成，2 AI 生成；缺失或未知值不视为 AI 标记。
+    #[serde(default)]
+    pub illust_ai_type: u32,
     #[serde(default)]
     pub series: Option<serde_json::Value>,
     pub meta_single_page: MetaSinglePage,

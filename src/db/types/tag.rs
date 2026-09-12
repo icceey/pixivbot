@@ -150,10 +150,8 @@ impl TagFilter {
         }
 
         // Normalize illust tags once
-        let illust_tags: Vec<String> = illust
-            .tags
-            .iter()
-            .map(|t| tag::normalize_tag(&t.name))
+        let illust_tags: Vec<String> = tag::pixiv_tag_names(illust)
+            .map(tag::normalize_tag)
             .collect();
 
         self.matches_normalized_tags(&illust_tags)

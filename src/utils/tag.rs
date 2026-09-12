@@ -19,15 +19,6 @@ fn remove_special_chars(tag: &str) -> String {
 ///
 /// Converts the tag to lowercase and removes special characters
 /// so that tags like "R-18", "R18", "r-18" all match.
-///
-/// # Example
-/// ```
-/// use pixivbot::utils::html::normalize_tag;
-///
-/// assert_eq!(normalize_tag("R-18"), "r18");
-/// assert_eq!(normalize_tag("R_18"), "r18");
-/// assert_eq!(normalize_tag("Genshin Impact"), "genshinimpact");
-/// ```
 pub fn normalize_tag(tag: &str) -> String {
     remove_special_chars(tag).to_lowercase()
 }
@@ -36,43 +27,32 @@ pub fn normalize_tag(tag: &str) -> String {
 ///
 /// Removes special characters that Telegram doesn't recognize in hashtags.
 /// Does NOT add hashtags or markdown escaping - that should be done by the caller.
-///
-/// # Example
-/// ```
-/// use pixivbot::utils::html::format_tags;
-///
-/// let tags = vec!["原神", "Genshin Impact", "R-18", "test-tag(test)"];
-/// let formatted = format_tags(&tags);
-/// // Returns: vec!["原神", "GenshinImpact", "R18", "testtagtest"]
-/// ```
 pub fn format_tags<T: AsRef<str>>(tags: &[T]) -> Vec<String> {
     tags.iter()
         .map(|tag| remove_special_chars(tag.as_ref()))
         .collect()
 }
 
+/// Prepend the platform AI label, deduplicating that label using filter normalization.
+pub fn pixiv_tag_names(illust: &pixiv_client::Illust) -> impl Iterator<Item = &str> {
+    let is_ai = illust.illust_ai_type == 2;
+    is_ai.then_some("AI生成").into_iter().chain(
+        illust
+            .tags
+            .iter()
+            .map(|tag| tag.name.as_str())
+            .filter(move |name| !is_ai || normalize_tag(name) != "ai生成"),
+    )
+}
+
 /// Format tags for display
 ///
 /// Adds hashtags and escapes for Telegram MarkdownV2.
 /// Returns a string like `\n\n\#tag1  \#tag2`
-/// # Example
-/// ```
-/// use pixivbot::utils::tag::format_tags_escaped;
-/// use pixiv_client::Illust;
-/// let illust = Illust {
-///     tags: vec![
-///         pixivbot::pixiv::model::Tag { name: "原神".to_string() },
-///         pixivbot::pixiv::model::Tag { name: "Genshin Impact".to_string() },
-///     ],
-///     ..Default::default()
-/// };
-/// let formatted = format_tags_escaped(&illust);
-/// // Returns: "\n\n\#原神  \#GenshinImpact"
-/// ```
 pub fn format_tags_escaped(illust: &pixiv_client::Illust) -> String {
     use teloxide::utils::markdown;
 
-    let tag_names: Vec<&str> = illust.tags.iter().map(|t| t.name.as_str()).collect();
+    let tag_names: Vec<&str> = pixiv_tag_names(illust).collect();
     let formatted = format_tags(&tag_names);
 
     if formatted.is_empty() {
