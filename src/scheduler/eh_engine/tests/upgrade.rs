@@ -50,7 +50,7 @@ async fn old_queue_upgrade_downloads_once_and_preserves_gp_and_delivery_progress
     repo.handoff_legacy_eh_archive_artifacts(&cache_dir)
         .await
         .unwrap();
-    repo.cleanup_eh_cache_orphans(&cache_dir, None)
+    repo.cleanup_eh_cache_orphans(&cache_dir, None, true)
         .await
         .unwrap();
     drain_eh_job_cleanup_maintenance(&repo, None, 1, true)

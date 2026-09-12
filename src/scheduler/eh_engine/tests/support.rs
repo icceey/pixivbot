@@ -807,6 +807,7 @@ impl ImageUploader for ZipFirstMockUploader {
 #[derive(Default)]
 pub(super) struct TerminalCleanupMockUploader {
     pub(super) cleanup_calls: std::sync::Mutex<Vec<(std::path::PathBuf, bool)>>,
+    pub(super) cleanup_attempted: tokio::sync::Notify,
     pub(super) fail_abort: bool,
 }
 
@@ -837,15 +838,17 @@ impl ImageUploader for TerminalCleanupMockUploader {
         ))
     }
 
-    async fn abort_upload_state(&self, uploads_dir: &std::path::Path) -> eh_client::Result<()> {
+    async fn abort_upload_state(
+        &self,
+        uploads_dir: &std::path::Path,
+    ) -> Result<(), eh_client::UploadStateError> {
         self.cleanup_calls
             .lock()
             .unwrap()
             .push((uploads_dir.to_path_buf(), uploads_dir.exists()));
+        self.cleanup_attempted.notify_one();
         if self.fail_abort {
-            return Err(eh_client::Error::Other(
-                "mock terminal Abort failure".to_string(),
-            ));
+            return Err(eh_client::UploadStateError::AbortHttp(503));
         }
         Ok(())
     }

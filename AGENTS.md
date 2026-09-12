@@ -8,6 +8,14 @@
 - H.264/ugoira encoder tests are behind `--features ffmpeg-codec`; only run them when the local FFmpeg has a working H.264 encoder.
 - Markdown-only docs can be verified with `git diff --check -- <path>`; do not run the full Rust CI for docs-only edits unless code or generated files changed.
 
+## Pre-Delivery Self-Review (Required)
+
+- Before delivering code, review the final diff and affected code paths against every applicable instruction in this file, scoped `AGENTS.md` files, and the user's requirements. This review is mandatory even when formatting, compilation, tests, and CI pass.
+- Check for unnecessary abstractions, pass-through wrappers, redundant defensive checks, speculative APIs, dead code, unused imports/parameters, and incomplete feature removal. Verify references across the workspace and relevant feature-gated paths before removing code; preserve implicit protocol, persistence, and resource-lifetime contracts.
+- Review the necessity of every added or modified test using the Testing Notes below. Remove low-value and redundant tests with their exclusive fixtures/helpers; do not justify keeping them by production-code calls, regression labels, case counts, or green results.
+- Verify that behavior changes stay within the requested scope and that affected configuration, documentation, migrations, error messages, and shared call paths remain consistent. Check changed code and fixtures for real credentials or private configuration; do not inspect the local `config.toml` to perform this check.
+- Confirm the actual toolchain used and complete the checks required for the change. Fix every identified instruction violation before handoff, then review the resulting diff again. Report the self-review outcome and validation performed in the delivery response, with any unresolved limitation stated explicitly; do not claim compliance while known violations remain.
+
 ## Code Cleanup Constraints
 
 - Keep implementations direct: do not add speculative APIs, pass-through wrappers, unused parameters, no-op branches, or duplicate branches with identical behavior.
@@ -92,15 +100,21 @@
 
 ## Testing Notes
 
-- Add a test only for a concrete failure or behavior of real production code. Mocks may replace external boundaries, but the behavior under test must call the actual implementation; do not copy an algorithm into a test and assert that copy's result.
+- Add only necessary unit tests. If no additional unit test is necessary, add none; delivering a change with zero new tests is acceptable. Never add tests to pursue coverage, raise line/branch/function coverage percentages, cover every changed path, or satisfy a test-count target.
+- A test must protect against a specific, non-trivial failure that code review, the compiler, and existing coverage do not adequately catch. A new feature, a changed branch, an uncovered code path, or a hypothetical future regression is not sufficient justification.
+- Calling real production code is necessary but does not make a test valuable. Mocks may replace external boundaries, but do not copy an algorithm into a test or turn a trivial assertion into an apparent integration test by calling it through more layers.
 - Do not add or retain tests that only check source text, file/symbol existence, function signatures, type fields, fixed configuration/constant values, trivial accessors, or data assignment. Serialization tests must protect an actual protocol or persistence contract, not merely a derived round trip or field presence.
-- Check existing coverage before adding a case. Extend an existing behavior test when appropriate, and remove redundant cases; do not disguise low-value assertions by renaming or combining them. Preserve distinct failure paths, boundary conditions, concurrency guarantees, and regression scenarios.
+- Treat tests that merely restate simple enum comparisons, boolean switches, tag membership, case normalization, string concatenation, or established include/exclude priority as low-value. Enumerating missing/default/known/unknown values or combinations of switches does not by itself justify a test.
+- Specifically, checking that an AI flag adds a label, repeating that label assertion through several caption builders, or checking that existing tag filters and blur switches react to the label are low-value tests. Do not retain them merely because they call production functions or are described as behavior/regression coverage.
+- Large synthetic fixtures, hand-picked result lists, and caption prefix/suffix assertions do not add value when the assertion still mirrors a straightforward implementation. Do not replace rejected unit tests with larger mocks, table-driven cases, or renamed integration tests that make the same assertions.
+- Before adding or retaining a test, identify the actual failure mechanism and the observable consequence it uniquely checks. Examples that can justify a test include malformed protocol input accepted unexpectedly, lost or duplicate work after partial failure/restart, broken transaction guarantees, or a reproducible concurrency race. Broad labels such as "boundary case", "state transition", "real behavior", or "regression" are not a justification on their own.
+- Check existing coverage first. Extend an existing justified test when appropriate; remove redundant or low-value tests together with their exclusive fixtures, helpers, mocks, and imports before delivery. Do not defend tests by their count, number of cases, passing result, or coverage percentage.
 - Do not create test-only constructors or business wrappers to preserve outdated call sites. Exercise the current production entrypoint with explicit inputs. Keep test setup limited to state and mocks that the test actually uses.
 - Synchronize concurrent tests on observable events or completion rather than arbitrary sleeps. Test servers must actually receive the intended request before asserting transport behavior; retries or longer waits must not mask a broken fixture.
-- Prefer small colocated `#[cfg(test)]` tests for parsing, state transitions, caption/Markdown output, and repo behavior that meet these criteria; several tests assert exact MarkdownV2 strings.
+- Parsing, state transitions, caption/Markdown output, and repo behavior are subject to the same necessity threshold. Exact output assertions and colocated `#[cfg(test)]` organization do not exempt a test from these rules.
 - Link parser tests cover Pixiv ordering and booru engine-specific URL support; update them when changing supported URL forms.
 - `BooruTaskKey` tests cover task-value encoding and filter signatures; adjust tests when task sharing semantics change.
-- For config or access-control changes, prefer focused unit tests around parsing, role checks, middleware filters, or command visibility instead of broad integration tests.
+- Apply the same threshold to config and access-control changes. Do not automatically add default-value, role-predicate, or command-visibility truth tables; a security test must demonstrate a concrete unauthorized-access risk through the relevant production checks.
 
 ## Release And Runtime
 

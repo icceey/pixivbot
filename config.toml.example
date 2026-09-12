@@ -230,6 +230,8 @@ download_original_threshold = 1
 # # Rolling window length (in hours) for `gp_rate_limit` (default: 24).
 # gp_rate_window_hours = 24
 # # Poll interval for download processor (seconds, default: 60)
+# # Also controls the wait between orphan cache cleanup sweeps (minimum: 10s).
+# # Cleanup runs alongside downloads; failed Abort attempts retain files for retry.
 # download_poll_interval_sec = 60
 # # Max pushed GIDs to remember per subscription (default: 500)
 # pushed_cap = 500

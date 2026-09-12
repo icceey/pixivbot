@@ -1,4 +1,4 @@
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, UploadStateError};
 use crate::s3_multipart::{
     abort_upload_state as abort_multipart_upload_state, fingerprint_fields, upload_multipart,
     uploader_identity_fingerprint, zip_put_extension_is_explicitly_unsupported, CapabilityState,
@@ -591,7 +591,7 @@ struct CompleteMultipartUploadResult {
 }
 
 fn validate_complete_multipart_upload_result_xml(body: &[u8]) -> Result<()> {
-    const ROOT_ELEMENT: &[u8] = b"CompleteMultipartUploadResult";
+    const ROOT_ELEMENT: &str = "CompleteMultipartUploadResult";
 
     let mut reader = quick_xml::Reader::from_reader(body);
     let mut buffer = Vec::new();
@@ -621,7 +621,7 @@ fn validate_complete_multipart_upload_result_xml(body: &[u8]) -> Result<()> {
                 | quick_xml::events::Event::DocType(_),
             ) => {}
             Ok(quick_xml::events::Event::Text(text))
-                if text.iter().all(u8::is_ascii_whitespace) => {}
+                if text.as_bytes().iter().all(u8::is_ascii_whitespace) => {}
             Ok(quick_xml::events::Event::Eof) | Ok(_) => {
                 return Err(Error::Other(
                     "invalid CompleteMultipartUploadResult XML: expected CompleteMultipartUploadResult root element".into(),
@@ -652,7 +652,7 @@ fn validate_complete_multipart_upload_result_xml(body: &[u8]) -> Result<()> {
             Ok(quick_xml::events::Event::Eof) => return Ok(()),
             Ok(quick_xml::events::Event::Comment(_) | quick_xml::events::Event::PI(_)) => {}
             Ok(quick_xml::events::Event::Text(text))
-                if text.iter().all(u8::is_ascii_whitespace) => {}
+                if text.as_bytes().iter().all(u8::is_ascii_whitespace) => {}
             Ok(_) => {
                 return Err(Error::Other(
                     "invalid CompleteMultipartUploadResult XML: trailing XML content after root element"
@@ -731,8 +731,8 @@ fn ipfs3_zip_multipart_complete_root(body: &[u8]) -> Result<IpfS3ZipMultipartCom
         match reader.read_event_into(&mut buffer) {
             Ok(quick_xml::events::Event::Start(element))
             | Ok(quick_xml::events::Event::Empty(element)) => match element.name().as_ref() {
-                b"DecompressZipResult" => return Ok(IpfS3ZipMultipartCompleteRoot::DecompressZip),
-                b"CompleteMultipartUploadResult" => {
+                "DecompressZipResult" => return Ok(IpfS3ZipMultipartCompleteRoot::DecompressZip),
+                "CompleteMultipartUploadResult" => {
                     return Ok(IpfS3ZipMultipartCompleteRoot::Standard)
                 }
                 _ => {
@@ -748,7 +748,7 @@ fn ipfs3_zip_multipart_complete_root(body: &[u8]) -> Result<IpfS3ZipMultipartCom
                 | quick_xml::events::Event::DocType(_),
             ) => {}
             Ok(quick_xml::events::Event::Text(text))
-                if text.iter().all(u8::is_ascii_whitespace) => {}
+                if text.as_bytes().iter().all(u8::is_ascii_whitespace) => {}
             Ok(quick_xml::events::Event::Eof) | Ok(_) => {
                 return Err(Error::Other(
                     "invalid ipfS3 ZIP multipart Complete XML: expected a result root element"
@@ -816,7 +816,10 @@ pub trait ImageUploader: Send + Sync {
         false
     }
 
-    async fn abort_upload_state(&self, _uploads_dir: &std::path::Path) -> Result<()> {
+    async fn abort_upload_state(
+        &self,
+        _uploads_dir: &std::path::Path,
+    ) -> std::result::Result<(), UploadStateError> {
         Ok(())
     }
 
@@ -1149,7 +1152,10 @@ impl S3Uploader {
 
 #[async_trait]
 impl ImageUploader for S3Uploader {
-    async fn abort_upload_state(&self, uploads_dir: &std::path::Path) -> Result<()> {
+    async fn abort_upload_state(
+        &self,
+        uploads_dir: &std::path::Path,
+    ) -> std::result::Result<(), UploadStateError> {
         abort_multipart_upload_state(
             self.bucket.as_ref(),
             ProviderKind::S3,
@@ -2002,7 +2008,10 @@ impl ImageUploader for IpfS3Uploader {
         self.config.zip_extract_enabled
     }
 
-    async fn abort_upload_state(&self, uploads_dir: &std::path::Path) -> Result<()> {
+    async fn abort_upload_state(
+        &self,
+        uploads_dir: &std::path::Path,
+    ) -> std::result::Result<(), UploadStateError> {
         abort_multipart_upload_state(
             self.bucket.as_ref(),
             ProviderKind::IpfS3,
@@ -2089,7 +2098,7 @@ struct IpfS3ZipExtractFailure {
 }
 
 fn validate_ipfs3_zip_extract_result_xml(body: &[u8]) -> Result<()> {
-    const ROOT_ELEMENT: &[u8] = b"DecompressZipResult";
+    const ROOT_ELEMENT: &str = "DecompressZipResult";
 
     let mut reader = quick_xml::Reader::from_reader(body);
     let mut buffer = Vec::new();
@@ -2121,7 +2130,7 @@ fn validate_ipfs3_zip_extract_result_xml(body: &[u8]) -> Result<()> {
                 | quick_xml::events::Event::DocType(_),
             ) => {}
             Ok(quick_xml::events::Event::Text(text))
-                if text.iter().all(u8::is_ascii_whitespace) => {}
+                if text.as_bytes().iter().all(u8::is_ascii_whitespace) => {}
             Ok(quick_xml::events::Event::Eof) | Ok(_) => {
                 return Err(Error::Other(
                     "invalid DecompressZipResult XML: expected DecompressZipResult root element"
@@ -2149,7 +2158,7 @@ fn validate_ipfs3_zip_extract_result_xml(body: &[u8]) -> Result<()> {
             Ok(quick_xml::events::Event::Eof) => return Ok(()),
             Ok(quick_xml::events::Event::Comment(_) | quick_xml::events::Event::PI(_)) => {}
             Ok(quick_xml::events::Event::Text(text))
-                if text.iter().all(u8::is_ascii_whitespace) => {}
+                if text.as_bytes().iter().all(u8::is_ascii_whitespace) => {}
             Ok(quick_xml::events::Event::Start(_) | quick_xml::events::Event::Empty(_)) => {
                 return Err(Error::Other(
                     "invalid DecompressZipResult XML: trailing XML content after root element"

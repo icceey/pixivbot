@@ -326,6 +326,7 @@ async fn main() -> Result<()> {
             .cleanup_eh_cache_orphans(
                 &eh_cache_dir.join("eh_cache"),
                 eh_startup_abort_uploader.as_deref(),
+                config.ehentai.send_archive,
             )
             .await
         {

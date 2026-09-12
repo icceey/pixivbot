@@ -190,10 +190,10 @@ pub(super) fn classify_embedded_s3_error(
     status: u16,
     body: &[u8],
 ) -> Option<MultipartFailure> {
-    if !has_root(body, b"Error") {
+    if !has_root(body, "Error") {
         return None;
     }
-    if !has_only_root(body, b"Error") {
+    if !has_only_root(body, "Error") {
         return Some(MultipartFailure::Protocol);
     }
 
@@ -337,13 +337,13 @@ struct S3ErrorBody {
 }
 
 fn parse_list_parts_result(body: &[u8]) -> Result<ListPartsResult, MultipartFailure> {
-    if !has_only_root(body, b"ListPartsResult") {
+    if !has_only_root(body, "ListPartsResult") {
         return Err(MultipartFailure::Protocol);
     }
     quick_xml::de::from_reader(std::io::Cursor::new(body)).map_err(|_| MultipartFailure::Protocol)
 }
 
-fn has_root(body: &[u8], expected: &[u8]) -> bool {
+fn has_root(body: &[u8], expected: &str) -> bool {
     let mut reader = quick_xml::Reader::from_reader(body);
     let mut buffer = Vec::new();
     loop {
@@ -353,13 +353,13 @@ fn has_root(body: &[u8], expected: &[u8]) -> bool {
                 return element.name().as_ref() == expected;
             }
             Ok(Event::Decl(_) | Event::Comment(_) | Event::PI(_) | Event::DocType(_)) => {}
-            Ok(Event::Text(text)) if text.iter().all(u8::is_ascii_whitespace) => {}
+            Ok(Event::Text(text)) if text.as_bytes().iter().all(u8::is_ascii_whitespace) => {}
             Ok(Event::Eof) | Ok(_) | Err(_) => return false,
         }
     }
 }
 
-fn has_only_root(body: &[u8], expected: &[u8]) -> bool {
+fn has_only_root(body: &[u8], expected: &str) -> bool {
     let mut reader = quick_xml::Reader::from_reader(body);
     let mut buffer = Vec::new();
     let root_is_empty = loop {
@@ -368,7 +368,7 @@ fn has_only_root(body: &[u8], expected: &[u8]) -> bool {
             Ok(Event::Start(element)) if element.name().as_ref() == expected => break false,
             Ok(Event::Empty(element)) if element.name().as_ref() == expected => break true,
             Ok(Event::Decl(_) | Event::Comment(_) | Event::PI(_) | Event::DocType(_)) => {}
-            Ok(Event::Text(text)) if text.iter().all(u8::is_ascii_whitespace) => {}
+            Ok(Event::Text(text)) if text.as_bytes().iter().all(u8::is_ascii_whitespace) => {}
             Ok(_) | Err(_) => return false,
         }
     };
@@ -381,7 +381,7 @@ fn has_only_root(body: &[u8], expected: &[u8]) -> bool {
         match reader.read_event_into(&mut buffer) {
             Ok(Event::Eof) => return true,
             Ok(Event::Comment(_) | Event::PI(_)) => {}
-            Ok(Event::Text(text)) if text.iter().all(u8::is_ascii_whitespace) => {}
+            Ok(Event::Text(text)) if text.as_bytes().iter().all(u8::is_ascii_whitespace) => {}
             Ok(_) | Err(_) => return false,
         }
     }
