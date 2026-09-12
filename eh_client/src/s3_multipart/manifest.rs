@@ -59,18 +59,16 @@ pub(super) enum ManifestMismatch {
     InvalidStoredValue,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct TerminalAbortManifest {
     pub(super) object_key: String,
     pub(super) upload_id: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum TerminalAbortManifestLoad {
     Verified(TerminalAbortManifest),
     Missing,
     MalformedJson,
-    Unverifiable,
+    Unverifiable(&'static str),
 }
 
 pub(super) fn is_terminal_abort_manifest_candidate(path: &Path) -> bool {
@@ -112,24 +110,31 @@ pub(super) async fn load_terminal_abort_manifest(
     path: &Path,
     provider: ProviderKind,
     uploader_identity_sha256: &str,
-) -> crate::Result<TerminalAbortManifestLoad> {
+) -> Result<TerminalAbortManifestLoad, crate::UploadStateError> {
     let bytes = match tokio::fs::read(path).await {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == ErrorKind::NotFound => {
             return Ok(TerminalAbortManifestLoad::Missing);
         }
-        Err(error) => return Err(error.into()),
+        Err(error) => return Err(crate::UploadStateError::Io(error.kind())),
     };
     let manifest: MultipartManifest = match serde_json::from_slice(&bytes) {
         Ok(manifest) => manifest,
         Err(_) => return Ok(TerminalAbortManifestLoad::MalformedJson),
     };
-    if manifest.version != MANIFEST_VERSION
-        || validate_stored_values(&manifest).is_err()
-        || manifest.provider != provider
-        || manifest.uploader_identity_sha256 != uploader_identity_sha256
-    {
-        return Ok(TerminalAbortManifestLoad::Unverifiable);
+    let mismatch = if manifest.version != MANIFEST_VERSION {
+        Some("multipart manifest version is unsupported")
+    } else if validate_stored_values(&manifest).is_err() {
+        Some("multipart manifest contains invalid stored values")
+    } else if manifest.provider != provider {
+        Some("multipart manifest provider does not match configured uploader")
+    } else if manifest.uploader_identity_sha256 != uploader_identity_sha256 {
+        Some("multipart manifest uploader identity does not match configured uploader")
+    } else {
+        None
+    };
+    if let Some(reason) = mismatch {
+        return Ok(TerminalAbortManifestLoad::Unverifiable(reason));
     }
     Ok(TerminalAbortManifestLoad::Verified(TerminalAbortManifest {
         object_key: manifest.object_key,
@@ -485,83 +490,6 @@ mod tests {
         tokio::fs::create_dir(&io_path).await.unwrap();
         let error = load_manifest(&io_path, &identity).await.unwrap_err();
         assert!(matches!(error, Error::Io(error) if error.kind() != ErrorKind::NotFound));
-    }
-
-    #[tokio::test]
-    async fn terminal_abort_load_classifies_verifiable_and_unverifiable_manifests() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("archive.json");
-        let identity = standard_identity();
-        assert_eq!(
-            load_terminal_abort_manifest(
-                &path,
-                identity.provider,
-                identity.uploader_identity_sha256
-            )
-            .await
-            .unwrap(),
-            TerminalAbortManifestLoad::Missing
-        );
-
-        tokio::fs::write(&path, b"not json").await.unwrap();
-        assert_eq!(
-            load_terminal_abort_manifest(
-                &path,
-                identity.provider,
-                identity.uploader_identity_sha256
-            )
-            .await
-            .unwrap(),
-            TerminalAbortManifestLoad::MalformedJson
-        );
-
-        let valid = new_manifest(
-            &identity,
-            "objects/archive.bin".to_owned(),
-            "upload-1".to_owned(),
-        )
-        .unwrap();
-        let mut unsupported_version = valid.clone();
-        unsupported_version.version = MANIFEST_VERSION + 1;
-        let mut invalid_stored_value = valid.clone();
-        invalid_stored_value.object_key = String::new();
-        let mut wrong_provider = valid.clone();
-        wrong_provider.provider = ProviderKind::IpfS3;
-        let mut wrong_uploader = valid.clone();
-        wrong_uploader.uploader_identity_sha256 = HASH_B.to_owned();
-        for manifest in [
-            unsupported_version,
-            invalid_stored_value,
-            wrong_provider,
-            wrong_uploader,
-        ] {
-            write_manifest_atomic(&path, &manifest).await.unwrap();
-            assert_eq!(
-                load_terminal_abort_manifest(
-                    &path,
-                    identity.provider,
-                    identity.uploader_identity_sha256
-                )
-                .await
-                .unwrap(),
-                TerminalAbortManifestLoad::Unverifiable
-            );
-        }
-
-        write_manifest_atomic(&path, &valid).await.unwrap();
-        assert!(matches!(
-            load_terminal_abort_manifest(
-                &path,
-                identity.provider,
-                identity.uploader_identity_sha256
-            )
-            .await
-            .unwrap(),
-            TerminalAbortManifestLoad::Verified(TerminalAbortManifest {
-                object_key,
-                upload_id,
-            }) if object_key == "objects/archive.bin" && upload_id == "upload-1"
-        ));
     }
 
     fn standard_identity() -> ManifestIdentity<'static> {

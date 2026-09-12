@@ -1,5 +1,31 @@
 use std::fmt;
 
+/// Cleanup diagnostics contain no paths, upload IDs, response bodies or request URLs.
+#[derive(Debug)]
+pub enum UploadStateError {
+    Io(std::io::ErrorKind),
+    Manifest(&'static str),
+    AbortHttp(u16),
+    AbortTimeout,
+    AbortTransport,
+    AbortProtocol,
+}
+
+impl fmt::Display for UploadStateError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io(kind) => write!(f, "failed to read multipart upload state: {kind}"),
+            Self::Manifest(reason) => f.write_str(reason),
+            Self::AbortHttp(status) => write!(f, "multipart Abort failed (HTTP {status})"),
+            Self::AbortTimeout => f.write_str("multipart Abort request timed out"),
+            Self::AbortTransport => f.write_str("multipart Abort transport failed"),
+            Self::AbortProtocol => f.write_str("multipart Abort response is invalid"),
+        }
+    }
+}
+
+impl std::error::Error for UploadStateError {}
+
 #[derive(Debug)]
 pub enum Error {
     Http(reqwest::Error),

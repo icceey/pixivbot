@@ -6,34 +6,8 @@ use anyhow::{Context, Result};
 use eh_client::{ArchiveArtifacts, ImageUploader};
 use tracing::warn;
 
-#[derive(Debug)]
-enum EhUploadStateAbortGateError {
-    NoAbortUploader { gid: i64 },
-    AbortFailed { gid: i64 },
-}
-
-impl std::fmt::Display for EhUploadStateAbortGateError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::NoAbortUploader { gid } => write!(
-                f,
-                "Cannot safely remove incomplete EH multipart upload state for gid={}: no Abort uploader configured",
-                gid
-            ),
-            Self::AbortFailed { gid } => write!(
-                f,
-                "Failed to abort incomplete EH multipart uploads for gid={}",
-                gid
-            ),
-        }
-    }
-}
-
-impl std::error::Error for EhUploadStateAbortGateError {}
-
 /// Require a provider-specific terminal Abort before deleting persisted multipart
-/// upload state. The error intentionally identifies only the gallery gid: local
-/// manifests can contain remote upload identifiers and must remain private.
+/// upload state. The uploader returns only redacted diagnostic categories.
 pub(super) async fn ensure_job_upload_state_aborted(
     job: &eh_gallery_jobs::Model,
     abort_uploader: Option<&dyn ImageUploader>,
@@ -45,14 +19,18 @@ pub(super) async fn ensure_job_upload_state_aborted(
     if !uploads_dir.exists() {
         return Ok(UploadStateAbortPermit);
     }
-    let abort_uploader = abort_uploader.ok_or_else(|| {
-        anyhow::Error::new(EhUploadStateAbortGateError::NoAbortUploader { gid: job.gid })
-    })?;
+    let abort_uploader = abort_uploader.with_context(|| format!(
+        "Cannot safely remove incomplete EH multipart upload state for gid={}: no Abort uploader configured",
+        job.gid
+    ))?;
     abort_uploader
         .abort_upload_state(&uploads_dir)
         .await
-        .map_err(|_| {
-            anyhow::Error::new(EhUploadStateAbortGateError::AbortFailed { gid: job.gid })
+        .with_context(|| {
+            format!(
+                "Failed to abort incomplete EH multipart uploads for gid={}",
+                job.gid
+            )
         })?;
     Ok(UploadStateAbortPermit)
 }

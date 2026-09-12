@@ -641,7 +641,8 @@ mod tests {
             repo.handoff_legacy_eh_archive_artifacts(&cache_dir).await?,
             3
         );
-        repo.cleanup_eh_cache_orphans(&cache_dir, None).await?;
+        repo.cleanup_eh_cache_orphans(&cache_dir, None, true)
+            .await?;
 
         let single_job = eh_gallery_jobs::Entity::find_by_id(702)
             .one(repo.db())
@@ -1418,7 +1419,8 @@ mod tests {
             repo.handoff_legacy_eh_archive_artifacts(&cache_dir).await?,
             1
         );
-        repo.cleanup_eh_cache_orphans(&cache_dir, None).await?;
+        repo.cleanup_eh_cache_orphans(&cache_dir, None, true)
+            .await?;
 
         let job = eh_gallery_jobs::Entity::find()
             .one(repo.db())
@@ -1504,7 +1506,8 @@ mod tests {
             0,
             "a completed handoff must be safe to repeat after a restart"
         );
-        repo.cleanup_eh_cache_orphans(&cache_dir, None).await?;
+        repo.cleanup_eh_cache_orphans(&cache_dir, None, true)
+            .await?;
 
         let target = ArchiveArtifacts::new(eh_gallery_job_artifact_path(&cache_dir, marked[0]));
         assert!(!legacy.assembly_scratch().exists());
@@ -1599,7 +1602,8 @@ mod tests {
             repo.handoff_legacy_eh_archive_artifacts(&cache_dir).await?,
             2
         );
-        repo.cleanup_eh_cache_orphans(&cache_dir, None).await?;
+        repo.cleanup_eh_cache_orphans(&cache_dir, None, true)
+            .await?;
         let quarantine =
             ArchiveArtifacts::new(cache_dir.join("legacy-conflicts/918_ambiguous-token.zip"));
         assert!(!legacy.assembly_scratch().exists());
@@ -1652,7 +1656,8 @@ mod tests {
             repo.handoff_legacy_eh_archive_artifacts(&cache_dir).await?,
             1
         );
-        repo.cleanup_eh_cache_orphans(&cache_dir, None).await?;
+        repo.cleanup_eh_cache_orphans(&cache_dir, None, true)
+            .await?;
 
         let job = eh_gallery_jobs::Entity::find()
             .one(repo.db())
@@ -1706,7 +1711,8 @@ mod tests {
             0,
             "a conflicting handoff must remain fail-closed across repeated startups"
         );
-        repo.cleanup_eh_cache_orphans(&cache_dir, None).await?;
+        repo.cleanup_eh_cache_orphans(&cache_dir, None, true)
+            .await?;
 
         let updated = eh_gallery_jobs::Entity::find_by_id(job.id)
             .one(repo.db())
@@ -1767,7 +1773,8 @@ mod tests {
             repo.handoff_legacy_eh_archive_artifacts(&cache_dir).await?,
             1
         );
-        repo.cleanup_eh_cache_orphans(&cache_dir, None).await?;
+        repo.cleanup_eh_cache_orphans(&cache_dir, None, true)
+            .await?;
 
         let updated = eh_gallery_jobs::Entity::find_by_id(job.id)
             .one(repo.db())

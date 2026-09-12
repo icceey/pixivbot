@@ -246,18 +246,43 @@ impl EhDownloadWorker {
 
     pub async fn run(self) {
         let poll = self.config.download_poll_interval_sec.max(10);
-        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(poll));
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            interval.tick().await;
-            if let Err(e) = self.tick().await {
-                match self.queue {
-                    EhDownloadQueue::Main => error!("EhDownloadWorker tick error: {:#}", e),
-                    EhDownloadQueue::Background => {
-                        error!("EhBackgroundDownloadWorker tick error: {:#}", e)
+        let downloads = async {
+            let mut interval = tokio::time::interval(Duration::from_secs(poll));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                if let Err(e) = self.tick().await {
+                    match self.queue {
+                        EhDownloadQueue::Main => error!("EhDownloadWorker tick error: {:#}", e),
+                        EhDownloadQueue::Background => {
+                            error!("EhBackgroundDownloadWorker tick error: {:#}", e)
+                        }
                     }
                 }
             }
+        };
+        if self.queue == EhDownloadQueue::Main {
+            // Orphan Abort requests may be slow. Retry in a separate future so
+            // a failed startup sweep cannot strand files or stall downloads.
+            let orphan_cleanup = async {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(poll)).await;
+                    if let Err(error) = self
+                        .repo
+                        .cleanup_eh_cache_orphans(
+                            &self.cache_dir.join("eh_cache"),
+                            self.startup_abort_uploader.as_deref(),
+                            self.config.send_archive,
+                        )
+                        .await
+                    {
+                        warn!("Failed to clean orphaned EH cache families: {error:#}");
+                    }
+                }
+            };
+            tokio::join!(downloads, orphan_cleanup);
+        } else {
+            downloads.await;
         }
     }
 

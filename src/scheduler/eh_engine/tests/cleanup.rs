@@ -1,6 +1,50 @@
 use super::*;
 
 #[tokio::test]
+async fn orphan_cleanup_retries_after_startup_failure_without_restart() {
+    let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+    let temp = tempfile::tempdir().unwrap();
+    let cache_dir = temp.path().join("eh_cache");
+    std::fs::create_dir(&cache_dir).unwrap();
+    let artifacts = seed_archive_artifact_family(&cache_dir.join("orphan.zip"));
+    let uploader = Arc::new(TerminalCleanupMockUploader {
+        fail_abort: true,
+        ..Default::default()
+    });
+    repo.cleanup_eh_cache_orphans(&cache_dir, Some(uploader.as_ref()), true)
+        .await
+        .unwrap();
+    uploader.cleanup_attempted.notified().await;
+
+    let server = MockServer::start().await;
+    let worker = EhDownloadWorker::new(
+        repo,
+        make_eh_client(&server),
+        Arc::new(EhentaiConfig::default()),
+        temp.path().to_path_buf(),
+        Main,
+        Some(uploader.clone()),
+    );
+    // Pause only around the maintenance timer, not SQLite's connection setup
+    // or filesystem I/O, which run on real threads.
+    tokio::time::pause();
+    let worker = tokio::spawn(worker.run());
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(60)).await;
+    tokio::time::resume();
+    let retried = tokio::time::timeout(
+        Duration::from_secs(5),
+        uploader.cleanup_attempted.notified(),
+    )
+    .await;
+    worker.abort();
+    let _ = worker.await;
+    retried.expect("the running worker must retry a failed startup orphan cleanup");
+    assert_eq!(uploader.cleanup_calls.lock().unwrap().len(), 2);
+    assert!(artifacts.uploads_dir().join("archive.json").exists());
+}
+
+#[tokio::test]
 async fn shared_zip_survives_first_delivery_and_is_removed_after_final_consumer() {
     let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
     let temp_dir = tempfile::tempdir().unwrap();
@@ -71,32 +115,34 @@ async fn shared_zip_survives_first_delivery_and_is_removed_after_final_consumer(
 }
 
 #[tokio::test]
-async fn abort_failure_then_enqueue_blocks_download_until_cleanup_succeeds() {
+async fn missing_zip_cancellation_recovers_cleanup_before_reenqueue() {
     let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
     let temp_dir = tempfile::tempdir().unwrap();
-    let zip_path = temp_dir.path().join("abort-first.zip");
-    create_test_zip(&zip_path, 1);
     let variant = EhGalleryVariant::archive("1280x");
-    let first = repo
-        .enqueue_eh_download(
-            -100,
-            882,
-            "abort",
-            "Abort first",
-            false,
-            SOURCE_DIRECT,
-            &variant,
-            None,
-            true,
-        )
-        .await
-        .unwrap()
-        .expect("delivery should be enqueued");
+    repo.enqueue_eh_subscription_download(
+        -100,
+        555,
+        882,
+        "abort",
+        "Abort first",
+        false,
+        &variant,
+        None,
+        true,
+    )
+    .await
+    .unwrap()
+    .expect("delivery should be enqueued");
     let downloaded = repo
         .claim_eh_download_job(Main, true)
         .await
         .unwrap()
         .unwrap();
+    let zip_path = archive_artifacts_for_job(temp_dir.path(), &downloaded)
+        .final_zip()
+        .to_path_buf();
+    std::fs::create_dir_all(zip_path.parent().unwrap()).unwrap();
+    create_test_zip(&zip_path, 1);
     repo.mark_eh_job_downloaded(
         Main,
         downloaded.id,
@@ -108,16 +154,21 @@ async fn abort_failure_then_enqueue_blocks_download_until_cleanup_succeeds() {
     .await
     .unwrap();
     let artifacts = seed_archive_artifact_family(&zip_path);
-    eh_download_queue::Entity::update_many()
-        .col_expr(
-            eh_download_queue::Column::Status,
-            Expr::value(STATUS_CANCELED),
-        )
-        .filter(eh_download_queue::Column::Id.eq(first.id))
-        .exec(repo.db())
+    std::fs::remove_file(&zip_path).unwrap();
+    repo.reset_eh_job_for_missing_zip(
+        downloaded.id,
+        downloaded.started_at.unwrap(),
+        zip_path.to_str().unwrap(),
+        3,
+    )
+    .await
+    .unwrap();
+    repo.cancel_eh_subscription_queue_entries(555, true)
         .await
         .unwrap();
-    repo.evaluate_eh_job_liveness(downloaded.id, true)
+    // The reset lost zip_path, so cancellation alone could not enqueue cleanup.
+    // The scan must reclaim the remaining family before a new delivery arrives.
+    repo.cleanup_eh_cache_orphans(zip_path.parent().unwrap(), None, true)
         .await
         .unwrap();
 
@@ -154,7 +205,6 @@ async fn abort_failure_then_enqueue_blocks_download_until_cleanup_succeeds() {
         .unwrap();
     assert_eq!(failed.cleanup_status, CLEANUP_STATUS_FAILED);
     assert!(failed.cleanup_next_retry_at.is_some());
-    assert!(artifacts.final_zip().exists());
     assert!(artifacts.uploads_dir().join("archive.json").exists());
     assert!(repo
         .claim_eh_download_job(Main, true)
@@ -169,7 +219,6 @@ async fn abort_failure_then_enqueue_blocks_download_until_cleanup_succeeds() {
             .unwrap(),
         Some(EhCleanupFinalizeOutcome::ReactivatedPending)
     );
-    assert!(!artifacts.final_zip().exists());
     assert!(!artifacts.uploads_dir().exists());
     let replacement = repo
         .claim_eh_download_job(Main, true)

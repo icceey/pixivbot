@@ -6,8 +6,6 @@ use std::sync::atomic::{AtomicU8, Ordering};
 
 pub(crate) const PART_SIZE: usize = 8 * 1024 * 1024;
 pub(crate) const MAX_PARTS: usize = 10_000;
-const TERMINAL_MANIFEST_VERIFICATION_ERROR: &str =
-    "multipart terminal manifest could not be safely verified";
 const TEMPORARY_MANIFEST_VERIFICATION_ERROR: &str =
     "multipart temporary manifest could not be safely verified";
 const RESUME_UPLOADER_IDENTITY_MISMATCH_ERROR: &str =
@@ -460,11 +458,11 @@ pub(crate) async fn abort_upload_state(
     provider: ProviderKind,
     uploader_identity_sha256: &str,
     uploads_dir: &Path,
-) -> crate::Result<()> {
+) -> Result<(), crate::UploadStateError> {
     let mut directory = match tokio::fs::read_dir(uploads_dir).await {
         Ok(directory) => directory,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error.into()),
+        Err(error) => return Err(crate::UploadStateError::Io(error.kind())),
     };
     let mut manifest_paths = Vec::new();
     let mut first_error = None;
@@ -473,7 +471,7 @@ pub(crate) async fn abort_upload_state(
             Ok(Some(entry)) => entry,
             Ok(None) => break,
             Err(error) => {
-                first_error = Some(crate::Error::Io(error));
+                first_error = Some(crate::UploadStateError::Io(error.kind()));
                 break;
             }
         };
@@ -482,7 +480,7 @@ pub(crate) async fn abort_upload_state(
             Ok(_) => continue,
             Err(error) => {
                 if first_error.is_none() {
-                    first_error = Some(error.into());
+                    first_error = Some(crate::UploadStateError::Io(error.kind()));
                 }
                 continue;
             }
@@ -500,18 +498,16 @@ pub(crate) async fn abort_upload_state(
                 .await
             {
                 Ok(manifest::TerminalAbortManifestLoad::Verified(manifest)) => manifest,
-                Ok(manifest::TerminalAbortManifestLoad::Unverifiable) if !is_temporary => {
+                Ok(manifest::TerminalAbortManifestLoad::Unverifiable(reason)) => {
                     if first_error.is_none() {
-                        first_error = Some(crate::Error::Other(
-                            TERMINAL_MANIFEST_VERIFICATION_ERROR.to_owned(),
-                        ));
+                        first_error = Some(crate::UploadStateError::Manifest(reason));
                     }
                     continue;
                 }
                 Ok(_) => {
                     if is_temporary && first_error.is_none() {
-                        first_error = Some(crate::Error::Other(
-                            TEMPORARY_MANIFEST_VERIFICATION_ERROR.to_owned(),
+                        first_error = Some(crate::UploadStateError::Manifest(
+                            TEMPORARY_MANIFEST_VERIFICATION_ERROR,
                         ));
                     }
                     continue;
@@ -527,7 +523,21 @@ pub(crate) async fn abort_upload_state(
             abort_for_replacement(bucket, &manifest.object_key, &manifest.upload_id).await
         {
             if first_error.is_none() {
-                first_error = Some(error);
+                first_error = Some(match error {
+                    list_parts::MultipartFailure::Service { status, .. }
+                    | list_parts::MultipartFailure::Unsupported { status, .. } => {
+                        crate::UploadStateError::AbortHttp(status)
+                    }
+                    list_parts::MultipartFailure::Client(crate::Error::Http(error))
+                        if error.is_timeout() =>
+                    {
+                        crate::UploadStateError::AbortTimeout
+                    }
+                    list_parts::MultipartFailure::Client(_) => {
+                        crate::UploadStateError::AbortTransport
+                    }
+                    _ => crate::UploadStateError::AbortProtocol,
+                });
             }
         }
     }
@@ -611,7 +621,7 @@ async fn create_session(
                 list_parts::MultipartFailure::Unsupported { operation, .. } => {
                     Ok(CreateSessionResult::Unsupported(operation))
                 }
-                failure => Err(multipart_failure_error(failure)),
+                failure => Err(crate::Error::from(failure)),
             };
         }
     };
@@ -692,12 +702,12 @@ async fn abort_for_replacement(
     bucket: &s3::Bucket,
     key: &str,
     upload_id: &str,
-) -> crate::Result<()> {
+) -> Result<(), list_parts::MultipartFailure> {
     match bucket.abort_upload(key, upload_id).await {
         Ok(_) => Ok(()),
         Err(error) => match list_parts::classify_s3_error(MultipartOperation::Abort, error) {
             list_parts::MultipartFailure::NoSuchUpload { .. } => Ok(()),
-            failure => Err(multipart_failure_error(failure)),
+            failure => Err(failure),
         },
     }
 }
@@ -719,7 +729,7 @@ async fn recover_lost_complete(
         return Ok(HeadDecision::Replace);
     }
     let (head, status) = bucket.head_object(object_key).await.map_err(|error| {
-        multipart_failure_error(list_parts::classify_s3_error(
+        crate::Error::from(list_parts::classify_s3_error(
             MultipartOperation::Head,
             error,
         ))
@@ -784,10 +794,12 @@ fn replacement_exhausted(operation: MultipartOperation) -> crate::Error {
     ))
 }
 
-fn multipart_failure_error(failure: list_parts::MultipartFailure) -> crate::Error {
-    match failure {
-        list_parts::MultipartFailure::Client(error) => error,
-        failure => crate::Error::Other(failure.to_string()),
+impl From<list_parts::MultipartFailure> for crate::Error {
+    fn from(failure: list_parts::MultipartFailure) -> Self {
+        match failure {
+            list_parts::MultipartFailure::Client(error) => error,
+            failure => crate::Error::Other(failure.to_string()),
+        }
     }
 }
 
@@ -802,7 +814,7 @@ fn multipart_failure_outcome(
         list_parts::MultipartFailure::Unsupported { operation, .. } => {
             Ok(MultipartOutcome::Unsupported { operation })
         }
-        failure => Err(multipart_failure_error(failure)),
+        failure => Err(crate::Error::from(failure)),
     }
 }
 
@@ -1966,14 +1978,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn terminal_abort_recovers_matching_atomic_temp_manifest() {
+    async fn terminal_abort_recovers_atomic_state_after_redacted_http_failure() {
         let server = MockServer::start().await;
-        mount_abort_for(&server, UPLOAD_ID).await;
+        let response_body = "private-response-body-sentinel";
+        let failing_request = Mock::given(method("DELETE"))
+            .respond_with(ResponseTemplate::new(503).set_body_string(response_body))
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
         let temp = tempfile::tempdir().unwrap();
         let uploads_dir = temp.path().join("gallery.zip.uploads");
         tokio::fs::create_dir(&uploads_dir).await.unwrap();
         let manifest_path = uploads_dir.join("manifest.json.tmp-crash");
         write_valid_manifest(&manifest_path, &vec![7; PART_SIZE], UPLOADER_ID).await;
+
+        let error = abort_upload_state(
+            test_bucket(&server).as_ref(),
+            ProviderKind::S3,
+            UPLOADER_ID,
+            &uploads_dir,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.to_string(), "multipart Abort failed (HTTP 503)");
+        let diagnostic = format!("{error:?}: {error}");
+        for forbidden in [
+            response_body,
+            KEY,
+            UPLOAD_ID,
+            manifest_path.to_str().unwrap(),
+        ] {
+            assert!(!diagnostic.contains(forbidden));
+        }
+        assert!(manifest_path.exists());
+        drop(failing_request);
+        mount_abort_for(&server, UPLOAD_ID).await;
 
         abort_upload_state(
             test_bucket(&server).as_ref(),
@@ -1985,7 +2024,7 @@ mod tests {
         .unwrap();
 
         let requests = server.received_requests().await.unwrap();
-        assert_request_sequence(&requests, &["DELETE"]);
+        assert_request_sequence(&requests, &["DELETE", "DELETE"]);
         assert_eq!(requests[0].url.path(), format!("/{BUCKET}/{KEY}"));
         assert_eq!(
             query_value(&requests[0], "uploadId").as_deref(),
@@ -2027,7 +2066,6 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(matches!(error, crate::Error::Other(_)));
         assert_eq!(
             error.to_string(),
             "multipart temporary manifest could not be safely verified"
@@ -2139,7 +2177,7 @@ mod tests {
 
         assert_eq!(
             error.to_string(),
-            "multipart terminal manifest could not be safely verified"
+            "multipart manifest uploader identity does not match configured uploader"
         );
         for forbidden in [
             mismatched_path.to_string_lossy().as_ref(),
