@@ -16,7 +16,7 @@ use sea_orm::{
     ColumnTrait, Condition, DatabaseTransaction, EntityTrait, Order, PaginatorTrait, QueryFilter,
     QueryOrder, QuerySelect, Set, TransactionTrait,
 };
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, LazyLock, Mutex, Weak};
 use tokio::sync::OwnedMutexGuard;
 use tracing::warn;
@@ -1878,19 +1878,17 @@ impl Repo {
             }
         }
 
+        let mut abort_failures = BTreeMap::<String, usize>::new();
+        let mut families_without_abort_uploader = 0;
         for (final_zip, artifacts) in artifact_families {
             let result = if !owned_final_zips.contains(&final_zip) {
                 if artifacts.uploads_dir().exists() {
                     let Some(uploader) = abort_uploader else {
-                        warn!(
-                            "Preserving EH orphan upload state because no S3/ipfS3 abort uploader is configured"
-                        );
+                        families_without_abort_uploader += 1;
                         continue;
                     };
                     if let Err(error) = uploader.abort_upload_state(artifacts.uploads_dir()).await {
-                        warn!(
-                            "Failed to abort EH orphan upload state; preserving local archive family: {error}"
-                        );
+                        *abort_failures.entry(error.to_string()).or_default() += 1;
                         continue;
                     }
                 }
@@ -1901,6 +1899,18 @@ impl Repo {
             if let Err(e) = result {
                 warn!("Failed to cleanup EH archive artifacts: {}", e);
             }
+        }
+        if families_without_abort_uploader > 0 {
+            warn!(
+                families = families_without_abort_uploader,
+                "Preserving EH orphan upload state because no S3/ipfS3 abort uploader is configured"
+            );
+        }
+        if !abort_failures.is_empty() {
+            warn!(
+                failures = ?abort_failures,
+                "Failed to abort EH orphan upload state; preserving local archive families"
+            );
         }
 
         Ok(())

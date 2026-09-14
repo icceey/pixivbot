@@ -201,7 +201,7 @@ pub(super) fn classify_embedded_s3_error(
         Ok(error) => error,
         Err(_) => return Some(MultipartFailure::Protocol),
     };
-    if error.code.trim().is_empty() || error.message.trim().is_empty() {
+    if error.code.trim().is_empty() {
         return Some(MultipartFailure::Protocol);
     }
 
@@ -332,8 +332,10 @@ struct ListedPart {
 struct S3ErrorBody {
     #[serde(rename = "Code")]
     code: String,
+    // S3-compatible services can omit Message. Keep the field to reject
+    // duplicate or malformed Message elements during deserialization.
     #[serde(rename = "Message")]
-    message: String,
+    _message: Option<String>,
 }
 
 fn parse_list_parts_result(body: &[u8]) -> Result<ListPartsResult, MultipartFailure> {
