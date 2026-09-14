@@ -684,7 +684,7 @@ async fn test_archive_key_downloads_reject_unsupported_resolution_before_network
 }
 
 #[tokio::test]
-async fn test_prepare_and_download_archive_form_flow() {
+async fn test_prepare_archive_fallback_uses_original_form_cost_and_size() {
     let server = MockServer::start().await;
     let gallery_page_html = r#"
 <html><body>
@@ -694,10 +694,18 @@ async fn test_prepare_and_download_archive_form_flow() {
     let archiver_form_html = format!(
         r#"
 <html><body>
-<form id="hathdl_form" method="post" action="{}/archiver.php?gid=4034806&amp;token=fedcba9876">
+<div>Download Cost: <strong>8,800 GP</strong></div>
+<form method="post" action="{}/archiver.php?gid=4034806&amp;token=fedcba9876">
   <input type="hidden" name="dltype" value="org" />
   <input type="submit" name="dlcheck" value="Download Original Archive" />
 </form>
+<p>Estimated Size: <strong>400.0 MiB</strong></p>
+<div>Download Cost: <strong>Free!</strong></div>
+<form method="post" action="/res-archiver.php">
+  <input type="hidden" name="dltype" value="res" />
+  <input type="submit" name="dlcheck" value="Download Resample Archive" disabled />
+</form>
+<p>Estimated Size: <strong>2.0 MiB</strong></p>
 </body></html>
 "#,
         server.uri()
@@ -741,9 +749,11 @@ async fn test_prepare_and_download_archive_form_flow() {
 
     let client = client_at(&server);
     let request = client
-        .prepare_archive_download(4034806, "e13b7d119b", "original")
+        .prepare_archive_download(4034806, "e13b7d119b", "1280x")
         .await
         .expect("should prepare form-driven archive request");
+    assert_eq!(request.cost(), &eh_client::parser::DownloadCost::Gp(8_800));
+    assert_eq!(request.estimated_size_bytes(), Some(400 * 1024 * 1024));
     let temp_dir = tempfile::tempdir().unwrap();
     let dest = temp_dir.path().join("archive.zip");
     let bytes = client

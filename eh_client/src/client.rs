@@ -338,6 +338,8 @@ impl EhClient {
     /// request so callers can decide whether to POST without spending GP.
     /// `resolution` must be exactly `780x`, `980x`, `1280x`, or `original`.
     /// Unsupported resolutions fail before any HTTP request.
+    /// Unavailable resamples fall back to an available original form; its cost
+    /// and estimated size are returned for the caller's download guards.
     pub async fn prepare_archive_download(
         &self,
         gid: u64,
@@ -348,7 +350,21 @@ impl EhClient {
         let (archiver_gid, archiver_token, archiver_html) =
             self.fetch_archiver_page(gid, token).await?;
 
-        // Parse the cost from the archiver page for the requested resolution.
+        let resolution = if resolution != "original"
+            && !parser::archive_form_is_available(&archiver_html, resolution)
+            && parser::archive_form_is_available(&archiver_html, "original")
+        {
+            tracing::info!(
+                gid,
+                requested = resolution,
+                "EH resample unavailable; using original archive"
+            );
+            "original"
+        } else {
+            resolution
+        };
+
+        // Parse the cost from the archiver page for the selected resolution.
         // This happens before any POST, so it does not spend GP. The cost is
         // attached to the returned request regardless of whether we take the
         // archiver-key path or the form path below, so callers can gate the

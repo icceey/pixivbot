@@ -23,7 +23,7 @@ async fn download_workers_reject_gp_policy_before_spending_or_size_retry() {
                 "7841d194d4",
                 ArchiverPage {
                     original_cost: "8,800 GP",
-                    resample_cost: "218 GP",
+                    resample_cost: "N/A",
                     sizes,
                     ..Default::default()
                 },
@@ -64,7 +64,7 @@ async fn download_workers_reject_gp_policy_before_spending_or_size_retry() {
             assert_eq!(updated.status, STATUS_FAILED);
             assert_eq!(
                 updated.error.as_deref(),
-                Some("EH archive GP cost 218 exceeds configured max_archive_gp_cost=0")
+                Some("EH archive GP cost 8800 exceeds configured max_archive_gp_cost=0")
             );
             assert!(updated.completed_at.is_some());
             assert!(updated.started_at.is_some());
@@ -553,8 +553,8 @@ async fn test_main_and_background_gp_rate_limit_allows_only_one_post() {
 }
 
 /// Verify the conservative "Unknown cost => defer" rule: when the archiver
-/// page contains an archiver_key but no recognizable Download Cost text,
-/// the download must defer rather than be treated as Unlocked.
+/// page contains an archiver_key but no price for the fallback original,
+/// the download must defer rather than reuse the disabled resample's price.
 #[tokio::test]
 async fn test_download_worker_unknown_cost_defers_without_post() {
     let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
@@ -570,9 +570,8 @@ async fn test_download_worker_unknown_cost_defers_without_post() {
     )
     .await;
 
-    // archiver page with an archiver_key in a hidden input but NO Download
-    // Cost text. This is the "simplified page" case where the parser cannot
-    // determine the cost -> must return Unknown -> must defer.
+    // The original price is missing. A lone Free! price belongs only to the
+    // disabled resample, even though the page also exposes an archiver key.
     let gallery_html = r#"<html><body>
             <a onclick="return popUp('/archiver.php?gid=123456&amp;token=abcdef0123',480,320)">Archive Download</a>
             </body></html>"#;
@@ -582,7 +581,14 @@ async fn test_download_worker_unknown_cost_defers_without_post() {
         .expect(1)
         .mount(&eh_server)
         .await;
-    let archiver_page_html = r#"<html><body><input type="hidden" name="or" value="123456--abc123def456" /></body></html>"#;
+    let archiver_page_html = r#"<html><body>
+        <form action="/archiver.php"><input name="dltype" value="org" />
+            <input name="dlcheck" value="Download Original Archive" /></form>
+        <div>Download Cost: <strong>Free!</strong></div>
+        <form action="/archiver.php"><input name="dltype" value="res" />
+            <input name="dlcheck" value="Download Resample Archive" disabled /></form>
+        <input type="hidden" name="or" value="123456--abc123def456" />
+        </body></html>"#;
     Mock::given(method("GET"))
         .and(path("/archiver.php"))
         .respond_with(ResponseTemplate::new(200).set_body_string(archiver_page_html))

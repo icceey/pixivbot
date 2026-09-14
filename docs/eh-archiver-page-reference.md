@@ -3,7 +3,7 @@
 Source: real captures provided by user (2026-07-18). Used by `eh_client/parser.rs`
 and `src/scheduler/eh_engine/download.rs` to gate archive size and GP-spending downloads.
 
-## Page Structure (consistent across all 4 samples)
+## Page Structure (consistent across the 4 initial samples)
 
 ```html
 <div id="db">
@@ -68,7 +68,7 @@ Observed across the 4 captured samples:
 |---|---|---|
 | `Free!` | No GP cost for this resolution | All samples at some resolution |
 | `{n} GP` | Costs N GP (thousand separators with commas) | `8,800 GP`, `218 GP`, `747,708 GP` |
-| `N/A` | Resolution not available | Observed in the ignored H@H table |
+| `N/A` | Resolution not available | Also reported on unavailable direct resample forms |
 | `Insufficient Funds` | Account lacks GP (variant from external sources) | Not in captured samples but seen in EhViewer test fixtures |
 
 Note: EH uses `Free!` with the `!` in the original/resample cost forms. The H@H
@@ -109,6 +109,19 @@ table cells use `Free` without `!`.
 - POSTing either generic form WILL charge GP (auto-converts credits if GP insufficient)
 - This is the case that needs the GP guard
 
+### Case 5: Direct resample unavailable
+
+- The resample form can show `N/A`, have a disabled `dlcheck` input, or be absent.
+- `prepare_archive_download()` then selects the original if its form exists,
+  is enabled, and does not show `N/A`.
+- The original's form, cost, and estimated size are used together, including
+  when the page exposes an archiver key. Original downloads still pass the
+  configured GP and size checks before POST.
+- Unknown costs and insufficient funds alone do not trigger a fallback. If
+  the original is also unavailable, the requested resolution is retained.
+- An original request never falls back to a resample. Existing persisted
+  archive downloads resume before preparing a new request.
+
 ## Resolution -> Form, Cost, and Estimated-Size Mapping
 
 ### Form-based prepared path
@@ -116,12 +129,15 @@ table cells use `Free` without `!`.
 When `prepare_archive_download()` constructs a request from an HTML form, it
 uses the generic forms: `dltype=org` (left) and `dltype=res` (right).
 
-| Config `resolution` | Form posted on the generic-form path |
+| Config `resolution` | Preferred form on the generic-form path |
 |---|---|
 | `original` | left (`dltype=org`) |
 | `780x` | right (`dltype=res`) |
 | `980x` | right (`dltype=res`) |
 | `1280x` | right (`dltype=res`) |
+
+Unavailable resamples use the original form as described in Case 5. Cost and
+size are parsed for that effective selection, rather than the preference.
 
 `1600x`, `2400x`, empty, and unknown values are rejected before the direct
 workflow makes a GET or POST. Donor resolutions require the separate H@H
@@ -164,6 +180,8 @@ guard cannot underestimate an archive.
    - anything else -> `DownloadCost::Unknown`
 4. `Insufficient`, `Unavailable`, and `Unknown` are temporary defer states:
    callers do not POST and do not treat them as permanent archive-policy failures.
+   Resolution fallback happens before this guard. A missing original price
+   remains `Unknown`; it must not borrow a lone price from the resample form.
 
 `parse_archive_download_estimated_size(html, resolution) -> Option<u64>` uses
 the same generic-form selection. It returns `None` for missing or malformed

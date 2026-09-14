@@ -159,8 +159,14 @@ pub fn parse_archiver_key(html: &str) -> Option<String> {
 /// `original` selects `dltype=org`; supported resamples (`780x`, `980x`, and
 /// `1280x`) select `dltype=res`. The separate H@H Downloader form is ignored.
 pub fn parse_archiver_form(html: &str, resolution: &str) -> Option<ArchiverForm> {
-    let target_dltype = resolution_dltype(resolution);
+    let form = find_archiver_form(html, resolution_dltype(resolution))?;
+    Some(ArchiverForm {
+        action: attr_value(form.get(1)?.as_str(), "action")?,
+        fields: form_fields(form.get(2)?.as_str()),
+    })
+}
 
+fn find_archiver_form<'a>(html: &'a str, target_dltype: &str) -> Option<regex::Captures<'a>> {
     for cap in archiver_form_re().captures_iter(html) {
         let attrs = cap.get(1)?.as_str();
         let body = cap.get(2)?.as_str();
@@ -177,11 +183,35 @@ pub fn parse_archiver_form(html: &str, resolution: &str) -> Option<ArchiverForm>
             .iter()
             .any(|(name, value)| name == "dltype" && value == target_dltype)
         {
-            return Some(ArchiverForm { action, fields });
+            return Some(cap);
         }
     }
 
     None
+}
+
+pub(crate) fn archive_form_is_available(html: &str, resolution: &str) -> bool {
+    let dltype = resolution_dltype(resolution);
+    let Some(form) = find_archiver_form(html, dltype) else {
+        return false;
+    };
+    if parse_form_download_cost(html, dltype) == DownloadCost::Unavailable {
+        return false;
+    }
+
+    // Consume complete attributes so "disabled" inside a quoted value or an
+    // attribute such as data-disabled does not disable the download button.
+    static ATTRIBUTE_RE: OnceLock<Regex> = OnceLock::new();
+    let attribute_re = ATTRIBUTE_RE.get_or_init(|| {
+        Regex::new(r#"(?is)([^\s=/>]+)(?:\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+))?"#)
+            .expect("invalid attribute regex")
+    });
+    !input_re().captures_iter(&form[2]).any(|input| {
+        attr_value(&input[1], "name").as_deref() == Some("dlcheck")
+            && attribute_re
+                .captures_iter(&input[1])
+                .any(|attr| attr[1].eq_ignore_ascii_case("disabled"))
+    })
 }
 
 /// Extract the archive download URL from the archiver.php HTML response.
@@ -310,35 +340,17 @@ fn parse_mib_size_bytes(text: &str) -> Option<u64> {
 }
 
 fn parse_form_estimated_size(html: &str, target_dltype: &str) -> Option<u64> {
-    for form in archiver_form_re().captures_iter(html) {
-        let attrs = form.get(1)?.as_str();
-        let body = form.get(2)?.as_str();
-        let Some(action) = attr_value(attrs, "action") else {
-            continue;
-        };
-        if !action.contains("archiver.php") {
-            continue;
-        }
-        if !form_fields(body)
-            .iter()
-            .any(|(name, value)| name == "dltype" && value == target_dltype)
-        {
-            continue;
-        }
-
-        // `parse_archiver_form` selects the first matching form. Do not bind a
-        // missing size on it to a later form's displayed size.
-        let after_form = &html[form.get(0)?.end()..];
-        let before_next_form = match archiver_form_re().find(after_form) {
-            Some(next_form) => &after_form[..next_form.start()],
-            None => after_form,
-        };
-        return estimated_size_strong_re()
-            .captures(before_next_form)
-            .and_then(|captures| captures.get(1))
-            .and_then(|size| parse_mib_size_bytes(size.as_str()));
-    }
-    None
+    let form = find_archiver_form(html, target_dltype)?;
+    // Do not bind a missing size on the selected form to a later form's size.
+    let after_form = &html[form.get(0)?.end()..];
+    let before_next_form = match archiver_form_re().find(after_form) {
+        Some(next_form) => &after_form[..next_form.start()],
+        None => after_form,
+    };
+    estimated_size_strong_re()
+        .captures(before_next_form)
+        .and_then(|captures| captures.get(1))
+        .and_then(|size| parse_mib_size_bytes(size.as_str()))
 }
 
 fn parse_cost_text(text: &str) -> DownloadCost {
@@ -381,7 +393,9 @@ fn parse_form_download_cost(html: &str, target_dltype: &str) -> DownloadCost {
         }
     }
 
-    if cost_caps.len() == 1 {
+    // A lone unbound cost can describe a legacy key-only page, but must not
+    // price a different direct-download form (especially after a fallback).
+    if cost_caps.len() == 1 && dltype_caps.is_empty() {
         return parse_cost_text(cost_caps[0].get(1).unwrap().as_str());
     }
 
@@ -396,8 +410,8 @@ fn parse_form_download_cost(html: &str, target_dltype: &str) -> DownloadCost {
 ///
 /// The separate H@H Downloader form and table are ignored.
 ///
-/// Resolution selection matches the form that `prepare_archive_download` will
-/// actually POST, so the returned cost reflects what the server will charge.
+/// Pass the selected resolution after any fallback so the returned cost
+/// reflects the form that will actually be posted.
 ///
 /// Returns `DownloadCost::Unknown` if the page structure cannot be recognized
 /// (e.g. neither `dltype=org` nor `dltype=res` form is present). Callers
