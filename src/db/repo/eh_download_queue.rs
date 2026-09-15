@@ -3736,13 +3736,16 @@ mod tests {
         let orphan_part = cache_dir.join("orphan.zip.part");
         let orphan_parts = cache_dir.join("orphan.zip.parts");
         let orphan_uploads = cache_dir.join("orphan.zip.uploads");
+        let orphan_selection = cache_dir.join("orphan.zip.original");
         let active_zip = cache_dir.join("active.zip");
         let active_part = cache_dir.join("active.zip.part");
         let active_parts = cache_dir.join("active.zip.parts");
         let active_uploads = cache_dir.join("active.zip.uploads");
+        let active_selection = cache_dir.join("active.zip.original");
         let unrelated = cache_dir.join("notes").join("keep.txt");
         std::fs::write(&orphan_zip, b"zip").unwrap();
         std::fs::write(&orphan_part, b"partial").unwrap();
+        std::fs::write(&orphan_selection, []).unwrap();
         std::fs::create_dir_all(orphan_parts.join("nested")).unwrap();
         std::fs::write(orphan_parts.join("manifest.json"), b"manifest").unwrap();
         std::fs::write(orphan_parts.join("nested").join("part-0001"), b"part").unwrap();
@@ -3751,6 +3754,7 @@ mod tests {
         std::fs::write(orphan_uploads.join("nested").join("image-0.json"), b"image").unwrap();
         std::fs::write(&active_zip, b"zip").unwrap();
         std::fs::write(&active_part, b"partial").unwrap();
+        std::fs::write(&active_selection, []).unwrap();
         std::fs::create_dir_all(active_parts.join("nested")).unwrap();
         std::fs::write(active_parts.join("manifest.json"), b"manifest").unwrap();
         std::fs::write(active_parts.join("nested").join("part-0001"), b"part").unwrap();
@@ -3804,6 +3808,14 @@ mod tests {
         );
 
         assert!(!orphan_zip.exists(), "orphan final ZIP should be removed");
+        assert!(
+            !orphan_selection.exists(),
+            "orphan selection must be removed with its archive"
+        );
+        assert!(
+            active_selection.exists(),
+            "active selection must survive cleanup for safe retries"
+        );
         assert!(
             !orphan_part.exists(),
             "orphan partial ZIP should be removed"

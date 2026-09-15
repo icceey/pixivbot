@@ -112,8 +112,8 @@ table cells use `Free` without `!`.
 ### Case 5: Direct resample unavailable
 
 - The resample form can show `N/A`, have a disabled `dlcheck` input, or be absent.
-- `prepare_archive_download()` then selects the original if its form exists,
-  is enabled, and does not show `N/A`.
+- `prepare_archive_download()` then selects the original if its form has an
+  enabled `dlcheck` input and does not show `N/A`.
 - The original's form, cost, and estimated size are used together, including
   when the page exposes an archiver key. Original downloads still pass the
   configured GP and size checks before POST.
@@ -121,6 +121,12 @@ table cells use `Free` without `!`.
   the original is also unavailable, the requested resolution is retained.
 - An original request never falls back to a resample. Existing persisted
   archive downloads resume before preparing a new request.
+- Automatic original selections are recorded in a `.zip.original` marker that
+  follows the archive through cleanup and migration. Switching into or out of
+  fallback discards the sequential `.zip.part` before changing the marker, so
+  retries cannot concatenate original and resample data. Retries with the same
+  selection retain their sequential progress; multipart manifests keep their
+  existing URL checks and resume path.
 
 ## Resolution -> Form, Cost, and Estimated-Size Mapping
 

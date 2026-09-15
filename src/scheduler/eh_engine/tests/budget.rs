@@ -627,6 +627,66 @@ async fn test_download_worker_unknown_cost_defers_without_post() {
     assert!(gp_attempts(repo.as_ref()).await.is_empty());
 }
 
+#[tokio::test]
+async fn original_fallback_without_download_control_never_spends_gp() {
+    let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+    let server = MockServer::start().await;
+    let temp = tempfile::tempdir().unwrap();
+    setup_chat(&repo, -100, true).await;
+    let entry = seed_delivery(
+        &repo,
+        -100,
+        (123456, "abcdef0123", "Unavailable Original"),
+        Default::default(),
+    )
+    .await;
+    Mock::given(method("GET"))
+        .and(path("/g/123456/abcdef0123/"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"<a href="/archiver.php?gid=123456&amp;token=abcdef0123">Archive</a>"#,
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/archiver.php"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"
+            <div>Download Cost: <strong>8,800 GP</strong></div>
+            <form action="/archiver.php"><input name="dltype" value="org" /></form>
+            <div>Download Cost: <strong>N/A</strong></div>
+            <form action="/archiver.php"><input name="dltype" value="res" />
+                <input name="dlcheck" value="Download Resample Archive" /></form>
+        "#,
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("unexpected paid request"))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let mut config = make_config();
+    config.max_archive_gp_cost = 8_800;
+    EhDownloadWorker::new(
+        Arc::clone(&repo),
+        make_eh_client(&server),
+        Arc::new(config),
+        temp.path().to_path_buf(),
+        Main,
+        None,
+    )
+    .tick()
+    .await
+    .unwrap();
+    assert!(gp_attempts(repo.as_ref()).await.is_empty());
+    let job = job_for_delivery(&repo, &entry).await;
+    assert_eq!(job.status, JOB_STATUS_PENDING);
+    assert!(job.next_retry_at.is_some());
+    server.verify().await;
+}
+
 /// Verify the parser picks the original-archive cost when resolution is
 /// "original" - the GP-required sample's original form says 8,800 GP, so
 /// with default config (max_archive_gp_cost = 0) it must be rejected.

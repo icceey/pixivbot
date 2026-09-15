@@ -8,6 +8,7 @@ pub struct ArchiveArtifacts {
     assembly_scratch: PathBuf,
     parts_dir: PathBuf,
     uploads_dir: PathBuf,
+    original_fallback_marker: PathBuf,
 }
 
 impl ArchiveArtifacts {
@@ -17,13 +18,16 @@ impl ArchiveArtifacts {
             assembly_scratch: final_zip.with_extension("zip.part"),
             parts_dir: final_zip.with_extension("zip.parts"),
             uploads_dir: final_zip.with_extension("zip.uploads"),
+            original_fallback_marker: final_zip.with_extension("zip.original"),
             final_zip,
         }
     }
 
     pub fn from_member(path: &Path) -> Option<Self> {
         let name = path.file_name()?.to_str()?;
-        let final_name = if let Some(name) = name.strip_suffix(".zip.parts") {
+        let final_name = if let Some(name) = name.strip_suffix(".zip.original") {
+            format!("{name}.zip")
+        } else if let Some(name) = name.strip_suffix(".zip.parts") {
             format!("{name}.zip")
         } else if let Some(name) = name.strip_suffix(".zip.uploads") {
             format!("{name}.zip")
@@ -53,6 +57,12 @@ impl ArchiveArtifacts {
         &self.uploads_dir
     }
 
+    /// Present when the archive was selected by automatic original fallback.
+    /// Kept across transfer resets so a later resample cannot reuse its prefix.
+    pub fn original_fallback_marker(&self) -> &Path {
+        &self.original_fallback_marker
+    }
+
     pub async fn remove_assembly_scratch(&self) -> Result<()> {
         remove_file_if_present(&self.assembly_scratch).await
     }
@@ -80,7 +90,8 @@ impl ArchiveArtifacts {
         final_result?;
         assembly_result?;
         parts_result?;
-        uploads_result
+        uploads_result?;
+        remove_file_if_present(&self.original_fallback_marker).await
     }
 }
 

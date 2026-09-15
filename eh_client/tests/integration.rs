@@ -684,7 +684,7 @@ async fn test_archive_key_downloads_reject_unsupported_resolution_before_network
 }
 
 #[tokio::test]
-async fn test_prepare_archive_fallback_uses_original_form_cost_and_size() {
+async fn test_original_fallback_keeps_form_guards_and_isolates_resample_retry() {
     let server = MockServer::start().await;
     let gallery_page_html = r#"
 <html><body>
@@ -719,16 +719,16 @@ async fn test_prepare_archive_fallback_uses_original_form_cost_and_size() {
     Mock::given(method("GET"))
         .and(path("/g/4034806/e13b7d119b/"))
         .respond_with(ResponseTemplate::new(200).set_body_string(gallery_page_html))
-        .expect(1)
+        .expect(2)
         .mount(&server)
         .await;
-    Mock::given(method("GET"))
+    let archiver_page = Mock::given(method("GET"))
         .and(path("/archiver.php"))
         .and(query_param("gid", "4034806"))
         .and(query_param("token", "fedcba9876"))
-        .respond_with(ResponseTemplate::new(200).set_body_string(archiver_form_html))
+        .respond_with(ResponseTemplate::new(200).set_body_string(archiver_form_html.clone()))
         .expect(1)
-        .mount(&server)
+        .mount_as_scoped(&server)
         .await;
     Mock::given(method("POST"))
         .and(path("/archiver.php"))
@@ -762,7 +762,77 @@ async fn test_prepare_archive_fallback_uses_original_form_cost_and_size() {
         .expect("form-driven download should succeed");
 
     assert_eq!(bytes as usize, zip_bytes.len());
-    assert_eq!(std::fs::read(dest).unwrap(), zip_bytes);
+    assert_eq!(std::fs::read(&dest).unwrap(), zip_bytes);
+
+    // Restore the original prefix as the state left by an interrupted transfer.
+    // A new client and a newly available resample must not append a different ZIP.
+    let part = dest.with_extension("zip.part");
+    let split_at = zip_bytes.len() / 2;
+    tokio::fs::rename(&dest, &part).await.unwrap();
+    tokio::fs::OpenOptions::new()
+        .write(true)
+        .open(&part)
+        .await
+        .unwrap()
+        .set_len(split_at as u64)
+        .await
+        .unwrap();
+    drop(archiver_page);
+    Mock::given(method("GET"))
+        .and(path("/archiver.php"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(archiver_form_html.replace(" disabled", "")),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/res-archiver.php"))
+        .and(BodyContains("dltype=res"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+            r#"<script>document.location = "{}/archive/resample.zip?start=1";</script>"#,
+            server.uri()
+        )))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let resample_zip = test_zip_bytes("image.jpg", b"resample_content");
+    Mock::given(method("GET"))
+        .and(path("/archive/resample.zip"))
+        .and(header("range", format!("bytes={split_at}-")))
+        .respond_with(
+            ResponseTemplate::new(206)
+                .insert_header(
+                    "Content-Range",
+                    format!(
+                        "bytes {split_at}-{}/{}",
+                        resample_zip.len() - 1,
+                        resample_zip.len()
+                    ),
+                )
+                .set_body_bytes(resample_zip[split_at..].to_vec()),
+        )
+        .expect(0)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/archive/resample.zip"))
+        .and(HeaderAbsent("range"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(resample_zip.clone()))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let restarted = client_at(&server);
+    let request = restarted
+        .prepare_archive_download(4034806, "e13b7d119b", "1280x")
+        .await
+        .unwrap();
+    restarted
+        .download_archive_with_request(&request, &dest)
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read(&dest).unwrap(), resample_zip);
+    server.verify().await;
 }
 
 #[tokio::test]

@@ -206,9 +206,9 @@ pub(crate) fn archive_form_is_available(html: &str, resolution: &str) -> bool {
         Regex::new(r#"(?is)([^\s=/>]+)(?:\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+))?"#)
             .expect("invalid attribute regex")
     });
-    !input_re().captures_iter(&form[2]).any(|input| {
+    input_re().captures_iter(&form[2]).any(|input| {
         attr_value(&input[1], "name").as_deref() == Some("dlcheck")
-            && attribute_re
+            && !attribute_re
                 .captures_iter(&input[1])
                 .any(|attr| attr[1].eq_ignore_ascii_case("disabled"))
     })

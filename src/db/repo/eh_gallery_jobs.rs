@@ -3954,12 +3954,13 @@ fn cleanup_pending_when_zip_owned_expr() -> SimpleExpr {
     .into()
 }
 
-fn archive_artifact_members(artifacts: &ArchiveArtifacts) -> [&std::path::Path; 4] {
+fn archive_artifact_members(artifacts: &ArchiveArtifacts) -> [&std::path::Path; 5] {
     [
         artifacts.final_zip(),
         artifacts.assembly_scratch(),
         artifacts.parts_dir(),
         artifacts.uploads_dir(),
+        artifacts.original_fallback_marker(),
     ]
 }
 
