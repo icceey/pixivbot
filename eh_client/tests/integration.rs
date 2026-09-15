@@ -684,7 +684,7 @@ async fn test_archive_key_downloads_reject_unsupported_resolution_before_network
 }
 
 #[tokio::test]
-async fn test_prepare_and_download_archive_form_flow() {
+async fn test_original_fallback_keeps_form_guards_and_isolates_resample_retry() {
     let server = MockServer::start().await;
     let gallery_page_html = r#"
 <html><body>
@@ -694,10 +694,18 @@ async fn test_prepare_and_download_archive_form_flow() {
     let archiver_form_html = format!(
         r#"
 <html><body>
-<form id="hathdl_form" method="post" action="{}/archiver.php?gid=4034806&amp;token=fedcba9876">
+<div>Download Cost: <strong>8,800 GP</strong></div>
+<form method="post" action="{}/archiver.php?gid=4034806&amp;token=fedcba9876">
   <input type="hidden" name="dltype" value="org" />
   <input type="submit" name="dlcheck" value="Download Original Archive" />
 </form>
+<p>Estimated Size: <strong>400.0 MiB</strong></p>
+<div>Download Cost: <strong>Free!</strong></div>
+<form method="post" action="/res-archiver.php">
+  <input type="hidden" name="dltype" value="res" />
+  <input type="submit" name="dlcheck" value="Download Resample Archive" disabled />
+</form>
+<p>Estimated Size: <strong>2.0 MiB</strong></p>
 </body></html>
 "#,
         server.uri()
@@ -711,16 +719,16 @@ async fn test_prepare_and_download_archive_form_flow() {
     Mock::given(method("GET"))
         .and(path("/g/4034806/e13b7d119b/"))
         .respond_with(ResponseTemplate::new(200).set_body_string(gallery_page_html))
-        .expect(1)
+        .expect(2)
         .mount(&server)
         .await;
-    Mock::given(method("GET"))
+    let archiver_page = Mock::given(method("GET"))
         .and(path("/archiver.php"))
         .and(query_param("gid", "4034806"))
         .and(query_param("token", "fedcba9876"))
-        .respond_with(ResponseTemplate::new(200).set_body_string(archiver_form_html))
+        .respond_with(ResponseTemplate::new(200).set_body_string(archiver_form_html.clone()))
         .expect(1)
-        .mount(&server)
+        .mount_as_scoped(&server)
         .await;
     Mock::given(method("POST"))
         .and(path("/archiver.php"))
@@ -741,9 +749,11 @@ async fn test_prepare_and_download_archive_form_flow() {
 
     let client = client_at(&server);
     let request = client
-        .prepare_archive_download(4034806, "e13b7d119b", "original")
+        .prepare_archive_download(4034806, "e13b7d119b", "1280x")
         .await
         .expect("should prepare form-driven archive request");
+    assert_eq!(request.cost(), &eh_client::parser::DownloadCost::Gp(8_800));
+    assert_eq!(request.estimated_size_bytes(), Some(400 * 1024 * 1024));
     let temp_dir = tempfile::tempdir().unwrap();
     let dest = temp_dir.path().join("archive.zip");
     let bytes = client
@@ -752,7 +762,77 @@ async fn test_prepare_and_download_archive_form_flow() {
         .expect("form-driven download should succeed");
 
     assert_eq!(bytes as usize, zip_bytes.len());
-    assert_eq!(std::fs::read(dest).unwrap(), zip_bytes);
+    assert_eq!(std::fs::read(&dest).unwrap(), zip_bytes);
+
+    // Restore the original prefix as the state left by an interrupted transfer.
+    // A new client and a newly available resample must not append a different ZIP.
+    let part = dest.with_extension("zip.part");
+    let split_at = zip_bytes.len() / 2;
+    tokio::fs::rename(&dest, &part).await.unwrap();
+    tokio::fs::OpenOptions::new()
+        .write(true)
+        .open(&part)
+        .await
+        .unwrap()
+        .set_len(split_at as u64)
+        .await
+        .unwrap();
+    drop(archiver_page);
+    Mock::given(method("GET"))
+        .and(path("/archiver.php"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(archiver_form_html.replace(" disabled", "")),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/res-archiver.php"))
+        .and(BodyContains("dltype=res"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+            r#"<script>document.location = "{}/archive/resample.zip?start=1";</script>"#,
+            server.uri()
+        )))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let resample_zip = test_zip_bytes("image.jpg", b"resample_content");
+    Mock::given(method("GET"))
+        .and(path("/archive/resample.zip"))
+        .and(header("range", format!("bytes={split_at}-")))
+        .respond_with(
+            ResponseTemplate::new(206)
+                .insert_header(
+                    "Content-Range",
+                    format!(
+                        "bytes {split_at}-{}/{}",
+                        resample_zip.len() - 1,
+                        resample_zip.len()
+                    ),
+                )
+                .set_body_bytes(resample_zip[split_at..].to_vec()),
+        )
+        .expect(0)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/archive/resample.zip"))
+        .and(HeaderAbsent("range"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(resample_zip.clone()))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let restarted = client_at(&server);
+    let request = restarted
+        .prepare_archive_download(4034806, "e13b7d119b", "1280x")
+        .await
+        .unwrap();
+    restarted
+        .download_archive_with_request(&request, &dest)
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read(&dest).unwrap(), resample_zip);
+    server.verify().await;
 }
 
 #[tokio::test]

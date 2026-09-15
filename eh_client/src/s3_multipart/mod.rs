@@ -1980,9 +1980,9 @@ mod tests {
     #[tokio::test]
     async fn terminal_abort_recovers_atomic_state_after_redacted_http_failure() {
         let server = MockServer::start().await;
-        let response_body = "private-response-body-sentinel";
+        let response_body = "<Error><Code>AccessDenied</Code><RequestId>private-response-body-sentinel</RequestId></Error>";
         let failing_request = Mock::given(method("DELETE"))
-            .respond_with(ResponseTemplate::new(503).set_body_string(response_body))
+            .respond_with(ResponseTemplate::new(403).set_body_string(response_body))
             .expect(1)
             .mount_as_scoped(&server)
             .await;
@@ -2000,10 +2000,10 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert_eq!(error.to_string(), "multipart Abort failed (HTTP 503)");
+        assert_eq!(error.to_string(), "multipart Abort failed (HTTP 403)");
         let diagnostic = format!("{error:?}: {error}");
         for forbidden in [
-            response_body,
+            "private-response-body-sentinel",
             KEY,
             UPLOAD_ID,
             manifest_path.to_str().unwrap(),
@@ -2012,7 +2012,15 @@ mod tests {
         }
         assert!(manifest_path.exists());
         drop(failing_request);
-        mount_abort_for(&server, UPLOAD_ID).await;
+        Mock::given(method("DELETE"))
+            .and(query_param("uploadId", UPLOAD_ID))
+            .respond_with(
+                ResponseTemplate::new(404)
+                    .set_body_string("<Error><Code>NoSuchUpload</Code></Error>"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
 
         abort_upload_state(
             test_bucket(&server).as_ref(),

@@ -175,6 +175,8 @@ download_original_threshold = 1
 # # Image resolution for subscription archive downloads: "780x", "980x", "1280x",
 # # or "original" (logged-in, costs GP/credits). Donor resolutions require a
 # # separate H@H Downloader and are rejected by direct archive downloads.
+# # Unavailable resamples fall back to the original archive, subject to its
+# # own GP cost and size limits. This also applies to /edl downloads below.
 # subscription_resolution = "1280x"
 # # Image resolution for /edl direct downloads: "780x", "980x", "1280x", or
 # # "original" (default: "1280x"). Donor resolutions require a separate H@H

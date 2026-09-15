@@ -337,6 +337,7 @@ pub struct EhentaiConfig {
     #[serde(default)]
     pub igneous: Option<String>,
     /// Resolution for subscription downloads: `780x`, `980x`, `1280x`, or `original`.
+    /// Unavailable resamples fall back to the original under the GP and size limits.
     /// Donor resolutions require a separate H@H Downloader and are rejected. Default: `1280x`.
     #[serde(
         default = "default_eh_subscription_resolution",
@@ -344,6 +345,7 @@ pub struct EhentaiConfig {
     )]
     pub subscription_resolution: String,
     /// Resolution for /edl direct downloads: `780x`, `980x`, `1280x`, or `original`.
+    /// Unavailable resamples fall back to the original under the GP and size limits.
     /// Donor resolutions require a separate H@H Downloader and are rejected. Default: `1280x`.
     #[serde(
         default = "default_eh_download_resolution",

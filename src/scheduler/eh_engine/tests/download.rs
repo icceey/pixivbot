@@ -48,7 +48,8 @@ async fn two_chats_share_one_download_purchase_artifact_and_completion() {
             "abcdef0123",
             ArchiverPage {
                 original_cost: "218 GP",
-                resample_cost: "218 GP",
+                resample_cost: "N/A",
+                keyed: true,
                 ..Default::default()
             },
         )
@@ -111,18 +112,15 @@ async fn two_chats_share_one_download_purchase_artifact_and_completion() {
             .await
             .unwrap();
         assert_eq!(completions.len(), 1);
-        assert_eq!(
-            eh_server
-                .received_requests()
-                .await
-                .unwrap()
-                .into_iter()
-                .filter(|request| {
-                    request.method.as_str() == "POST" && request.url.path() == "/archiver.php"
-                })
-                .count(),
-            1
-        );
+        let requests = eh_server.received_requests().await.unwrap();
+        let archive_posts: Vec<_> = requests
+            .iter()
+            .filter(|r| r.method.as_str() == "POST" && r.url.path() == "/archiver.php")
+            .collect();
+        assert_eq!(archive_posts.len(), 1);
+        assert!(std::str::from_utf8(&archive_posts[0].body)
+            .unwrap()
+            .contains("hathdl_xres=org"));
         assert_eq!(completions[0].job_id, Some(job.id));
         assert_eq!(
             repo.get_eh_downloaded_bytes_in_window(24).await.unwrap(),
@@ -560,7 +558,7 @@ async fn test_download_worker_slow_progress_hands_off_shared_job_to_background()
 }
 
 #[tokio::test]
-async fn test_download_size_limit_blocks_oversized_selected_archive_before_post() {
+async fn test_download_size_limit_blocks_oversized_fallback_archive_before_post() {
     let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
     setup_chat(&repo, -100, true).await;
     let eh_server = MockServer::start().await;
@@ -571,7 +569,8 @@ async fn test_download_size_limit_blocks_oversized_selected_archive_before_post(
         900,
         "abcdef0123",
         ArchiverPage {
-            sizes: Some(("400.0 MiB", "300.01 MiB")),
+            resample_cost: "N/A",
+            sizes: Some(("400.0 MiB", "2.0 MiB")),
             ..Default::default()
         },
     )

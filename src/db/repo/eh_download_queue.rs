@@ -16,7 +16,7 @@ use sea_orm::{
     ColumnTrait, Condition, DatabaseTransaction, EntityTrait, Order, PaginatorTrait, QueryFilter,
     QueryOrder, QuerySelect, Set, TransactionTrait,
 };
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, LazyLock, Mutex, Weak};
 use tokio::sync::OwnedMutexGuard;
 use tracing::warn;
@@ -1878,19 +1878,17 @@ impl Repo {
             }
         }
 
+        let mut abort_failures = BTreeMap::<String, usize>::new();
+        let mut families_without_abort_uploader = 0;
         for (final_zip, artifacts) in artifact_families {
             let result = if !owned_final_zips.contains(&final_zip) {
                 if artifacts.uploads_dir().exists() {
                     let Some(uploader) = abort_uploader else {
-                        warn!(
-                            "Preserving EH orphan upload state because no S3/ipfS3 abort uploader is configured"
-                        );
+                        families_without_abort_uploader += 1;
                         continue;
                     };
                     if let Err(error) = uploader.abort_upload_state(artifacts.uploads_dir()).await {
-                        warn!(
-                            "Failed to abort EH orphan upload state; preserving local archive family: {error}"
-                        );
+                        *abort_failures.entry(error.to_string()).or_default() += 1;
                         continue;
                     }
                 }
@@ -1901,6 +1899,18 @@ impl Repo {
             if let Err(e) = result {
                 warn!("Failed to cleanup EH archive artifacts: {}", e);
             }
+        }
+        if families_without_abort_uploader > 0 {
+            warn!(
+                families = families_without_abort_uploader,
+                "Preserving EH orphan upload state because no S3/ipfS3 abort uploader is configured"
+            );
+        }
+        if !abort_failures.is_empty() {
+            warn!(
+                failures = ?abort_failures,
+                "Failed to abort EH orphan upload state; preserving local archive families"
+            );
         }
 
         Ok(())
@@ -3726,13 +3736,16 @@ mod tests {
         let orphan_part = cache_dir.join("orphan.zip.part");
         let orphan_parts = cache_dir.join("orphan.zip.parts");
         let orphan_uploads = cache_dir.join("orphan.zip.uploads");
+        let orphan_selection = cache_dir.join("orphan.zip.original");
         let active_zip = cache_dir.join("active.zip");
         let active_part = cache_dir.join("active.zip.part");
         let active_parts = cache_dir.join("active.zip.parts");
         let active_uploads = cache_dir.join("active.zip.uploads");
+        let active_selection = cache_dir.join("active.zip.original");
         let unrelated = cache_dir.join("notes").join("keep.txt");
         std::fs::write(&orphan_zip, b"zip").unwrap();
         std::fs::write(&orphan_part, b"partial").unwrap();
+        std::fs::write(&orphan_selection, []).unwrap();
         std::fs::create_dir_all(orphan_parts.join("nested")).unwrap();
         std::fs::write(orphan_parts.join("manifest.json"), b"manifest").unwrap();
         std::fs::write(orphan_parts.join("nested").join("part-0001"), b"part").unwrap();
@@ -3741,6 +3754,7 @@ mod tests {
         std::fs::write(orphan_uploads.join("nested").join("image-0.json"), b"image").unwrap();
         std::fs::write(&active_zip, b"zip").unwrap();
         std::fs::write(&active_part, b"partial").unwrap();
+        std::fs::write(&active_selection, []).unwrap();
         std::fs::create_dir_all(active_parts.join("nested")).unwrap();
         std::fs::write(active_parts.join("manifest.json"), b"manifest").unwrap();
         std::fs::write(active_parts.join("nested").join("part-0001"), b"part").unwrap();
@@ -3794,6 +3808,14 @@ mod tests {
         );
 
         assert!(!orphan_zip.exists(), "orphan final ZIP should be removed");
+        assert!(
+            !orphan_selection.exists(),
+            "orphan selection must be removed with its archive"
+        );
+        assert!(
+            active_selection.exists(),
+            "active selection must survive cleanup for safe retries"
+        );
         assert!(
             !orphan_part.exists(),
             "orphan partial ZIP should be removed"

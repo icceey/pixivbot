@@ -376,11 +376,8 @@ impl EhUploadWorker {
                 let mut data = Vec::new();
                 std::io::Read::read_to_end(&mut file, &mut data)
                     .context("Failed to read image from zip")?;
-                let filename = std::path::Path::new(file.name())
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("image.jpg")
-                    .to_string();
+                // ZIP paths use '/', independently of the host filesystem.
+                let filename = file.name().rsplit('/').next().unwrap().to_string();
 
                 if image_tx
                     .blocking_send(ZipImageData {

@@ -44,6 +44,7 @@ pub struct ArchiveDownloadRequest {
     /// Estimated bytes for the archive selected by this request's form.
     /// `None` means the archiver page did not provide a trustworthy size.
     estimated_size_bytes: Option<u64>,
+    original_fallback: bool,
 }
 
 impl ArchiveDownloadRequest {
@@ -65,6 +66,7 @@ impl ArchiveDownloadRequest {
             // means the download is free / already unlocked.
             cost: parser::DownloadCost::Unlocked,
             estimated_size_bytes: None,
+            original_fallback: false,
         }
     }
 
@@ -82,6 +84,7 @@ impl ArchiveDownloadRequest {
             form_data,
             cost,
             estimated_size_bytes,
+            original_fallback: false,
         }
     }
 
@@ -338,6 +341,8 @@ impl EhClient {
     /// request so callers can decide whether to POST without spending GP.
     /// `resolution` must be exactly `780x`, `980x`, `1280x`, or `original`.
     /// Unsupported resolutions fail before any HTTP request.
+    /// Unavailable resamples fall back to an available original form; its cost
+    /// and estimated size are returned for the caller's download guards.
     pub async fn prepare_archive_download(
         &self,
         gid: u64,
@@ -348,7 +353,21 @@ impl EhClient {
         let (archiver_gid, archiver_token, archiver_html) =
             self.fetch_archiver_page(gid, token).await?;
 
-        // Parse the cost from the archiver page for the requested resolution.
+        let original_fallback = resolution != "original"
+            && !parser::archive_form_is_available(&archiver_html, resolution)
+            && parser::archive_form_is_available(&archiver_html, "original");
+        let resolution = if original_fallback {
+            tracing::info!(
+                gid,
+                requested = resolution,
+                "EH resample unavailable; using original archive"
+            );
+            "original"
+        } else {
+            resolution
+        };
+
+        // Parse the cost from the archiver page for the selected resolution.
         // This happens before any POST, so it does not spend GP. The cost is
         // attached to the returned request regardless of whether we take the
         // archiver-key path or the form path below, so callers can gate the
@@ -359,7 +378,7 @@ impl EhClient {
         let estimated_size_bytes =
             parser::parse_archive_download_estimated_size(&archiver_html, resolution);
 
-        if let Some(archiver_key) = parser::parse_archiver_key(&archiver_html) {
+        let mut request = if let Some(archiver_key) = parser::parse_archiver_key(&archiver_html) {
             let mut request = ArchiveDownloadRequest::from_archiver_key(
                 &self.base_url,
                 archiver_gid,
@@ -373,19 +392,22 @@ impl EhClient {
             // a key but the Download Cost text cannot be recognized.
             request.cost = cost;
             request.estimated_size_bytes = estimated_size_bytes;
-            return Ok(request);
-        }
-
-        let form = parser::parse_archiver_form(&archiver_html, resolution).ok_or_else(|| {
-            Error::Parse("archiver download form not found in archiver.php response".into())
-        })?;
-        Ok(ArchiveDownloadRequest::from_archiver_form(
-            &self.base_url,
-            form,
-            resolution,
-            cost,
-            estimated_size_bytes,
-        ))
+            request
+        } else {
+            let form =
+                parser::parse_archiver_form(&archiver_html, resolution).ok_or_else(|| {
+                    Error::Parse("archiver download form not found in archiver.php response".into())
+                })?;
+            ArchiveDownloadRequest::from_archiver_form(
+                &self.base_url,
+                form,
+                resolution,
+                cost,
+                estimated_size_bytes,
+            )
+        };
+        request.original_fallback = original_fallback;
+        Ok(request)
     }
 
     /// Download a gallery archive ZIP to the specified path.
@@ -460,6 +482,18 @@ impl EhClient {
         options: ArchiveDownloadOptions,
     ) -> Result<u64> {
         let options = options.validate()?;
+        let artifacts = ArchiveArtifacts::new(dest);
+        let original_marker = artifacts.original_fallback_marker();
+        if tokio::fs::try_exists(original_marker).await? != request.original_fallback {
+            // Remove the old prefix before recording the new selection. A crash
+            // between these operations can lose progress, but cannot mix ZIPs.
+            artifacts.remove_assembly_scratch().await?;
+            if request.original_fallback {
+                tokio::fs::File::create(original_marker).await?;
+            } else {
+                tokio::fs::remove_file(original_marker).await?;
+            }
+        }
         // Step 1: POST to archiver.php to initiate download
         let resp = self
             .http
@@ -485,7 +519,6 @@ impl EhClient {
             .ok_or_else(|| Error::Parse("archive redirect URL not found".into()))?;
 
         // Step 4: Stream to temp file, validate, then rename atomically
-        let artifacts = ArchiveArtifacts::new(dest);
         download_to_partial(
             &self.http,
             &self.cookies,
