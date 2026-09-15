@@ -1,3 +1,4 @@
+use reqwest::header::{HeaderName, HeaderValue, AUTHORIZATION, CONTENT_LENGTH, DATE};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -271,7 +272,13 @@ pub(crate) async fn upload_multipart(
                         "multipart stale manifest cannot be safely replaced".to_owned(),
                     ));
                 }
-                abort_for_replacement(bucket, &manifest.object_key, &manifest.upload_id).await?;
+                abort_session(
+                    bucket,
+                    request.provider,
+                    &manifest.object_key,
+                    &manifest.upload_id,
+                )
+                .await?;
                 manifest::remove_manifest(path).await?;
                 claim_replacement_budget(&mut replacement_used, MultipartOperation::Create)?;
                 None
@@ -342,6 +349,7 @@ pub(crate) async fn upload_multipart(
             Err(failure @ list_parts::MultipartFailure::InvalidInventory) => {
                 replace_corrupt_session(
                     bucket,
+                    request.provider,
                     &active,
                     request.manifest_path,
                     &mut replacement_used,
@@ -352,8 +360,14 @@ pub(crate) async fn upload_multipart(
                 continue;
             }
             Err(failure) => {
-                return finish_multipart_failure(bucket, &active, request.manifest_path, failure)
-                    .await;
+                return finish_multipart_failure(
+                    bucket,
+                    request.provider,
+                    &active,
+                    request.manifest_path,
+                    failure,
+                )
+                .await;
             }
         };
         let mut parts = match reconcile_parts(request.bytes.len(), listed_parts) {
@@ -361,6 +375,7 @@ pub(crate) async fn upload_multipart(
             Err(_) => {
                 replace_corrupt_session(
                     bucket,
+                    request.provider,
                     &active,
                     request.manifest_path,
                     &mut replacement_used,
@@ -393,6 +408,7 @@ pub(crate) async fn upload_multipart(
                 Err(failure) => {
                     return finish_multipart_failure(
                         bucket,
+                        request.provider,
                         &active,
                         request.manifest_path,
                         failure,
@@ -418,6 +434,7 @@ pub(crate) async fn upload_multipart(
             Err(error) => {
                 return finish_multipart_failure(
                     bucket,
+                    request.provider,
                     &active,
                     request.manifest_path,
                     list_parts::classify_s3_error(MultipartOperation::Complete, error),
@@ -431,7 +448,14 @@ pub(crate) async fn upload_multipart(
             status,
             response.bytes(),
         ) {
-            return finish_multipart_failure(bucket, &active, request.manifest_path, failure).await;
+            return finish_multipart_failure(
+                bucket,
+                request.provider,
+                &active,
+                request.manifest_path,
+                failure,
+            )
+            .await;
         }
         if !(200..300).contains(&status) {
             let failure = list_parts::classify_response(
@@ -440,7 +464,14 @@ pub(crate) async fn upload_multipart(
                 response.bytes(),
             )
             .expect_err("non-success multipart complete response must be classified as a failure");
-            return finish_multipart_failure(bucket, &active, request.manifest_path, failure).await;
+            return finish_multipart_failure(
+                bucket,
+                request.provider,
+                &active,
+                request.manifest_path,
+                failure,
+            )
+            .await;
         }
 
         return Ok(MultipartOutcome::Completed(CompletedUpload {
@@ -520,7 +551,7 @@ pub(crate) async fn abort_upload_state(
                 }
             };
         if let Err(error) =
-            abort_for_replacement(bucket, &manifest.object_key, &manifest.upload_id).await
+            abort_session(bucket, provider, &manifest.object_key, &manifest.upload_id).await
         {
             if first_error.is_none() {
                 first_error = Some(match error {
@@ -595,25 +626,24 @@ async fn create_session(
     manifest_path: Option<&Path>,
     manifest_identity: &manifest::ManifestIdentity<'_>,
 ) -> crate::Result<CreateSessionResult> {
-    let create = match create_extension {
-        CreateExtension::None => {
-            bucket
-                .initiate_multipart_upload(object_key, content_type)
-                .await
-        }
-        CreateExtension::IpfS3DecompressZip { .. } => {
-            let archive_stem = object_key.strip_suffix(".zip").ok_or_else(|| {
-                crate::Error::Other(
-                    "decompress-zip multipart object key must end in .zip".to_owned(),
-                )
-            })?;
-            let mut create_bucket = bucket.clone();
-            create_bucket.add_query("decompress-zip", &format!("{archive_stem}/"));
-            create_bucket
-                .initiate_multipart_upload(object_key, content_type)
-                .await
-        }
-    };
+    let mut create_bucket = bucket.clone();
+    if manifest_identity.provider == ProviderKind::IpfS3 {
+        // ipfS3 restores Content-Length from this signed header when a proxy
+        // changes the empty Init request to chunked. Keep it off body-bearing requests.
+        create_bucket.extra_headers.insert(
+            HeaderName::from_static("x-amz-decoded-content-length"),
+            HeaderValue::from_static("0"),
+        );
+    }
+    if let CreateExtension::IpfS3DecompressZip { .. } = create_extension {
+        let archive_stem = object_key.strip_suffix(".zip").ok_or_else(|| {
+            crate::Error::Other("decompress-zip multipart object key must end in .zip".to_owned())
+        })?;
+        create_bucket.add_query("decompress-zip", &format!("{archive_stem}/"));
+    }
+    let create = create_bucket
+        .initiate_multipart_upload(object_key, content_type)
+        .await;
     let created = match create {
         Ok(created) => created,
         Err(error) => {
@@ -632,7 +662,13 @@ async fn create_session(
             } else {
                 created.key.as_str()
             };
-            best_effort_abort(bucket, abort_key, &created.upload_id).await;
+            let _ = abort_session(
+                bucket,
+                manifest_identity.provider,
+                abort_key,
+                &created.upload_id,
+            )
+            .await;
         }
         return Err(crate::Error::Other(
             "multipart create response did not identify the requested upload".to_owned(),
@@ -649,7 +685,13 @@ async fn create_session(
         }
         .await;
         if let Err(error) = persistence {
-            best_effort_abort(bucket, object_key, &created.upload_id).await;
+            let _ = abort_session(
+                bucket,
+                manifest_identity.provider,
+                object_key,
+                &created.upload_id,
+            )
+            .await;
             return Err(error);
         }
     }
@@ -662,25 +704,25 @@ async fn create_session(
 
 async fn finish_multipart_failure(
     bucket: &s3::Bucket,
+    provider: ProviderKind,
     active: &ActiveSession,
     manifest_path: Option<&Path>,
     failure: list_parts::MultipartFailure,
 ) -> crate::Result<MultipartOutcome> {
-    if matches!(failure, list_parts::MultipartFailure::Unsupported { .. }) {
-        if let Some(path) = manifest_path {
-            abort_for_replacement(bucket, &active.object_key, &active.upload_id).await?;
+    if let Some(path) = manifest_path {
+        if matches!(failure, list_parts::MultipartFailure::Unsupported { .. }) {
+            abort_session(bucket, provider, &active.object_key, &active.upload_id).await?;
             manifest::remove_manifest(path).await?;
-        } else {
-            best_effort_abort(bucket, &active.object_key, &active.upload_id).await;
         }
-    } else if manifest_path.is_none() {
-        best_effort_abort(bucket, &active.object_key, &active.upload_id).await;
+    } else {
+        let _ = abort_session(bucket, provider, &active.object_key, &active.upload_id).await;
     }
     multipart_failure_outcome(failure)
 }
 
 async fn replace_corrupt_session(
     bucket: &s3::Bucket,
+    provider: ProviderKind,
     active: &ActiveSession,
     manifest_path: Option<&Path>,
     replacement_used: &mut bool,
@@ -689,21 +731,79 @@ async fn replace_corrupt_session(
     if *replacement_used {
         return Err(replacement_exhausted(operation));
     }
-    abort_for_replacement(bucket, &active.object_key, &active.upload_id).await?;
+    abort_session(bucket, provider, &active.object_key, &active.upload_id).await?;
     remove_manifest_for_replacement(manifest_path).await?;
     claim_replacement_budget(replacement_used, operation)
 }
 
-async fn best_effort_abort(bucket: &s3::Bucket, key: &str, upload_id: &str) {
-    let _ = bucket.abort_upload(key, upload_id).await;
-}
-
-async fn abort_for_replacement(
+async fn abort_session(
     bucket: &s3::Bucket,
+    provider: ProviderKind,
     key: &str,
     upload_id: &str,
 ) -> Result<(), list_parts::MultipartFailure> {
-    match bucket.abort_upload(key, upload_id).await {
+    let result: Result<(), s3::error::S3Error> = async {
+        if provider == ProviderKind::S3 {
+            return bucket.abort_upload(key, upload_id).await;
+        }
+        use s3::request::Request;
+
+        let request = s3::request::tokio_backend::ReqwestRequest::new(
+            bucket,
+            key,
+            s3::command::Command::AbortMultipartUpload { upload_id },
+        )
+        .await?;
+        let max_retries = u64::from(s3::get_retries());
+        let mut retries = 0_u64;
+        let response = loop {
+            let send: Result<_, s3::error::S3Error> = async {
+                let mut headers = request.headers().await?;
+                headers.remove(AUTHORIZATION);
+                // Proxies can omit Content-Length: 0 on DELETE without using chunked,
+                // so ipfS3's decoded-length bridge cannot restore it for verification.
+                headers.remove(CONTENT_LENGTH);
+                // rust-s3 adds Date after signing; preserve that exclusion when re-signing.
+                let date = headers.remove(DATE);
+                let authorization = request.authorization(&headers).await?;
+                headers.insert(AUTHORIZATION, authorization.parse()?);
+                if let Some(date) = date {
+                    headers.insert(DATE, date);
+                }
+                Ok(bucket
+                    .http_client()
+                    .delete(request.url()?)
+                    .headers(headers)
+                    .body(Vec::<u8>::new())
+                    .send()
+                    .await?)
+            }
+            .await;
+            match send {
+                Ok(response) => break response,
+                Err(error) if retries == max_retries => return Err(error),
+                Err(_) => {
+                    // Match rust-s3 response_data's transport retry budget and delay.
+                    // HTTP statuses and response-body read errors are handled below.
+                    retries += 1;
+                    tracing::warn!(retries, "Retrying ipfS3 multipart Abort request");
+                    tokio::time::sleep(std::time::Duration::from_secs(retries.pow(2))).await;
+                }
+            }
+        };
+        let status = response.status().as_u16();
+        let body = response.bytes().await?;
+        if (200..300).contains(&status) {
+            Ok(())
+        } else {
+            Err(s3::error::S3Error::HttpFailWithBody(
+                status,
+                String::from_utf8(body.to_vec())?,
+            ))
+        }
+    }
+    .await;
+    match result {
         Ok(_) => Ok(()),
         Err(error) => match list_parts::classify_s3_error(MultipartOperation::Abort, error) {
             list_parts::MultipartFailure::NoSuchUpload { .. } => Ok(()),
@@ -1803,6 +1903,7 @@ mod tests {
 
         let result = finish_multipart_failure(
             bucket.as_ref(),
+            ProviderKind::S3,
             &active,
             Some(&manifest_path),
             list_parts::MultipartFailure::Unsupported {
@@ -1837,6 +1938,7 @@ mod tests {
 
         let result = finish_multipart_failure(
             test_bucket(&server).as_ref(),
+            ProviderKind::S3,
             &active,
             Some(&manifest_path),
             list_parts::MultipartFailure::Unsupported {
@@ -1990,11 +2092,17 @@ mod tests {
         let uploads_dir = temp.path().join("gallery.zip.uploads");
         tokio::fs::create_dir(&uploads_dir).await.unwrap();
         let manifest_path = uploads_dir.join("manifest.json.tmp-crash");
-        write_valid_manifest(&manifest_path, &vec![7; PART_SIZE], UPLOADER_ID).await;
+        write_valid_manifest_for(
+            &manifest_path,
+            &vec![7; PART_SIZE],
+            UPLOADER_ID,
+            ProviderKind::IpfS3,
+        )
+        .await;
 
         let error = abort_upload_state(
             test_bucket(&server).as_ref(),
-            ProviderKind::S3,
+            ProviderKind::IpfS3,
             UPLOADER_ID,
             &uploads_dir,
         )
@@ -2024,20 +2132,13 @@ mod tests {
 
         abort_upload_state(
             test_bucket(&server).as_ref(),
-            ProviderKind::S3,
+            ProviderKind::IpfS3,
             UPLOADER_ID,
             &uploads_dir,
         )
         .await
         .unwrap();
 
-        let requests = server.received_requests().await.unwrap();
-        assert_request_sequence(&requests, &["DELETE", "DELETE"]);
-        assert_eq!(requests[0].url.path(), format!("/{BUCKET}/{KEY}"));
-        assert_eq!(
-            query_value(&requests[0], "uploadId").as_deref(),
-            Some(UPLOAD_ID)
-        );
         server.verify().await;
     }
 
