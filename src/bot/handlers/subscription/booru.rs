@@ -267,9 +267,8 @@ impl BotHandler {
             }
         };
 
-        let parts: Vec<&str> = parsed.remaining.split_whitespace().collect();
-
-        if parts.is_empty() {
+        let remaining = parsed.remaining.trim();
+        if remaining.is_empty() {
             let available: Vec<&str> = self
                 .booru_registry
                 .iter()
@@ -282,15 +281,32 @@ impl BotHandler {
             return Ok(());
         }
 
-        let internal_target = if parts.len() == 1 {
-            parse_bunsub_internal_key(parts[0])
-        } else {
-            None
+        let subscriptions = match self.repo.list_subscriptions_by_chat(target_chat_id.0).await {
+            Ok(subscriptions) => subscriptions,
+            Err(e) => {
+                error!(
+                    "Failed to list Booru subscriptions for chat {}: {:#}",
+                    target_chat_id.0, e
+                );
+                bot.send_message(chat_id, "❌ 查询订阅失败，请稍后重试")
+                    .await?;
+                return Ok(());
+            }
         };
 
-        let (task_type, task_value) = if let Some(target) = internal_target {
+        let exact_target = subscriptions.iter().find_map(|(_, task)| {
+            matches!(task.r#type, TaskType::BooruTag | TaskType::BooruRanking)
+                .then_some(task)
+                .filter(|task| task.value == remaining)
+                .map(|task| (task.r#type, task.value.clone()))
+        });
+
+        let (task_type, task_value) = if let Some(target) =
+            exact_target.or_else(|| parse_bunsub_internal_key(remaining))
+        {
             target
         } else {
+            let parts: Vec<&str> = remaining.split_whitespace().collect();
             let site_tags_str = parts[0];
             let (site_name, first_tag) = match site_tags_str.split_once(':') {
                 Some((site, tags)) => (site, tags),
@@ -471,7 +487,15 @@ impl BotHandler {
                     "Failed to unsubscribe booru tag {} for chat {}: {:#}",
                     task_value, target_chat_id.0, e
                 );
-                bot.send_message(chat_id, "❌ 未找到该订阅").await?;
+                let error_message = e.to_string();
+                let user_message = if e.chain().len() == 1
+                    && matches!(error_message.as_str(), "未找到" | "未订阅")
+                {
+                    "❌ 未找到该订阅"
+                } else {
+                    "❌ 取消订阅失败，请稍后重试"
+                };
+                bot.send_message(chat_id, user_message).await?;
             }
         }
 
@@ -997,7 +1021,7 @@ fn build_bsub_usage_message(site_names: &[&str]) -> String {
 
 fn build_bunsub_usage_message(site_names: &[&str]) -> String {
     let Some(first_site) = site_names.first() else {
-        return "❌ 未配置任何 Booru 站点".to_string();
+        return "❌ 用法: `/bunsub [ch=<频道ID>] <ID或站点参数>`\n\n优先精确匹配目标聊天中 /list 显示的完整 ID；复制代码格式中的内容即可，无需输入反引号。未匹配时才按原站点、标签和参数语法解析。\n\n当前未配置 Booru 站点。".to_string();
     };
 
     let available_sites = site_names
@@ -1008,7 +1032,7 @@ fn build_bunsub_usage_message(site_names: &[&str]) -> String {
     let first_site = markdown::escape(first_site);
 
     format!(
-        "❌ 用法: `/bunsub [ch=<频道ID>] <站点名:[标签]> [order=...|scale=day|week|month|interval=<时长>] [过滤条件]`\n\n可用站点: {}\n\n示例:\n`/bunsub {}:landscape`\n`/bunsub {}:landscape scale=day`\n`/bunsub {}: interval=1h`",
+        "❌ 用法: `/bunsub [ch=<频道ID>] <ID或站点参数>`\n\n优先精确匹配目标聊天中 /list 显示的完整 ID；复制代码格式中的内容即可，无需输入反引号。未匹配时才按原站点、标签和参数语法解析。\n\n可用站点: {}\n\n示例:\n`/bunsub {}:landscape`\n`/bunsub {}:landscape scale=day`\n`/bunsub {}: interval=1h`",
         available_sites, first_site, first_site, first_site
     )
 }

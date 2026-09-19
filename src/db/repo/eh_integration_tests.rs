@@ -7,11 +7,14 @@ use crate::db::repo::eh_gallery_jobs::{
 use crate::db::repo::tests_helpers;
 use crate::db::types::{EhFilter, EhTagState, SubscriptionState, TagFilter, TaskType};
 use crate::db::{
-    entities::{eh_download_queue, eh_gallery_jobs},
+    entities::{eh_download_queue, eh_gallery_jobs, subscriptions},
     repo::eh_download_queue::*,
 };
 use chrono::{Duration, NaiveDate};
-use sea_orm::{ActiveModelTrait, EntityTrait, Set};
+use sea_orm::{
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, DbBackend, EntityTrait, QueryFilter, Set,
+    Statement,
+};
 
 #[tokio::test]
 async fn test_eh_queue_status_snapshot_scopes_orders_and_selects_recent_terminal() {
@@ -428,13 +431,37 @@ async fn eh_subscription_upsert_updates_filters_without_replacing_subscription()
     repo.update_subscription_latest_data(initial.id, progress.clone())
         .await
         .unwrap();
+
+    repo.db()
+        .execute(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE subscriptions SET eh_filter = ? WHERE id = ?",
+            [r#"{"min_rating":4}"#.into(), initial.id.into()],
+        ))
+        .await
+        .unwrap();
+    let legacy = subscriptions::Entity::find()
+        .filter(subscriptions::Column::Id.eq(initial.id))
+        .one(repo.db())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        legacy.eh_filter,
+        Some(EhFilter {
+            min_rating: Some(4.0),
+            ..Default::default()
+        })
+    );
+
     for filter in [
         Some(EhFilter {
-            min_rating: Some(3),
+            min_rating: Some(3.0),
             ..Default::default()
         }),
         Some(EhFilter {
-            min_rating: Some(4),
+            min_rating: Some(4.5),
+            min_rating_strict: true,
             min_pages: Some(20),
             telegraph: true,
             ..Default::default()
