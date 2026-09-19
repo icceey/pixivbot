@@ -66,7 +66,7 @@ impl BotHandler {
                     chat_id,
                     "用法: /esub <搜索词> [过滤条件]\n\n\
                      过滤条件:\n\
-                     • rating>=N — 最低评分 (2-5, 触发48h扫描)\n\
+                     • rating>=N / rating>N — 最低评分 (支持小数，2-5；默认扫描窗口48h)\n\
                      • pages>=N — 最低页数\n\
                      • pages<=N — 最高页数\n\
                      • cat=<类别> — 分类筛选 (逗号分隔)\n\
@@ -204,54 +204,64 @@ impl BotHandler {
 
         let remaining = parsed.remaining.trim();
         if remaining.is_empty() {
-            let _ = bot.send_message(chat_id, "用法: /eunsub <搜索词>").await;
+            let _ = bot
+                .send_message(
+                    chat_id,
+                    "用法: /eunsub [ch=<频道ID>] <ID或搜索词>\n\nID 请复制 /list 中代码格式的内容，无需输入反引号。合法 eh:/ehq: ID 只做精确匹配，未找到不会按搜索词重试；搜索词本身看起来像 ID 时，请使用它在 /list 中的完整 ID。",
+                )
+                .await;
             return Ok(());
         }
 
-        // Try to parse as internal key first (contains |)
-        let task_value = if remaining.contains('|') {
-            // Already a task value format
-            if EhTaskKey::parse(remaining).is_some() {
-                remaining.to_string()
-            } else {
-                let _ = bot.send_message(chat_id, "❌ 无效的订阅标识").await;
+        let subscriptions = match self.repo.list_subscriptions_by_chat(target_chat_id).await {
+            Ok(subscriptions) => subscriptions,
+            Err(e) => {
+                error!(
+                    "Failed to list EH subscriptions for chat {}: {:#}",
+                    target_chat_id, e
+                );
+                let _ = bot
+                    .send_message(chat_id, "❌ 查询订阅失败，请稍后重试")
+                    .await;
                 return Ok(());
             }
-        } else {
-            // List subscriptions and find one whose query matches
-            let subs = self.repo.list_subscriptions_by_chat(target_chat_id).await;
-            match subs {
-                Ok(subs) => {
-                    let matching: Vec<_> = subs
-                        .into_iter()
-                        .filter(|(_, task)| task.r#type == crate::db::types::TaskType::Ehentai)
-                        .filter_map(|(sub, task)| {
-                            eh_task_value_for_query(&task.value, remaining)
-                                .map(|value| (sub, value.to_string()))
-                        })
-                        .collect();
+        };
 
-                    match matching.len() {
-                        0 => {
-                            let _ = bot.send_message(chat_id, "❌ 未找到对应的订阅").await;
-                            return Ok(());
-                        }
-                        1 => matching[0].1.clone(),
-                        _ => {
-                            let _ = bot
-                                .send_message(
-                                    chat_id,
-                                    "❌ 找到多个匹配的订阅，请使用 /list 查看完整标识后用 /eunsub <标识>",
-                                )
-                                .await;
-                            return Ok(());
-                        }
-                    }
+        let task_value = if EhTaskKey::parse(remaining).is_some() {
+            match subscriptions
+                .iter()
+                .find(|(_, task)| task.r#type == TaskType::Ehentai && task.value == remaining)
+            {
+                Some((_, task)) => task.value.clone(),
+                None => {
+                    let _ = bot.send_message(chat_id, "❌ 未找到对应的订阅").await;
+                    return Ok(());
                 }
-                Err(e) => {
+            }
+        } else if remaining.contains('|') {
+            let _ = bot.send_message(chat_id, "❌ 无效的订阅标识").await;
+            return Ok(());
+        } else {
+            let matching: Vec<_> = subscriptions
+                .iter()
+                .filter(|(_, task)| task.r#type == TaskType::Ehentai)
+                .filter_map(|(_, task)| {
+                    eh_task_value_for_query(&task.value, remaining).map(str::to_string)
+                })
+                .collect();
+
+            match matching.len() {
+                0 => {
+                    let _ = bot.send_message(chat_id, "❌ 未找到对应的订阅").await;
+                    return Ok(());
+                }
+                1 => matching[0].clone(),
+                _ => {
                     let _ = bot
-                        .send_message(chat_id, format!("❌ {}", markdown::escape(&e.to_string())))
-                        .parse_mode(ParseMode::MarkdownV2)
+                        .send_message(
+                            chat_id,
+                            "❌ 找到多个匹配的订阅，请使用 /list 查看完整标识后用 /eunsub <标识>",
+                        )
                         .await;
                     return Ok(());
                 }
@@ -266,15 +276,23 @@ impl BotHandler {
                 let _ = bot.send_message(chat_id, "✅ 已取消 E-Hentai 订阅").await;
             }
             Err(e) => {
-                let msg = if e.to_string().contains("未订阅") {
-                    "❌ 未找到对应的订阅".to_string()
+                error!(
+                    "Failed to unsubscribe EH task {} for chat {}: {:#}",
+                    task_value, target_chat_id, e
+                );
+                let error_message = e.root_cause().to_string();
+                let user_message = if matches!(
+                    error_message.as_str(),
+                    "未找到"
+                        | "未订阅"
+                        | "EH subscription disappeared before cancellation"
+                        | "EH subscription disappeared during cancellation"
+                ) {
+                    "❌ 未找到对应的订阅"
                 } else {
-                    format!("❌ {}", markdown::escape(&e.to_string()))
+                    "❌ 取消订阅失败，请稍后重试"
                 };
-                let _ = bot
-                    .send_message(chat_id, msg)
-                    .parse_mode(ParseMode::MarkdownV2)
-                    .await;
+                let _ = bot.send_message(chat_id, user_message).await;
             }
         }
 
@@ -612,11 +630,19 @@ fn parse_eh_filter(args: &[String]) -> Result<EhFilter, String> {
 
     for arg in args {
         if let Some(val) = arg.strip_prefix("rating>=") {
-            let n: u8 = val.parse().map_err(|_| format!("无效的评分值: {}", val))?;
-            if !(2..=5).contains(&n) {
+            let n: f64 = val.parse().map_err(|_| format!("无效的评分值: {}", val))?;
+            if !n.is_finite() || !(2.0..=5.0).contains(&n) {
                 return Err(format!("评分范围: 2-5, 得到: {}", n));
             }
             filter.min_rating = Some(n);
+            filter.min_rating_strict = false;
+        } else if let Some(val) = arg.strip_prefix("rating>") {
+            let n: f64 = val.parse().map_err(|_| format!("无效的评分值: {}", val))?;
+            if !n.is_finite() || !(2.0..=5.0).contains(&n) {
+                return Err(format!("评分范围: 2-5, 得到: {}", n));
+            }
+            filter.min_rating = Some(n);
+            filter.min_rating_strict = true;
         } else if let Some(val) = arg.strip_prefix("pages>=") {
             let n: u32 = val.parse().map_err(|_| format!("无效的页数: {}", val))?;
             filter.min_pages = Some(n);
@@ -664,10 +690,7 @@ fn parse_esub_remaining(remaining: &str) -> Result<ParsedEhSubscriptionArgs, Str
         if let Some(val) = part.strip_prefix("rating>=") {
             filter_args.push(format!("rating>={val}"));
         } else if let Some(val) = part.strip_prefix("rating>") {
-            let n = val
-                .parse::<u8>()
-                .map_err(|_| format!("无效的评分值: {val}"))?;
-            filter_args.push(format!("rating>={}", n.saturating_add(1)));
+            filter_args.push(format!("rating>{val}"));
         } else if let Some(val) = part.strip_prefix("pages>=") {
             filter_args.push(format!("pages>={val}"));
         } else if let Some(val) = part.strip_prefix("pages>") {
@@ -871,48 +894,43 @@ fn format_eh_queue_status_with_visible_active_count(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use eh_client::EhGallery;
 
     #[test]
     fn subscription_options_parse_through_to_filters() {
-        for (input, query, filter_args, cat, telegraph, expected) in [
-            (
-                "foo rating>=4",
-                "foo",
-                vec!["rating>=4"],
-                None,
-                false,
-                (Some(4), None, None),
-            ),
-            (
-                "foo rating>=3 pages>=20 pages<=500",
-                "foo",
-                vec!["rating>=3", "pages>=20", "pages<=500"],
-                None,
-                false,
-                (Some(3), Some(20), Some(500)),
-            ),
-            (
-                "foo rating>3 pages>20 pages<100 telegraph=on cat=manga",
-                "foo",
-                vec!["rating>=4", "pages>=21", "pages<=99"],
-                Some("manga"),
-                true,
-                (Some(4), Some(21), Some(99)),
-            ),
-        ] {
-            let parsed = parse_esub_remaining(input).unwrap();
-            assert_eq!(parsed.query, query);
-            assert_eq!(parsed.filter_args, filter_args);
-            assert_eq!(parsed.cat_str.as_deref(), cat);
-            assert_eq!(parsed.telegraph_on, telegraph);
-            let filter = parse_eh_filter(&parsed.filter_args).unwrap();
-            assert_eq!(
-                (filter.min_rating, filter.min_pages, filter.max_pages),
-                expected,
-                "{input}"
-            );
-            assert!(!filter.telegraph);
-        }
+        let parsed =
+            parse_esub_remaining("foo rating>4.5 pages>20 pages<100 telegraph=on cat=manga")
+                .unwrap();
+        assert_eq!(parsed.query, "foo");
+        assert_eq!(parsed.cat_str.as_deref(), Some("manga"));
+        assert!(parsed.telegraph_on);
+        let filter = parse_eh_filter(&parsed.filter_args).unwrap();
+        assert_eq!((filter.min_pages, filter.max_pages), (Some(21), Some(99)));
+
+        let gallery_with_rating = |rating| EhGallery {
+            gid: 1,
+            token: "token".to_string(),
+            title: "title".to_string(),
+            title_jpn: None,
+            category: "Manga".to_string(),
+            thumb: "thumb".to_string(),
+            uploader: "uploader".to_string(),
+            posted: 1,
+            filecount: 50,
+            filesize: 1,
+            expunged: false,
+            rating,
+            tags: Vec::new(),
+        };
+        assert!(!filter.matches(&gallery_with_rating(4.5)));
+        assert!(filter.matches(&gallery_with_rating(4.75)));
+
+        let inclusive = parse_esub_remaining("foo rating>4 rating>=4.5").unwrap();
+        let inclusive = parse_eh_filter(&inclusive.filter_args).unwrap();
+        assert!(inclusive.matches(&gallery_with_rating(4.5)));
+
+        let non_finite = parse_esub_remaining("foo rating>NaN").unwrap();
+        assert!(parse_eh_filter(&non_finite.filter_args).is_err());
     }
 
     #[test]
@@ -925,7 +943,7 @@ mod tests {
     #[test]
     fn test_eh_task_value_for_query_matches_encoded_value() {
         let filter = EhFilter {
-            min_rating: Some(4),
+            min_rating: Some(4.0),
             ..Default::default()
         };
         let key = EhTaskKey::new("foo|bar", 0, &filter);

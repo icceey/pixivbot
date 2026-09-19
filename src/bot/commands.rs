@@ -34,7 +34,7 @@ pub enum Command {
     Download(String),
     #[command(description = "订阅 Booru 标签\n  用法: /bsub [ch=<频道ID>] <站点:标签> [过滤条件]")]
     BSub(String),
-    #[command(description = "取消 Booru 标签订阅\n  用法: /bunsub [ch=<频道ID>] <站点:标签>")]
+    #[command(description = "取消 Booru 订阅\n  用法: /bunsub [ch=<频道ID>] <list中的完整ID>")]
     BUnsub(String),
     #[command(description = "订阅 Booru 排行榜: <站点:> scale=day|week|month [过滤条件]")]
     BRank(String),
@@ -48,7 +48,7 @@ pub enum Command {
     BRand(String),
     #[command(description = "订阅 E-Hentai 画廊\n  用法: /esub [ch=<频道ID>] <搜索词> [过滤条件]")]
     ESub(String),
-    #[command(description = "取消 E-Hentai 订阅\n  用法: /eunsub [ch=<频道ID>] <搜索词>")]
+    #[command(description = "取消 E-Hentai 订阅\n  用法: /eunsub [ch=<频道ID>] <list中的完整ID>")]
     EUnsub(String),
     #[command(description = "直接下载 E-Hentai 画廊\n  用法: /edl <url> [telegraph=on]")]
     EDl(String),
@@ -82,7 +82,7 @@ impl Command {
         if has_booru {
             commands.extend([
                 BotCommand::new("bsub", "订阅Booru标签 - /bsub <站点:标签> [过滤条件]"),
-                BotCommand::new("bunsub", "取消Booru标签订阅 - /bunsub <站点:标签>"),
+                BotCommand::new("bunsub", "取消Booru订阅 - /bunsub <list中的完整ID>"),
                 BotCommand::new(
                     "brank",
                     "订阅Booru排行榜 - /brank <站点:> scale=day|week|month [+tag -tag]",
@@ -106,7 +106,7 @@ impl Command {
         if has_ehentai {
             commands.extend([
                 BotCommand::new("esub", "订阅EH画廊 - /esub <搜索词> [过滤条件]"),
-                BotCommand::new("eunsub", "取消EH订阅 - /eunsub <搜索词>"),
+                BotCommand::new("eunsub", "取消EH订阅 - /eunsub <list中的完整ID>"),
                 BotCommand::new("edl", "下载EH画廊 - /edl <url> [telegraph=on]"),
                 BotCommand::new("estatus", "查看当前聊天的EH下载队列"),
                 BotCommand::new(

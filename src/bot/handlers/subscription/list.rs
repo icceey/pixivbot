@@ -94,6 +94,9 @@ impl BotHandler {
                         TaskType::BooruTag | TaskType::BooruPool | TaskType::BooruRanking
                     )
                 });
+                let page_has_eh_subscription = page_subscriptions
+                    .iter()
+                    .any(|(_, task)| task.r#type == TaskType::Ehentai);
 
                 let header = if is_channel {
                     if total_pages > 1 {
@@ -162,7 +165,7 @@ impl BotHandler {
                                 }
                             }
                         } else {
-                            markdown::escape(&task.value)
+                            format!("ID: `{}`", escape_markdown_code(&task.value))
                         };
                         (type_emoji, display_info)
                     };
@@ -189,27 +192,37 @@ impl BotHandler {
                     ));
                 }
 
-                if is_channel {
-                    let footer = if page_has_booru_subscription {
-                        format!(
-                            "\n💡 使用 `/unsub ch={cid} <id>` `/unsubrank ch={cid} <mode>` `/bunsub ch={cid} <站点:标签>` 取消订阅",
-                            cid = target_chat_id.0
-                        )
-                    } else {
-                        format!(
-                            "\n💡 使用 `/unsub ch={cid} <id>` `/unsubrank ch={cid} <mode>` 取消订阅",
-                            cid = target_chat_id.0
-                        )
-                    };
-                    message.push_str(&footer);
+                let mut unsubscribe_hints = if is_channel {
+                    vec![
+                        format!("/unsub ch={} <id>", target_chat_id.0),
+                        format!("/unsubrank ch={} <mode>", target_chat_id.0),
+                    ]
                 } else {
-                    let footer = if page_has_booru_subscription {
-                        "\n💡 使用 `/unsub <id>` `/unsubrank <mode>` `/bunsub <站点:标签>` 取消订阅"
+                    vec!["/unsub <id>".to_string(), "/unsubrank <mode>".to_string()]
+                };
+                if page_has_booru_subscription {
+                    unsubscribe_hints.push(if is_channel {
+                        format!("/bunsub ch={} <ID>", target_chat_id.0)
                     } else {
-                        "\n💡 使用 `/unsub <id>` `/unsubrank <mode>` 取消订阅"
-                    };
-                    message.push_str(footer);
+                        "/bunsub <ID>".to_string()
+                    });
                 }
+                if page_has_eh_subscription {
+                    unsubscribe_hints.push(if is_channel {
+                        format!("/eunsub ch={} <ID>", target_chat_id.0)
+                    } else {
+                        "/eunsub <ID>".to_string()
+                    });
+                }
+                message.push_str("\n💡 使用 ");
+                message.push_str(
+                    &unsubscribe_hints
+                        .iter()
+                        .map(|hint| format!("`{}`", escape_markdown_code(hint)))
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                );
+                message.push_str(" 取消订阅；ID 为代码格式内容，无需反引号");
 
                 let keyboard = if total_pages > 1 {
                     Some(build_pagination_keyboard(
@@ -280,7 +293,7 @@ fn booru_list_display(
         format!(
             "{} \\| `{}`",
             markdown::escape(name),
-            markdown::escape(task_value)
+            escape_markdown_code(task_value)
         )
     } else {
         let label = match task_type {
@@ -292,10 +305,14 @@ fn booru_list_display(
             }
         };
 
-        format!("{}: `{}`", label, markdown::escape(task_value))
+        format!("{}: `{}`", label, escape_markdown_code(task_value))
     };
 
     (type_emoji, display_info)
+}
+
+fn escape_markdown_code(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('`', "\\`")
 }
 
 fn booru_ranking_list_emoji(task_value: &str) -> &'static str {

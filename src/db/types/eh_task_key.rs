@@ -143,7 +143,7 @@ mod tests {
                 "female:elf",
                 0,
                 EhFilter {
-                    min_rating: Some(4),
+                    min_rating: Some(4.0),
                     ..Default::default()
                 },
                 "eh:female:elf|f=r4",
@@ -152,7 +152,7 @@ mod tests {
                 "parody:touhou",
                 3,
                 EhFilter {
-                    min_rating: Some(4),
+                    min_rating: Some(4.0),
                     min_pages: Some(20),
                     telegraph: true,
                     ..Default::default()
@@ -163,7 +163,7 @@ mod tests {
                 "female:elf cat:2",
                 7,
                 EhFilter {
-                    min_rating: Some(3),
+                    min_rating: Some(3.0),
                     min_pages: Some(10),
                     max_pages: Some(200),
                     ..Default::default()
@@ -174,7 +174,7 @@ mod tests {
                 "foo|f=r3 100% ~bar",
                 2,
                 EhFilter {
-                    min_rating: Some(5),
+                    min_rating: Some(5.0),
                     ..Default::default()
                 },
                 "ehq:foo%7Cf=r3 100%25 ~bar|c=2|f=r5",

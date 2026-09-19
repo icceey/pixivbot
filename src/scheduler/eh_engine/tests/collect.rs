@@ -1,6 +1,102 @@
 use super::*;
 
 #[tokio::test]
+async fn inclusive_rating_survives_shared_strict_filter_aggregation() {
+    let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+    setup_chat(&repo, -100, true).await;
+    setup_chat(&repo, -200, true).await;
+
+    let task = repo
+        .get_or_create_task(
+            TaskType::Ehentai,
+            "eh:artist:rating-aggregate|f=r4.5".to_string(),
+            None,
+        )
+        .await
+        .unwrap();
+    let task_id = task.id;
+    let mut active: tasks::ActiveModel = task.into();
+    active.next_poll_at = Set(Local::now().naive_local() - chrono::Duration::seconds(1));
+    active.update(repo.db()).await.unwrap();
+
+    repo.upsert_eh_subscription(
+        -100,
+        task_id,
+        crate::db::types::TagFilter::default(),
+        Some(EhFilter {
+            min_rating: Some(4.5),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    repo.upsert_eh_subscription(
+        -200,
+        task_id,
+        crate::db::types::TagFilter::default(),
+        Some(EhFilter {
+            min_rating: Some(4.5),
+            min_rating_strict: true,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    let now = Local::now().timestamp();
+    let server = MockServer::start().await;
+    let search_html = r#"
+        <div class="gl1t"><a href="https://e-hentai.org/g/3101/aaaaaaaaaa/"><div class="glink">Boundary</div></a></div>
+        <div class="gl1t"><a href="https://e-hentai.org/g/3102/bbbbbbbbbb/"><div class="glink">Above</div></a></div>
+        "#;
+    Mock::given(method("GET"))
+        .and(path("/"))
+        .and(query_param("f_search", "artist:rating-aggregate"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(search_html))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api.php"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "gmetadata": [
+                {"gid": 3101, "token": "aaaaaaaaaa", "title": "Boundary", "title_jpn": null, "category": "Doujinshi", "thumb": "https://ehgt.org/t/3101.jpg", "uploader": "tester", "posted": (now - 60).to_string(), "filecount": "10", "filesize": 1000, "expunged": false, "rating": "4.5", "tags": ["artist:rating-aggregate"]},
+                {"gid": 3102, "token": "bbbbbbbbbb", "title": "Above", "title_jpn": null, "category": "Doujinshi", "thumb": "https://ehgt.org/t/3102.jpg", "uploader": "tester", "posted": (now - 30).to_string(), "filecount": "10", "filesize": 1000, "expunged": false, "rating": "4.75", "tags": ["artist:rating-aggregate"]}
+            ]
+        })))
+        .mount(&server)
+        .await;
+
+    let mut engine = EhEngine::new(
+        Arc::clone(&repo),
+        make_eh_client(&server),
+        Arc::new(make_config()),
+        true,
+        60,
+    );
+    engine.search_request_interval = Duration::ZERO;
+    engine.tick().await.unwrap();
+
+    let queued = eh_download_queue::Entity::find()
+        .all(repo.db())
+        .await
+        .unwrap();
+    let mut inclusive_gids = queued
+        .iter()
+        .filter(|delivery| delivery.chat_id == -100)
+        .map(|delivery| delivery.gid)
+        .collect::<Vec<_>>();
+    let mut strict_gids = queued
+        .iter()
+        .filter(|delivery| delivery.chat_id == -200)
+        .map(|delivery| delivery.gid)
+        .collect::<Vec<_>>();
+    inclusive_gids.sort_unstable();
+    strict_gids.sort_unstable();
+    assert_eq!(inclusive_gids, vec![3101, 3102]);
+    assert_eq!(strict_gids, vec![3102]);
+}
+
+#[tokio::test]
 async fn test_collect_overflow_pending_enqueued_on_next_tick() {
     let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
     setup_chat(&repo, -100, true).await;

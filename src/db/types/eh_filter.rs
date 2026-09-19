@@ -8,10 +8,12 @@ use serde::{Deserialize, Serialize};
 /// delivery preference, not a filter that changes which galleries are fetched.
 /// This means two subscriptions with the same query + rating filter but different
 /// telegraph settings share the same task (and thus the same search poll).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, FromJsonQueryResult)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, FromJsonQueryResult)]
 pub struct EhFilter {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub min_rating: Option<u8>,
+    pub min_rating: Option<f64>,
+    #[serde(default)]
+    pub min_rating_strict: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min_pages: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -32,7 +34,8 @@ impl EhFilter {
 
     /// Task-value filter-key signature using value-encoding (not just presence).
     ///
-    /// Format: `r{rating}p{min_pages}P{max_pages}` (fixed order).
+    /// Format: `r{rating}` for inclusive ratings or `rgt{rating}` for strict
+    /// ratings, followed by `p{min_pages}P{max_pages}` (fixed order).
     /// Returns `""` when no filter is set.
     ///
     /// The order is fixed and persisted in `task_value`, so existing rows depend
@@ -40,7 +43,11 @@ impl EhFilter {
     pub fn task_value_signature(&self) -> String {
         let mut sig = String::new();
         if let Some(r) = self.min_rating {
-            sig.push_str(&format!("r{r}"));
+            if self.min_rating_strict {
+                sig.push_str(&format!("rgt{r}"));
+            } else {
+                sig.push_str(&format!("r{r}"));
+            }
         }
         if let Some(p) = self.min_pages {
             sig.push_str(&format!("p{p}"));
@@ -51,7 +58,7 @@ impl EhFilter {
         sig
     }
 
-    /// True when a minimum-rating filter is set, which triggers 48h scan mode.
+    /// True when a minimum-rating filter is set, which triggers configured scan-window mode.
     pub fn has_rating_filter(&self) -> bool {
         self.min_rating.is_some()
     }
@@ -59,7 +66,12 @@ impl EhFilter {
     /// Check if a gallery matches all filter criteria.
     pub fn matches(&self, gallery: &EhGallery) -> bool {
         if let Some(min_rating) = self.min_rating {
-            if gallery.rating < min_rating as f64 {
+            let rating_misses = if self.min_rating_strict {
+                gallery.rating <= min_rating
+            } else {
+                gallery.rating < min_rating
+            };
+            if rating_misses {
                 return false;
             }
         }
@@ -88,10 +100,16 @@ impl EhFilter {
         let filters: Vec<&EhFilter> = filters.iter().filter_map(|f| *f).collect();
 
         let min_rating = if filters.iter().all(|f| f.min_rating.is_some()) {
-            filters.iter().filter_map(|f| f.min_rating).min()
+            filters.iter().filter_map(|f| f.min_rating).reduce(f64::min)
         } else {
             None
         };
+        let min_rating_strict = min_rating.is_some_and(|minimum| {
+            filters
+                .iter()
+                .filter(|filter| filter.min_rating == Some(minimum))
+                .all(|filter| filter.min_rating_strict)
+        });
 
         let min_pages = if filters.iter().all(|f| f.min_pages.is_some()) {
             filters.iter().filter_map(|f| f.min_pages).min()
@@ -109,6 +127,7 @@ impl EhFilter {
 
         EhFilter {
             min_rating,
+            min_rating_strict,
             min_pages,
             max_pages,
             telegraph,
@@ -118,7 +137,8 @@ impl EhFilter {
     pub fn format_for_display(&self) -> String {
         let mut parts = Vec::new();
         if let Some(rating) = self.min_rating {
-            parts.push(format!("rating≥{rating}"));
+            let operator = if self.min_rating_strict { ">" } else { "≥" };
+            parts.push(format!("rating{operator}{rating}"));
         }
         if let Some(pages) = self.min_pages {
             parts.push(format!("pages≥{pages}"));
