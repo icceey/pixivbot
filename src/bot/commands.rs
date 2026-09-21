@@ -6,7 +6,7 @@ use teloxide::utils::command::BotCommands;
 pub enum Command {
     #[command(description = "显示帮助信息")]
     Help,
-    #[command(description = "[仅Admin私聊] 查看 Bot 状态信息")]
+    #[command(description = "查看 Bot 状态信息")]
     Info,
     #[command(description = "订阅作者\n  用法: /sub [ch=<频道ID>] <id,...> [+tag1 -tag2]")]
     Sub(String),
@@ -116,6 +116,7 @@ impl Command {
             ]);
         }
 
+        commands.push(BotCommand::new("info", "查看 Bot 状态信息"));
         commands.push(BotCommand::new("help", "显示帮助信息"));
 
         commands
@@ -125,7 +126,6 @@ impl Command {
     pub fn admin_commands(has_booru: bool, has_ehentai: bool) -> Vec<BotCommand> {
         let mut cmds = Self::user_commands(has_booru, has_ehentai);
         cmds.extend([
-            BotCommand::new("info", "[Admin] 查看 Bot 状态信息"),
             BotCommand::new("enablechat", "[Admin] 启用聊天 - /enablechat [chat_id]"),
             BotCommand::new("disablechat", "[Admin] 禁用聊天 - /disablechat [chat_id]"),
         ]);
@@ -185,9 +185,6 @@ mod tests {
                             "{role}: {command}, booru={booru}, eh={eh}"
                         );
                     }
-                }
-                if role == "admin" {
-                    assert!(names.iter().any(|name| name == "info"));
                 }
                 if role == "owner" {
                     assert!(names.iter().any(|name| name == "setadmin"));
