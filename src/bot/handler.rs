@@ -31,9 +31,9 @@ pub struct BotHandler {
     pub(crate) download_original_threshold: u8,
     /// 群组中是否需要 @bot 才响应 (默认: true)
     pub(crate) require_mention_in_group: bool,
-    /// 缓存目录路径 (用于管理员查看磁盘占用)
+    /// 缓存目录路径 (用于查看磁盘占用)
     pub(crate) cache_dir: String,
-    /// 日志目录路径 (用于管理员查看磁盘占用)
+    /// 日志目录路径 (用于查看磁盘占用)
     pub(crate) log_dir: String,
     pub(crate) booru_registry: Arc<BooruSiteRegistry>,
     pub(crate) eh_client: Option<Arc<eh_client::EhClient>>,
@@ -122,9 +122,7 @@ impl BotHandler {
         match cmd {
             // Help and Info commands (defined in handlers/info.rs)
             Command::Help => self.handle_help(bot, chat_id).await,
-            Command::Info if user_role.is_admin() && chat_id.is_user() => {
-                self.handle_info(bot, chat_id).await
-            }
+            Command::Info => self.handle_info(bot, chat_id).await,
 
             // Subscription commands (defined in handlers/subscription.rs)
             Command::Sub(args) => self.handle_sub_author(bot, chat_id, user_id, args).await,

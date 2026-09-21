@@ -112,7 +112,7 @@ impl BotHandler {
     // Info Command
     // ------------------------------------------------------------------------
 
-    /// 显示 Bot 状态信息（仅管理员可用）
+    /// 显示 Bot 状态信息
     pub async fn handle_info(&self, bot: ThrottledBot, chat_id: ChatId) -> ResponseResult<()> {
         // Gather statistics
         let admin_count = self.repo.count_admin_users().await.unwrap_or(0);
@@ -127,7 +127,7 @@ impl BotHandler {
         let cache_size = calculate_dir_size(cache_path);
         let log_size = calculate_dir_size(log_path);
 
-        let message = format!(
+        let mut message = format!(
             "📊 *PixivBot 状态信息*\n\n\
             👥 管理员人数: `{}`\n\
             💬 启用的聊天数: `{}`\n\
@@ -143,6 +143,27 @@ impl BotHandler {
             format_size(cache_size),
             format_size(log_size)
         );
+
+        if self.eh_client.is_some() {
+            message.push_str("\n\n📥 *EH 下载统计*");
+            for (hours, label) in [(24, "最近 24 小时"), (168, "最近 7 天")] {
+                let downloaded = match self.repo.get_eh_downloaded_bytes_in_window(hours).await {
+                    Ok(bytes) => format_size(bytes as u64),
+                    Err(error) => {
+                        tracing::error!("Failed to fetch EH downloaded bytes: {:#}", error);
+                        "暂不可用".to_string()
+                    }
+                };
+                let gp = match self.repo.get_eh_gp_cost_in_window(hours as u64).await {
+                    Ok(cost) => cost.to_string(),
+                    Err(error) => {
+                        tracing::error!("Failed to fetch EH GP spend: {:#}", error);
+                        "暂不可用".to_string()
+                    }
+                };
+                message.push_str(&format!("\n{label}: 下载 `{downloaded}`，GP 消耗 `{gp}`"));
+            }
+        }
 
         bot.send_message(chat_id, message)
             .parse_mode(ParseMode::MarkdownV2)
