@@ -1038,15 +1038,11 @@ impl Repo {
         }
     }
 
-    /// Calculate exponential backoff delay (seconds) for a given retry count.
-    /// 1→60s, 2→300s, 3→900s, beyond→3600s.
+    /// EH retry delay: two minutes doubled per retry, capped at 24 hours.
     pub fn backoff_delay_secs(retry_count: i32) -> i64 {
-        match retry_count {
-            0 | 1 => 60,
-            2 => 300,
-            3 => 900,
-            _ => 3600,
-        }
+        120_i64
+            .saturating_mul(2_i64.saturating_pow(retry_count.saturating_sub(1).max(0) as u32))
+            .min(24 * 60 * 60)
     }
 
     /// Reopen a cleaned rewrite-retained job only when this waiting delivery

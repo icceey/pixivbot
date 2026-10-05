@@ -571,7 +571,7 @@ fn default_eh_max_push_per_tick() -> usize {
 }
 
 fn default_eh_max_retry_count() -> u8 {
-    3
+    10
 }
 
 fn default_eh_scan_window_hours() -> u64 {

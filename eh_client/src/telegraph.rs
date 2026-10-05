@@ -3,9 +3,10 @@ use crate::s3_multipart::{
     abort_upload_state as abort_multipart_upload_state, fingerprint_fields, upload_multipart,
     uploader_identity_fingerprint, zip_put_extension_is_explicitly_unsupported, CapabilityState,
     CompletionEvidence, CreateExtension, HeadRecovery, MultipartCapability, MultipartOperation,
-    MultipartOutcome, MultipartUploadRequest, ProviderKind,
+    MultipartOutcome, MultipartUploadRequest, ProviderKind, IPFS3_DECOMPRESS_TAGGING,
 };
 use async_trait::async_trait;
+use reqwest::header::{HeaderName, HeaderValue};
 use s3::command::Command;
 use s3::creds::Credentials;
 use s3::request::{tokio_backend::ReqwestRequest, Request};
@@ -1832,6 +1833,10 @@ impl IpfS3Uploader {
     ) -> Result<Option<Vec<TelegraphImageUrlPair>>> {
         let mut upload_bucket = self.bucket.clone();
         upload_bucket.add_query("decompress-zip", extraction_prefix);
+        upload_bucket.extra_headers.insert(
+            HeaderName::from_static("x-amz-tagging"),
+            HeaderValue::from_static(IPFS3_DECOMPRESS_TAGGING),
+        );
 
         let command = Command::PutObject {
             content: archive.bytes,
@@ -4527,7 +4532,7 @@ mod tests {
 
     impl wiremock::Respond for ImageFailThenSucceedPart {
         fn respond(&self, _request: &wiremock::Request) -> wiremock::ResponseTemplate {
-            if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 3 {
                 wiremock::ResponseTemplate::new(503)
             } else {
                 wiremock::ResponseTemplate::new(200).insert_header("ETag", "\"part-one\"")
@@ -4925,7 +4930,7 @@ mod tests {
             .respond_with(ImageFailThenSucceedPart {
                 calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             })
-            .expect(2)
+            .expect(4)
             .mount(&server)
             .await;
         Mock::given(ImageS3Request::Complete)
@@ -5018,7 +5023,7 @@ mod tests {
             .respond_with(ImageFailThenSucceedPart {
                 calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             })
-            .expect(2)
+            .expect(4)
             .mount(&server)
             .await;
         Mock::given(ImageS3Request::Complete)
@@ -5548,7 +5553,7 @@ mod tests {
             .respond_with(ImageFailThenSucceedPart {
                 calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             })
-            .expect(2)
+            .expect(4)
             .mount(&server)
             .await;
         Mock::given(ImageS3Request::Complete)
@@ -5613,10 +5618,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn s3_each_explicit_multipart_operation_unsupported_uses_exactly_one_put_object() {
+    async fn s3_unsupported_multipart_setup_or_completion_uses_one_put_object() {
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
-        for operation in ["create", "list", "part", "complete"] {
+        for operation in ["create", "list", "complete"] {
             let server = MockServer::start().await;
             let mut config = complete_s3_config(&server.uri(), "https://cdn.example/root/");
             config.multipart_image_threshold_mb = 1;
@@ -5638,31 +5643,6 @@ mod tests {
                         .mount(&server)
                         .await;
                     Mock::given(ImageS3Request::ListParts)
-                        .respond_with(ImageCompleteBody::Error {
-                            status: 405,
-                            code: "NotImplemented".to_string(),
-                        })
-                        .expect(1)
-                        .mount(&server)
-                        .await;
-                    Mock::given(ImageS3Request::Abort)
-                        .respond_with(ResponseTemplate::new(204))
-                        .expect(1)
-                        .mount(&server)
-                        .await;
-                }
-                "part" => {
-                    Mock::given(ImageS3Request::Create)
-                        .respond_with(ImageCreateResponder)
-                        .expect(1)
-                        .mount(&server)
-                        .await;
-                    Mock::given(ImageS3Request::ListParts)
-                        .respond_with(ImageEmptyListPartsResponder)
-                        .expect(1)
-                        .mount(&server)
-                        .await;
-                    Mock::given(ImageS3Request::UploadPart)
                         .respond_with(ImageCompleteBody::Error {
                             status: 405,
                             code: "NotImplemented".to_string(),
@@ -6148,7 +6128,7 @@ mod tests {
             .await;
         Mock::given(ImageS3Request::UploadPart)
             .respond_with(ResponseTemplate::new(503))
-            .expect(1)
+            .expect(3)
             .mount(&server)
             .await;
         Mock::given(ImageS3Request::Head)
