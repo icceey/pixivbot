@@ -44,11 +44,6 @@ fn should_schedule_background_download(failures: i32, bytes_delta: u64, elapsed:
         && bytes_delta / elapsed.as_secs() < SLOW_DOWNLOAD_BYTES_PER_SEC
 }
 
-/// Convert a byte count to whole MiB, rounding up so partial MiB is not under-reported.
-fn format_mib(bytes: u64) -> u64 {
-    bytes.div_ceil(1024 * 1024)
-}
-
 /// Selected-archive size gate for logged-in EH archive downloads.
 ///
 /// Runs after `prepare_archive_download()` and before the GP reservation / archive
@@ -70,11 +65,11 @@ fn ensure_eh_archive_under_size_limit(
         return Ok(());
     }
 
-    anyhow::bail!(
-        "selected EH archive size is too large: {} MiB exceeds configured {} MiB limit",
-        format_mib(estimated_size_bytes),
-        format_mib(limit_bytes)
-    );
+    Err(eh_client::Error::ArchiveSizeLimitExceeded {
+        size_bytes: estimated_size_bytes,
+        limit_bytes,
+    }
+    .into())
 }
 
 /// Outcome of `check_and_reserve_archive_cost` for a prepared archive request.
@@ -483,7 +478,22 @@ impl EhDownloadWorker {
 
         // Keep the source-attempt boundary: mkdir, mode resolution, transfer and
         // quota deferral failures consume a background attempt; settlement does not.
-        match self.download(job, expected_started_at, &zip_path).await {
+        let outcome = match self.download(job, expected_started_at, &zip_path).await {
+            Err(error)
+                if error.chain().any(|cause| {
+                    matches!(
+                        cause.downcast_ref::<eh_client::Error>(),
+                        Some(eh_client::Error::ArchiveSizeLimitExceeded { .. })
+                    )
+                }) =>
+            {
+                Ok(DownloadOutcome::Rejected {
+                    reason: format!("{error:#}"),
+                })
+            }
+            outcome => outcome,
+        };
+        match outcome {
             Ok(DownloadOutcome::Completed { file_size, gp_cost }) => {
                 if !background {
                     info!(

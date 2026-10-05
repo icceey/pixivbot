@@ -218,6 +218,7 @@ download_original_threshold = 1
 # download_rate_window_hours = 168
 # # Maximum selected EH archive estimate for logged-in archive downloads, in MiB.
 # # Parsed from the archiver page before the GP-spending archive POST.
+# # Oversized archives fail permanently without download retries.
 # # Set to 0 to disable this selected archive limit.
 # max_archive_size_mb = 300
 # # Maximum GP cost allowed for a single archive download (default: 0).

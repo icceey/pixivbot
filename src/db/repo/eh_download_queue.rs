@@ -32,12 +32,12 @@ use crate::db::entities::subscriptions;
 /// waiting cannot refresh a stale snapshot. Rolling back and re-running the
 /// transaction acquires a fresh snapshot, so bounded retries absorb the
 /// contention instead of failing the scheduler tick.
-const SQLITE_TRANSACTION_ATTEMPTS: usize = 3;
+pub(super) const SQLITE_TRANSACTION_ATTEMPTS: usize = 3;
 
 /// Lock-contention errors that a full transaction retry can resolve. The
 /// CAS filters inside each transaction keep retries safe: a row changed by
 /// the contender is either claimed under its new generation or skipped.
-fn is_retryable_sqlite_lock_error(error: &anyhow::Error) -> bool {
+pub(super) fn is_retryable_sqlite_lock_error(error: &anyhow::Error) -> bool {
     let message = error
         .chain()
         .map(|cause| cause.to_string())
@@ -2033,6 +2033,69 @@ mod tests {
             .expect("claim should succeed after retry");
         assert_eq!(claim.delivery.id, delivery.id);
         assert_eq!(claim.delivery.status, STATUS_PUBLISHING);
+    }
+
+    #[tokio::test]
+    async fn cleanup_finalization_retries_busy_snapshot_and_preserves_new_delivery() {
+        use crate::db::repo::eh_gallery_jobs::{
+            EhCleanupFinalizeOutcome, EH_CLEANUP_FINALIZE_GATE,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let (repo, outside) = setup_wal_file_db(&dir).await;
+        let (delivery, job) = seed_publishing_archive_delivery(&repo, 90_002).await;
+        repo.mark_eh_archive_delivery_sent(delivery.id)
+            .await
+            .unwrap();
+        repo.mark_eh_delivery_done(delivery.id, job.id, true)
+            .await
+            .unwrap();
+        let cleanup = repo.get_next_eh_job_for_cleanup().await.unwrap().unwrap();
+        let gate = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+        let finalize = {
+            let repo = Repo::new(repo.db().clone());
+            let gate = gate.clone();
+            tokio::spawn(async move {
+                EH_CLEANUP_FINALIZE_GATE
+                    .scope(
+                        std::cell::RefCell::new(Some(gate)),
+                        repo.finalize_eh_job_cleanup(
+                            job.id,
+                            cleanup.cleanup_started_at.unwrap(),
+                            false,
+                        ),
+                    )
+                    .await
+            })
+        };
+
+        gate.wait().await;
+        // Commit a new consumer after cleanup has read its retirement snapshot.
+        sea_orm::sqlx::query(
+            "INSERT INTO eh_download_queue \
+             (job_id, chat_id, gid, token, title, telegraph, source, status, created_at) \
+             SELECT id, -200, gid, token, title, 0, 'direct', 'waiting', CURRENT_TIMESTAMP \
+             FROM eh_gallery_jobs WHERE id = ?",
+        )
+        .bind(job.id)
+        .execute(&outside)
+        .await
+        .unwrap();
+        gate.wait().await;
+
+        assert_eq!(
+            finalize.await.unwrap().unwrap(),
+            Some(EhCleanupFinalizeOutcome::ReactivatedPending)
+        );
+        let claim = repo
+            .claim_eh_download_job(Main, false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(claim.id, job.id);
+        let waiting = repo.get_active_eh_job_deliveries(job.id).await.unwrap();
+        assert_eq!(waiting.len(), 1);
+        assert_eq!(waiting[0].chat_id, -200);
     }
 
     async fn setup_wal_file_db(dir: &tempfile::TempDir) -> (Repo, sea_orm::sqlx::SqlitePool) {

@@ -620,7 +620,6 @@ async fn test_download_size_limit_blocks_oversized_fallback_archive_before_post(
 
     let mut cfg = make_config();
     cfg.max_archive_size_mb = 300;
-    cfg.max_retry_count = 0;
     let entry = seed_delivery(
         &repo,
         -100,
@@ -639,16 +638,24 @@ async fn test_download_size_limit_blocks_oversized_fallback_archive_before_post(
 
     worker.tick().await.unwrap();
 
-    let model = job_for_delivery(&repo, &entry).await;
-    assert_eq!(model.status, JOB_STATUS_RETIRED);
-    assert_eq!(model.cleanup_status, CLEANUP_STATUS_PENDING);
-    assert!(
-        model
-            .error
-            .as_ref()
-            .is_some_and(|e| e.contains("selected EH archive size is too large")),
-        "error should mention the configured limit, got: {:?}",
-        model.error
+    let delivery = eh_download_queue::Entity::find_by_id(entry.id)
+        .one(repo.db())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(delivery.status, DELIVERY_STATUS_FAILED);
+    worker.tick().await.unwrap();
+    worker.tick().await.unwrap();
+    let requests = eh_server.received_requests().await.unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| {
+                request.method.as_str() == "GET" && request.url.path() == "/archiver.php"
+            })
+            .count(),
+        1,
+        "cleanup must not restart a policy-rejected download"
     );
     assert_eq!(
         eh_server
@@ -1200,12 +1207,9 @@ async fn test_background_worker_selected_size_limit_runs_after_prepare_without_m
     worker.tick().await.unwrap();
 
     let updated = job_for_delivery(&repo, &entry).await;
-    assert_eq!(updated.status, STATUS_PENDING);
-    assert_eq!(
-        updated.background_download_status.as_deref(),
-        Some(BACKGROUND_STATUS_PENDING)
-    );
-    assert_eq!(updated.background_download_attempt_count, 1);
+    assert_eq!(updated.status, JOB_STATUS_FAILED);
+    assert!(updated.background_download_status.is_none());
+    worker.tick().await.unwrap();
 
     let requests = eh_server.received_requests().await.unwrap();
     assert!(requests.iter().any(|request| {

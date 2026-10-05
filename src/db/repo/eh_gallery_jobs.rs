@@ -3,8 +3,9 @@ use crate::config::EhentaiConfig;
 use crate::db::entities::{eh_download_queue, eh_gallery_jobs, eh_gallery_push_ledger};
 use crate::db::repo::eh_download_queue::{
     eh_delivery_needs_archive, eh_pending_archive_delivery_filter,
-    eh_pending_telegraph_delivery_filter, merge_subscription_ids, merge_telegraph_subscription_ids,
-    EH_CHAT_LOCKS, SOURCE_DIRECT, SOURCE_SUBSCRIPTION,
+    eh_pending_telegraph_delivery_filter, is_retryable_sqlite_lock_error, merge_subscription_ids,
+    merge_telegraph_subscription_ids, EH_CHAT_LOCKS, SOURCE_DIRECT, SOURCE_SUBSCRIPTION,
+    SQLITE_TRANSACTION_ATTEMPTS,
 };
 use crate::db::repo::eh_gallery_push_ledger::{record_eh_push_in_txn, EhPushSurface};
 use crate::db::repo::eh_gallery_results::{
@@ -378,6 +379,11 @@ tokio::task_local! {
 #[cfg(test)]
 tokio::task_local! {
     pub(crate) static EH_JOB_LIVENESS_UPDATE_FAILURE: std::sync::Arc<std::sync::atomic::AtomicBool>;
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    pub(super) static EH_CLEANUP_FINALIZE_GATE: std::cell::RefCell<Option<std::sync::Arc<tokio::sync::Barrier>>>;
 }
 
 #[cfg(test)]
@@ -1558,6 +1564,29 @@ impl Repo {
         expected_cleanup_started_at: DateTime,
         send_archive: bool,
     ) -> Result<Option<EhCleanupFinalizeOutcome>> {
+        for _ in 0..SQLITE_TRANSACTION_ATTEMPTS {
+            match self
+                .finalize_eh_job_cleanup_once(job_id, expected_cleanup_started_at, send_archive)
+                .await
+            {
+                Ok(outcome) => return Ok(outcome),
+                Err(error) => {
+                    if !is_retryable_sqlite_lock_error(&error) {
+                        return Err(error);
+                    }
+                }
+            }
+        }
+        self.finalize_eh_job_cleanup_once(job_id, expected_cleanup_started_at, send_archive)
+            .await
+    }
+
+    async fn finalize_eh_job_cleanup_once(
+        &self,
+        job_id: i32,
+        expected_cleanup_started_at: DateTime,
+        send_archive: bool,
+    ) -> Result<Option<EhCleanupFinalizeOutcome>> {
         let txn = self
             .db
             .begin()
@@ -1581,6 +1610,15 @@ impl Repo {
                 .all(&txn)
                 .await
                 .context("Failed to select shared EH deliveries for cleanup finalization")?;
+            #[cfg(test)]
+            if let Some(gate) = EH_CLEANUP_FINALIZE_GATE
+                .try_with(|gate| gate.borrow_mut().take())
+                .ok()
+                .flatten()
+            {
+                gate.wait().await;
+                gate.wait().await;
+            }
             let has_active_delivery = deliveries
                 .iter()
                 .any(|delivery| is_active_delivery_status(&delivery.status));
