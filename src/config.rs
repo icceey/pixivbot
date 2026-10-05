@@ -398,6 +398,7 @@ pub struct EhentaiConfig {
     /// Default: 24 (one day).
     #[serde(default = "default_eh_gp_rate_window_hours")]
     pub gp_rate_window_hours: u64,
+    /// Idle wait between EH worker polls; ready jobs continue immediately.
     #[serde(default = "default_eh_download_poll_interval_sec")]
     pub download_poll_interval_sec: u64,
     /// Maximum active HTTP Range requests used by one authenticated EH archive.

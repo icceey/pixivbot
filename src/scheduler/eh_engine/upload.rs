@@ -138,22 +138,22 @@ impl EhUploadWorker {
     }
 
     pub async fn run(self) {
-        let poll = self.config.download_poll_interval_sec.max(10);
-        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(poll));
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
+        let idle_wait =
+            tokio::time::Duration::from_secs(self.config.download_poll_interval_sec.max(10));
         loop {
-            interval.tick().await;
-            if let Err(e) = self.tick().await {
-                error!("EhUploadWorker tick error: {:#}", e);
+            match self.tick().await {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(error) => error!("EhUploadWorker tick error: {:#}", error),
             }
+            tokio::time::sleep(idle_wait).await;
         }
     }
 
-    pub(super) async fn tick(&self) -> Result<()> {
+    pub(super) async fn tick(&self) -> Result<bool> {
         let job = self.repo.get_next_eh_job_for_upload().await?;
         let Some(job) = job else {
-            return Ok(());
+            return Ok(false);
         };
         let expected_started_at = job
             .started_at
@@ -206,7 +206,7 @@ impl EhUploadWorker {
                     job.id
                 );
             }
-            return Ok(());
+            return Ok(true);
         }
 
         if let Err(error) = self.process(&job).await {
@@ -291,7 +291,7 @@ impl EhUploadWorker {
             }
         }
 
-        Ok(())
+        Ok(true)
     }
 
     pub(super) async fn process(&self, job: &eh_gallery_jobs::Model) -> Result<()> {

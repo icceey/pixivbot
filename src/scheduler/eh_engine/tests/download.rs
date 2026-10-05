@@ -235,6 +235,7 @@ async fn test_download_worker_chat_disabled_schedules_retry() {
 
     let mut config = make_config();
     config.background_download_enabled = false;
+    config.download_poll_interval_sec = 0;
     let worker = EhDownloadWorker::new(
         Arc::clone(&repo),
         make_eh_client(&eh_server),
@@ -259,6 +260,8 @@ async fn test_download_worker_chat_disabled_schedules_retry() {
         updated.next_retry_at.is_some(),
         "should have next_retry_at set"
     );
+    assert!(!worker.tick().await.unwrap());
+    assert!(eh_server.received_requests().await.unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -272,7 +275,10 @@ async fn test_download_worker_failure_schedules_retry() {
         &repo,
         -100,
         (123456, "abcdef0123", "Test"),
-        Default::default(),
+        DeliveryOptions {
+            telegraph: true,
+            ..Default::default()
+        },
     )
     .await;
 
@@ -295,6 +301,7 @@ async fn test_download_worker_failure_schedules_retry() {
 
     let mut config = make_config();
     config.background_download_enabled = false;
+    config.send_archive = false;
     let worker = EhDownloadWorker::new(
         Arc::clone(&repo),
         make_eh_client(&eh_server),
@@ -314,6 +321,16 @@ async fn test_download_worker_failure_schedules_retry() {
     assert!(
         updated.next_retry_at.is_some(),
         "should have next_retry_at set"
+    );
+    let requests_after_failure = eh_server.received_requests().await.unwrap().len();
+    worker.tick().await.unwrap();
+    let deferred = job_for_delivery(&repo, &entry).await;
+    assert_eq!(deferred.next_retry_at, updated.next_retry_at);
+    assert_eq!(deferred.retry_count, updated.retry_count);
+    assert_eq!(
+        eh_server.received_requests().await.unwrap().len(),
+        requests_after_failure,
+        "cleanup must not restart a source download before its retry is due"
     );
 }
 

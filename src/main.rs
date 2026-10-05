@@ -338,7 +338,7 @@ async fn main() -> Result<()> {
         if let Err(e) = scheduler::drain_eh_job_cleanup_maintenance(
             repo.as_ref(),
             eh_startup_abort_uploader.as_deref(),
-            config.ehentai.download_poll_interval_sec as i64,
+            config.ehentai.download_poll_interval_sec.max(10) as i64,
             config.ehentai.send_archive,
         )
         .await

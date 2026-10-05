@@ -68,15 +68,13 @@ impl EhPublishWorker {
     }
 
     pub async fn run(self) {
-        let poll = self.config.download_poll_interval_sec.max(10);
-        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(poll));
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
+        let idle_wait =
+            tokio::time::Duration::from_secs(self.config.download_poll_interval_sec.max(10));
         loop {
-            interval.tick().await;
-            if let Err(e) = self.tick().await {
-                error!("EhPublishWorker tick error: {:#}", e);
+            if let Err(error) = self.tick().await {
+                error!("EhPublishWorker tick error: {:#}", error);
             }
+            tokio::time::sleep(idle_wait).await;
         }
     }
 
@@ -105,10 +103,7 @@ impl EhPublishWorker {
                         };
                         tasks.spawn(async move { worker.process_claimed(claim).await });
                     }
-                    Ok(None) => {
-                        no_more_claims = true;
-                        break;
-                    }
+                    Ok(None) => break,
                     Err(error) => {
                         error!("Failed to claim shared EH publish delivery: {:#}", error);
                         if first_error.is_none() {
@@ -176,7 +171,7 @@ impl EhPublishWorker {
             self.repo
                 .defer_eh_delivery_publish(
                     delivery.id,
-                    self.config.download_poll_interval_sec as i64,
+                    self.config.download_poll_interval_sec.max(10) as i64,
                 )
                 .await?;
             info!(
@@ -194,7 +189,7 @@ impl EhPublishWorker {
             self.repo
                 .defer_eh_delivery_publish(
                     delivery.id,
-                    self.config.download_poll_interval_sec as i64,
+                    self.config.download_poll_interval_sec.max(10) as i64,
                 )
                 .await?;
             return Ok(());
@@ -203,7 +198,7 @@ impl EhPublishWorker {
             self.repo
                 .defer_eh_delivery_publish(
                     delivery.id,
-                    self.config.download_poll_interval_sec as i64,
+                    self.config.download_poll_interval_sec.max(10) as i64,
                 )
                 .await?;
             return Ok(());
@@ -302,7 +297,10 @@ impl EhPublishWorker {
         job: &eh_gallery_jobs::Model,
     ) -> Result<()> {
         self.repo
-            .defer_eh_delivery_publish(delivery.id, self.config.download_poll_interval_sec as i64)
+            .defer_eh_delivery_publish(
+                delivery.id,
+                self.config.download_poll_interval_sec.max(10) as i64,
+            )
             .await?;
         let expected_zip_path = job
             .zip_path

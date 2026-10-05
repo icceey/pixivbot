@@ -233,7 +233,8 @@ download_original_threshold = 1
 # gp_rate_limit = 0
 # # Rolling window length (in hours) for `gp_rate_limit` (default: 24).
 # gp_rate_window_hours = 24
-# # Poll interval for download processor (seconds, default: 60)
+# # Idle wait for EH download, upload, delivery, and rewrite workers (seconds, default: 60, minimum: 10).
+# # Ready jobs are processed continuously; retry backoff and rate limits still apply.
 # # Also controls the wait between orphan cache cleanup sweeps (minimum: 10s).
 # # Cleanup runs alongside downloads; failed Abort attempts retain files for retry.
 # download_poll_interval_sec = 60

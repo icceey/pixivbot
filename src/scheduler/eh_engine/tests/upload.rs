@@ -343,13 +343,13 @@ async fn upload_worker_defers_all_disabled_destinations_without_spending_quota_o
     .await;
     let body = serde_json::json!({
         "ok": true,
-        "result": {"url": "https://telegra.ph/Enabled-Gallery-01-01"}
+        "result": {"url": "https://example.com/enabled-gallery"}
     });
-    Mock::given(method("POST"))
+    let page_created = Mock::given(method("POST"))
         .and(path("/createPage"))
         .respond_with(ResponseTemplate::new(200).set_body_json(body))
         .expect(1)
-        .mount(&tg_server)
+        .mount_as_scoped(&tg_server)
         .await;
     let uploader = Arc::new(ZipFirstMockUploader::default());
     let worker = EhUploadWorker::new(
@@ -362,31 +362,25 @@ async fn upload_worker_defers_all_disabled_destinations_without_spending_quota_o
         Arc::new(make_config()),
     );
 
-    worker.tick().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::select! {
+            _ = worker.run() => panic!("upload worker stopped"),
+            _ = async {
+                page_created.wait_until_satisfied().await;
+                loop {
+                    let job = eh_gallery_jobs::Entity::find_by_id(enabled_job.id)
+                        .one(repo.db()).await.unwrap().unwrap();
+                    if job.telegraph_status == TELEGRAPH_STATUS_READY {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            } => {}
+        }
+    })
+    .await
+    .expect("a deferred destination must not delay the next available upload");
 
-    assert_eq!(
-        uploader.zip_calls.load(std::sync::atomic::Ordering::SeqCst),
-        0,
-        "disabled Telegraph destinations must not invoke the ZIP uploader"
-    );
-    assert_eq!(
-        uploader
-            .image_calls
-            .load(std::sync::atomic::Ordering::SeqCst),
-        0,
-        "disabled Telegraph destinations must not invoke the image uploader"
-    );
-    assert_eq!(
-        tg_server
-            .received_requests()
-            .await
-            .unwrap()
-            .iter()
-            .filter(|request| request.url.path() == "/createPage")
-            .count(),
-        0,
-        "disabled Telegraph destinations must not create a Telegraph page"
-    );
     let deferred = eh_gallery_jobs::Entity::find_by_id(disabled_job.id)
         .one(repo.db())
         .await
@@ -409,8 +403,6 @@ async fn upload_worker_defers_all_disabled_destinations_without_spending_quota_o
         assert_eq!(delivery.status, DELIVERY_STATUS_WAITING);
         assert!(delivery.telegraph_sent_at.is_none());
     }
-
-    worker.tick().await.unwrap();
 
     assert_eq!(
         uploader.zip_calls.load(std::sync::atomic::Ordering::SeqCst),

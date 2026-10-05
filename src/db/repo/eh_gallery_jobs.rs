@@ -3268,10 +3268,19 @@ impl Repo {
                 || (job.telegraph_status == TELEGRAPH_STATUS_PENDING && job.telegraph_required);
             let download_in_flight = job.status == JOB_STATUS_DOWNLOADING
                 || job.background_download_status.as_deref() == Some(BACKGROUND_STATUS_RUNNING);
+            let download_still_needs_zip = download_in_flight
+                || (job.status == JOB_STATUS_PENDING
+                    && !(job.telegraph_status == TELEGRAPH_STATUS_READY
+                        && job.telegraph_url.is_some())
+                    && deliveries.iter().any(|delivery| {
+                        is_active_delivery_status(&delivery.status)
+                            && delivery.telegraph
+                            && delivery.telegraph_sent_at.is_none()
+                    }));
             let remove_archive_family = job.zip_path.is_some()
                 && !archive_still_needed
                 && !upload_still_needs_zip
-                && !download_in_flight;
+                && !download_still_needs_zip;
             let retire = !has_active_delivery
                 && !rewrite_in_progress
                 && !download_in_flight
