@@ -20,7 +20,7 @@ async fn two_chats_share_one_download_purchase_artifact_and_completion() {
                 SOURCE_DIRECT,
                 &variant,
                 None,
-                false,
+                true,
             )
             .await
             .unwrap()
@@ -35,7 +35,7 @@ async fn two_chats_share_one_download_purchase_artifact_and_completion() {
                 SOURCE_DIRECT,
                 &variant,
                 None,
-                false,
+                true,
             )
             .await
             .unwrap()
@@ -64,7 +64,7 @@ async fn two_chats_share_one_download_purchase_artifact_and_completion() {
 
         let mut config = make_config();
         config.max_archive_gp_cost = 218;
-        config.send_archive = false;
+        config.send_archive = true;
         config.background_download_enabled = background;
         config.background_download_concurrency = 2;
         let queue = if background {

@@ -393,6 +393,16 @@ impl BotHandler {
             return Ok(());
         }
 
+        if !self.eh_config.send_archive && !telegraph {
+            let _ = bot
+                .send_message(
+                    chat_id,
+                    "❌ 本次请求没有可用的投递方式。请启用 ZIP 投递或使用 telegraph=on。",
+                )
+                .await;
+            return Ok(());
+        }
+
         // Parse gallery URL
         let (gid, token) = match parse_gallery_ref(&input) {
             Some(g) => g,

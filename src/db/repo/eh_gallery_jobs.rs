@@ -2,7 +2,6 @@ use super::Repo;
 use crate::config::EhentaiConfig;
 use crate::db::entities::{eh_download_queue, eh_gallery_jobs, eh_gallery_push_ledger};
 use crate::db::repo::eh_download_queue::{
-    eh_delivery_needs_archive, eh_pending_archive_delivery_filter,
     eh_pending_telegraph_delivery_filter, is_retryable_sqlite_lock_error, merge_subscription_ids,
     merge_telegraph_subscription_ids, EH_CHAT_LOCKS, SOURCE_DIRECT, SOURCE_SUBSCRIPTION,
     SQLITE_TRANSACTION_ATTEMPTS,
@@ -135,7 +134,7 @@ pub(crate) async fn try_apply_cached_eh_result_in_txn(
     }
 
     let has_archive_demand =
-        has_active_eh_archive_delivery_in_txn(txn, job.id, send_archive).await?;
+        send_archive && has_active_eh_archive_delivery_in_txn(txn, job.id).await?;
     let make_zipless_ready = !has_archive_demand
         && job.status == JOB_STATUS_PENDING
         && job.background_download_status.is_none();
@@ -554,7 +553,6 @@ impl Repo {
         } else {
             None
         };
-        let send_archive = req.send_archive || !req.telegraph;
         let premarked_archive_sent_at = if req.source == SOURCE_SUBSCRIPTION {
             push_ledger
                 .as_ref()
@@ -569,7 +567,7 @@ impl Repo {
         } else {
             None
         };
-        if (!send_archive || premarked_archive_sent_at.is_some())
+        if (!req.send_archive || premarked_archive_sent_at.is_some())
             && (!req.telegraph || premarked_telegraph_sent_at.is_some())
         {
             return Ok(None);
@@ -1628,10 +1626,11 @@ impl Repo {
             );
             let has_usable_ready_telegraph =
                 job.telegraph_status == TELEGRAPH_STATUS_READY && job.telegraph_url.is_some();
-            let archive_source_required = deliveries.iter().any(|delivery| {
-                is_active_delivery_status(&delivery.status)
-                    && eh_delivery_needs_archive(delivery, send_archive)
-            });
+            let archive_source_required = send_archive
+                && deliveries.iter().any(|delivery| {
+                    is_active_delivery_status(&delivery.status)
+                        && delivery.archive_sent_at.is_none()
+                });
             let telegraph_source_required = !has_usable_ready_telegraph
                 && deliveries.iter().any(|delivery| {
                     is_active_delivery_status(&delivery.status)
@@ -2367,27 +2366,36 @@ impl Repo {
                 .filter(eh_download_queue::Column::Telegraph.eq(true))
                 .filter(eh_download_queue::Column::TelegraphSentAt.is_null())
                 .filter(eh_download_queue::Column::Status.eq(&delivery.status));
-            transition = transition.set(eh_download_queue::ActiveModel {
-                telegraph: Set(false),
-                telegraph_subscription_ids: Set(None),
-                status: Set((if delivery.archive_sent_at.is_some() {
-                    DELIVERY_STATUS_DONE
+            if send_archive {
+                transition = transition.set(eh_download_queue::ActiveModel {
+                    telegraph: Set(false),
+                    telegraph_subscription_ids: Set(None),
+                    status: Set((if delivery.archive_sent_at.is_some() {
+                        DELIVERY_STATUS_DONE
+                    } else {
+                        DELIVERY_STATUS_WAITING
+                    })
+                    .to_string()),
+                    next_retry_at: Set(None),
+                    ..Default::default()
+                });
+                if delivery.archive_sent_at.is_some() {
+                    transition = transition.col_expr(
+                        eh_download_queue::Column::CompletedAt,
+                        Expr::value(Some(now)),
+                    );
                 } else {
-                    DELIVERY_STATUS_WAITING
-                })
-                .to_string()),
-                next_retry_at: Set(None),
-                ..Default::default()
-            });
-            if delivery.archive_sent_at.is_some() {
-                transition = transition.col_expr(
-                    eh_download_queue::Column::CompletedAt,
-                    Expr::value(Some(now)),
-                );
+                    transition = transition.set(eh_download_queue::ActiveModel {
+                        started_at: Set(None),
+                        completed_at: Set(None),
+                        ..Default::default()
+                    });
+                }
             } else {
                 transition = transition.set(eh_download_queue::ActiveModel {
-                    started_at: Set(None),
-                    completed_at: Set(None),
+                    status: Set(DELIVERY_STATUS_FAILED.to_string()),
+                    completed_at: Set(Some(now)),
+                    next_retry_at: Set(None),
                     ..Default::default()
                 });
             }
@@ -3259,10 +3267,11 @@ impl Repo {
                 || job.telegraph_rewrite_status.as_deref() == Some(TELEGRAPH_REWRITE_STATUS_FAILED);
             let clear_rewrite_payload =
                 rewrite_is_terminal && !rewrite_in_progress && job.telegraph_rewrite_data.is_some();
-            let archive_still_needed = deliveries.iter().any(|delivery| {
-                is_active_delivery_status(&delivery.status)
-                    && eh_delivery_needs_archive(delivery, send_archive)
-            });
+            let archive_still_needed = send_archive
+                && deliveries.iter().any(|delivery| {
+                    is_active_delivery_status(&delivery.status)
+                        && delivery.archive_sent_at.is_none()
+                });
             let upload_in_flight = job.telegraph_status == TELEGRAPH_STATUS_UPLOADING;
             let upload_still_needs_zip = upload_in_flight
                 || (job.telegraph_status == TELEGRAPH_STATUS_PENDING && job.telegraph_required);
@@ -3885,11 +3894,10 @@ async fn has_active_eh_delivery_in_txn(txn: &DatabaseTransaction, job_id: i32) -
 async fn has_active_eh_archive_delivery_in_txn(
     txn: &DatabaseTransaction,
     job_id: i32,
-    send_archive: bool,
 ) -> Result<bool> {
     Ok(eh_download_queue::Entity::find()
         .filter(eh_download_queue::Column::JobId.eq(job_id))
-        .filter(eh_pending_archive_delivery_filter(send_archive))
+        .filter(eh_download_queue::Column::ArchiveSentAt.is_null())
         .filter(eh_active_delivery_status_filter())
         .one(txn)
         .await
@@ -3969,8 +3977,11 @@ fn eh_active_delivery_status_filter() -> SimpleExpr {
 }
 
 fn eh_configured_source_surface_filter(send_archive: bool) -> SimpleExpr {
-    sea_orm::Condition::any()
-        .add(eh_pending_archive_delivery_filter(send_archive))
+    let mut source_surface = sea_orm::Condition::any();
+    if send_archive {
+        source_surface = source_surface.add(eh_download_queue::Column::ArchiveSentAt.is_null());
+    }
+    source_surface
         .add(eh_pending_telegraph_delivery_filter())
         .into()
 }
@@ -5884,8 +5895,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn late_telegraph_consumer_reuses_download_and_terminal_upload_failure_falls_back_to_archive(
-    ) {
+    async fn late_telegraph_consumer_reuses_download_and_preserves_configured_archive() {
         let repo = tests_helpers::setup_test_db().await.unwrap();
         let variant = EhGalleryVariant::archive("1280x");
         let archive_only = repo
@@ -6020,7 +6030,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn terminal_upload_archive_fallback_retires_subscription_telegraph_owners() {
+    async fn terminal_upload_failure_preserves_archive_subscription_owners() {
         let repo = tests_helpers::setup_test_db().await.unwrap();
         let variant = EhGalleryVariant::archive("1280x");
         let first = repo
@@ -6040,7 +6050,7 @@ mod tests {
             download.id,
             download.started_at.unwrap(),
             123,
-            "subscription-fallback.zip",
+            "subscription-archive.zip",
             0,
         )
         .await
@@ -6060,15 +6070,15 @@ mod tests {
             panic!("expected a terminal shared upload failure");
         };
 
-        let fallback = eh_download_queue::Entity::find_by_id(first.id)
+        let archive = eh_download_queue::Entity::find_by_id(first.id)
             .one(repo.db())
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(fallback.status, DELIVERY_STATUS_WAITING);
-        assert!(!fallback.telegraph);
-        assert!(fallback.telegraph_subscription_ids.is_none());
-        assert_eq!(fallback.subscription_ids.as_deref(), Some("101"));
+        assert_eq!(archive.status, DELIVERY_STATUS_WAITING);
+        assert!(!archive.telegraph);
+        assert!(archive.telegraph_subscription_ids.is_none());
+        assert_eq!(archive.subscription_ids.as_deref(), Some("101"));
         let failed = load_eh_job(&repo, upload.id).await;
         assert!(!failed.telegraph_required);
 
@@ -6105,13 +6115,13 @@ mod tests {
         seed_push_ledger(&repo, -100, 701, Some(archive_sent_at), None).await;
         let delivery = repo
             .enqueue_eh_subscription_download(
-                -100, 101, 701, "token", "Gallery", true, &variant, None, false,
+                -100, 101, 701, "token", "Gallery", true, &variant, None, true,
             )
             .await
             .unwrap()
             .expect("delivery should be enqueued");
         let download = repo
-            .claim_eh_download_job(Main, false)
+            .claim_eh_download_job(Main, true)
             .await
             .unwrap()
             .unwrap();
@@ -6132,7 +6142,7 @@ mod tests {
                 upload.started_at.unwrap(),
                 "provider secret",
                 0,
-                false,
+                true,
             )
             .await
             .unwrap();
@@ -6163,7 +6173,7 @@ mod tests {
         assert!(completed.completed_at.is_some());
         assert!(completed.next_retry_at.is_none());
         assert!(repo
-            .get_next_eh_delivery_for_publish(false)
+            .get_next_eh_delivery_for_publish(true)
             .await
             .unwrap()
             .is_none());
@@ -7521,13 +7531,13 @@ mod tests {
             outcome,
             EhJobUploadFailureOutcome::Terminal { .. }
         ));
-        let archive_fallback = eh_download_queue::Entity::find_by_id(failed_telegraph.id)
+        let archive_delivery = eh_download_queue::Entity::find_by_id(failed_telegraph.id)
             .one(repo.db())
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(archive_fallback.status, DELIVERY_STATUS_WAITING);
-        assert!(!archive_fallback.telegraph);
+        assert_eq!(archive_delivery.status, DELIVERY_STATUS_WAITING);
+        assert!(!archive_delivery.telegraph);
 
         let late = repo
             .enqueue_eh_download(

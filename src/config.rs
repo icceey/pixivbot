@@ -352,8 +352,7 @@ pub struct EhentaiConfig {
         deserialize_with = "deserialize_eh_archive_resolution"
     )]
     pub download_resolution: String,
-    /// Whether subscription updates also send the archive ZIP (default: true).
-    /// ZIP is always sent when no Telegraph delivery is available.
+    /// Whether subscription updates send the archive ZIP (default: true).
     #[serde(default = "default_eh_send_archive")]
     pub send_archive: bool,
     /// Whether subscription updates upload to Telegraph (default: false).
