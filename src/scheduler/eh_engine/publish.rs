@@ -1,6 +1,8 @@
 use crate::bot::notifier::Notifier;
 use crate::config::EhentaiConfig;
-use crate::db::repo::eh_download_queue::{EhDeliveryClaim, EH_CHAT_LOCKS, STATUS_PUBLISHING};
+use crate::db::repo::eh_download_queue::{
+    eh_delivery_needs_archive, EhDeliveryClaim, EH_CHAT_LOCKS, STATUS_PUBLISHING,
+};
 use crate::db::repo::eh_gallery_jobs::{
     EhMissingZipResetOutcome, JOB_STATUS_DOWNLOADED, TELEGRAPH_STATUS_READY,
 };
@@ -184,7 +186,7 @@ impl EhPublishWorker {
             return Ok(());
         }
 
-        let archive_required = self.config.send_archive && delivery.archive_sent_at.is_none();
+        let archive_required = eh_delivery_needs_archive(&delivery, self.config.send_archive);
         let telegraph_required = delivery.telegraph && delivery.telegraph_sent_at.is_none();
         if telegraph_required
             && (job.telegraph_status != TELEGRAPH_STATUS_READY || job.telegraph_url.is_none())

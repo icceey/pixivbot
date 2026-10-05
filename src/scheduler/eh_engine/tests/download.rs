@@ -20,7 +20,7 @@ async fn two_chats_share_one_download_purchase_artifact_and_completion() {
                 SOURCE_DIRECT,
                 &variant,
                 None,
-                true,
+                false,
             )
             .await
             .unwrap()
@@ -35,7 +35,7 @@ async fn two_chats_share_one_download_purchase_artifact_and_completion() {
                 SOURCE_DIRECT,
                 &variant,
                 None,
-                true,
+                false,
             )
             .await
             .unwrap()
@@ -64,6 +64,7 @@ async fn two_chats_share_one_download_purchase_artifact_and_completion() {
 
         let mut config = make_config();
         config.max_archive_gp_cost = 218;
+        config.send_archive = false;
         config.background_download_enabled = background;
         config.background_download_concurrency = 2;
         let queue = if background {
@@ -72,10 +73,11 @@ async fn two_chats_share_one_download_purchase_artifact_and_completion() {
         } else {
             Main
         };
+        let config = Arc::new(config);
         EhDownloadWorker::new(
             Arc::clone(&repo),
             make_eh_client(&eh_server),
-            Arc::new(config),
+            Arc::clone(&config),
             temp.path().to_path_buf(),
             queue,
             None,
@@ -130,6 +132,39 @@ async fn two_chats_share_one_download_purchase_artifact_and_completion() {
             completions[0].file_size,
             i64::try_from(zip_bytes.len()).unwrap()
         );
+        let tg_server = MockServer::start().await;
+        for chat_id in [-100, -200] {
+            mock_tg_send_document_for_chat(&tg_server, chat_id, 200, None).await;
+        }
+        let publisher = EhPublishWorker::new(
+            Arc::clone(&repo),
+            make_notifier(&tg_server),
+            make_eh_client(&eh_server),
+            None,
+            config,
+        );
+        publisher.tick().await.unwrap();
+        publisher.tick().await.unwrap();
+        let sent = tg_server.received_requests().await.unwrap();
+        for chat_id in [-100, -200] {
+            assert_eq!(
+                sent.iter()
+                    .filter(|request| {
+                        wiremock::Match::matches(&TelegramDocumentChat(chat_id), request)
+                    })
+                    .count(),
+                1
+            );
+        }
+        for delivery in deliveries {
+            let delivered = eh_download_queue::Entity::find_by_id(delivery.id)
+                .one(repo.db())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(delivered.status, DELIVERY_STATUS_DONE);
+            assert!(delivered.archive_sent_at.is_some());
+        }
     }
 }
 

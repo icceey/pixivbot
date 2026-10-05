@@ -182,7 +182,8 @@ download_original_threshold = 1
 # # "original" (default: "1280x"). Donor resolutions require a separate H@H
 # # Downloader and are rejected by direct archive downloads.
 # download_resolution = "1280x"
-# # Send archive ZIP to chat (default: true)
+# # Also send archive ZIP to chat (default: true).
+# # ZIP is the fallback when Telegraph is disabled, unavailable, or fails permanently.
 # send_archive = true
 # # Upload to Telegraph and send link for subscription updates (default: false)
 # # Requires telegraph_access_token. Image hosting uses the [image_upload] provider.
