@@ -193,10 +193,21 @@ async fn two_telegraph_deliveries_upload_zip_and_create_page_once() {
         &[(-100, true, "T1"), (-200, true, "T2")],
     )
     .await;
+    eh_gallery_jobs::Entity::update_many()
+        .set(eh_gallery_jobs::ActiveModel {
+            telegraph_required: Set(false),
+            telegraph_status: Set(TELEGRAPH_STATUS_NOT_REQUIRED.to_string()),
+            ..Default::default()
+        })
+        .filter(eh_gallery_jobs::Column::Id.eq(job.id))
+        .exec(repo.db())
+        .await
+        .unwrap();
     let uploader = Arc::new(ZipFirstMockUploader::default());
+    let page_url = "https://example.com/shared-gallery";
     let body = serde_json::json!({
         "ok": true,
-        "result": {"url": "https://telegra.ph/Shared-Gallery-01-01"}
+        "result": {"url": page_url}
     });
     Mock::given(method("POST"))
         .and(path("/createPage"))
@@ -204,6 +215,10 @@ async fn two_telegraph_deliveries_upload_zip_and_create_page_once() {
         .expect(1)
         .mount(&tg_server)
         .await;
+    let config = Arc::new(EhentaiConfig {
+        send_archive: false,
+        ..make_config()
+    });
     let worker = EhUploadWorker::new(
         Arc::clone(&repo),
         make_notifier(&tg_server),
@@ -215,7 +230,7 @@ async fn two_telegraph_deliveries_upload_zip_and_create_page_once() {
             public_gateway_url: "https://public.example".to_string(),
             delay_sec: 60,
         }),
-        Arc::new(make_config()),
+        Arc::clone(&config),
     );
 
     worker.tick().await.unwrap();
@@ -241,23 +256,49 @@ async fn two_telegraph_deliveries_upload_zip_and_create_page_once() {
         .unwrap()
         .unwrap();
     assert_eq!(ready.telegraph_status, TELEGRAPH_STATUS_READY);
-    assert_eq!(
-        ready.telegraph_url.as_deref(),
-        Some("https://telegra.ph/Shared-Gallery-01-01")
-    );
+    assert_eq!(ready.telegraph_url.as_deref(), Some(page_url));
     assert!(
         ready.telegraph_rewrite_data.is_some(),
         "create-page rewrite payload must be persisted once on the shared job"
     );
+    for chat_id in [-100, -200] {
+        Mock::given(method("POST"))
+            .and(path("/botfake_token/SendMessage"))
+            .and(wiremock::matchers::body_partial_json(serde_json::json!({
+                "chat_id": chat_id
+            })))
+            .and(body_string_contains(page_url))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": {
+                    "message_id": 43,
+                    "date": 1700000000,
+                    "chat": {"id": chat_id, "type": "group"}
+                }
+            })))
+            .expect(1)
+            .mount(&tg_server)
+            .await;
+    }
+    let publisher = EhPublishWorker::new(
+        Arc::clone(&repo),
+        make_notifier(&tg_server),
+        make_eh_client(&tg_server),
+        Some(60),
+        config,
+    );
+    publisher.tick().await.unwrap();
+    publisher.tick().await.unwrap();
+    worker.tick().await.unwrap();
+
     for delivery in deliveries {
         let delivery = eh_download_queue::Entity::find_by_id(delivery.id)
             .one(repo.db())
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(delivery.status, DELIVERY_STATUS_WAITING);
-        assert_eq!(delivery.telegraph_url, None);
-        assert_eq!(delivery.telegraph_rewrite_data, None);
+        assert_eq!(delivery.status, DELIVERY_STATUS_DONE);
+        assert!(delivery.telegraph_sent_at.is_some());
     }
 }
 
@@ -302,13 +343,13 @@ async fn upload_worker_defers_all_disabled_destinations_without_spending_quota_o
     .await;
     let body = serde_json::json!({
         "ok": true,
-        "result": {"url": "https://telegra.ph/Enabled-Gallery-01-01"}
+        "result": {"url": "https://example.com/enabled-gallery"}
     });
-    Mock::given(method("POST"))
+    let page_created = Mock::given(method("POST"))
         .and(path("/createPage"))
         .respond_with(ResponseTemplate::new(200).set_body_json(body))
         .expect(1)
-        .mount(&tg_server)
+        .mount_as_scoped(&tg_server)
         .await;
     let uploader = Arc::new(ZipFirstMockUploader::default());
     let worker = EhUploadWorker::new(
@@ -321,31 +362,25 @@ async fn upload_worker_defers_all_disabled_destinations_without_spending_quota_o
         Arc::new(make_config()),
     );
 
-    worker.tick().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::select! {
+            _ = worker.run() => panic!("upload worker stopped"),
+            _ = async {
+                page_created.wait_until_satisfied().await;
+                loop {
+                    let job = eh_gallery_jobs::Entity::find_by_id(enabled_job.id)
+                        .one(repo.db()).await.unwrap().unwrap();
+                    if job.telegraph_status == TELEGRAPH_STATUS_READY {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            } => {}
+        }
+    })
+    .await
+    .expect("a deferred destination must not delay the next available upload");
 
-    assert_eq!(
-        uploader.zip_calls.load(std::sync::atomic::Ordering::SeqCst),
-        0,
-        "disabled Telegraph destinations must not invoke the ZIP uploader"
-    );
-    assert_eq!(
-        uploader
-            .image_calls
-            .load(std::sync::atomic::Ordering::SeqCst),
-        0,
-        "disabled Telegraph destinations must not invoke the image uploader"
-    );
-    assert_eq!(
-        tg_server
-            .received_requests()
-            .await
-            .unwrap()
-            .iter()
-            .filter(|request| request.url.path() == "/createPage")
-            .count(),
-        0,
-        "disabled Telegraph destinations must not create a Telegraph page"
-    );
     let deferred = eh_gallery_jobs::Entity::find_by_id(disabled_job.id)
         .one(repo.db())
         .await
@@ -368,8 +403,6 @@ async fn upload_worker_defers_all_disabled_destinations_without_spending_quota_o
         assert_eq!(delivery.status, DELIVERY_STATUS_WAITING);
         assert!(delivery.telegraph_sent_at.is_none());
     }
-
-    worker.tick().await.unwrap();
 
     assert_eq!(
         uploader.zip_calls.load(std::sync::atomic::Ordering::SeqCst),
@@ -460,8 +493,8 @@ async fn terminal_upload_notifies_each_telegraph_chat_once_and_never_archive_onl
             .map(|body| body["text"].as_str().unwrap())
             .collect::<Vec<_>>(),
         vec![
-            "⚠️ Telegraph 上传失败，请稍后重试\n\n📦 T1",
-            "⚠️ Telegraph 上传失败，请稍后重试\n\n📦 T2",
+            "⚠️ Telegraph 上传失败，改用 ZIP 投递\n\n📦 T1",
+            "⚠️ Telegraph 上传失败，改用 ZIP 投递\n\n📦 T2",
         ]
     );
     assert!(requests.iter().all(|body| {
@@ -574,7 +607,7 @@ async fn terminal_upload_failure_skips_disabled_shared_destination_notification(
     );
     assert_eq!(
         requests[0]["text"].as_str(),
-        Some("⚠️ Telegraph 上传失败，请稍后重试\n\n📦 Enabled")
+        Some("⚠️ Telegraph 上传失败，改用 ZIP 投递\n\n📦 Enabled")
     );
     for delivery in deliveries {
         let delivery = eh_download_queue::Entity::find_by_id(delivery.id)
@@ -962,7 +995,7 @@ async fn terminal_upload_failure_preserves_archive_fallback_with_any_abort_suppo
         let notifier = make_notifier(&tg_server);
         let mut cfg = make_config();
         cfg.max_retry_count = 0;
-        cfg.send_archive = true;
+        cfg.send_archive = false;
         let config = Arc::new(cfg);
         let temp_dir = tempfile::tempdir().unwrap();
         let zip_path = temp_dir.path().join("505.zip");
@@ -1017,7 +1050,7 @@ async fn terminal_upload_failure_preserves_archive_fallback_with_any_abort_suppo
         assert!(artifacts.assembly_scratch().exists());
         assert!(artifacts.parts_dir().exists());
         let fallback_claim = repo
-            .get_next_eh_delivery_for_publish(true)
+            .get_next_eh_delivery_for_publish(false)
             .await
             .unwrap()
             .unwrap();
@@ -1038,138 +1071,6 @@ async fn terminal_upload_failure_preserves_archive_fallback_with_any_abort_suppo
         assert!(ledger.archive_sent_at.is_some());
         assert!(ledger.telegraph_sent_at.is_none());
     }
-}
-
-#[tokio::test]
-async fn test_upload_permanent_failure_without_fallback_removes_whole_archive_family() {
-    let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
-    setup_chat(&repo, -100, true).await;
-    let tg_server = MockServer::start().await;
-    let notifier = make_notifier(&tg_server);
-    let mut cfg = make_config();
-    cfg.max_retry_count = 0;
-    cfg.send_archive = false;
-    let config = Arc::new(cfg);
-    let temp_dir = tempfile::tempdir().unwrap();
-    let zip_path = temp_dir.path().join("506.zip");
-    create_test_zip(&zip_path, 2);
-    let artifacts = seed_archive_artifact_family(&zip_path);
-    let entry = seed_delivery(
-        &repo,
-        -100,
-        (506, "tok", "Title"),
-        DeliveryOptions {
-            telegraph: true,
-            job_status: JOB_STATUS_DOWNLOADED,
-            zip_path: Some(zip_path.to_str().unwrap()),
-            ..Default::default()
-        },
-    )
-    .await;
-    let uploader = Arc::new(TerminalCleanupMockUploader::default());
-
-    let worker = EhUploadWorker::new(
-        Arc::clone(&repo),
-        notifier,
-        make_telegraph_client(&tg_server),
-        uploader.clone(),
-        Some(uploader.clone()),
-        None,
-        config,
-    );
-    worker.tick().await.unwrap();
-
-    let delivery = eh_download_queue::Entity::find_by_id(entry.id)
-        .one(repo.db())
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(delivery.status, STATUS_FAILED);
-    assert_eq!(delivery.error, None);
-    let job = job_for_delivery(&repo, &entry).await;
-    assert_eq!(job.status, JOB_STATUS_RETIRED);
-    assert_eq!(job.telegraph_status, TELEGRAPH_STATUS_FAILED);
-    assert_eq!(job.retry_count, 1);
-    assert!(job.next_retry_at.is_none());
-    assert_eq!(job.cleanup_status, CLEANUP_STATUS_PENDING);
-    assert_eq!(
-        run_eh_job_cleanup_maintenance_once(repo.as_ref(), Some(uploader.as_ref()), 1, true)
-            .await
-            .unwrap(),
-        Some(EhCleanupFinalizeOutcome::CleanRetired)
-    );
-    assert!(!artifacts.final_zip().exists());
-    assert!(!artifacts.assembly_scratch().exists());
-    assert!(!artifacts.parts_dir().exists());
-    assert!(!artifacts.uploads_dir().exists());
-    assert_terminal_cleanup_precedes_local_removal(&uploader, &artifacts);
-}
-
-#[tokio::test]
-async fn test_upload_permanent_failure_without_fallback_preserves_family_when_abort_fails() {
-    let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
-    setup_chat(&repo, -100, true).await;
-    let tg_server = MockServer::start().await;
-    let notifier = make_notifier(&tg_server);
-    let mut cfg = make_config();
-    cfg.max_retry_count = 0;
-    cfg.send_archive = false;
-    let temp_dir = tempfile::tempdir().unwrap();
-    let zip_path = temp_dir.path().join("506-abort-fails.zip");
-    create_test_zip(&zip_path, 2);
-    let artifacts = seed_archive_artifact_family(&zip_path);
-    let entry = seed_delivery(
-        &repo,
-        -100,
-        (506, "tok", "Title"),
-        DeliveryOptions {
-            telegraph: true,
-            job_status: JOB_STATUS_DOWNLOADED,
-            zip_path: Some(zip_path.to_str().unwrap()),
-            ..Default::default()
-        },
-    )
-    .await;
-    let uploader = Arc::new(TerminalCleanupMockUploader {
-        fail_abort: true,
-        ..Default::default()
-    });
-    let worker = EhUploadWorker::new(
-        Arc::clone(&repo),
-        notifier,
-        make_telegraph_client(&tg_server),
-        uploader.clone(),
-        Some(uploader.clone()),
-        None,
-        Arc::new(cfg),
-    );
-
-    worker.tick().await.unwrap();
-    let delivery = eh_download_queue::Entity::find_by_id(entry.id)
-        .one(repo.db())
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(delivery.status, DELIVERY_STATUS_FAILED);
-    assert_eq!(delivery.error, None);
-    let job = job_for_delivery(&repo, &entry).await;
-    assert_eq!(job.status, JOB_STATUS_RETIRED);
-    assert_eq!(job.telegraph_status, TELEGRAPH_STATUS_FAILED);
-    assert_eq!(job.retry_count, 1);
-    assert_eq!(job.cleanup_status, CLEANUP_STATUS_PENDING);
-    assert!(
-        run_eh_job_cleanup_maintenance_once(repo.as_ref(), Some(uploader.as_ref()), 1, true)
-            .await
-            .is_err()
-    );
-    let failed_cleanup = job_for_delivery(&repo, &entry).await;
-    assert_eq!(failed_cleanup.cleanup_status, CLEANUP_STATUS_FAILED);
-    assert!(artifacts.final_zip().exists());
-    assert!(artifacts.assembly_scratch().exists());
-    assert!(artifacts.parts_dir().exists());
-    assert!(artifacts.uploads_dir().exists());
-    assert!(artifacts.uploads_dir().join("archive.json").exists());
-    assert_terminal_cleanup_precedes_local_removal(&uploader, &artifacts);
 }
 
 #[tokio::test]

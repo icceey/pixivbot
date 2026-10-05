@@ -131,6 +131,8 @@ async fn test_collect_overflow_pending_enqueued_on_next_tick() {
 
     let mut config = make_config();
     config.max_push_per_tick = 3;
+    config.send_archive = false;
+    config.upload_telegraph = false;
     let mut engine = EhEngine::new(
         Arc::clone(&repo),
         make_eh_client(&eh_server),

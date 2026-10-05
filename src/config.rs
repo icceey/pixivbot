@@ -352,7 +352,8 @@ pub struct EhentaiConfig {
         deserialize_with = "deserialize_eh_archive_resolution"
     )]
     pub download_resolution: String,
-    /// Whether subscription updates send the archive ZIP (default: true).
+    /// Whether subscription updates also send the archive ZIP (default: true).
+    /// ZIP is always sent when no Telegraph delivery is available.
     #[serde(default = "default_eh_send_archive")]
     pub send_archive: bool,
     /// Whether subscription updates upload to Telegraph (default: false).
@@ -378,6 +379,7 @@ pub struct EhentaiConfig {
     pub download_rate_window_hours: u64,
     /// Maximum selected EH archive estimate allowed for logged-in downloads, in MiB.
     /// The archiver page supplies this estimate before the GP-spending POST.
+    /// Oversized archives fail permanently without download retries.
     /// `0` disables this per-gallery archive gate.
     #[serde(default = "default_eh_max_archive_size_mb")]
     pub max_archive_size_mb: u64,
@@ -396,6 +398,7 @@ pub struct EhentaiConfig {
     /// Default: 24 (one day).
     #[serde(default = "default_eh_gp_rate_window_hours")]
     pub gp_rate_window_hours: u64,
+    /// Idle wait between EH worker polls; ready jobs continue immediately.
     #[serde(default = "default_eh_download_poll_interval_sec")]
     pub download_poll_interval_sec: u64,
     /// Maximum active HTTP Range requests used by one authenticated EH archive.

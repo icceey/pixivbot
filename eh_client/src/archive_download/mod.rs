@@ -175,9 +175,10 @@ pub(crate) fn ensure_archive_size_under_limit(
     max_size_bytes: Option<u64>,
 ) -> Result<()> {
     if let Some(limit) = max_size_bytes.filter(|limit| total_len > *limit) {
-        return Err(Error::Other(format!(
-            "persisted EH archive size {total_len} bytes exceeds configured {limit} byte limit"
-        )));
+        return Err(Error::ArchiveSizeLimitExceeded {
+            size_bytes: total_len,
+            limit_bytes: limit,
+        });
     }
     Ok(())
 }

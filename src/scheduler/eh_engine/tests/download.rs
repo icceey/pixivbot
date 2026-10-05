@@ -20,7 +20,7 @@ async fn two_chats_share_one_download_purchase_artifact_and_completion() {
                 SOURCE_DIRECT,
                 &variant,
                 None,
-                true,
+                false,
             )
             .await
             .unwrap()
@@ -35,7 +35,7 @@ async fn two_chats_share_one_download_purchase_artifact_and_completion() {
                 SOURCE_DIRECT,
                 &variant,
                 None,
-                true,
+                false,
             )
             .await
             .unwrap()
@@ -64,6 +64,7 @@ async fn two_chats_share_one_download_purchase_artifact_and_completion() {
 
         let mut config = make_config();
         config.max_archive_gp_cost = 218;
+        config.send_archive = false;
         config.background_download_enabled = background;
         config.background_download_concurrency = 2;
         let queue = if background {
@@ -72,10 +73,11 @@ async fn two_chats_share_one_download_purchase_artifact_and_completion() {
         } else {
             Main
         };
+        let config = Arc::new(config);
         EhDownloadWorker::new(
             Arc::clone(&repo),
             make_eh_client(&eh_server),
-            Arc::new(config),
+            Arc::clone(&config),
             temp.path().to_path_buf(),
             queue,
             None,
@@ -130,6 +132,39 @@ async fn two_chats_share_one_download_purchase_artifact_and_completion() {
             completions[0].file_size,
             i64::try_from(zip_bytes.len()).unwrap()
         );
+        let tg_server = MockServer::start().await;
+        for chat_id in [-100, -200] {
+            mock_tg_send_document_for_chat(&tg_server, chat_id, 200, None).await;
+        }
+        let publisher = EhPublishWorker::new(
+            Arc::clone(&repo),
+            make_notifier(&tg_server),
+            make_eh_client(&eh_server),
+            None,
+            config,
+        );
+        publisher.tick().await.unwrap();
+        publisher.tick().await.unwrap();
+        let sent = tg_server.received_requests().await.unwrap();
+        for chat_id in [-100, -200] {
+            assert_eq!(
+                sent.iter()
+                    .filter(|request| {
+                        wiremock::Match::matches(&TelegramDocumentChat(chat_id), request)
+                    })
+                    .count(),
+                1
+            );
+        }
+        for delivery in deliveries {
+            let delivered = eh_download_queue::Entity::find_by_id(delivery.id)
+                .one(repo.db())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(delivered.status, DELIVERY_STATUS_DONE);
+            assert!(delivered.archive_sent_at.is_some());
+        }
     }
 }
 
@@ -200,6 +235,7 @@ async fn test_download_worker_chat_disabled_schedules_retry() {
 
     let mut config = make_config();
     config.background_download_enabled = false;
+    config.download_poll_interval_sec = 0;
     let worker = EhDownloadWorker::new(
         Arc::clone(&repo),
         make_eh_client(&eh_server),
@@ -224,6 +260,8 @@ async fn test_download_worker_chat_disabled_schedules_retry() {
         updated.next_retry_at.is_some(),
         "should have next_retry_at set"
     );
+    assert!(!worker.tick().await.unwrap());
+    assert!(eh_server.received_requests().await.unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -237,7 +275,10 @@ async fn test_download_worker_failure_schedules_retry() {
         &repo,
         -100,
         (123456, "abcdef0123", "Test"),
-        Default::default(),
+        DeliveryOptions {
+            telegraph: true,
+            ..Default::default()
+        },
     )
     .await;
 
@@ -260,6 +301,7 @@ async fn test_download_worker_failure_schedules_retry() {
 
     let mut config = make_config();
     config.background_download_enabled = false;
+    config.send_archive = false;
     let worker = EhDownloadWorker::new(
         Arc::clone(&repo),
         make_eh_client(&eh_server),
@@ -279,6 +321,16 @@ async fn test_download_worker_failure_schedules_retry() {
     assert!(
         updated.next_retry_at.is_some(),
         "should have next_retry_at set"
+    );
+    let requests_after_failure = eh_server.received_requests().await.unwrap().len();
+    worker.tick().await.unwrap();
+    let deferred = job_for_delivery(&repo, &entry).await;
+    assert_eq!(deferred.next_retry_at, updated.next_retry_at);
+    assert_eq!(deferred.retry_count, updated.retry_count);
+    assert_eq!(
+        eh_server.received_requests().await.unwrap().len(),
+        requests_after_failure,
+        "cleanup must not restart a source download before its retry is due"
     );
 }
 
@@ -585,7 +637,6 @@ async fn test_download_size_limit_blocks_oversized_fallback_archive_before_post(
 
     let mut cfg = make_config();
     cfg.max_archive_size_mb = 300;
-    cfg.max_retry_count = 0;
     let entry = seed_delivery(
         &repo,
         -100,
@@ -604,16 +655,24 @@ async fn test_download_size_limit_blocks_oversized_fallback_archive_before_post(
 
     worker.tick().await.unwrap();
 
-    let model = job_for_delivery(&repo, &entry).await;
-    assert_eq!(model.status, JOB_STATUS_RETIRED);
-    assert_eq!(model.cleanup_status, CLEANUP_STATUS_PENDING);
-    assert!(
-        model
-            .error
-            .as_ref()
-            .is_some_and(|e| e.contains("selected EH archive size is too large")),
-        "error should mention the configured limit, got: {:?}",
-        model.error
+    let delivery = eh_download_queue::Entity::find_by_id(entry.id)
+        .one(repo.db())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(delivery.status, DELIVERY_STATUS_FAILED);
+    worker.tick().await.unwrap();
+    worker.tick().await.unwrap();
+    let requests = eh_server.received_requests().await.unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| {
+                request.method.as_str() == "GET" && request.url.path() == "/archiver.php"
+            })
+            .count(),
+        1,
+        "cleanup must not restart a policy-rejected download"
     );
     assert_eq!(
         eh_server
@@ -1165,12 +1224,9 @@ async fn test_background_worker_selected_size_limit_runs_after_prepare_without_m
     worker.tick().await.unwrap();
 
     let updated = job_for_delivery(&repo, &entry).await;
-    assert_eq!(updated.status, STATUS_PENDING);
-    assert_eq!(
-        updated.background_download_status.as_deref(),
-        Some(BACKGROUND_STATUS_PENDING)
-    );
-    assert_eq!(updated.background_download_attempt_count, 1);
+    assert_eq!(updated.status, JOB_STATUS_FAILED);
+    assert!(updated.background_download_status.is_none());
+    worker.tick().await.unwrap();
 
     let requests = eh_server.received_requests().await.unwrap();
     assert!(requests.iter().any(|request| {

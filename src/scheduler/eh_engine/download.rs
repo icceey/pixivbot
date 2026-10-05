@@ -44,11 +44,6 @@ fn should_schedule_background_download(failures: i32, bytes_delta: u64, elapsed:
         && bytes_delta / elapsed.as_secs() < SLOW_DOWNLOAD_BYTES_PER_SEC
 }
 
-/// Convert a byte count to whole MiB, rounding up so partial MiB is not under-reported.
-fn format_mib(bytes: u64) -> u64 {
-    bytes.div_ceil(1024 * 1024)
-}
-
 /// Selected-archive size gate for logged-in EH archive downloads.
 ///
 /// Runs after `prepare_archive_download()` and before the GP reservation / archive
@@ -70,11 +65,11 @@ fn ensure_eh_archive_under_size_limit(
         return Ok(());
     }
 
-    anyhow::bail!(
-        "selected EH archive size is too large: {} MiB exceeds configured {} MiB limit",
-        format_mib(estimated_size_bytes),
-        format_mib(limit_bytes)
-    );
+    Err(eh_client::Error::ArchiveSizeLimitExceeded {
+        size_bytes: estimated_size_bytes,
+        limit_bytes,
+    }
+    .into())
 }
 
 /// Outcome of `check_and_reserve_archive_cost` for a prepared archive request.
@@ -247,18 +242,18 @@ impl EhDownloadWorker {
     pub async fn run(self) {
         let poll = self.config.download_poll_interval_sec.max(10);
         let downloads = async {
-            let mut interval = tokio::time::interval(Duration::from_secs(poll));
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
-                interval.tick().await;
-                if let Err(e) = self.tick().await {
-                    match self.queue {
-                        EhDownloadQueue::Main => error!("EhDownloadWorker tick error: {:#}", e),
+                match self.tick().await {
+                    Ok(true) => continue,
+                    Ok(false) => {}
+                    Err(error) => match self.queue {
+                        EhDownloadQueue::Main => error!("EhDownloadWorker tick error: {:#}", error),
                         EhDownloadQueue::Background => {
-                            error!("EhBackgroundDownloadWorker tick error: {:#}", e)
+                            error!("EhBackgroundDownloadWorker tick error: {:#}", error)
                         }
-                    }
+                    },
                 }
+                tokio::time::sleep(Duration::from_secs(poll)).await;
             }
         };
         if self.queue == EhDownloadQueue::Main {
@@ -286,22 +281,24 @@ impl EhDownloadWorker {
         }
     }
 
-    pub(super) async fn tick(&self) -> Result<()> {
+    pub(super) async fn tick(&self) -> Result<bool> {
+        let mut did_work = false;
         if self.queue == EhDownloadQueue::Main {
-            if let Err(error) = run_eh_job_cleanup_maintenance_once(
+            match run_eh_job_cleanup_maintenance_once(
                 self.repo.as_ref(),
                 self.startup_abort_uploader.as_deref(),
-                self.config.download_poll_interval_sec as i64,
+                self.config.download_poll_interval_sec.max(10) as i64,
                 self.config.send_archive,
             )
             .await
             {
-                error!("Shared EH cleanup maintenance failed; continuing normal download selection: {:#}", error);
+                Ok(outcome) => did_work = outcome.is_some(),
+                Err(error) => error!("Shared EH cleanup maintenance failed; continuing normal download selection: {:#}", error),
             }
         }
         let window_hours = i64::try_from(self.config.download_rate_window_hours)
             .context("EH download rate window hours exceed the supported range")?;
-        let downloaded_bytes = self
+        let mut downloaded_bytes = self
             .repo
             .get_eh_downloaded_bytes_in_window(window_hours)
             .await?;
@@ -312,7 +309,7 @@ impl EhDownloadWorker {
                     "EH background download byte rate limit reached ({} bytes in last {}h), skipping this tick",
                     downloaded_bytes, self.config.download_rate_window_hours),
             }
-            return Ok(());
+            return Ok(did_work);
         }
 
         if self.queue == EhDownloadQueue::Main {
@@ -322,22 +319,43 @@ impl EhDownloadWorker {
                 .await?
             {
                 self.process(&job).await?;
+                did_work = true;
             }
-            return Ok(());
+            return Ok(did_work);
         }
         let mut tasks = JoinSet::new();
-        for _ in 0..self.config.background_download_concurrency.max(1) {
-            let Some(job) = self
-                .repo
-                .claim_eh_download_job(self.queue, self.config.send_archive)
-                .await?
-            else {
-                break;
-            };
-            let worker = self.clone();
-            tasks.spawn(async move { worker.process(&job).await });
+        let result: Result<()> = async {
+            loop {
+                while tasks.len() < self.config.background_download_concurrency.max(1)
+                    && downloaded_bytes < self.config.download_rate_limit_bytes() as i64
+                {
+                    let Some(job) = self
+                        .repo
+                        .claim_eh_download_job(self.queue, self.config.send_archive)
+                        .await?
+                    else {
+                        break;
+                    };
+                    let worker = self.clone();
+                    tasks.spawn(async move { worker.process(&job).await });
+                    did_work = true;
+                }
+                let Some(result) = tasks.join_next().await else {
+                    break;
+                };
+                result.context("background download task failed")??;
+                downloaded_bytes = self
+                    .repo
+                    .get_eh_downloaded_bytes_in_window(window_hours)
+                    .await?;
+            }
+            Ok(())
         }
-        drain_background_download_tasks(&mut tasks).await
+        .await;
+        let drained = drain_background_download_tasks(&mut tasks).await;
+        result?;
+        drained?;
+        Ok(did_work)
     }
 
     async fn process(&self, job: &eh_gallery_jobs::Model) -> Result<()> {
@@ -356,7 +374,7 @@ impl EhDownloadWorker {
                 .defer_eh_job_background_download(
                     job.id,
                     expected_started_at,
-                    self.config.download_poll_interval_sec.max(1) as i64,
+                    self.config.download_poll_interval_sec.max(10) as i64,
                     &reason,
                 )
                 .await
@@ -459,7 +477,7 @@ impl EhDownloadWorker {
                     self.repo
                         .defer_eh_job_download(
                             job.id,
-                            self.config.download_poll_interval_sec as i64,
+                            self.config.download_poll_interval_sec.max(10) as i64,
                         )
                         .await?
                 }
@@ -469,7 +487,7 @@ impl EhDownloadWorker {
                         .defer_eh_job_background_download(
                             job.id,
                             expected_started_at,
-                            self.config.download_poll_interval_sec as i64,
+                            self.config.download_poll_interval_sec.max(10) as i64,
                             reason,
                         )
                         .await?
@@ -483,7 +501,22 @@ impl EhDownloadWorker {
 
         // Keep the source-attempt boundary: mkdir, mode resolution, transfer and
         // quota deferral failures consume a background attempt; settlement does not.
-        match self.download(job, expected_started_at, &zip_path).await {
+        let outcome = match self.download(job, expected_started_at, &zip_path).await {
+            Err(error)
+                if error.chain().any(|cause| {
+                    matches!(
+                        cause.downcast_ref::<eh_client::Error>(),
+                        Some(eh_client::Error::ArchiveSizeLimitExceeded { .. })
+                    )
+                }) =>
+            {
+                Ok(DownloadOutcome::Rejected {
+                    reason: format!("{error:#}"),
+                })
+            }
+            outcome => outcome,
+        };
+        match outcome {
             Ok(DownloadOutcome::Completed { file_size, gp_cost }) => {
                 if !background {
                     info!(
@@ -718,7 +751,10 @@ impl EhDownloadWorker {
                     .await?;
             } else {
                 self.repo
-                    .defer_eh_job_download(job.id, self.config.download_poll_interval_sec as i64)
+                    .defer_eh_job_download(
+                        job.id,
+                        self.config.download_poll_interval_sec.max(10) as i64,
+                    )
                     .await?;
             }
             self.repo

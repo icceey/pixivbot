@@ -35,22 +35,22 @@ impl EhTelegraphRewriteWorker {
     }
 
     pub async fn run(self) {
-        let poll = self.config.download_poll_interval_sec.max(10);
-        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(poll));
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
+        let idle_wait =
+            tokio::time::Duration::from_secs(self.config.download_poll_interval_sec.max(10));
         loop {
-            interval.tick().await;
-            if let Err(e) = self.tick().await {
-                error!("EhTelegraphRewriteWorker tick error: {:#}", e);
+            match self.tick().await {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(error) => error!("EhTelegraphRewriteWorker tick error: {:#}", error),
             }
+            tokio::time::sleep(idle_wait).await;
         }
     }
 
-    pub(super) async fn tick(&self) -> Result<()> {
+    pub(super) async fn tick(&self) -> Result<bool> {
         let job = self.repo.get_next_eh_job_for_telegraph_rewrite().await?;
         let Some(job) = job else {
-            return Ok(());
+            return Ok(false);
         };
         let generation = job
             .telegraph_rewrite_started_at
@@ -76,7 +76,7 @@ impl EhTelegraphRewriteWorker {
                     job.id
                 );
             }
-            return Ok(());
+            return Ok(true);
         }
 
         if self
@@ -98,7 +98,7 @@ impl EhTelegraphRewriteWorker {
             );
         }
 
-        Ok(())
+        Ok(true)
     }
 
     pub(super) async fn process(&self, job: &eh_gallery_jobs::Model) -> Result<()> {

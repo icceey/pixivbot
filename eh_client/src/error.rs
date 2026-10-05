@@ -41,6 +41,10 @@ pub enum Error {
     RateLimited {
         retry_after_secs: Option<u64>,
     },
+    ArchiveSizeLimitExceeded {
+        size_bytes: u64,
+        limit_bytes: u64,
+    },
     Other(String),
     /// Archive download failed but this attempt made real progress (>10KB/s).
     /// Preserve `.part` file for resumption instead of incrementing retry_count.
@@ -65,6 +69,13 @@ impl fmt::Display for Error {
                 write!(f, "Rate limited (429), retry after {:?}", retry_after_secs)
             }
             Error::Other(msg) => write!(f, "{}", msg),
+            Error::ArchiveSizeLimitExceeded {
+                size_bytes,
+                limit_bytes,
+            } => write!(
+                f,
+                "EH archive size {size_bytes} bytes exceeds configured {limit_bytes} byte limit"
+            ),
             Error::DownloadInProgress { inner, .. } => {
                 write!(f, "download failed but made progress: {}", inner)
             }
