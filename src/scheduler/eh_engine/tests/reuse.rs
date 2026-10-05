@@ -429,14 +429,14 @@ async fn fingerprint_change_forces_full_refetch() {
 }
 
 #[tokio::test]
-async fn terminal_upload_failure_fallback_then_later_telegraph_subscription() {
+async fn configured_archive_delivery_then_later_telegraph_subscription() {
     let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
     let eh_server = MockServer::start().await;
     let telegram_server = MockServer::start().await;
     let temp = tempfile::tempdir().unwrap();
     let variant = EhGalleryVariant::archive("1280x");
     let gid = 9_803;
-    let token = "fallback-token";
+    let token = "archive-token";
     setup_chat(&repo, -100, true).await;
 
     let first = repo
@@ -444,7 +444,7 @@ async fn terminal_upload_failure_fallback_then_later_telegraph_subscription() {
             -100,
             gid,
             token,
-            "Fallback Gallery",
+            "Shared Gallery",
             true,
             SOURCE_DIRECT,
             &variant,
@@ -454,7 +454,7 @@ async fn terminal_upload_failure_fallback_then_later_telegraph_subscription() {
         .await
         .unwrap()
         .expect("initial mixed subscription delivery");
-    let first_source = temp.path().join("fallback-first.zip");
+    let first_source = temp.path().join("archive-first.zip");
     create_test_zip(&first_source, 2);
     let first_claim = repo
         .claim_eh_download_job(Main, true)
@@ -499,13 +499,13 @@ async fn terminal_upload_failure_fallback_then_later_telegraph_subscription() {
     let failed_job = job_for_delivery(&repo, &first).await;
     assert_eq!(failed_job.status, JOB_STATUS_DOWNLOADED);
     assert_eq!(failed_job.telegraph_status, TELEGRAPH_STATUS_FAILED);
-    let fallback = eh_download_queue::Entity::find_by_id(first.id)
+    let archive = eh_download_queue::Entity::find_by_id(first.id)
         .one(repo.db())
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(fallback.status, DELIVERY_STATUS_WAITING);
-    assert!(!fallback.telegraph);
+    assert_eq!(archive.status, DELIVERY_STATUS_WAITING);
+    assert!(!archive.telegraph);
 
     mock_tg_send_document(&telegram_server).await;
     let archive_config = Arc::new(make_config());
@@ -525,7 +525,7 @@ async fn terminal_upload_failure_fallback_then_later_telegraph_subscription() {
         .one(repo.db())
         .await
         .unwrap()
-        .expect("archive fallback must persist its ledger marker");
+        .expect("archive delivery must persist its ledger marker");
     assert!(archive_ledger.archive_sent_at.is_some());
     assert!(archive_ledger.telegraph_sent_at.is_none());
     assert_eq!(
@@ -545,7 +545,7 @@ async fn terminal_upload_failure_fallback_then_later_telegraph_subscription() {
     let later_task = repo
         .get_or_create_task(
             TaskType::Ehentai,
-            "eh:artist:fallback-later".to_string(),
+            "eh:artist:archive-later".to_string(),
             None,
         )
         .await
@@ -570,7 +570,7 @@ async fn terminal_upload_failure_fallback_then_later_telegraph_subscription() {
             later_subscription.id,
             gid,
             token,
-            "Fallback Gallery",
+            "Shared Gallery",
             true,
             &variant,
             None,
@@ -581,7 +581,7 @@ async fn terminal_upload_failure_fallback_then_later_telegraph_subscription() {
         .expect("the missing Telegraph surface must start a later subscription wave");
     assert_eq!(later.archive_sent_at, archive_ledger.archive_sent_at);
     assert!(later.telegraph_sent_at.is_none());
-    let second_source = temp.path().join("fallback-second.zip");
+    let second_source = temp.path().join("archive-second.zip");
     create_test_zip(&second_source, 2);
     let later_claim = repo
         .claim_eh_download_job(Main, true)

@@ -254,23 +254,6 @@ async fn await_eh_publish_candidate_gate() {
         gate.release.wait().await;
     }
 }
-pub(crate) fn eh_delivery_needs_archive(
-    delivery: &eh_download_queue::Model,
-    send_archive: bool,
-) -> bool {
-    delivery.archive_sent_at.is_none()
-        && (send_archive || (!delivery.telegraph && delivery.telegraph_sent_at.is_none()))
-}
-
-pub(crate) fn eh_pending_archive_delivery_filter(send_archive: bool) -> SimpleExpr {
-    let mut pending = Condition::all().add(eh_download_queue::Column::ArchiveSentAt.is_null());
-    if !send_archive {
-        pending = pending
-            .add(eh_download_queue::Column::Telegraph.eq(false))
-            .add(eh_download_queue::Column::TelegraphSentAt.is_null());
-    }
-    pending.into()
-}
 
 pub(crate) fn eh_pending_telegraph_delivery_filter() -> SimpleExpr {
     Condition::all()
@@ -284,7 +267,7 @@ fn eh_delivery_is_ready_for_publish(
     job: &eh_gallery_jobs::Model,
     send_archive: bool,
 ) -> bool {
-    let archive_required = eh_delivery_needs_archive(delivery, send_archive);
+    let archive_required = send_archive && delivery.archive_sent_at.is_none();
     let telegraph_required = delivery.telegraph && delivery.telegraph_sent_at.is_none();
     let telegraph_ready =
         job.telegraph_status == TELEGRAPH_STATUS_READY && job.telegraph_url.is_some();
@@ -309,20 +292,21 @@ fn eh_delivery_is_ready_for_publish(
 /// rows joined with their shared jobs. This makes the claim selector read only
 /// a publishable row rather than materializing due-but-blocked deliveries.
 fn eh_delivery_ready_for_publish_filter(send_archive: bool) -> Condition {
-    let archive_pending = eh_pending_archive_delivery_filter(send_archive);
+    let archive_pending = Condition::all()
+        .add(Expr::value(send_archive))
+        .add(eh_download_queue::Column::ArchiveSentAt.is_null());
     let telegraph_pending = eh_pending_telegraph_delivery_filter();
     let telegraph_ready = Condition::all()
         .add(telegraph_pending.clone())
         .add(eh_gallery_jobs::Column::TelegraphStatus.eq(TELEGRAPH_STATUS_READY))
         .add(eh_gallery_jobs::Column::TelegraphUrl.is_not_null());
-    let settled = Condition::all()
+    let no_pending_surfaces = Condition::all()
         .add(archive_pending.clone().not())
         .add(telegraph_pending.clone().not());
     let archive_ready = Condition::all()
         .add(archive_pending.clone())
         .add(eh_gallery_jobs::Column::Status.eq(JOB_STATUS_DOWNLOADED))
         .add(eh_gallery_jobs::Column::ZipPath.is_not_null());
-
     Condition::all()
         .add(
             Condition::any()
@@ -333,7 +317,7 @@ fn eh_delivery_ready_for_publish_filter(send_archive: bool) -> Condition {
             Condition::any()
                 .add(telegraph_ready)
                 .add(archive_ready)
-                .add(settled),
+                .add(no_pending_surfaces),
         )
         .add(
             Condition::any()
@@ -1075,7 +1059,8 @@ impl Repo {
         job: &eh_gallery_jobs::Model,
         send_archive: bool,
     ) -> Result<bool> {
-        if !eh_delivery_needs_archive(delivery, send_archive)
+        if !send_archive
+            || delivery.archive_sent_at.is_some()
             || job.status != JOB_STATUS_DOWNLOADED
             || job.zip_path.is_some()
             || job.cleanup_status != CLEANUP_STATUS_NONE
@@ -1132,9 +1117,8 @@ impl Repo {
         Ok(recovered.rows_affected == 1)
     }
 
-    /// Claim the next due shared-gallery delivery that has at least one ready
-    /// publish surface. Legacy rows without a `job_id` are deliberately never
-    /// claimed by this runtime lane.
+    /// Claim the next due shared-gallery delivery ready to send or finalize.
+    /// Legacy rows without a `job_id` are never claimed by this runtime lane.
     pub async fn get_next_eh_delivery_for_publish(
         &self,
         send_archive: bool,
@@ -1168,36 +1152,43 @@ impl Repo {
             .context("Failed to begin shared EH delivery publish claim transaction")?;
         let result = async {
             let mut committed_state_transition = false;
-            let missing_archive_candidates = eh_download_queue::Entity::find()
-                .find_also_related(eh_gallery_jobs::Entity)
-                .filter(eh_download_queue::Column::Status.eq(STATUS_WAITING))
-                .filter(eh_download_queue::Column::JobId.is_not_null())
-                .filter(eh_pending_archive_delivery_filter(send_archive))
-                .filter(eh_gallery_jobs::Column::Status.eq(JOB_STATUS_DOWNLOADED))
-                .filter(eh_gallery_jobs::Column::ZipPath.is_null())
-                .filter(eh_gallery_jobs::Column::CleanupStatus.eq(CLEANUP_STATUS_NONE))
-                .filter(eh_gallery_jobs::Column::BackgroundDownloadStatus.is_null())
-                .filter(eh_gallery_jobs::Column::TelegraphStatus.ne(TELEGRAPH_STATUS_UPLOADING))
-                .filter(
-                    eh_download_queue::Column::NextRetryAt
-                        .is_null()
-                        .or(eh_download_queue::Column::NextRetryAt.lte(now)),
-                )
-                .order_by(eh_download_queue::Column::CreatedAt, Order::Asc)
-                .order_by(eh_download_queue::Column::Id, Order::Asc)
-                .limit(PUBLISH_MAINTENANCE_BATCH_SIZE)
-                .all(&txn)
-                .await
-                .context("Failed to fetch missing-archive shared EH deliveries for publish")?;
-            for (delivery, job) in missing_archive_candidates {
-                let Some(job) = job else {
-                    continue;
-                };
-                if self
-                    .recover_eh_job_for_missing_archive_in_txn(&txn, &delivery, &job, send_archive)
-                    .await?
-                {
-                    committed_state_transition = true;
+            if send_archive {
+                let missing_archive_candidates = eh_download_queue::Entity::find()
+                    .find_also_related(eh_gallery_jobs::Entity)
+                    .filter(eh_download_queue::Column::Status.eq(STATUS_WAITING))
+                    .filter(eh_download_queue::Column::JobId.is_not_null())
+                    .filter(eh_download_queue::Column::ArchiveSentAt.is_null())
+                    .filter(eh_gallery_jobs::Column::Status.eq(JOB_STATUS_DOWNLOADED))
+                    .filter(eh_gallery_jobs::Column::ZipPath.is_null())
+                    .filter(eh_gallery_jobs::Column::CleanupStatus.eq(CLEANUP_STATUS_NONE))
+                    .filter(eh_gallery_jobs::Column::BackgroundDownloadStatus.is_null())
+                    .filter(eh_gallery_jobs::Column::TelegraphStatus.ne(TELEGRAPH_STATUS_UPLOADING))
+                    .filter(
+                        eh_download_queue::Column::NextRetryAt
+                            .is_null()
+                            .or(eh_download_queue::Column::NextRetryAt.lte(now)),
+                    )
+                    .order_by(eh_download_queue::Column::CreatedAt, Order::Asc)
+                    .order_by(eh_download_queue::Column::Id, Order::Asc)
+                    .limit(PUBLISH_MAINTENANCE_BATCH_SIZE)
+                    .all(&txn)
+                    .await
+                    .context("Failed to fetch missing-archive shared EH deliveries for publish")?;
+                for (delivery, job) in missing_archive_candidates {
+                    let Some(job) = job else {
+                        continue;
+                    };
+                    if self
+                        .recover_eh_job_for_missing_archive_in_txn(
+                            &txn,
+                            &delivery,
+                            &job,
+                            send_archive,
+                        )
+                        .await?
+                    {
+                        committed_state_transition = true;
+                    }
                 }
             }
 
@@ -2062,7 +2053,7 @@ mod tests {
                         repo.finalize_eh_job_cleanup(
                             job.id,
                             cleanup.cleanup_started_at.unwrap(),
-                            false,
+                            true,
                         ),
                     )
                     .await
@@ -2088,7 +2079,7 @@ mod tests {
             Some(EhCleanupFinalizeOutcome::ReactivatedPending)
         );
         let claim = repo
-            .claim_eh_download_job(Main, false)
+            .claim_eh_download_job(Main, true)
             .await
             .unwrap()
             .unwrap();

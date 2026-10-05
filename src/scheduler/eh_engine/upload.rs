@@ -312,8 +312,7 @@ impl EhUploadWorker {
                             }
                         }
                         let title = teloxide::utils::markdown::escape(&delivery.title);
-                        let message =
-                            format!("⚠️ Telegraph 上传失败，改用 ZIP 投递\n\n📦 {}", title);
+                        let message = format!("⚠️ Telegraph 上传失败，请稍后重试\n\n📦 {}", title);
                         if let Err(notify_error) = self
                             .notifier
                             .send_text(teloxide::types::ChatId(delivery.chat_id), &message, false)

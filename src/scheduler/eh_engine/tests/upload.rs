@@ -455,7 +455,8 @@ async fn terminal_upload_notifies_each_telegraph_chat_once_and_never_archive_onl
         .await;
     let mut config = make_config();
     config.max_retry_count = 0;
-    config.send_archive = true;
+    config.send_archive = false;
+    let config = Arc::new(config);
     let worker = EhUploadWorker::new(
         Arc::clone(&repo),
         make_notifier(&tg_server),
@@ -466,7 +467,7 @@ async fn terminal_upload_notifies_each_telegraph_chat_once_and_never_archive_onl
         }),
         None,
         None,
-        Arc::new(config),
+        Arc::clone(&config),
     );
 
     worker.tick().await.unwrap();
@@ -487,16 +488,6 @@ async fn terminal_upload_notifies_each_telegraph_chat_once_and_never_archive_onl
             .collect::<Vec<_>>(),
         vec![-100, -200]
     );
-    assert_eq!(
-        requests
-            .iter()
-            .map(|body| body["text"].as_str().unwrap())
-            .collect::<Vec<_>>(),
-        vec![
-            "⚠️ Telegraph 上传失败，改用 ZIP 投递\n\n📦 T1",
-            "⚠️ Telegraph 上传失败，改用 ZIP 投递\n\n📦 T2",
-        ]
-    );
     assert!(requests.iter().all(|body| {
         let text = body["text"].as_str().unwrap();
         !text.contains("sqlite secret")
@@ -512,8 +503,8 @@ async fn terminal_upload_notifies_each_telegraph_chat_once_and_never_archive_onl
     assert_eq!(failed_job.telegraph_status, TELEGRAPH_STATUS_FAILED);
     assert!(failed_job.error.unwrap().contains("sqlite secret"));
     for (delivery, (expected_status, expected_telegraph)) in deliveries.iter().zip([
-        (DELIVERY_STATUS_WAITING, false),
-        (DELIVERY_STATUS_WAITING, false),
+        (DELIVERY_STATUS_FAILED, true),
+        (DELIVERY_STATUS_FAILED, true),
         (DELIVERY_STATUS_WAITING, false),
     ]) {
         let delivery = eh_download_queue::Entity::find_by_id(delivery.id)
@@ -525,13 +516,30 @@ async fn terminal_upload_notifies_each_telegraph_chat_once_and_never_archive_onl
         assert_eq!(delivery.telegraph, expected_telegraph);
         assert_eq!(delivery.error, None);
     }
-    let fallback_claim = repo
-        .get_next_eh_delivery_for_publish(true)
+    run_eh_job_cleanup_maintenance_once(repo.as_ref(), None, 0, false)
+        .await
+        .unwrap();
+    EhPublishWorker::new(
+        Arc::clone(&repo),
+        make_notifier(&tg_server),
+        make_eh_client(&tg_server),
+        None,
+        config,
+    )
+    .tick()
+    .await
+    .unwrap();
+    let archive_only = eh_download_queue::Entity::find_by_id(deliveries[2].id)
+        .one(repo.db())
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(fallback_claim.delivery.id, deliveries[0].id);
-    assert!(!fallback_claim.delivery.telegraph);
+    assert_eq!(archive_only.status, DELIVERY_STATUS_FAILED);
+    assert!(repo
+        .claim_eh_download_job(Main, false)
+        .await
+        .unwrap()
+        .is_none());
 }
 
 #[tokio::test]
@@ -604,10 +612,6 @@ async fn terminal_upload_failure_skips_disabled_shared_destination_notification(
             .collect::<Vec<_>>(),
         vec![-100],
         "terminal notification must skip the disabled sibling and remain exact-once"
-    );
-    assert_eq!(
-        requests[0]["text"].as_str(),
-        Some("⚠️ Telegraph 上传失败，改用 ZIP 投递\n\n📦 Enabled")
     );
     for delivery in deliveries {
         let delivery = eh_download_queue::Entity::find_by_id(delivery.id)
@@ -987,7 +991,7 @@ async fn test_upload_worker_fallback_skips_unsupported_non_image_zip_entry() {
 }
 
 #[tokio::test]
-async fn terminal_upload_failure_preserves_archive_fallback_with_any_abort_support() {
+async fn terminal_upload_failure_preserves_configured_archive_with_any_abort_support() {
     for abort_support in [Some(false), Some(true), None] {
         let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
         setup_chat(&repo, -100, true).await;
@@ -995,7 +999,7 @@ async fn terminal_upload_failure_preserves_archive_fallback_with_any_abort_suppo
         let notifier = make_notifier(&tg_server);
         let mut cfg = make_config();
         cfg.max_retry_count = 0;
-        cfg.send_archive = false;
+        cfg.send_archive = true;
         let config = Arc::new(cfg);
         let temp_dir = tempfile::tempdir().unwrap();
         let zip_path = temp_dir.path().join("505.zip");
@@ -1049,16 +1053,16 @@ async fn terminal_upload_failure_preserves_archive_fallback_with_any_abort_suppo
         assert!(artifacts.uploads_dir().join("archive.json").exists());
         assert!(artifacts.assembly_scratch().exists());
         assert!(artifacts.parts_dir().exists());
-        let fallback_claim = repo
-            .get_next_eh_delivery_for_publish(false)
+        let archive_claim = repo
+            .get_next_eh_delivery_for_publish(true)
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(fallback_claim.delivery.id, entry.id);
-        assert!(!fallback_claim.delivery.telegraph);
+        assert_eq!(archive_claim.delivery.id, entry.id);
+        assert!(!archive_claim.delivery.telegraph);
         assert!(uploader.cleanup_calls.lock().unwrap().is_empty());
 
-        repo.mark_eh_archive_delivery_sent(fallback_claim.delivery.id)
+        repo.mark_eh_archive_delivery_sent(archive_claim.delivery.id)
             .await
             .unwrap();
         let ledger = eh_gallery_push_ledger::Entity::find()
@@ -1067,7 +1071,7 @@ async fn terminal_upload_failure_preserves_archive_fallback_with_any_abort_suppo
             .one(repo.db())
             .await
             .unwrap()
-            .expect("archive fallback's standard publish marker must write the push ledger");
+            .expect("archive delivery marker must write the push ledger");
         assert!(ledger.archive_sent_at.is_some());
         assert!(ledger.telegraph_sent_at.is_none());
     }
