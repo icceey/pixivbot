@@ -1,7 +1,7 @@
 use super::cleanup::{ensure_job_upload_state_aborted, remove_job_upload_state};
 use crate::bot::notifier::Notifier;
 use crate::config::EhentaiConfig;
-use crate::db::repo::eh_gallery_jobs::EhJobUploadFailureOutcome;
+use crate::db::repo::eh_gallery_jobs::{EhJobUploadFailureOutcome, EhMissingZipResetOutcome};
 use crate::db::{entities::eh_gallery_jobs, repo::Repo};
 use crate::scheduler::helpers::get_chat_if_should_notify;
 use anyhow::{Context, Result};
@@ -210,6 +210,44 @@ impl EhUploadWorker {
         }
 
         if let Err(error) = self.process(&job).await {
+            if let Some(zip_path) = job
+                .zip_path
+                .as_deref()
+                .filter(|path| matches!(std::path::Path::new(path).try_exists(), Ok(false)))
+            {
+                if self
+                    .repo
+                    .defer_eh_job_upload(
+                        job.id,
+                        expected_started_at,
+                        defer_delay_secs as i64,
+                        self.config.send_archive,
+                    )
+                    .await?
+                {
+                    match self
+                        .repo
+                        .reset_eh_job_for_missing_zip(
+                            job.id,
+                            expected_started_at,
+                            zip_path,
+                            self.config.max_retry_count,
+                        )
+                        .await?
+                    {
+                        EhMissingZipResetOutcome::Reset => warn!(
+                            "Reset shared EH job {} for download after its upload ZIP disappeared",
+                            job.id
+                        ),
+                        EhMissingZipResetOutcome::Exhausted => error!(
+                            "Shared EH job {} exhausted missing-ZIP retries before upload",
+                            job.id
+                        ),
+                        EhMissingZipResetOutcome::Stale => {}
+                    }
+                }
+                return Ok(true);
+            }
             error!("Upload failed for shared EH job {}: {:#}", job.id, error);
             let failure_outcome = match self
                 .repo

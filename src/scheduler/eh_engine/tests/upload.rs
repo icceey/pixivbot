@@ -1207,49 +1207,149 @@ async fn test_upload_canceled_after_claim_preserves_upload_state_when_abort_fail
 }
 
 #[tokio::test]
-async fn test_upload_permanent_failure_with_missing_zip_enters_archive_fallback() {
+async fn missing_upload_zip_redownloads_once_and_preserves_shared_telegraph_delivery() {
     let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
-    setup_chat(&repo, -100, true).await;
     let tg_server = MockServer::start().await;
-    let notifier = make_notifier(&tg_server);
-    let mut cfg = make_config();
-    cfg.max_retry_count = 0;
-    cfg.send_archive = true;
-    let config = Arc::new(cfg);
-    let entry = seed_delivery(
+    let eh_server = MockServer::start().await;
+    let temp = tempfile::tempdir().unwrap();
+    let zip_path = temp.path().join("missing.zip");
+    create_test_zip(&zip_path, 1);
+    let zip_bytes = std::fs::read(&zip_path).unwrap();
+    setup_chat(&repo, -100, true).await;
+    setup_chat(&repo, -200, true).await;
+    let (job, deliveries) = seed_downloaded_job_with_deliveries(
         &repo,
-        -100,
-        (506, "tok", "Title"),
-        DeliveryOptions {
-            telegraph: true,
-            job_status: JOB_STATUS_DOWNLOADED,
-            zip_path: Some("data/test_cache/missing_506.zip"),
+        506,
+        "abcdef0123",
+        "Shared gallery",
+        &zip_path,
+        &[(-100, true, "First"), (-200, true, "Second")],
+    )
+    .await;
+    std::fs::remove_file(&zip_path).unwrap();
+    let mut cfg = make_config();
+    cfg.send_archive = false;
+    cfg.background_download_enabled = false;
+    let config = Arc::new(cfg);
+    eh_gallery_jobs::Entity::update_many()
+        .col_expr(
+            eh_gallery_jobs::Column::RetryCount,
+            Expr::value(i32::from(config.max_retry_count) - 1),
+        )
+        .filter(eh_gallery_jobs::Column::Id.eq(job.id))
+        .exec(repo.db())
+        .await
+        .unwrap();
+    let uploader = Arc::new(ZipFirstMockUploader::default());
+    let worker = EhUploadWorker::new(
+        Arc::clone(&repo),
+        make_notifier(&tg_server),
+        make_telegraph_client(&tg_server),
+        uploader.clone(),
+        None,
+        None,
+        Arc::clone(&config),
+    );
+
+    worker.tick().await.unwrap();
+    let reset = job_for_delivery(&repo, &deliveries[0]).await;
+    assert_eq!(reset.status, JOB_STATUS_PENDING);
+    assert_eq!(reset.telegraph_status, TELEGRAPH_STATUS_PENDING);
+    assert!(tg_server.received_requests().await.unwrap().is_empty());
+    assert!(!worker.tick().await.unwrap());
+
+    mock_archiver(
+        &eh_server,
+        506,
+        "abcdef0123",
+        ArchiverPage {
+            keyed: true,
             ..Default::default()
         },
     )
     .await;
-
-    let worker = EhUploadWorker::new(
+    mock_eh_archiver_post(
+        &eh_server,
+        &format!("{}/archive/506/token/0", eh_server.uri()),
+    )
+    .await;
+    Mock::given(method("GET"))
+        .and(path("/archive/506/token/0"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(zip_bytes))
+        .expect(1)
+        .mount(&eh_server)
+        .await;
+    eh_gallery_jobs::Entity::update_many()
+        .col_expr(
+            eh_gallery_jobs::Column::NextRetryAt,
+            Expr::value(None::<chrono::NaiveDateTime>),
+        )
+        .filter(eh_gallery_jobs::Column::Id.eq(job.id))
+        .exec(repo.db())
+        .await
+        .unwrap();
+    EhDownloadWorker::new(
         Arc::clone(&repo),
-        notifier,
-        make_telegraph_client(&tg_server),
-        make_image_uploader(&tg_server),
+        make_eh_client(&eh_server),
+        Arc::clone(&config),
+        temp.path().to_path_buf(),
+        Main,
         None,
+    )
+    .tick()
+    .await
+    .unwrap();
+    let downloaded = job_for_delivery(&repo, &deliveries[0]).await;
+    assert_eq!(
+        downloaded.status, JOB_STATUS_DOWNLOADED,
+        "{:?}",
+        downloaded.error
+    );
+    Mock::given(method("POST"))
+        .and(path("/createPage"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "ok": true,
+            "result": {"url": "https://example.com/shared-gallery"}
+        })))
+        .expect(1)
+        .mount(&tg_server)
+        .await;
+    worker.tick().await.unwrap();
+    mock_tg_send_message(&tg_server).await;
+    EhPublishWorker::new(
+        Arc::clone(&repo),
+        make_notifier(&tg_server),
+        make_eh_client(&eh_server),
         None,
         config,
+    )
+    .tick()
+    .await
+    .unwrap();
+
+    for delivery in deliveries {
+        let delivered = eh_download_queue::Entity::find_by_id(delivery.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(delivered.status, STATUS_DONE);
+        assert!(delivered.telegraph_sent_at.is_some());
+        assert!(delivered.archive_sent_at.is_none());
+    }
+    assert_eq!(
+        uploader.zip_calls.load(std::sync::atomic::Ordering::SeqCst),
+        1
     );
-    worker.tick().await.unwrap();
-    let model = eh_download_queue::Entity::find_by_id(entry.id)
-        .one(repo.db())
-        .await
-        .unwrap()
-        .unwrap();
-    // The terminal upload failure preserves the DB-visible archive surface;
-    // the publish worker owns filesystem validation and missing-ZIP recovery.
-    assert_eq!(model.status, DELIVERY_STATUS_WAITING);
-    assert!(!model.telegraph);
-    assert_eq!(model.error, None, "provider errors stay on the shared job");
-    assert!(job_for_delivery(&repo, &entry).await.error.is_some());
+    let requests = tg_server.received_requests().await.unwrap();
+    let messages = requests
+        .iter()
+        .filter(|r| r.url.path() == "/botfake_token/SendMessage")
+        .collect::<Vec<_>>();
+    assert_eq!(messages.len(), 2);
+    assert!(messages
+        .iter()
+        .all(|r| String::from_utf8_lossy(&r.body).contains("https://example.com/shared-gallery")));
 }
 
 #[tokio::test]
