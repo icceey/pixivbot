@@ -208,8 +208,9 @@ download_original_threshold = 1
 # # This controls delivery futures only; the existing Throttle<Bot> remains the
 # # Telegram rate-limit authority.
 # publish_concurrency = 2
-# # Max retry count for failed pushes (default: 3)
-# max_retry_count = 3
+# # Max EH retries after the initial attempt (default: 10).
+# # Retry delay doubles from 2 minutes, capped at 24 hours.
+# max_retry_count = 10
 # # 48h scan window for rating-filtered subscriptions (default: 48)
 # scan_window_hours = 48
 # # Download rate limiting (default: 7 GB per 7 days / 168 hours)

@@ -7,6 +7,8 @@ use std::sync::atomic::{AtomicU8, Ordering};
 
 pub(crate) const PART_SIZE: usize = 8 * 1024 * 1024;
 pub(crate) const MAX_PARTS: usize = 10_000;
+pub(crate) const IPFS3_DECOMPRESS_TAGGING: &str =
+    "ipfs-s3%3Apin=true&ipfs-s3%3Aduration=1d&ipfs-s3%3Acontent=decompressed";
 const TEMPORARY_MANIFEST_VERIFICATION_ERROR: &str =
     "multipart temporary manifest could not be safely verified";
 const RESUME_UPLOADER_IDENTITY_MISMATCH_ERROR: &str =
@@ -394,26 +396,33 @@ pub(crate) async fn upload_multipart(
                 .expect("multipart part number is in the upload plan");
             let start = (part_number as usize - 1) * PART_SIZE;
             let chunk = &request.bytes[start..start + part_size];
-            let etag = match upload_part(
-                bucket,
-                &active.object_key,
-                &active.upload_id,
-                part_number,
-                chunk,
-                request.content_type,
-            )
-            .await
-            {
-                Ok(etag) => etag,
-                Err(failure) => {
-                    return finish_multipart_failure(
-                        bucket,
-                        request.provider,
-                        &active,
-                        request.manifest_path,
-                        failure,
-                    )
-                    .await;
+            let mut retries = 0;
+            let etag = loop {
+                match upload_part(
+                    bucket,
+                    &active.object_key,
+                    &active.upload_id,
+                    part_number,
+                    chunk,
+                    request.content_type,
+                )
+                .await
+                {
+                    Ok(etag) => break etag,
+                    Err(failure) if retries < 2 => {
+                        retries += 1;
+                        tracing::warn!(part_number, retries, error = %failure, "Retrying multipart part");
+                    }
+                    Err(failure) => {
+                        return finish_multipart_failure(
+                            bucket,
+                            request.provider,
+                            &active,
+                            request.manifest_path,
+                            failure,
+                        )
+                        .await;
+                    }
                 }
             };
             parts.insert(part_number, etag);
@@ -640,6 +649,10 @@ async fn create_session(
             crate::Error::Other("decompress-zip multipart object key must end in .zip".to_owned())
         })?;
         create_bucket.add_query("decompress-zip", &format!("{archive_stem}/"));
+        create_bucket.extra_headers.insert(
+            HeaderName::from_static("x-amz-tagging"),
+            HeaderValue::from_static(IPFS3_DECOMPRESS_TAGGING),
+        );
     }
     let create = create_bucket
         .initiate_multipart_upload(object_key, content_type)
@@ -911,7 +924,9 @@ fn multipart_failure_outcome(
     failure: list_parts::MultipartFailure,
 ) -> crate::Result<MultipartOutcome> {
     match failure {
-        list_parts::MultipartFailure::Unsupported { operation, .. } => {
+        list_parts::MultipartFailure::Unsupported { operation, .. }
+            if operation != MultipartOperation::UploadPart =>
+        {
             Ok(MultipartOutcome::Unsupported { operation })
         }
         failure => Err(crate::Error::from(failure)),
@@ -925,7 +940,7 @@ mod tests {
     use s3::{Bucket, Region};
     use std::io::{Read, Write};
     use std::net::{Shutdown, TcpListener, TcpStream};
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::thread::JoinHandle;
     use std::time::Duration;
@@ -1013,19 +1028,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fresh_multipart_creates_lists_uploads_sequential_parts_and_completes_sorted() {
+    async fn multipart_retries_each_failed_part_and_completes_in_order() {
         let server = MockServer::start().await;
         mount_create(&server).await;
         mount_empty_list_parts(&server).await;
         for part_number in 1..=3 {
+            let attempts = AtomicUsize::new(0);
             Mock::given(method("PUT"))
                 .and(query_param("uploadId", UPLOAD_ID))
                 .and(query_param("partNumber", part_number.to_string()))
-                .respond_with(
+                .respond_with(move |_: &wiremock::Request| {
+                    if part_number > 1 && attempts.fetch_add(1, Ordering::SeqCst) < 2 {
+                        return ResponseTemplate::new(503);
+                    }
                     ResponseTemplate::new(200)
-                        .insert_header("ETag", format!("\"part-{part_number}\"")),
-                )
-                .expect(1)
+                        .insert_header("ETag", format!("\"part-{part_number}\""))
+                })
+                .expect(if part_number > 1 { 3 } else { 1 })
                 .mount(&server)
                 .await;
         }
@@ -1042,25 +1061,25 @@ mod tests {
         assert!(matches!(result, MultipartOutcome::Completed(_)));
 
         let requests = server.received_requests().await.unwrap();
-        assert_request_sequence(&requests, &["POST", "GET", "PUT", "PUT", "PUT", "POST"]);
+        assert_request_sequence(
+            &requests,
+            &[
+                "POST", "GET", "PUT", "PUT", "PUT", "PUT", "PUT", "PUT", "PUT", "POST",
+            ],
+        );
         assert_eq!(
             query_value(&requests[1], "uploadId").as_deref(),
             Some(UPLOAD_ID)
         );
         assert_eq!(
-            query_value(&requests[2], "partNumber").as_deref(),
-            Some("1")
+            requests
+                .iter()
+                .filter_map(|request| query_value(request, "partNumber"))
+                .collect::<Vec<_>>(),
+            ["1", "2", "2", "2", "3", "3", "3"],
         );
         assert_eq!(
-            query_value(&requests[3], "partNumber").as_deref(),
-            Some("2")
-        );
-        assert_eq!(
-            query_value(&requests[4], "partNumber").as_deref(),
-            Some("3")
-        );
-        assert_eq!(
-            complete_parts(&requests[5]),
+            complete_parts(requests.last().unwrap()),
             vec![
                 (1, "\"part-1\"".to_owned()),
                 (2, "\"part-2\"".to_owned()),
@@ -1226,7 +1245,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn accepted_part_with_lost_response_is_not_retransmitted_when_listed() {
+    async fn resumed_upload_skips_listed_parts_after_lost_responses() {
         let temp = tempfile::tempdir().unwrap();
         let manifest_path = temp.path().join("archive.json");
         let bytes = vec![9; PART_SIZE];
@@ -1265,7 +1284,7 @@ mod tests {
                         && raw_query_value(&request.target, "partNumber") == Some("1")
                 })
                 .count(),
-            1
+            3
         );
         assert_eq!(
             requests
@@ -1391,7 +1410,7 @@ mod tests {
             .and(query_param("uploadId", UPLOAD_ID))
             .and(query_param("partNumber", "1"))
             .respond_with(ResponseTemplate::new(200).insert_header("ETag", " \t "))
-            .expect(1)
+            .expect(3)
             .mount(&server)
             .await;
         Mock::given(method("POST"))
@@ -2508,7 +2527,7 @@ mod tests {
                     .and(query_param("uploadId", UPLOAD_ID))
                     .and(query_param("partNumber", "1"))
                     .respond_with(ResponseTemplate::new(503))
-                    .expect(1)
+                    .expect(3)
                     .mount(&server)
                     .await;
                 Mock::given(method("POST"))
@@ -2773,7 +2792,7 @@ mod tests {
                     .into_bytes(),
                 ))
             } else if let Some(part_number) = part_number {
-                if part_number == state.lost_response_part && state.lost_response_calls == 0 {
+                if part_number == state.lost_response_part && state.lost_response_calls < 3 {
                     state.lost_response_calls += 1;
                     None
                 } else {
