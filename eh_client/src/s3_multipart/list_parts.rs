@@ -205,6 +205,19 @@ pub(super) fn classify_embedded_s3_error(
         return Some(MultipartFailure::Protocol);
     }
 
+    // Response bodies can contain object keys and signed URLs; log only a bounded code.
+    let code = if error.code.len() <= 64
+        && error
+            .code
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        error.code.as_str()
+    } else {
+        "[redacted]"
+    };
+    tracing::warn!(?operation, status, code, "S3 multipart error response");
+
     if status == 501
         && error.code == "NotImplemented"
         && is_canonical_not_implemented_operation(operation)
