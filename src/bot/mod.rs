@@ -127,6 +127,34 @@ fn build_handler_tree(
         .filter(|cmd: Command| matches!(cmd, Command::EnableChat(_) | Command::DisableChat(_)))
         .endpoint(handle_command);
 
+    // Active-dialogue cancellation/reopening must work even when a group
+    // requires @bot, and must never fall through into tag input.
+    let settings_control_handler = Message::filter_text()
+        .chain(middleware::filter_hybrid_command::<Command, HandlerResult>())
+        .filter(|cmd: Command| matches!(cmd, Command::Cancel | Command::Settings))
+        .chain(middleware::filter_user_chat())
+        .chain(middleware::filter_chat_accessible())
+        .filter_async(|msg: Message, storage: SettingsStorage| async move {
+            let Some(user) = permissions::message_actor(&msg) else {
+                return false;
+            };
+            storage.read().await.contains_key(&(msg.chat.id, user.id))
+        })
+        .endpoint(
+            |bot: ThrottledBot,
+             msg: Message,
+             cmd: Command,
+             handler: BotHandler,
+             ctx: UserChatContext,
+             storage: SettingsStorage| async move {
+                if matches!(cmd, Command::Cancel) {
+                    handle_cancel_command(bot, msg, storage, ctx).await
+                } else {
+                    handle_command(bot, msg, cmd, handler, ctx, storage).await
+                }
+            },
+        );
+
     // 常规命令 - 保持原有的聊天可访问性检查，并添加 @mention 要求检查
     let command_handler = Message::filter_text()
         .chain(middleware::filter_hybrid_command::<Command, HandlerResult>())
@@ -184,6 +212,7 @@ fn build_handler_tree(
         Update::filter_message()
             .branch(migration_handler)
             .branch(admin_chat_control_handler)
+            .branch(settings_control_handler)
             .branch(cancel_handler)
             .branch(command_handler)
             .branch(settings_dialogue_handler)
@@ -243,7 +272,13 @@ async fn handle_command(
     cmd: Command,
     handler: BotHandler,
     ctx: UserChatContext,
+    storage: SettingsStorage,
 ) -> HandlerResult {
+    if matches!(cmd, Command::Settings) {
+        if let Some(user) = permissions::message_actor(&msg) {
+            storage.write().await.remove(&(msg.chat.id, user.id));
+        }
+    }
     handler.handle_command(bot, msg, cmd, ctx).await?;
     Ok(())
 }
@@ -260,44 +295,19 @@ async fn handle_message(
     Ok(())
 }
 
-/// Filter to check if user is in a settings dialogue state.
-/// This filter checks the storage before entering the dialogue handler,
-/// preventing unnecessary processing and avoiding error logging when
-/// users are not in a dialogue state.
-///
-/// Also handles timeout: if the state has expired, it is automatically
-/// removed and the filter returns false.
+/// Only the input stage intercepts text; expiry is checked again at submission.
 fn filter_in_settings_dialogue<Output>() -> Handler<'static, Output, DpHandlerDescription>
 where
     Output: Send + Sync + 'static,
 {
     dptree::filter_async(|msg: Message, storage: SettingsStorage| async move {
-        let chat_id = msg.chat.id;
-        let user_id = match msg.from.as_ref() {
-            Some(user) => user.id,
-            None => return false,
+        let Some(user) = permissions::message_actor(&msg) else {
+            return false;
         };
-
-        // Check if user has an active dialogue state
-        let state = {
-            let storage_guard = storage.read().await;
-            storage_guard.get(&(chat_id, user_id)).cloned()
-        };
-
-        match state {
-            Some(s) if s.is_expired() => {
-                // State has expired, remove it
-                let mut storage_guard = storage.write().await;
-                storage_guard.remove(&(chat_id, user_id));
-                info!(
-                    "Settings dialogue expired for user {} in chat {}",
-                    user_id, chat_id
-                );
-                false
-            }
-            Some(_) => true, // Valid active state
-            None => false,   // No state
-        }
+        let states = storage.read().await;
+        states
+            .get(&(msg.chat.id, user.id))
+            .is_some_and(|state| matches!(state.phase, state::SettingsPhase::WaitingForTags { .. }))
     })
 }
 
@@ -310,10 +320,11 @@ async fn handle_settings_dialogue(
     handler: BotHandler,
     storage: SettingsStorage,
     _ctx: UserChatContext,
+    update: Update,
 ) -> HandlerResult {
     // Handle the message as settings input
     // The filter has already verified the user is in a dialogue state
-    match handle_settings_input(bot, msg, handler, storage).await {
+    match handle_settings_input(bot, msg, handler, storage, update.id.0).await {
         Ok(_) => Ok(()),
         Err(e) => Err(e),
     }
@@ -614,8 +625,9 @@ async fn wrap_settings_callback(
     callback_data: String,
     handler: BotHandler,
     storage: SettingsStorage,
+    update: Update,
 ) -> HandlerResult {
-    handle_settings_callback(bot, q, callback_data, handler, storage).await
+    handle_settings_callback(bot, q, callback_data, handler, storage, update.id.0).await
 }
 
 /// 处理聊天迁移（普通群组升级为超级群组）

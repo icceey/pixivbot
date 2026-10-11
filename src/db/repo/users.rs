@@ -121,6 +121,55 @@ impl Repo {
         Ok(user)
     }
 
+    /// A validated reply identifies a real sender, but its username may be old.
+    /// Cache it only for a new row; never overwrite existing identity metadata or
+    /// run the first-contact Owner initialization path.
+    pub async fn set_admin_from_reply(
+        &self,
+        user_id: i64,
+        username: Option<String>,
+    ) -> Result<users::Model> {
+        use sea_orm::TransactionTrait;
+        let txn = self
+            .db
+            .begin()
+            .await
+            .context("Failed to start reply promotion")?;
+        users::Entity::insert(users::ActiveModel {
+            id: Set(user_id),
+            username: Set(username),
+            role: Set(UserRole::User),
+            created_at: Set(Local::now().naive_local()),
+        })
+        .on_conflict(
+            OnConflict::column(users::Column::Id)
+                .do_nothing()
+                .to_owned(),
+        )
+        .exec_without_returning(&txn)
+        .await
+        .context("Failed to register replied user")?;
+        let result = users::Entity::update_many()
+            .col_expr(
+                users::Column::Role,
+                sea_orm::sea_query::Expr::value(UserRole::Admin),
+            )
+            .filter(users::Column::Id.eq(user_id))
+            .filter(users::Column::Role.ne(UserRole::Owner))
+            .exec(&txn)
+            .await
+            .context("Failed to promote replied user")?;
+        anyhow::ensure!(result.rows_affected == 1, "Cannot modify Owner");
+        let user = users::Entity::find_by_id(user_id)
+            .one(&txn)
+            .await?
+            .context("Replied user missing")?;
+        txn.commit()
+            .await
+            .context("Failed to commit reply promotion")?;
+        Ok(user)
+    }
+
     pub async fn set_user_role(&self, user_id: i64, role: UserRole) -> Result<users::Model> {
         anyhow::ensure!(!role.is_owner(), "Owner assignment is not supported here");
         let result = users::Entity::update_many()

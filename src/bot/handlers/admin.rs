@@ -34,7 +34,7 @@ impl BotHandler {
                 return Ok(());
             }
         }
-        let target_user_id = match resolve_admin_target(&bot, &self.repo, msg, &args).await {
+        let target = match resolve_admin_target(&bot, &self.repo, msg, &args).await {
             Ok(id) => id,
             Err(message) => {
                 bot.send_message(chat_id, message).await?;
@@ -48,7 +48,19 @@ impl BotHandler {
             UserRole::User
         };
 
-        match self.repo.set_user_role(target_user_id, role).await {
+        let target_user_id = match &target {
+            AdminTarget::Known(id) => *id,
+            AdminTarget::Reply(user) => user.id.0 as i64,
+        };
+        let result = match target {
+            AdminTarget::Reply(user) if is_admin => {
+                self.repo
+                    .set_admin_from_reply(target_user_id, user.username)
+                    .await
+            }
+            _ => self.repo.set_user_role(target_user_id, role).await,
+        };
+        match result {
             Ok(user) => {
                 bot.send_message(
                     chat_id,
@@ -63,7 +75,7 @@ impl BotHandler {
                 error!("Failed to set user role: {:#}", e);
                 bot.send_message(
                     chat_id,
-                    "❌ 设置用户角色失败。目标须已有数据库记录，且不能修改 Owner。",
+                    "❌ 设置用户角色失败。不能修改 Owner；数字 ID、用户名及取消操作的目标须已登记。",
                 )
                 .await?;
             }
@@ -165,24 +177,32 @@ impl BotHandler {
     }
 }
 
+#[derive(Debug)]
+enum AdminTarget {
+    Known(i64),
+    Reply(teloxide::types::User),
+}
+
 /// Resolve only explicit IDs, actual reply senders, or freshly verified cached names.
 async fn resolve_admin_target(
     bot: &ThrottledBot,
     repo: &crate::db::repo::Repo,
     msg: &Message,
     args: &str,
-) -> Result<i64, &'static str> {
+) -> Result<AdminTarget, &'static str> {
     let arg = args.trim();
     if arg.is_empty() {
         return msg
             .reply_to_message()
             .filter(|reply| reply.chat.id == msg.chat.id)
             .and_then(crate::bot::permissions::message_actor)
-            .map(|user| user.id.0 as i64)
+            .map(|user| AdminTarget::Reply(user.clone()))
             .ok_or("❌ 请提供 user_id、@username，或回复真实用户的消息；不支持匿名或频道发送者。");
     }
     if let Ok(id) = arg.parse::<i64>() {
-        return (id > 0).then_some(id).ok_or("❌ user_id 必须为正整数。");
+        return (id > 0)
+            .then_some(AdminTarget::Known(id))
+            .ok_or("❌ user_id 必须为正整数。");
     }
     let unresolved = "❌ 无法可靠解析 @username。目标需已与机器人交互且 Telegram 能验证其当前用户名；请改用数字 ID 或回复该用户消息。";
     let username = arg
@@ -239,7 +259,7 @@ async fn resolve_admin_target(
             verified = Some(candidate.id);
         }
     }
-    verified.ok_or(unresolved)
+    verified.map(AdminTarget::Known).ok_or(unresolved)
 }
 
 #[cfg(test)]

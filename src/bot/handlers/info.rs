@@ -83,33 +83,26 @@ impl BotHandler {
    取消订阅排行榜
    \- 示例: `/unsubrank day`
 
-🔒 `/blursensitive <on|off>`
-   启用或禁用敏感内容模糊
-   \- 示例: `/blursensitive on`
-
-🏷 `/sensitivetags <tag1,tag2,...>`
-   设置此聊天的敏感标签
-   \- 示例: `/sensitivetags R\-18,R\-18G`
-
-🗑 `/clearsensitivetags`
-   清除所有敏感标签
-
-🚫 `/excludetags <tag1,tag2,...>`
-   设置此聊天的全局排除标签
-   \- 示例: `/excludetags R\-18,gore`
-
-🗑 `/clearexcludedtags`
-   清除所有排除的标签
-
 🔑 `/enablechat [chat_id]` / `/disablechat [chat_id]`
    全局管理员可管理聊天；群主和群管理员自动获得当前群的管理权限
    群权限不写入全局角色，不能管理其他聊天或授予全局角色
-   `/settings` 的修改也支持当前群管理员，提交时重新验证权限
+
+⚙️ `/settings`
+   管理当前聊天的敏感内容模糊、敏感标签及排除标签
+   支持当前群管理员修改，提交时重新验证权限
+   敏感标签和排除标签先选模式：第一行追加 / 删减，第二行覆盖 / 清空
+   两阶段提示列出当前标签供参考；长列表仅截断展示，不丢失标签
+   使用中英文逗号分隔，发送 /cancel 取消
+   追加按完整标签去重，删减仅删除完全相同的项；覆盖替换完整列表
+   选择后编辑原消息；输入和清空确认均可点取消
+   清空须再次点击确认清空；`clear` 是普通标签，空输入不修改
+   每个有效阶段限3分钟；重开 /settings 作废旧会话
 
 👑 `/setadmin <user_id|@username>` / `/unsetadmin <user_id|@username>`
    仅 Owner 可设置或取消全局 Bot Admin，不能修改 Owner
    也可不带参数回复用户消息；转发消息以实际发送者为目标
-   目标须已有数据库记录；用户名仅支持已知且能实时验证的用户
+   回复真人消息设置 Admin 可自动建档；数字 ID 和用户名须已登记
+   取消管理员不建档；用户名仅支持已知且能实时验证的用户
    无法验证时请改用数字 ID 或回复；不支持匿名和频道发送者
 "#;
 
