@@ -270,7 +270,7 @@ pub async fn handle_settings_callback(
                 is_sensitive: action == "edit:sensitive",
                 settings_message_id: message_id,
                 selection_message_id: None,
-                phase: SettingsPhase::PreparingMode,
+                phase: SettingsPhase::Preparing,
                 created_at: Instant::now(),
             },
         );
@@ -299,109 +299,44 @@ pub async fn handle_settings_callback(
     }
 
     match action {
-        "blur:toggle" => {
-            // Toggle blur setting
-            match handler.repo.get_chat(chat_id.0).await {
-                Ok(Some(chat)) => {
-                    let new_blur = !chat.blur_sensitive_tags;
-                    match handler
-                        .repo
-                        .set_blur_sensitive_tags(chat_id.0, new_blur)
-                        .await
-                    {
-                        Ok(_) => {
-                            info!(
-                                "Chat {} blur_sensitive_tags toggled to {} by user {}",
-                                chat_id, new_blur, user_id
-                            );
-
-                            // Refresh the settings panel
-                            handler
-                                .refresh_settings_panel(bot.clone(), chat_id, message_id)
-                                .await?;
-
-                            bot.answer_callback_query(q.id).await?;
-                        }
-                        Err(e) => {
-                            error!("Failed to toggle blur setting: {:#}", e);
-                            bot.answer_callback_query(q.id)
-                                .text("更新设置失败")
-                                .show_alert(true)
-                                .await?;
-                        }
-                    }
+        "blur:toggle" | "mention:toggle" => {
+            let chat = match handler.repo.get_chat(chat_id.0).await {
+                Ok(chat) => chat,
+                Err(e) => {
+                    error!("Failed to fetch chat settings: {:#}", e);
+                    None
                 }
-                Ok(None) => {
-                    warn!(
-                        "Chat {} not found when toggling blur_sensitive_tags by user {}",
-                        chat_id, user_id
-                    );
-                    bot.answer_callback_query(q.id)
-                        .text("获取聊天信息失败")
-                        .show_alert(true)
+            };
+            let Some(chat) = chat else {
+                bot.answer_callback_query(q.id)
+                    .text("获取聊天信息失败")
+                    .show_alert(true)
+                    .await?;
+                return Ok(());
+            };
+            let result = if action == "blur:toggle" {
+                handler
+                    .repo
+                    .set_blur_sensitive_tags(chat_id.0, !chat.blur_sensitive_tags)
+                    .await
+            } else {
+                handler
+                    .repo
+                    .set_allow_without_mention(chat_id.0, !chat.allow_without_mention)
+                    .await
+            };
+            match result {
+                Ok(_) => {
+                    info!("Chat {} {} by user {}", chat_id, action, user_id);
+                    handler
+                        .refresh_settings_panel(bot.clone(), chat_id, message_id)
                         .await?;
+                    bot.answer_callback_query(q.id).await?;
                 }
                 Err(e) => {
-                    error!(
-                        "Failed to fetch chat {} for blur toggle by user {}: {:#}",
-                        chat_id, user_id, e
-                    );
+                    error!("Failed to toggle chat setting: {:#}", e);
                     bot.answer_callback_query(q.id)
-                        .text("获取聊天信息失败")
-                        .show_alert(true)
-                        .await?;
-                }
-            }
-        }
-        "mention:toggle" => {
-            // Toggle allow_without_mention setting
-            match handler.repo.get_chat(chat_id.0).await {
-                Ok(Some(chat)) => {
-                    let new_allow = !chat.allow_without_mention;
-                    match handler
-                        .repo
-                        .set_allow_without_mention(chat_id.0, new_allow)
-                        .await
-                    {
-                        Ok(_) => {
-                            info!(
-                                "Chat {} allow_without_mention toggled to {} by user {}",
-                                chat_id, new_allow, user_id
-                            );
-
-                            // Refresh the settings panel
-                            handler
-                                .refresh_settings_panel(bot.clone(), chat_id, message_id)
-                                .await?;
-
-                            bot.answer_callback_query(q.id).await?;
-                        }
-                        Err(e) => {
-                            error!("Failed to toggle mention setting: {:#}", e);
-                            bot.answer_callback_query(q.id)
-                                .text("更新设置失败")
-                                .show_alert(true)
-                                .await?;
-                        }
-                    }
-                }
-                Ok(None) => {
-                    warn!(
-                        "Chat {} not found when toggling allow_without_mention by user {}",
-                        chat_id, user_id
-                    );
-                    bot.answer_callback_query(q.id)
-                        .text("获取聊天信息失败")
-                        .show_alert(true)
-                        .await?;
-                }
-                Err(e) => {
-                    error!(
-                        "Failed to fetch chat {} for mention toggle by user {}: {:#}",
-                        chat_id, user_id, e
-                    );
-                    bot.answer_callback_query(q.id)
-                        .text("获取聊天信息失败")
+                        .text("更新设置失败")
                         .show_alert(true)
                         .await?;
                 }
@@ -544,7 +479,7 @@ pub async fn handle_settings_callback(
             } else {
                 "排除标签"
             };
-            state.phase = SettingsPhase::PreparingInput;
+            state.phase = SettingsPhase::Preparing;
             drop(states);
             let reference = match current_tag_reference(&handler, chat_id, is_sensitive).await {
                 Ok(reference) => reference,

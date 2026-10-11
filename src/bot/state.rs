@@ -12,9 +12,8 @@ pub const DIALOGUE_TIMEOUT: Duration = Duration::from_secs(3 * 60);
 
 #[derive(Clone, Debug)]
 pub enum SettingsPhase {
-    PreparingMode,
+    Preparing,
     ChoosingMode,
-    PreparingInput,
     ConfirmingClear,
     WaitingForTags {
         mode: TagEditMode,
