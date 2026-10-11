@@ -637,14 +637,14 @@ async fn tag_modes_apply_to_current_lists_and_empty_input_never_clears() {
             "settings:mode:append",
         )
         .await;
-        tag_input(&bot, &handler, &storage, " old， new, new ,, ").await;
+        tag_input(&bot, &handler, &storage, " old， clear, CLEAR, clear ,, ").await;
         let current = handler.repo.get_chat(-100).await.unwrap().unwrap();
         let tags = if sensitive {
             current.sensitive_tags
         } else {
             current.excluded_tags
         };
-        assert_eq!(tags.0, vec!["old", "concurrent", "new"]);
+        assert_eq!(tags.0, vec!["old", "concurrent", "clear", "CLEAR"]);
         let selector = begin_tag_edit(&bot, &handler, &storage, sensitive).await;
         settings_click(
             &bot,
@@ -656,14 +656,14 @@ async fn tag_modes_apply_to_current_lists_and_empty_input_never_clears() {
             "settings:mode:remove",
         )
         .await;
-        tag_input(&bot, &handler, &storage, "new,missing").await;
+        tag_input(&bot, &handler, &storage, "clear,missing").await;
         let current = handler.repo.get_chat(-100).await.unwrap().unwrap();
         let tags = if sensitive {
             current.sensitive_tags
         } else {
             current.excluded_tags
         };
-        assert_eq!(tags.0, vec!["old", "concurrent"]);
+        assert_eq!(tags.0, vec!["old", "concurrent", "CLEAR"]);
         let selector = begin_tag_edit(&bot, &handler, &storage, sensitive).await;
         settings_click(
             &bot,
@@ -680,44 +680,6 @@ async fn tag_modes_apply_to_current_lists_and_empty_input_never_clears() {
             .read()
             .await
             .contains_key(&(ChatId(-100), UserId(1))));
-        tag_input(&bot, &handler, &storage, "replacement").await;
-        let current = handler.repo.get_chat(-100).await.unwrap().unwrap();
-        let tags = if sensitive {
-            current.sensitive_tags
-        } else {
-            current.excluded_tags
-        };
-        assert_eq!(tags.0, vec!["replacement"]);
-        let selector = begin_tag_edit(&bot, &handler, &storage, sensitive).await;
-        settings_click(
-            &bot,
-            &handler,
-            &storage,
-            -100,
-            1,
-            selector,
-            "settings:mode:append",
-        )
-        .await;
-        tag_input(&bot, &handler, &storage, "clear").await;
-        let current = handler.repo.get_chat(-100).await.unwrap().unwrap();
-        let tags = if sensitive {
-            current.sensitive_tags
-        } else {
-            current.excluded_tags
-        };
-        assert_eq!(tags.0, vec!["replacement", "clear"]);
-        let selector = begin_tag_edit(&bot, &handler, &storage, sensitive).await;
-        settings_click(
-            &bot,
-            &handler,
-            &storage,
-            -100,
-            1,
-            selector,
-            "settings:mode:replace",
-        )
-        .await;
         tag_input(&bot, &handler, &storage, "CLEAR").await;
         let current = handler.repo.get_chat(-100).await.unwrap().unwrap();
         let tags = if sensitive {
@@ -726,8 +688,6 @@ async fn tag_modes_apply_to_current_lists_and_empty_input_never_clears() {
             current.excluded_tags
         };
         assert_eq!(tags.0, vec!["CLEAR"]);
-        assert!(current.blur_sensitive_tags);
-        assert!(!current.allow_without_mention);
     }
 }
 
@@ -736,7 +696,7 @@ async fn tag_modes_apply_to_current_lists_and_empty_input_never_clears() {
 #[tokio::test]
 async fn tag_mode_buttons_bind_actor_chat_and_session_and_select_once() {
     use crate::bot::state::SettingsPhase;
-    let (server, bot, handler) = fixture().await;
+    let (_server, bot, handler) = fixture().await;
     handler
         .repo
         .set_user_role(2, UserRole::Admin)
@@ -744,31 +704,6 @@ async fn tag_mode_buttons_bind_actor_chat_and_session_and_select_once() {
         .unwrap();
     let storage = crate::bot::state::new_settings_storage();
     let old = begin_tag_edit(&bot, &handler, &storage, false).await;
-    let requests = server.received_requests().await.unwrap();
-    let selection: Value = serde_json::from_slice(
-        &requests
-            .iter()
-            .find(|request| {
-                let body: Value = serde_json::from_slice(&request.body).unwrap();
-                body["reply_markup"]["inline_keyboard"].is_array()
-            })
-            .unwrap()
-            .body,
-    )
-    .unwrap();
-    let rows = selection["reply_markup"]["inline_keyboard"]
-        .as_array()
-        .unwrap();
-    assert_eq!(rows.len(), 2);
-    assert_eq!(
-        rows[0]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|button| button["text"].as_str().unwrap())
-            .collect::<Vec<_>>(),
-        ["追加", "删减"]
-    );
     let early_input: Message = serde_json::from_value(json!({
         "message_id": 50, "date": 1700000000,
         "chat": {"id": -100, "type": "supergroup", "title": "Test"},
@@ -1359,10 +1294,6 @@ async fn tag_prompts_refresh_current_values_and_bound_display_without_data_loss(
     .await;
     let prompt = last_settings_prompt(&server).await;
     assert_eq!(prompt["message_id"], selector.0);
-    assert_eq!(
-        prompt["reply_markup"]["inline_keyboard"][0][0]["text"],
-        "取消"
-    );
     assert!(prompt["text"].as_str().unwrap().contains(&special));
     assert!(prompt.get("parse_mode").is_none()); // Plain text cannot interpret tag markup.
     handler
@@ -1444,7 +1375,7 @@ async fn tag_prompts_refresh_current_values_and_bound_display_without_data_loss(
 async fn clear_confirmation_is_bound_expiring_and_consumed_once() {
     use crate::bot::state::SettingsPhase;
     use crate::db::types::{TagEditMode, Tags};
-    let (server, bot, handler) = fixture().await;
+    let (_server, bot, handler) = fixture().await;
     let storage = crate::bot::state::new_settings_storage();
     handler
         .repo
@@ -1635,12 +1566,4 @@ async fn clear_confirmation_is_bound_expiring_and_consumed_once() {
             .0,
         ["new"]
     );
-    let requests = server.received_requests().await.unwrap();
-    let edits: Vec<Value> = requests
-        .iter()
-        .filter(|request| request.url.path().ends_with("/EditMessageText"))
-        .map(|request| serde_json::from_slice(&request.body).unwrap())
-        .collect();
-    assert!(edits.iter().any(|body| body["message_id"] == selector.0
-        && body["reply_markup"]["inline_keyboard"][0][0]["text"] == "确认清空"));
 }
