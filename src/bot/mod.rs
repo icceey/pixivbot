@@ -133,7 +133,6 @@ fn build_handler_tree(
         .chain(middleware::filter_hybrid_command::<Command, HandlerResult>())
         .filter(|cmd: Command| matches!(cmd, Command::Cancel | Command::Settings))
         .chain(middleware::filter_user_chat())
-        .chain(middleware::filter_chat_accessible())
         .filter_async(|msg: Message, storage: SettingsStorage| async move {
             let Some(user) = permissions::message_actor(&msg) else {
                 return false;
@@ -145,6 +144,10 @@ fn build_handler_tree(
             }
             states.contains_key(&key)
         })
+        .branch(
+            dptree::filter(|cmd: Command| matches!(cmd, Command::Cancel)).endpoint(handle_command),
+        )
+        .chain(middleware::filter_chat_accessible())
         .endpoint(handle_command);
 
     // 常规命令 - 保持原有的聊天可访问性检查，并添加 @mention 要求检查

@@ -991,6 +991,31 @@ async fn active_settings_controls_bypass_mention_without_becoming_tags() {
         assert!(storage.read().await.is_empty());
         assert_eq!(server.received_requests().await.unwrap().len(), before);
     }
+    let selector = begin_tag_edit(&bot, &handler, &storage, false).await;
+    settings_click(
+        &bot,
+        &handler,
+        &storage,
+        -100,
+        1,
+        selector,
+        "settings:mode:replace",
+    )
+    .await;
+    assert!(dispatch_settings_text(&bot, &handler, &storage, "/disablechat").await);
+    for text in ["/settings", "must not become a tag"] {
+        assert!(!dispatch_settings_text(&bot, &handler, &storage, text).await);
+    }
+    assert!(dispatch_settings_text(&bot, &handler, &storage, "/cancel").await);
+    assert!(storage.read().await.is_empty());
+    assert!(handler
+        .repo
+        .get_chat(-100)
+        .await
+        .unwrap()
+        .unwrap()
+        .excluded_tags
+        .is_empty());
 }
 
 // Synchronize on the actual HTTP request. Unrelated operations must finish
