@@ -1394,7 +1394,7 @@ async fn tag_prompts_refresh_current_values_and_bound_display_without_data_loss(
 async fn clear_confirmation_is_bound_expiring_and_consumed_once() {
     use crate::bot::state::SettingsPhase;
     use crate::db::types::{TagEditMode, Tags};
-    let (_server, bot, handler) = fixture().await;
+    let (server, bot, handler) = fixture().await;
     let storage = crate::bot::state::new_settings_storage();
     handler
         .repo
@@ -1517,6 +1517,47 @@ async fn clear_confirmation_is_bound_expiring_and_consumed_once() {
         .unwrap()
         .excluded_tags
         .is_empty());
+    // Telegram rejects identical panel edits even though clearing an empty list
+    // is successful. The confirmation still needs its callback acknowledgement.
+    let empty_selector = begin_tag_edit(&bot, &handler, &storage, false).await;
+    settings_click(
+        &bot,
+        &handler,
+        &storage,
+        -100,
+        1,
+        empty_selector,
+        "settings:mode:clear",
+    )
+    .await;
+    {
+        Mock::given(path("/botfake_token/EditMessageText"))
+            .and(body_partial_json(json!({"chat_id": -100, "message_id": 5})))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                "ok": false, "error_code": 400,
+                "description": "Bad Request: message is not modified: specified new message content and reply markup are exactly the same as a current content and reply markup of the message"
+            })))
+            .with_priority(1).up_to_n_times(1).expect(1).mount(&server).await;
+        Mock::given(path("/botfake_token/AnswerCallbackQuery"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"ok": true, "result": true})),
+            )
+            .with_priority(1)
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        settings_click(
+            &bot,
+            &handler,
+            &storage,
+            -100,
+            1,
+            empty_selector,
+            "settings:confirm:clear",
+        )
+        .await;
+    }
     handler
         .repo
         .edit_chat_tags(

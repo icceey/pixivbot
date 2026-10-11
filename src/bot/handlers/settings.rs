@@ -60,10 +60,16 @@ impl BotHandler {
             Ok(Some(chat)) => {
                 let (message, keyboard) = build_settings_panel(&chat);
 
-                bot.edit_message_text(chat_id, message_id, message)
+                match bot
+                    .edit_message_text(chat_id, message_id, message)
                     .parse_mode(ParseMode::MarkdownV2)
                     .reply_markup(keyboard)
-                    .await?;
+                    .await
+                {
+                    Ok(_)
+                    | Err(teloxide::RequestError::Api(teloxide::ApiError::MessageNotModified)) => {}
+                    Err(error) => return Err(error),
+                }
             }
             Ok(None) => {
                 warn!("Chat {} not found when refreshing settings panel", chat_id);

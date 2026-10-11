@@ -671,7 +671,7 @@ async fn handle_chat_migration(msg: Message, repo: Arc<Repo>) -> HandlerResult {
 
 /// 设置命令可见性
 /// - 普通用户看到基础命令
-/// - 数据库中的 Admin 用户看到管理员命令
+/// - 群管理员在群内、数据库中的 Admin 在私聊看到管理员命令
 /// - 数据库中的 Owner 用户看到所有命令
 async fn setup_commands(bot: &ThrottledBot, repo: &Repo, has_booru: bool, has_ehentai: bool) {
     // 1. 设置默认命令（所有用户都能看到的基础命令）
@@ -683,6 +683,14 @@ async fn setup_commands(bot: &ThrottledBot, repo: &Repo, has_booru: bool, has_eh
         tracing::warn!("Failed to set default commands: {:#}", e);
     } else {
         info!("✅ Set default commands for all users");
+    }
+
+    if let Err(e) = bot
+        .set_my_commands(Command::admin_commands(has_booru, has_ehentai))
+        .scope(BotCommandScope::AllChatAdministrators)
+        .await
+    {
+        tracing::warn!("Failed to set group administrator commands: {:#}", e);
     }
 
     // 2. 从数据库获取所有管理员用户，为他们设置对应的命令可见性

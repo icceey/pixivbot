@@ -130,8 +130,14 @@ impl Command {
     pub fn admin_commands(has_booru: bool, has_ehentai: bool) -> Vec<BotCommand> {
         let mut cmds = Self::user_commands(has_booru, has_ehentai);
         cmds.extend([
-            BotCommand::new("enablechat", "[Admin] 启用聊天 - /enablechat [chat_id]"),
-            BotCommand::new("disablechat", "[Admin] 禁用聊天 - /disablechat [chat_id]"),
+            BotCommand::new(
+                "enablechat",
+                "[Admin/群管理员] 启用聊天 - /enablechat [chat_id]",
+            ),
+            BotCommand::new(
+                "disablechat",
+                "[Admin/群管理员] 禁用聊天 - /disablechat [chat_id]",
+            ),
         ]);
         cmds
     }
