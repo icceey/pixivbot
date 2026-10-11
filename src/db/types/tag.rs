@@ -19,6 +19,14 @@ use teloxide::utils::markdown;
 #[serde(transparent)]
 pub struct Tags(pub Vec<String>);
 
+/// Editing a stored chat tag list, independently of subscription tag filters.
+#[derive(Clone, Copy, Debug)]
+pub enum TagEditMode {
+    Append,
+    Remove,
+    Replace,
+}
+
 impl Deref for Tags {
     type Target = Vec<String>;
     fn deref(&self) -> &Self::Target {

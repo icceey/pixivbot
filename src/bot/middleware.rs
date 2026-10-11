@@ -92,6 +92,8 @@ async fn ensure_user_and_chat(
     repo: &Repo,
     handler: &super::BotHandler,
 ) -> Result<UserChatContext> {
+    let user = super::permissions::message_actor(msg)
+        .context("Message has no identifiable human sender")?;
     let chat_id = msg.chat.id.0;
     let chat_type = match msg.chat.is_group() || msg.chat.is_supergroup() {
         true => "group",
@@ -114,18 +116,17 @@ async fn ensure_user_and_chat(
         .await
         .context("Failed to upsert chat")?;
 
-    // Get or create user - require user info to exist
-    let user = msg
-        .from
-        .as_ref()
-        .context("Message has no user information")?;
-
+    // Get or create the identified sender.
     let user_id = user.id.0 as i64;
     let username = user.username.clone();
 
     // Check if user already exists
     let user_model = match repo.get_user(user_id).await.context("Failed to get user")? {
-        Some(existing_user) => existing_user,
+        Some(existing_user) if existing_user.username == username => existing_user,
+        Some(existing_user) => repo
+            .upsert_user(user_id, username, existing_user.role)
+            .await
+            .context("Failed to refresh username")?,
         None => {
             // New user - determine role
             if handler.owner_id == Some(user_id) {

@@ -1,12 +1,12 @@
 use crate::bot::notifier::ThrottledBot;
-use crate::bot::state::{SettingsState, SettingsStorage};
+use crate::bot::state::{SettingsPhase, SettingsState, SettingsStorage};
 use crate::bot::BotHandler;
 use crate::db::entities::chats;
-use crate::db::types::Tags;
-use std::time::Instant;
+use crate::db::types::{TagEditMode, Tags};
 use teloxide::prelude::*;
 use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup, MessageId, ParseMode};
 use teloxide::utils::markdown;
+use tokio::time::Instant;
 use tracing::{error, info, warn};
 
 /// Callback data prefix for settings buttons
@@ -60,10 +60,16 @@ impl BotHandler {
             Ok(Some(chat)) => {
                 let (message, keyboard) = build_settings_panel(&chat);
 
-                bot.edit_message_text(chat_id, message_id, message)
+                match bot
+                    .edit_message_text(chat_id, message_id, message)
                     .parse_mode(ParseMode::MarkdownV2)
                     .reply_markup(keyboard)
-                    .await?;
+                    .await
+                {
+                    Ok(_)
+                    | Err(teloxide::RequestError::Api(teloxide::ApiError::MessageNotModified)) => {}
+                    Err(error) => return Err(error),
+                }
             }
             Ok(None) => {
                 warn!("Chat {} not found when refreshing settings panel", chat_id);
@@ -92,25 +98,10 @@ fn build_settings_panel(chat: &chats::Model) -> (String, InlineKeyboardMarkup) {
         "*需要@响应*"
     };
 
-    let sensitive_tags = if chat.sensitive_tags.is_empty() {
-        "无".to_string()
-    } else {
-        chat.sensitive_tags
-            .iter()
-            .map(|s| format!("`{}`", markdown::escape(s)))
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
-
-    let excluded_tags = if chat.excluded_tags.is_empty() {
-        "无".to_string()
-    } else {
-        chat.excluded_tags
-            .iter()
-            .map(|s| format!("`{}`", markdown::escape(s)))
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
+    // Each source budget leaves room for Markdown escaping (up to 2x),
+    // the other list and panel labels within Telegram's 4096-character limit.
+    let sensitive_tags = markdown::escape(&tag_reference(&chat.sensitive_tags, 700));
+    let excluded_tags = markdown::escape(&tag_reference(&chat.excluded_tags, 700));
 
     // 私聊时不显示群组命令响应设置（该设置只对群组有意义）
     let is_private = chat.r#type == "private";
@@ -186,6 +177,49 @@ fn build_settings_panel(chat: &chats::Model) -> (String, InlineKeyboardMarkup) {
     (message, keyboard)
 }
 
+/// Bound display only, counting UTF-16 units conservatively for Telegram.
+/// Prompts use plain text; the Markdown panel escapes this text afterwards.
+fn tag_reference(tags: &Tags, budget: usize) -> String {
+    if tags.is_empty() {
+        return "暂无标签".to_string();
+    }
+    let text = tags.join(", ");
+    if text.encode_utf16().count() <= budget {
+        return text;
+    }
+    let suffix = "…（仅展示部分；实际操作使用完整列表）";
+    let limit = budget.saturating_sub(suffix.encode_utf16().count());
+    let mut units = 0;
+    let mut preview: String = text
+        .chars()
+        .take_while(|ch| {
+            units += ch.len_utf16();
+            units <= limit
+        })
+        .collect();
+    preview.push_str(suffix);
+    preview
+}
+
+async fn current_tag_reference(
+    handler: &BotHandler,
+    chat_id: ChatId,
+    is_sensitive: bool,
+) -> anyhow::Result<String> {
+    use anyhow::Context;
+    let chat = handler
+        .repo
+        .get_chat(chat_id.0)
+        .await?
+        .context("Chat not found")?;
+    let tags = if is_sensitive {
+        chat.sensitive_tags
+    } else {
+        chat.excluded_tags
+    };
+    Ok(tag_reference(&tags, 3000))
+}
+
 /// Parse tags from user input (comma-separated, supports both , and ，)
 pub fn parse_tags_input(input: &str) -> Vec<String> {
     input
@@ -200,14 +234,15 @@ pub fn parse_tags_input(input: &str) -> Vec<String> {
 /// This function handles callback queries from the settings panel buttons.
 /// It's called from the dispatcher and handles:
 /// - `settings:blur:toggle` - Toggle blur setting
-/// - `settings:edit:sensitive` - Prompt for sensitive tags input
-/// - `settings:edit:exclude` - Prompt for excluded tags input
+/// - `settings:edit:sensitive` - Choose a sensitive-tag edit mode
+/// - `settings:edit:exclude` - Choose an excluded-tag edit mode
 pub async fn handle_settings_callback(
     bot: ThrottledBot,
     q: CallbackQuery,
     callback_data: String,
     handler: BotHandler,
     storage: SettingsStorage,
+    update_id: u32,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Get chat and message info
     let (chat_id, message_id) = match &q.message {
@@ -221,34 +256,41 @@ pub async fn handle_settings_callback(
 
     let user_id = q.from.id;
 
-    // Check if user is admin (security check)
-    // Note: The middleware ensures users exist via ensure_user_and_chat, so Ok(None)
-    // indicates a data inconsistency issue that should be logged.
-    let user_role = match handler.repo.get_user(user_id.0 as i64).await {
-        Ok(Some(user)) => user.role,
-        Ok(None) => {
-            // This shouldn't happen as middleware ensures users exist
-            warn!(
-                "User {} not found in database during settings callback - data inconsistency",
-                user_id
-            );
-            bot.answer_callback_query(q.id)
-                .text("发生错误，请稍后重试")
-                .show_alert(true)
-                .await?;
-            return Ok(());
-        }
-        Err(e) => {
-            error!("Failed to get user for callback: {:#}", e);
-            bot.answer_callback_query(q.id)
-                .text("发生错误，请稍后重试")
-                .show_alert(true)
-                .await?;
-            return Ok(());
-        }
+    let action = callback_data
+        .strip_prefix(SETTINGS_CALLBACK_PREFIX)
+        .unwrap_or("");
+    // Reserve before permission I/O. Cancellation/reopening can invalidate this
+    // generation even when Telegram is slow; never hold the global lock over I/O.
+    let opening_session = if !q.from.is_bot && matches!(action, "edit:sensitive" | "edit:exclude") {
+        let session_id = rand::random();
+        storage.write().await.insert(
+            (chat_id, user_id),
+            SettingsState {
+                session_id,
+                is_sensitive: action == "edit:sensitive",
+                settings_message_id: message_id,
+                selection_message_id: None,
+                phase: SettingsPhase::Preparing,
+                created_at: Instant::now(),
+            },
+        );
+        Some(session_id)
+    } else {
+        None
     };
 
-    if !user_role.is_admin() {
+    if q.from.is_bot
+        || !crate::bot::permissions::can_manage_chat(
+            &bot,
+            &handler.repo,
+            q.message.as_ref().unwrap().chat(),
+            user_id,
+        )
+        .await
+    {
+        if let Some(session_id) = opening_session {
+            remove_session(&storage, (chat_id, user_id), session_id).await;
+        }
         bot.answer_callback_query(q.id)
             .text("只有管理员可以修改设置")
             .show_alert(true)
@@ -256,170 +298,285 @@ pub async fn handle_settings_callback(
         return Ok(());
     }
 
-    // Parse callback data (format: settings:action:value)
-    let action = callback_data
-        .strip_prefix(SETTINGS_CALLBACK_PREFIX)
-        .unwrap_or("");
+    if q.message
+        .as_ref()
+        .is_some_and(|msg| msg.chat().is_group() || msg.chat().is_supergroup())
+    {
+        let enabled = match handler.repo.get_chat(chat_id.0).await {
+            Ok(Some(chat)) => chat.enabled,
+            Ok(None) => false,
+            Err(e) => {
+                error!("Failed to read chat availability: {:#}", e);
+                false
+            }
+        };
+        if !enabled {
+            storage.write().await.remove(&(chat_id, user_id));
+            bot.answer_callback_query(q.id)
+                .text("请先启用当前群聊，再修改设置")
+                .show_alert(true)
+                .await?;
+            return Ok(());
+        }
+    }
 
     match action {
-        "blur:toggle" => {
-            // Toggle blur setting
-            match handler.repo.get_chat(chat_id.0).await {
-                Ok(Some(chat)) => {
-                    let new_blur = !chat.blur_sensitive_tags;
-                    match handler
-                        .repo
-                        .set_blur_sensitive_tags(chat_id.0, new_blur)
-                        .await
-                    {
-                        Ok(_) => {
-                            info!(
-                                "Chat {} blur_sensitive_tags toggled to {} by user {}",
-                                chat_id, new_blur, user_id
-                            );
-
-                            // Refresh the settings panel
-                            handler
-                                .refresh_settings_panel(bot.clone(), chat_id, message_id)
-                                .await?;
-
-                            bot.answer_callback_query(q.id).await?;
-                        }
-                        Err(e) => {
-                            error!("Failed to toggle blur setting: {:#}", e);
-                            bot.answer_callback_query(q.id)
-                                .text("更新设置失败")
-                                .show_alert(true)
-                                .await?;
-                        }
-                    }
+        "blur:toggle" | "mention:toggle" => {
+            let chat = match handler.repo.get_chat(chat_id.0).await {
+                Ok(chat) => chat,
+                Err(e) => {
+                    error!("Failed to fetch chat settings: {:#}", e);
+                    None
                 }
-                Ok(None) => {
-                    warn!(
-                        "Chat {} not found when toggling blur_sensitive_tags by user {}",
-                        chat_id, user_id
-                    );
-                    bot.answer_callback_query(q.id)
-                        .text("获取聊天信息失败")
-                        .show_alert(true)
+            };
+            let Some(chat) = chat else {
+                bot.answer_callback_query(q.id)
+                    .text("获取聊天信息失败")
+                    .show_alert(true)
+                    .await?;
+                return Ok(());
+            };
+            let result = if action == "blur:toggle" {
+                handler
+                    .repo
+                    .set_blur_sensitive_tags(chat_id.0, !chat.blur_sensitive_tags)
+                    .await
+            } else {
+                handler
+                    .repo
+                    .set_allow_without_mention(chat_id.0, !chat.allow_without_mention)
+                    .await
+            };
+            match result {
+                Ok(_) => {
+                    info!("Chat {} {} by user {}", chat_id, action, user_id);
+                    handler
+                        .refresh_settings_panel(bot.clone(), chat_id, message_id)
                         .await?;
+                    bot.answer_callback_query(q.id).await?;
                 }
                 Err(e) => {
-                    error!(
-                        "Failed to fetch chat {} for blur toggle by user {}: {:#}",
-                        chat_id, user_id, e
-                    );
+                    error!("Failed to toggle chat setting: {:#}", e);
                     bot.answer_callback_query(q.id)
-                        .text("获取聊天信息失败")
-                        .show_alert(true)
-                        .await?;
-                }
-            }
-        }
-        "mention:toggle" => {
-            // Toggle allow_without_mention setting
-            match handler.repo.get_chat(chat_id.0).await {
-                Ok(Some(chat)) => {
-                    let new_allow = !chat.allow_without_mention;
-                    match handler
-                        .repo
-                        .set_allow_without_mention(chat_id.0, new_allow)
-                        .await
-                    {
-                        Ok(_) => {
-                            info!(
-                                "Chat {} allow_without_mention toggled to {} by user {}",
-                                chat_id, new_allow, user_id
-                            );
-
-                            // Refresh the settings panel
-                            handler
-                                .refresh_settings_panel(bot.clone(), chat_id, message_id)
-                                .await?;
-
-                            bot.answer_callback_query(q.id).await?;
-                        }
-                        Err(e) => {
-                            error!("Failed to toggle mention setting: {:#}", e);
-                            bot.answer_callback_query(q.id)
-                                .text("更新设置失败")
-                                .show_alert(true)
-                                .await?;
-                        }
-                    }
-                }
-                Ok(None) => {
-                    warn!(
-                        "Chat {} not found when toggling allow_without_mention by user {}",
-                        chat_id, user_id
-                    );
-                    bot.answer_callback_query(q.id)
-                        .text("获取聊天信息失败")
-                        .show_alert(true)
-                        .await?;
-                }
-                Err(e) => {
-                    error!(
-                        "Failed to fetch chat {} for mention toggle by user {}: {:#}",
-                        chat_id, user_id, e
-                    );
-                    bot.answer_callback_query(q.id)
-                        .text("获取聊天信息失败")
+                        .text("更新设置失败")
                         .show_alert(true)
                         .await?;
                 }
             }
         }
         "edit:sensitive" | "edit:exclude" => {
-            // Store dialogue state for this user
+            let session_id = opening_session.unwrap();
             let is_sensitive = action == "edit:sensitive";
-            let state = if is_sensitive {
-                SettingsState::WaitingForSensitiveTags {
-                    settings_message_id: message_id,
-                    created_at: Instant::now(),
-                }
-            } else {
-                SettingsState::WaitingForExcludedTags {
-                    settings_message_id: message_id,
-                    created_at: Instant::now(),
-                }
-            };
-
-            // Store the state
-            {
-                let mut storage_guard = storage.write().await;
-                storage_guard.insert((chat_id, user_id), state);
-            }
-
             let tag_type = if is_sensitive {
                 "敏感标签"
             } else {
                 "排除标签"
             };
-
-            let username = q
-                .from
-                .username
-                .as_ref()
-                .map(|u| format!("@{}", u))
-                .unwrap_or_else(|| q.from.first_name.clone());
-
-            let prompt = format!(
-                "{} 请在5分钟内发送新的{}（用逗号分隔），或发送 `clear` 清除所有标签。您发送的内容将直接覆盖原有配置\n\n发送 /cancel 取消操作。",
-                markdown::escape(&username),
-                tag_type
-            );
-
-            bot.send_message(chat_id, prompt)
-                .parse_mode(ParseMode::MarkdownV2)
-                .await?;
-
+            let reference = match current_tag_reference(&handler, chat_id, is_sensitive).await {
+                Ok(reference) => reference,
+                Err(e) => {
+                    error!("Failed to read current tags: {:#}", e);
+                    remove_session(&storage, (chat_id, user_id), session_id).await;
+                    bot.answer_callback_query(q.id)
+                        .text("获取当前标签失败，请重新打开设置。")
+                        .show_alert(true)
+                        .await?;
+                    return Ok(());
+                }
+            };
+            let button = |label, operation| {
+                InlineKeyboardButton::callback(
+                    label,
+                    format!("settings:mode:{session_id}:{operation}"),
+                )
+            };
+            let keyboard = InlineKeyboardMarkup::new(vec![
+                vec![button("追加", "append"), button("删减", "remove")],
+                vec![button("覆盖", "replace"), button("清空", "clear")],
+            ]);
+            let result = bot.send_message(chat_id, format!(
+                "{}，请在3分钟内选择{}的操作模式：追加 / 删减 / 覆盖 / 清空。发送 /cancel 取消。\n\n当前标签：{}",
+                q.from.first_name, tag_type, reference,
+            )).reply_markup(keyboard).await;
+            match result {
+                Ok(prompt) => {
+                    if let Some(state) = storage
+                        .write()
+                        .await
+                        .get_mut(&(chat_id, user_id))
+                        .filter(|s| s.session_id == session_id)
+                    {
+                        state.selection_message_id = Some(prompt.id);
+                        state.phase = SettingsPhase::ChoosingMode;
+                        state.created_at = Instant::now();
+                    }
+                }
+                Err(e) => {
+                    remove_session(&storage, (chat_id, user_id), session_id).await;
+                    return Err(e.into());
+                }
+            }
             bot.answer_callback_query(q.id).await?;
-
-            info!(
-                "User {} in chat {} started editing {} (message_id: {})",
-                user_id, chat_id, tag_type, message_id
-            );
+        }
+        action
+            if action.starts_with("mode:")
+                || action.starts_with("cancel:")
+                || action.starts_with("confirm:") =>
+        {
+            let parts: Vec<_> = action.split(':').collect();
+            let token = parts.get(1).and_then(|value| value.parse::<u64>().ok());
+            let operation = parts.get(2).copied().unwrap_or("");
+            let command = parts[0];
+            let mut states = storage.write().await;
+            let key = (chat_id, user_id);
+            let Some(state) = states.get_mut(&key).filter(|state| {
+                token == Some(state.session_id)
+                    && parts.len() == 3
+                    && state.selection_message_id == Some(message_id)
+                    && matches!(
+                        (command, operation, &state.phase),
+                        (
+                            "mode",
+                            "append" | "remove" | "replace" | "clear",
+                            SettingsPhase::ChoosingMode
+                        ) | ("cancel", "input", SettingsPhase::WaitingForTags { .. })
+                            | ("cancel", "confirm", SettingsPhase::ConfirmingClear)
+                            | ("confirm", "clear", SettingsPhase::ConfirmingClear)
+                    )
+            }) else {
+                drop(states);
+                bot.answer_callback_query(q.id)
+                    .text("此按钮不属于你的当前会话，或模式已选择；请重新打开设置。")
+                    .show_alert(true)
+                    .await?;
+                return Ok(());
+            };
+            if state.is_expired() {
+                states.remove(&key);
+                drop(states);
+                bot.answer_callback_query(q.id)
+                    .text("操作已超时，请重新打开设置。")
+                    .show_alert(true)
+                    .await?;
+                return Ok(());
+            }
+            if command == "cancel" || command == "confirm" {
+                let state = states.remove(&key).unwrap();
+                drop(states);
+                let text = if command == "cancel" {
+                    "✅ 操作已取消"
+                } else {
+                    match handler
+                        .repo
+                        .edit_chat_tags(
+                            chat_id.0,
+                            state.is_sensitive,
+                            TagEditMode::Replace,
+                            Tags::default(),
+                        )
+                        .await
+                    {
+                        Ok(_) => "✅ 标签已清空",
+                        Err(e) => {
+                            error!("Failed to clear tags: {:#}", e);
+                            "❌ 更新设置失败，请重新打开设置后重试"
+                        }
+                    }
+                };
+                bot.edit_message_text(chat_id, message_id, text)
+                    .reply_markup(InlineKeyboardMarkup::default())
+                    .await?;
+                if command == "confirm" {
+                    handler
+                        .refresh_settings_panel(bot.clone(), chat_id, state.settings_message_id)
+                        .await?;
+                }
+                bot.answer_callback_query(q.id).await?;
+                return Ok(());
+            }
+            let session_id = state.session_id;
+            let is_sensitive = state.is_sensitive;
+            let tag_type = if state.is_sensitive {
+                "敏感标签"
+            } else {
+                "排除标签"
+            };
+            state.phase = SettingsPhase::Preparing;
+            drop(states);
+            let reference = match current_tag_reference(&handler, chat_id, is_sensitive).await {
+                Ok(reference) => reference,
+                Err(e) => {
+                    error!("Failed to refresh current tags: {:#}", e);
+                    remove_session(&storage, key, session_id).await;
+                    bot.answer_callback_query(q.id)
+                        .text("获取当前标签失败，请重新打开设置。")
+                        .show_alert(true)
+                        .await?;
+                    return Ok(());
+                }
+            };
+            let (mode, description) = match operation {
+                "append" => (
+                    TagEditMode::Append,
+                    "追加：保留现有标签，并添加不重复的标签",
+                ),
+                "remove" => (
+                    TagEditMode::Remove,
+                    "删减：仅删除指定标签，不存在的标签将忽略",
+                ),
+                _ => (TagEditMode::Replace, "覆盖：用输入完整替换现有列表"),
+            };
+            let clearing = operation == "clear";
+            let (prompt, keyboard) = if clearing {
+                (
+                    format!(
+                        "确认清空{tag_type}？请在3分钟内确认，或取消。\n\n当前标签：{reference}"
+                    ),
+                    InlineKeyboardMarkup::new(vec![vec![
+                        InlineKeyboardButton::callback(
+                            "确认清空",
+                            format!("settings:confirm:{session_id}:clear"),
+                        ),
+                        InlineKeyboardButton::callback(
+                            "取消",
+                            format!("settings:cancel:{session_id}:confirm"),
+                        ),
+                    ]]),
+                )
+            } else {
+                (format!("{}，{}（{}）。请在3分钟内发送标签，用英文或中文逗号分隔。空输入不会清空列表。\n\n当前标签：{}",
+                    q.from.first_name, description, tag_type, reference),
+                 InlineKeyboardMarkup::new(vec![vec![InlineKeyboardButton::callback("取消", format!("settings:cancel:{session_id}:input"))]]))
+            };
+            let result = bot
+                .edit_message_text(chat_id, message_id, prompt)
+                .reply_markup(keyboard)
+                .await;
+            match result {
+                Ok(_) => {
+                    if let Some(state) = storage
+                        .write()
+                        .await
+                        .get_mut(&key)
+                        .filter(|s| s.session_id == session_id)
+                    {
+                        state.phase = if clearing {
+                            SettingsPhase::ConfirmingClear
+                        } else {
+                            SettingsPhase::WaitingForTags {
+                                mode,
+                                after_update_id: update_id,
+                            }
+                        };
+                        state.created_at = Instant::now();
+                    }
+                }
+                Err(e) => {
+                    remove_session(&storage, key, session_id).await;
+                    return Err(e.into());
+                }
+            }
+            bot.answer_callback_query(q.id).await?;
         }
         _ => {
             warn!("Unknown settings callback action: {}", action);
@@ -428,6 +585,16 @@ pub async fn handle_settings_callback(
     }
 
     Ok(())
+}
+
+async fn remove_session(storage: &SettingsStorage, key: (ChatId, UserId), session_id: u64) {
+    let mut states = storage.write().await;
+    if states
+        .get(&key)
+        .is_some_and(|state| state.session_id == session_id)
+    {
+        states.remove(&key);
+    }
 }
 
 /// Process settings text input (for tag editing)
@@ -442,120 +609,100 @@ pub async fn handle_settings_input(
     msg: Message,
     handler: BotHandler,
     storage: SettingsStorage,
+    update_id: u32,
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-    let chat_id = msg.chat.id;
-    let user_id = match msg.from.as_ref() {
-        Some(user) => user.id,
-        None => return Ok(false),
-    };
-
-    // Check if user has an active dialogue state
-    let state = {
-        let storage_guard = storage.read().await;
-        storage_guard.get(&(chat_id, user_id)).cloned()
-    };
-
-    let (is_sensitive, settings_message_id) = match &state {
-        Some(s @ SettingsState::WaitingForSensitiveTags { .. }) => (true, s.settings_message_id()),
-        Some(s @ SettingsState::WaitingForExcludedTags { .. }) => (false, s.settings_message_id()),
-        None => return Ok(false), // No active state, not handled
-    };
-
-    let text = msg.text().unwrap_or("");
-
-    // Check for clear keyword
-    if text.eq_ignore_ascii_case("clear") {
-        let result = if is_sensitive {
-            handler
-                .repo
-                .set_sensitive_tags(chat_id.0, Tags::default())
-                .await
-        } else {
-            handler
-                .repo
-                .set_excluded_tags(chat_id.0, Tags::default())
-                .await
-        };
-
-        match result {
-            Ok(_) => {
-                let tag_type = if is_sensitive {
-                    "敏感标签"
-                } else {
-                    "排除标签"
-                };
-                bot.send_message(chat_id, format!("✅ {}已清除", tag_type))
-                    .await?;
-
-                info!("Chat {} cleared {} by user {}", chat_id, tag_type, user_id);
-            }
-            Err(e) => {
-                error!("Failed to clear tags: {:#}", e);
-                bot.send_message(chat_id, "❌ 更新设置失败").await?;
-            }
-        }
-    } else {
-        // Parse tags
-        let tags = parse_tags_input(text);
-
-        if tags.is_empty() {
-            bot.send_message(chat_id, "❌ 未提供有效的标签").await?;
-            // Clear state and return as handled
-            {
-                let mut storage_guard = storage.write().await;
-                storage_guard.remove(&(chat_id, user_id));
-            }
-            return Ok(true);
-        }
-
-        let tags_obj = Tags::from(tags.clone());
-
-        let result = if is_sensitive {
-            handler.repo.set_sensitive_tags(chat_id.0, tags_obj).await
-        } else {
-            handler.repo.set_excluded_tags(chat_id.0, tags_obj).await
-        };
-
-        match result {
-            Ok(_) => {
-                let tag_type = if is_sensitive {
-                    "敏感标签"
-                } else {
-                    "排除标签"
-                };
-
-                let tag_list: Vec<String> = tags
-                    .iter()
-                    .map(|s| format!("`{}`", markdown::escape(s)))
-                    .collect();
-
-                let message = format!("✅ {}已更新: {}", tag_type, tag_list.join(", "));
-
-                bot.send_message(chat_id, message)
-                    .parse_mode(ParseMode::MarkdownV2)
-                    .await?;
-
-                info!("Chat {} updated {} by user {}", chat_id, tag_type, user_id);
-            }
-            Err(e) => {
-                error!("Failed to update tags: {:#}", e);
-                bot.send_message(chat_id, "❌ 更新设置失败").await?;
-            }
-        }
-    }
-
-    // Clear state after processing
+    // Commands that did not match this bot's command routes are never tag data.
+    if msg
+        .text()
+        .is_some_and(|text| text.trim_start().starts_with('/'))
     {
-        let mut storage_guard = storage.write().await;
-        storage_guard.remove(&(chat_id, user_id));
+        return Ok(false);
     }
-
-    // Refresh the settings panel
-    handler
-        .refresh_settings_panel(bot, chat_id, settings_message_id)
+    let chat_id = msg.chat.id;
+    let Some(user) = crate::bot::permissions::message_actor(&msg) else {
+        return Ok(false);
+    };
+    let user_id = user.id;
+    let key = (chat_id, user_id);
+    if !storage
+        .read()
+        .await
+        .get(&key)
+        .is_some_and(|state| matches!(state.phase, SettingsPhase::WaitingForTags { .. }))
+    {
+        return Ok(false);
+    }
+    // Recheck privileges on submission, including revocation during the dialogue.
+    let authorized =
+        crate::bot::permissions::can_manage_chat(&bot, &handler.repo, &msg.chat, user_id).await;
+    let mut states = storage.write().await;
+    let Some(state) = states.get(&key) else {
+        return Ok(false);
+    };
+    let SettingsPhase::WaitingForTags {
+        mode,
+        after_update_id,
+    } = state.phase
+    else {
+        return Ok(false);
+    };
+    // A message sent before mode selection (or before a replacement session)
+    // must not become input just because its handler completed later.
+    if update_id <= after_update_id {
+        return Ok(false);
+    }
+    if state.is_expired() || !authorized {
+        let error = if state.is_expired() {
+            "操作已超时，请重新打开设置。"
+        } else {
+            "只有管理员可以修改设置"
+        };
+        states.remove(&key);
+        drop(states);
+        bot.send_message(chat_id, error).await?;
+        return Ok(true);
+    }
+    let text = msg.text().unwrap_or("");
+    let tags = parse_tags_input(text);
+    if tags.is_empty() {
+        drop(states);
+        bot.send_message(
+            chat_id,
+            "❌ 未提供有效的标签；可在剩余时间内重新输入。清空请取消后选择清空按钮。",
+        )
         .await?;
-
-    Ok(true) // Message was handled
+        return Ok(true);
+    }
+    // Claim this input once. Later callbacks cannot change its operation mode;
+    // completion must not delete a newer session opened during the DB request.
+    let state = states.remove(&key).unwrap();
+    drop(states);
+    let input = Tags::from(tags);
+    match handler
+        .repo
+        .edit_chat_tags(chat_id.0, state.is_sensitive, mode, input)
+        .await
+    {
+        Ok(tags) => {
+            let tag_type = if state.is_sensitive {
+                "敏感标签"
+            } else {
+                "排除标签"
+            };
+            let list = tag_reference(&tags, 3000);
+            bot.send_message(chat_id, format!("✅ {}已更新: {}", tag_type, list))
+                .await?;
+            handler
+                .refresh_settings_panel(bot, chat_id, state.settings_message_id)
+                .await?;
+        }
+        Err(e) => {
+            error!("Failed to edit chat tags: {:#}", e);
+            bot.send_message(chat_id, "❌ 更新设置失败，请重新打开设置后重试")
+                .await?;
+        }
+    }
+    Ok(true)
 }
 
 /// Handle /cancel command - clear any pending settings dialogue state
@@ -568,10 +715,10 @@ pub async fn handle_settings_cancel(
     storage: SettingsStorage,
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     let chat_id = msg.chat.id;
-    let user_id = match msg.from.as_ref() {
-        Some(user) => user.id,
-        None => return Ok(false),
+    let Some(user) = crate::bot::permissions::message_actor(&msg) else {
+        return Ok(false);
     };
+    let user_id = user.id;
 
     // Check if user has an active dialogue state
     let had_state = {

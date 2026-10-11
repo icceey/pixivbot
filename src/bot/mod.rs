@@ -4,6 +4,7 @@ mod handlers;
 pub mod link_handler;
 pub mod middleware;
 pub mod notifier;
+mod permissions;
 pub mod state;
 
 use crate::booru::BooruSiteRegistry;
@@ -118,16 +119,35 @@ fn build_handler_tree(
 ) -> teloxide::dispatching::UpdateHandler<Box<dyn std::error::Error + Send + Sync + 'static>> {
     // 管理员启用/禁用聊天命令 - 只检查用户权限，不检查聊天是否启用
     // 这允许管理员在禁用的聊天中使用 /enablechat 命令
-    // 注意：此处的 is_admin() 检查与 handler 中 dispatch_command 的 pattern guard 是有意重复的（纵深防御）
+    // 权限在操作入口按目标聊天实时检查，不能将群管理员提升为全局角色。
     // 注意：admin_chat_control_handler 不使用 filter_mention_requirement，因为管理员命令总是需要能够执行
     let admin_chat_control_handler = Message::filter_text()
         .chain(middleware::filter_hybrid_command::<Command, HandlerResult>())
         .chain(middleware::filter_user_chat())
-        .filter(|cmd: Command, ctx: UserChatContext| {
-            // 仅当用户是管理员且命令是 EnableChat 或 DisableChat 时处理
-            ctx.user.role.is_admin()
-                && matches!(cmd, Command::EnableChat(_) | Command::DisableChat(_))
+        .filter(|cmd: Command| matches!(cmd, Command::EnableChat(_) | Command::DisableChat(_)))
+        .endpoint(handle_command);
+
+    // Active-dialogue cancellation/reopening must work even when a group
+    // requires @bot, and must never fall through into tag input.
+    let settings_control_handler = Message::filter_text()
+        .chain(middleware::filter_hybrid_command::<Command, HandlerResult>())
+        .filter(|cmd: Command| matches!(cmd, Command::Cancel | Command::Settings))
+        .chain(middleware::filter_user_chat())
+        .filter_async(|msg: Message, storage: SettingsStorage| async move {
+            let Some(user) = permissions::message_actor(&msg) else {
+                return false;
+            };
+            let key = (msg.chat.id, user.id);
+            let mut states = storage.write().await;
+            if states.get(&key).is_some_and(|state| state.is_expired()) {
+                states.remove(&key);
+            }
+            states.contains_key(&key)
         })
+        .branch(
+            dptree::filter(|cmd: Command| matches!(cmd, Command::Cancel)).endpoint(handle_command),
+        )
+        .chain(middleware::filter_chat_accessible())
         .endpoint(handle_command);
 
     // 常规命令 - 保持原有的聊天可访问性检查，并添加 @mention 要求检查
@@ -168,26 +188,11 @@ fn build_handler_tree(
         .chain(filter_in_settings_dialogue())
         .endpoint(handle_settings_dialogue);
 
-    // Cancel command handler for settings dialogue
-    // Uses middleware to ensure user/chat exist and chat is accessible
-    // Middleware is applied before command parsing to avoid unnecessary parsing for inaccessible chats
-    // 注意：cancel_handler 也需要检查 @mention 要求
-    let cancel_handler = Message::filter_text()
-        .chain(middleware::filter_user_chat())
-        .chain(middleware::filter_chat_accessible())
-        .chain(middleware::filter_hybrid_command::<Command, HandlerResult>())
-        .chain(middleware::filter_mention_requirement::<
-            Command,
-            HandlerResult,
-        >())
-        .filter(|cmd: Command, _ctx: UserChatContext| matches!(cmd, Command::Cancel))
-        .endpoint(handle_cancel_command);
-
     dptree::entry().branch(build_callback_handlers()).branch(
         Update::filter_message()
             .branch(migration_handler)
             .branch(admin_chat_control_handler)
-            .branch(cancel_handler)
+            .branch(settings_control_handler)
             .branch(command_handler)
             .branch(settings_dialogue_handler)
             .branch(message_handler),
@@ -246,7 +251,16 @@ async fn handle_command(
     cmd: Command,
     handler: BotHandler,
     ctx: UserChatContext,
+    storage: SettingsStorage,
 ) -> HandlerResult {
+    if matches!(cmd, Command::Cancel) {
+        return handle_settings_cancel(bot, msg, storage).await.map(|_| ());
+    }
+    if matches!(cmd, Command::Settings) {
+        if let Some(user) = permissions::message_actor(&msg) {
+            storage.write().await.remove(&(msg.chat.id, user.id));
+        }
+    }
     handler.handle_command(bot, msg, cmd, ctx).await?;
     Ok(())
 }
@@ -263,44 +277,23 @@ async fn handle_message(
     Ok(())
 }
 
-/// Filter to check if user is in a settings dialogue state.
-/// This filter checks the storage before entering the dialogue handler,
-/// preventing unnecessary processing and avoiding error logging when
-/// users are not in a dialogue state.
-///
-/// Also handles timeout: if the state has expired, it is automatically
-/// removed and the filter returns false.
+/// Only the input stage intercepts text; expiry is checked again at submission.
 fn filter_in_settings_dialogue<Output>() -> Handler<'static, Output, DpHandlerDescription>
 where
     Output: Send + Sync + 'static,
 {
     dptree::filter_async(|msg: Message, storage: SettingsStorage| async move {
-        let chat_id = msg.chat.id;
-        let user_id = match msg.from.as_ref() {
-            Some(user) => user.id,
-            None => return false,
+        let Some(user) = permissions::message_actor(&msg) else {
+            return false;
         };
-
-        // Check if user has an active dialogue state
-        let state = {
-            let storage_guard = storage.read().await;
-            storage_guard.get(&(chat_id, user_id)).cloned()
-        };
-
-        match state {
-            Some(s) if s.is_expired() => {
-                // State has expired, remove it
-                let mut storage_guard = storage.write().await;
-                storage_guard.remove(&(chat_id, user_id));
-                info!(
-                    "Settings dialogue expired for user {} in chat {}",
-                    user_id, chat_id
-                );
-                false
-            }
-            Some(_) => true, // Valid active state
-            None => false,   // No state
+        let key = (msg.chat.id, user.id);
+        let mut states = storage.write().await;
+        if states.get(&key).is_some_and(|state| state.is_expired()) {
+            states.remove(&key);
         }
+        states
+            .get(&key)
+            .is_some_and(|state| matches!(state.phase, state::SettingsPhase::WaitingForTags { .. }))
     })
 }
 
@@ -313,30 +306,11 @@ async fn handle_settings_dialogue(
     handler: BotHandler,
     storage: SettingsStorage,
     _ctx: UserChatContext,
+    update: Update,
 ) -> HandlerResult {
-    // Handle the message as settings input
-    // The filter has already verified the user is in a dialogue state
-    match handle_settings_input(bot, msg, handler, storage).await {
-        Ok(_) => Ok(()),
-        Err(e) => Err(e),
-    }
-}
-
-/// Handle /cancel command
-async fn handle_cancel_command(
-    bot: ThrottledBot,
-    msg: Message,
-    storage: SettingsStorage,
-    _ctx: UserChatContext,
-) -> HandlerResult {
-    match handle_settings_cancel(bot, msg, storage).await {
-        Ok(true) => Ok(()), // Cancellation was handled
-        Ok(false) => {
-            // No active state to cancel - just ignore
-            Ok(())
-        }
-        Err(e) => Err(e),
-    }
+    handle_settings_input(bot, msg, handler, storage, update.id.0)
+        .await
+        .map(|_| ())
 }
 
 /// 处理列表分页回调
@@ -440,23 +414,24 @@ async fn handle_download_callback(
     let user_id = q.from.id.0 as i64;
     match repo.get_chat(chat_id.0).await {
         Ok(Some(chat)) => {
-            if !chat.enabled {
-                // Check if user is admin who can still access disabled chats
-                match repo.get_user(user_id).await {
-                    Ok(Some(user)) if user.role.is_admin() => {
-                        // Admin can access disabled chats
-                    }
-                    _ => {
-                        warn!(
-                            "User {} attempted to use download button in disabled chat {}",
-                            user_id, chat_id
-                        );
-                        let _ = bot
-                            .send_message(chat_id, "❌ 此聊天未启用，无法使用下载功能")
-                            .await;
-                        return Ok(());
-                    }
-                }
+            if !chat.enabled
+                && (q.from.is_bot
+                    || !permissions::can_manage_chat(
+                        &bot,
+                        &repo,
+                        q.message.as_ref().unwrap().chat(),
+                        q.from.id,
+                    )
+                    .await)
+            {
+                warn!(
+                    "User {} attempted download in disabled chat {}",
+                    user_id, chat_id
+                );
+                let _ = bot
+                    .send_message(chat_id, "❌ 此聊天未启用，无法使用下载功能")
+                    .await;
+                return Ok(());
             }
         }
         Ok(None) => {
@@ -545,20 +520,24 @@ async fn handle_booru_download_callback(
     let user_id = q.from.id.0 as i64;
     match repo.get_chat(chat_id.0).await {
         Ok(Some(chat)) => {
-            if !chat.enabled {
-                match repo.get_user(user_id).await {
-                    Ok(Some(user)) if user.role.is_admin() => {}
-                    _ => {
-                        warn!(
-                            "User {} attempted to use booru download button in disabled chat {}",
-                            user_id, chat_id
-                        );
-                        let _ = bot
-                            .send_message(chat_id, "❌ 此聊天未启用，无法使用下载功能")
-                            .await;
-                        return Ok(());
-                    }
-                }
+            if !chat.enabled
+                && (q.from.is_bot
+                    || !permissions::can_manage_chat(
+                        &bot,
+                        &repo,
+                        q.message.as_ref().unwrap().chat(),
+                        q.from.id,
+                    )
+                    .await)
+            {
+                warn!(
+                    "User {} attempted booru download in disabled chat {}",
+                    user_id, chat_id
+                );
+                let _ = bot
+                    .send_message(chat_id, "❌ 此聊天未启用，无法使用下载功能")
+                    .await;
+                return Ok(());
             }
         }
         Ok(None) => {
@@ -612,8 +591,9 @@ async fn wrap_settings_callback(
     callback_data: String,
     handler: BotHandler,
     storage: SettingsStorage,
+    update: Update,
 ) -> HandlerResult {
-    handle_settings_callback(bot, q, callback_data, handler, storage).await
+    handle_settings_callback(bot, q, callback_data, handler, storage, update.id.0).await
 }
 
 /// 处理聊天迁移（普通群组升级为超级群组）
@@ -657,7 +637,7 @@ async fn handle_chat_migration(msg: Message, repo: Arc<Repo>) -> HandlerResult {
 
 /// 设置命令可见性
 /// - 普通用户看到基础命令
-/// - 数据库中的 Admin 用户看到管理员命令
+/// - 群管理员在群内、数据库中的 Admin 在私聊看到管理员命令
 /// - 数据库中的 Owner 用户看到所有命令
 async fn setup_commands(bot: &ThrottledBot, repo: &Repo, has_booru: bool, has_ehentai: bool) {
     // 1. 设置默认命令（所有用户都能看到的基础命令）
@@ -669,6 +649,14 @@ async fn setup_commands(bot: &ThrottledBot, repo: &Repo, has_booru: bool, has_eh
         tracing::warn!("Failed to set default commands: {:#}", e);
     } else {
         info!("✅ Set default commands for all users");
+    }
+
+    if let Err(e) = bot
+        .set_my_commands(Command::admin_commands(has_booru, has_ehentai))
+        .scope(BotCommandScope::AllChatAdministrators)
+        .await
+    {
+        tracing::warn!("Failed to set group administrator commands: {:#}", e);
     }
 
     // 2. 从数据库获取所有管理员用户，为他们设置对应的命令可见性

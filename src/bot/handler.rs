@@ -94,6 +94,9 @@ impl BotHandler {
         cmd: Command,
         ctx: crate::bot::UserChatContext,
     ) -> ResponseResult<()> {
+        if super::permissions::message_actor(&msg).is_none() {
+            return Ok(());
+        }
         let chat_id = msg.chat.id;
         let user_id = msg.from.as_ref().map(|u| u.id.0 as i64).unwrap_or(0);
 
@@ -173,20 +176,16 @@ impl BotHandler {
             Command::EStatus {} => self.handle_estatus(bot, chat_id).await,
             Command::Telegraph(args) => self.handle_telegraph(bot, msg, chat_id, args).await,
 
-            // Admin commands (require admin or owner role, defined in handlers/admin.rs)
-            Command::EnableChat(args) if user_role.is_admin() => {
-                self.handle_enable_chat(bot, chat_id, args, true).await
-            }
-            Command::DisableChat(args) if user_role.is_admin() => {
-                self.handle_enable_chat(bot, chat_id, args, false).await
-            }
+            // Chat control checks global or current-group privileges at the operation entrypoint.
+            Command::EnableChat(args) => self.handle_enable_chat(bot, &msg, args, true).await,
+            Command::DisableChat(args) => self.handle_enable_chat(bot, &msg, args, false).await,
 
             // Owner commands (require owner role, defined in handlers/admin.rs)
             Command::SetAdmin(args) if user_role.is_owner() => {
-                self.handle_set_admin(bot, chat_id, args, true).await
+                self.handle_set_admin(bot, &msg, args, true).await
             }
             Command::UnsetAdmin(args) if user_role.is_owner() => {
-                self.handle_set_admin(bot, chat_id, args, false).await
+                self.handle_set_admin(bot, &msg, args, false).await
             }
 
             // Silently ignore unauthorized commands

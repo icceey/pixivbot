@@ -1,10 +1,11 @@
 use super::Repo;
 use crate::db::entities::chats;
-use crate::db::types::Tags;
+use crate::db::types::{TagEditMode, Tags};
 use anyhow::{Context, Result};
 use chrono::Local;
 use sea_orm::{
-    sea_query::OnConflict, ActiveModelTrait, ConnectionTrait, EntityTrait, IntoActiveModel, Set,
+    sea_query::{Expr, OnConflict},
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, IntoActiveModel, QueryFilter, Set,
     Statement,
 };
 
@@ -114,34 +115,54 @@ impl Repo {
             .context("Failed to update blur_sensitive_tags")
     }
 
-    pub async fn set_excluded_tags(&self, chat_id: i64, tags: Tags) -> Result<chats::Model> {
-        let chat = chats::Entity::find_by_id(chat_id)
-            .one(&self.db)
+    /// Read the latest list at submission; Telegram updates in one chat are serialized.
+    pub async fn edit_chat_tags(
+        &self,
+        chat_id: i64,
+        is_sensitive: bool,
+        mode: TagEditMode,
+        input: Tags,
+    ) -> Result<Tags> {
+        let column = if is_sensitive {
+            chats::Column::SensitiveTags
+        } else {
+            chats::Column::ExcludedTags
+        };
+        let chat = self.get_chat(chat_id).await?.context("Chat not found")?;
+        let current = if is_sensitive {
+            chat.sensitive_tags
+        } else {
+            chat.excluded_tags
+        };
+        let updated = match mode {
+            TagEditMode::Append => {
+                let mut seen = std::collections::HashSet::new();
+                Tags(
+                    current
+                        .iter()
+                        .chain(input.iter())
+                        .filter(|tag| seen.insert((*tag).clone()))
+                        .cloned()
+                        .collect(),
+                )
+            }
+            TagEditMode::Remove => Tags(
+                current
+                    .iter()
+                    .filter(|tag| !input.contains(tag))
+                    .cloned()
+                    .collect(),
+            ),
+            TagEditMode::Replace => input,
+        };
+        let result = chats::Entity::update_many()
+            .col_expr(column, Expr::value(updated.clone()))
+            .filter(chats::Column::Id.eq(chat_id))
+            .exec(&self.db)
             .await
-            .context("Failed to query chat")?
-            .ok_or_else(|| anyhow::anyhow!("Chat {} not found", chat_id))?;
-
-        let mut active: chats::ActiveModel = chat.into_active_model();
-        active.excluded_tags = Set(tags);
-        active
-            .update(&self.db)
-            .await
-            .context("Failed to update excluded_tags")
-    }
-
-    pub async fn set_sensitive_tags(&self, chat_id: i64, tags: Tags) -> Result<chats::Model> {
-        let chat = chats::Entity::find_by_id(chat_id)
-            .one(&self.db)
-            .await
-            .context("Failed to query chat")?
-            .ok_or_else(|| anyhow::anyhow!("Chat {} not found", chat_id))?;
-
-        let mut active: chats::ActiveModel = chat.into_active_model();
-        active.sensitive_tags = Set(tags);
-        active
-            .update(&self.db)
-            .await
-            .context("Failed to update sensitive_tags")
+            .context("Failed to edit chat tags")?;
+        anyhow::ensure!(result.rows_affected == 1, "Chat not found");
+        Ok(updated)
     }
 
     pub async fn get_chat(&self, chat_id: i64) -> Result<Option<chats::Model>> {
