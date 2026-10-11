@@ -147,7 +147,26 @@ async fn role(repo: &Repo, id: i64) -> UserRole {
 async fn telegram_roles_are_scoped_and_queries_fail_closed() {
     for status in ["creator", "administrator", "member"] {
         let (server, bot, handler) = fixture().await;
-        mock_member(&server, -100, 2, member(status, 2, "Alice")).await;
+        Mock::given(path("/botfake_token/GetChatMember"))
+            .and(body_partial_json(json!({"chat_id": -100, "user_id": 2})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(member(status, 2, "Alice")))
+            .expect(4)
+            .mount(&server)
+            .await;
+        for command_type in [
+            Command::EnableChat("invalid".into()),
+            Command::DisableChat("invalid".into()),
+        ] {
+            command(&handler, &bot, message(-100, 2), command_type).await;
+        }
+        let responses = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|request| request.url.path() == "/botfake_token/SendMessage")
+            .count();
+        assert_eq!(responses, if status == "member" { 0 } else { 2 });
         command(
             &handler,
             &bot,

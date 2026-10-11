@@ -87,7 +87,7 @@ impl BotHandler {
     /// 启用或禁用聊天
     ///
     /// # Arguments
-    /// * `current_chat_id` - 当前聊天ID（用于发送响应消息）
+    /// * `msg` - 包含实际发送者和当前聊天的命令消息
     /// * `args` - 目标聊天ID（可选，默认为当前聊天）
     /// * `enabled` - true: 启用, false: 禁用
     pub async fn handle_enable_chat(
@@ -101,6 +101,21 @@ impl BotHandler {
         let Some(actor) = crate::bot::permissions::message_actor(msg) else {
             return Ok(());
         };
+        let global_admin = match self.repo.get_user(actor.id.0 as i64).await {
+            Ok(Some(user)) => user.role.is_admin(),
+            Ok(None) => false,
+            Err(e) => {
+                error!("Failed to authorize chat control: {:#}", e);
+                return Ok(());
+            }
+        };
+        if !global_admin
+            && !crate::bot::permissions::can_manage_chat(&bot, &self.repo, &msg.chat, actor.id)
+                .await
+        {
+            return Ok(());
+        }
+
         // Parse target chat_id from args, or use current chat_id
         let target_chat_id = if args.trim().is_empty() {
             current_chat_id.0
@@ -123,19 +138,7 @@ impl BotHandler {
             }
         };
 
-        let global_admin = match self.repo.get_user(actor.id.0 as i64).await {
-            Ok(Some(user)) => user.role.is_admin(),
-            Ok(None) => false,
-            Err(e) => {
-                error!("Failed to authorize chat control: {:#}", e);
-                return Ok(());
-            }
-        };
-        if !global_admin
-            && (target_chat_id != current_chat_id.0
-                || !crate::bot::permissions::can_manage_chat(&bot, &self.repo, &msg.chat, actor.id)
-                    .await)
-        {
+        if !global_admin && target_chat_id != current_chat_id.0 {
             return Ok(());
         }
 
