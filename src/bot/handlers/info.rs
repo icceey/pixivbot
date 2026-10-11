@@ -100,6 +100,17 @@ impl BotHandler {
 
 🗑 `/clearexcludedtags`
    清除所有排除的标签
+
+🔑 `/enablechat [chat_id]` / `/disablechat [chat_id]`
+   全局管理员可管理聊天；群主和群管理员自动获得当前群的管理权限
+   群权限不写入全局角色，不能管理其他聊天或授予全局角色
+   `/settings` 的修改也支持当前群管理员，提交时重新验证权限
+
+👑 `/setadmin <user_id|@username>` / `/unsetadmin <user_id|@username>`
+   仅 Owner 可设置或取消全局 Bot Admin，不能修改 Owner
+   也可不带参数回复用户消息；转发消息以实际发送者为目标
+   目标须已有数据库记录；用户名仅支持已知且能实时验证的用户
+   无法验证时请改用数字 ID 或回复；不支持匿名和频道发送者
 "#;
 
         bot.send_message(chat_id, help_text)

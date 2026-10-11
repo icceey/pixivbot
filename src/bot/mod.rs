@@ -4,6 +4,7 @@ mod handlers;
 pub mod link_handler;
 pub mod middleware;
 pub mod notifier;
+mod permissions;
 pub mod state;
 
 use crate::booru::BooruSiteRegistry;
@@ -118,16 +119,12 @@ fn build_handler_tree(
 ) -> teloxide::dispatching::UpdateHandler<Box<dyn std::error::Error + Send + Sync + 'static>> {
     // 管理员启用/禁用聊天命令 - 只检查用户权限，不检查聊天是否启用
     // 这允许管理员在禁用的聊天中使用 /enablechat 命令
-    // 注意：此处的 is_admin() 检查与 handler 中 dispatch_command 的 pattern guard 是有意重复的（纵深防御）
+    // 权限在操作入口按目标聊天实时检查，不能将群管理员提升为全局角色。
     // 注意：admin_chat_control_handler 不使用 filter_mention_requirement，因为管理员命令总是需要能够执行
     let admin_chat_control_handler = Message::filter_text()
         .chain(middleware::filter_hybrid_command::<Command, HandlerResult>())
         .chain(middleware::filter_user_chat())
-        .filter(|cmd: Command, ctx: UserChatContext| {
-            // 仅当用户是管理员且命令是 EnableChat 或 DisableChat 时处理
-            ctx.user.role.is_admin()
-                && matches!(cmd, Command::EnableChat(_) | Command::DisableChat(_))
-        })
+        .filter(|cmd: Command| matches!(cmd, Command::EnableChat(_) | Command::DisableChat(_)))
         .endpoint(handle_command);
 
     // 常规命令 - 保持原有的聊天可访问性检查，并添加 @mention 要求检查
@@ -440,23 +437,24 @@ async fn handle_download_callback(
     let user_id = q.from.id.0 as i64;
     match repo.get_chat(chat_id.0).await {
         Ok(Some(chat)) => {
-            if !chat.enabled {
-                // Check if user is admin who can still access disabled chats
-                match repo.get_user(user_id).await {
-                    Ok(Some(user)) if user.role.is_admin() => {
-                        // Admin can access disabled chats
-                    }
-                    _ => {
-                        warn!(
-                            "User {} attempted to use download button in disabled chat {}",
-                            user_id, chat_id
-                        );
-                        let _ = bot
-                            .send_message(chat_id, "❌ 此聊天未启用，无法使用下载功能")
-                            .await;
-                        return Ok(());
-                    }
-                }
+            if !chat.enabled
+                && (q.from.is_bot
+                    || !permissions::can_manage_chat(
+                        &bot,
+                        &repo,
+                        q.message.as_ref().unwrap().chat(),
+                        q.from.id,
+                    )
+                    .await)
+            {
+                warn!(
+                    "User {} attempted download in disabled chat {}",
+                    user_id, chat_id
+                );
+                let _ = bot
+                    .send_message(chat_id, "❌ 此聊天未启用，无法使用下载功能")
+                    .await;
+                return Ok(());
             }
         }
         Ok(None) => {
@@ -545,20 +543,24 @@ async fn handle_booru_download_callback(
     let user_id = q.from.id.0 as i64;
     match repo.get_chat(chat_id.0).await {
         Ok(Some(chat)) => {
-            if !chat.enabled {
-                match repo.get_user(user_id).await {
-                    Ok(Some(user)) if user.role.is_admin() => {}
-                    _ => {
-                        warn!(
-                            "User {} attempted to use booru download button in disabled chat {}",
-                            user_id, chat_id
-                        );
-                        let _ = bot
-                            .send_message(chat_id, "❌ 此聊天未启用，无法使用下载功能")
-                            .await;
-                        return Ok(());
-                    }
-                }
+            if !chat.enabled
+                && (q.from.is_bot
+                    || !permissions::can_manage_chat(
+                        &bot,
+                        &repo,
+                        q.message.as_ref().unwrap().chat(),
+                        q.from.id,
+                    )
+                    .await)
+            {
+                warn!(
+                    "User {} attempted booru download in disabled chat {}",
+                    user_id, chat_id
+                );
+                let _ = bot
+                    .send_message(chat_id, "❌ 此聊天未启用，无法使用下载功能")
+                    .await;
+                return Ok(());
             }
         }
         Ok(None) => {

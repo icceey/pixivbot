@@ -3,10 +3,7 @@ use crate::db::entities::users;
 use crate::db::types::UserRole;
 use anyhow::{Context, Result};
 use chrono::Local;
-use sea_orm::{
-    sea_query::OnConflict, ActiveModelTrait, ColumnTrait, EntityTrait, IntoActiveModel,
-    PaginatorTrait, QueryFilter, Set,
-};
+use sea_orm::{sea_query::OnConflict, ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter, Set};
 
 impl Repo {
     pub async fn upsert_user(
@@ -46,6 +43,19 @@ impl Repo {
             .one(&self.db)
             .await
             .context("Failed to get user")
+    }
+
+    /// Cached names are candidates only; callers must verify with Telegram.
+    pub async fn get_username_candidates(&self, username: &str) -> Result<Vec<users::Model>> {
+        use sea_orm::sea_query::{Expr, Func};
+        users::Entity::find()
+            .filter(
+                Expr::expr(Func::lower(Expr::col(users::Column::Username)))
+                    .eq(username.to_ascii_lowercase()),
+            )
+            .all(&self.db)
+            .await
+            .context("Failed to find username candidates")
     }
 
     pub async fn get_admin_users(&self) -> Result<Vec<users::Model>> {
@@ -112,17 +122,17 @@ impl Repo {
     }
 
     pub async fn set_user_role(&self, user_id: i64, role: UserRole) -> Result<users::Model> {
-        let user = users::Entity::find_by_id(user_id)
-            .one(&self.db)
+        anyhow::ensure!(!role.is_owner(), "Owner assignment is not supported here");
+        let result = users::Entity::update_many()
+            .col_expr(users::Column::Role, sea_orm::sea_query::Expr::value(role))
+            .filter(users::Column::Id.eq(user_id))
+            .filter(users::Column::Role.ne(UserRole::Owner))
+            .exec(&self.db)
             .await
-            .context("Failed to query user")?
-            .ok_or_else(|| anyhow::anyhow!("User {} not found", user_id))?;
-
-        let mut active: users::ActiveModel = user.into_active_model();
-        active.role = Set(role);
-        active
-            .update(&self.db)
-            .await
-            .context("Failed to update user role")
+            .context("Failed to update user role")?;
+        anyhow::ensure!(result.rows_affected == 1, "User missing or protected Owner");
+        self.get_user(user_id)
+            .await?
+            .context("Updated user not found")
     }
 }

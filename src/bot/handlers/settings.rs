@@ -221,34 +221,15 @@ pub async fn handle_settings_callback(
 
     let user_id = q.from.id;
 
-    // Check if user is admin (security check)
-    // Note: The middleware ensures users exist via ensure_user_and_chat, so Ok(None)
-    // indicates a data inconsistency issue that should be logged.
-    let user_role = match handler.repo.get_user(user_id.0 as i64).await {
-        Ok(Some(user)) => user.role,
-        Ok(None) => {
-            // This shouldn't happen as middleware ensures users exist
-            warn!(
-                "User {} not found in database during settings callback - data inconsistency",
-                user_id
-            );
-            bot.answer_callback_query(q.id)
-                .text("发生错误，请稍后重试")
-                .show_alert(true)
-                .await?;
-            return Ok(());
-        }
-        Err(e) => {
-            error!("Failed to get user for callback: {:#}", e);
-            bot.answer_callback_query(q.id)
-                .text("发生错误，请稍后重试")
-                .show_alert(true)
-                .await?;
-            return Ok(());
-        }
-    };
-
-    if !user_role.is_admin() {
+    if q.from.is_bot
+        || !crate::bot::permissions::can_manage_chat(
+            &bot,
+            &handler.repo,
+            q.message.as_ref().unwrap().chat(),
+            user_id,
+        )
+        .await
+    {
         bot.answer_callback_query(q.id)
             .text("只有管理员可以修改设置")
             .show_alert(true)
@@ -460,6 +441,15 @@ pub async fn handle_settings_input(
         Some(s @ SettingsState::WaitingForExcludedTags { .. }) => (false, s.settings_message_id()),
         None => return Ok(false), // No active state, not handled
     };
+
+    // Recheck after the dialogue starts: Telegram privileges may have been revoked.
+    if crate::bot::permissions::message_actor(&msg).is_none()
+        || !crate::bot::permissions::can_manage_chat(&bot, &handler.repo, &msg.chat, user_id).await
+    {
+        storage.write().await.remove(&(chat_id, user_id));
+        bot.send_message(chat_id, "只有管理员可以修改设置").await?;
+        return Ok(true);
+    }
 
     let text = msg.text().unwrap_or("");
 

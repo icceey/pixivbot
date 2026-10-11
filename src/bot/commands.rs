@@ -20,13 +20,17 @@ pub enum Command {
     UnsubThis,
     #[command(description = "列出当前订阅\n  用法: /list [ch=<频道ID>]")]
     List(String),
-    #[command(description = "[仅Owner] 设置用户为管理员\n  用法: /setadmin <user_id>")]
+    #[command(
+        description = "[仅Owner] 设置用户为管理员\n  用法: /setadmin <user_id|@username> 或回复用户消息"
+    )]
     SetAdmin(String),
-    #[command(description = "[仅Owner] 移除用户管理员角色\n  用法: /unsetadmin <user_id>")]
+    #[command(
+        description = "[仅Owner] 移除用户管理员角色\n  用法: /unsetadmin <user_id|@username> 或回复用户消息"
+    )]
     UnsetAdmin(String),
-    #[command(description = "[仅Admin] 启用聊天\n  用法: /enablechat [chat_id]")]
+    #[command(description = "[Admin/当前群管理员] 启用聊天\n  用法: /enablechat [chat_id]")]
     EnableChat(String),
-    #[command(description = "[仅Admin] 禁用聊天\n  用法: /disablechat [chat_id]")]
+    #[command(description = "[Admin/当前群管理员] 禁用聊天\n  用法: /disablechat [chat_id]")]
     DisableChat(String),
     #[command(description = "显示和管理聊天设置")]
     Settings,
@@ -136,8 +140,14 @@ impl Command {
     pub fn owner_commands(has_booru: bool, has_ehentai: bool) -> Vec<BotCommand> {
         let mut cmds = Self::admin_commands(has_booru, has_ehentai);
         cmds.extend([
-            BotCommand::new("setadmin", "[Owner] 设置管理员 - /setadmin <user_id>"),
-            BotCommand::new("unsetadmin", "[Owner] 移除管理员 - /unsetadmin <user_id>"),
+            BotCommand::new(
+                "setadmin",
+                "[Owner] 设置管理员 - /setadmin <user_id|@username> 或回复用户消息",
+            ),
+            BotCommand::new(
+                "unsetadmin",
+                "[Owner] 移除管理员 - /unsetadmin <user_id|@username> 或回复用户消息",
+            ),
         ]);
         cmds
     }

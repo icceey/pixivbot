@@ -152,8 +152,20 @@ Pixiv 标记为 AI 生成的作品会在标签首位显示 `#AI生成`，并参�
 
 ### 所有者命令
 
-- `/setadmin <user_id>` - 将用户提升为管理员
-- `/unsetadmin <user_id>` - 将管理员降级为用户
+- `/setadmin <user_id|@username>` - 将已有用户提升为全局 Bot Admin
+- `/unsetadmin <user_id|@username>` - 取消全局 Bot Admin
+- 也可回复用户消息，不带参数执行 `/setadmin` 或 `/unsetadmin`；显式参数优先。A 转发 B 的消息后，回复该消息的目标是实际发送者 A。
+- 仅数据库中的 Owner 可执行；不能通过这两个命令修改 Owner。目标仍需已有数据库记录。
+
+### 部署与权限范围
+
+群主和 Telegram 群管理员自动获得**当前群**的管理权限：启用/禁用该群、修改 `/settings`（包括输入提交时重新检查），以及在该群使用管理员下载按钮权限。此权限不写入数据库全局角色、不授予私聊权限，也不能管理其他群或设置全局管理员。全局 Bot Admin 和 Owner 保留原有跨聊天管理能力。`/unsetadmin` 只取消全局角色，不会撤销 Telegram 本身的群管理身份。
+
+将机器人设为群管理员以确保 [getChatMember](https://core.telegram.org/bots/api#getchatmember) 能可靠查询其他成员。每次受保护操作实时查询；API 查询失败时不授予群权限，无缓存授权。匿名管理员、`sender_chat`（包括以频道身份发送）、机器人发送者均不被当作真实操作者；请切换为个人身份。正常消息的群启用与 @bot 要求保持不变，启停命令仍可在禁用群使用。
+
+Bot API **不支持按任意个人 @username 查询用户 ID**。用户名大小写不敏感，数据库只提供候选 ID；群内通过 `getChatMember` 核对当前 username，私聊通过数字 ID 调用 `getChat` 核对当前私聊 username。未知、已变更、重复歧义或无法验证的用户名明确报错，不猜测 ID、不使用转发来源。用户名改变后，用户应先与机器人交互刷新记录；也可使用数字 ID 或回复实际用户消息。所有方式都要求目标已有数据库记录。
+
+`[telegram].owner_id` 仍是可选数字 ID，Owner 初始化策略未改动；部署时建议明确配置。无需数据库迁移或生产凭证即可运行测试。
 
 ## 贡献
 
