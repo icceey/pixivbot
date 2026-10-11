@@ -115,8 +115,7 @@ impl Repo {
             .context("Failed to update blur_sensitive_tags")
     }
 
-    /// Compare-and-swap the selected list so simultaneous editors do not lose
-    /// each other's changes. Never use a snapshot captured when the panel opened.
+    /// Read the latest list at submission; Telegram updates in one chat are serialized.
     pub async fn edit_chat_tags(
         &self,
         chat_id: i64,
@@ -129,46 +128,41 @@ impl Repo {
         } else {
             chats::Column::ExcludedTags
         };
-        for _ in 0..16 {
-            let chat = self.get_chat(chat_id).await?.context("Chat not found")?;
-            let current = if is_sensitive {
-                chat.sensitive_tags
-            } else {
-                chat.excluded_tags
-            };
-            let updated = match mode {
-                TagEditMode::Append => {
-                    let mut seen = std::collections::HashSet::new();
-                    Tags(
-                        current
-                            .iter()
-                            .chain(input.iter())
-                            .filter(|tag| seen.insert((*tag).clone()))
-                            .cloned()
-                            .collect(),
-                    )
-                }
-                TagEditMode::Remove => Tags(
+        let chat = self.get_chat(chat_id).await?.context("Chat not found")?;
+        let current = if is_sensitive {
+            chat.sensitive_tags
+        } else {
+            chat.excluded_tags
+        };
+        let updated = match mode {
+            TagEditMode::Append => {
+                let mut seen = std::collections::HashSet::new();
+                Tags(
                     current
                         .iter()
-                        .filter(|tag| !input.contains(tag))
+                        .chain(input.iter())
+                        .filter(|tag| seen.insert((*tag).clone()))
                         .cloned()
                         .collect(),
-                ),
-                TagEditMode::Replace => input.clone(),
-            };
-            let result = chats::Entity::update_many()
-                .col_expr(column, Expr::value(updated.clone()))
-                .filter(chats::Column::Id.eq(chat_id))
-                .filter(column.eq(current))
-                .exec(&self.db)
-                .await
-                .context("Failed to edit chat tags")?;
-            if result.rows_affected == 1 {
-                return Ok(updated);
+                )
             }
-        }
-        anyhow::bail!("Chat tags changed too frequently; retry the operation")
+            TagEditMode::Remove => Tags(
+                current
+                    .iter()
+                    .filter(|tag| !input.contains(tag))
+                    .cloned()
+                    .collect(),
+            ),
+            TagEditMode::Replace => input,
+        };
+        let result = chats::Entity::update_many()
+            .col_expr(column, Expr::value(updated.clone()))
+            .filter(chats::Column::Id.eq(chat_id))
+            .exec(&self.db)
+            .await
+            .context("Failed to edit chat tags")?;
+        anyhow::ensure!(result.rows_affected == 1, "Chat not found");
+        Ok(updated)
     }
 
     pub async fn get_chat(&self, chat_id: i64) -> Result<Option<chats::Model>> {

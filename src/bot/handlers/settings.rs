@@ -298,6 +298,28 @@ pub async fn handle_settings_callback(
         return Ok(());
     }
 
+    if q.message
+        .as_ref()
+        .is_some_and(|msg| msg.chat().is_group() || msg.chat().is_supergroup())
+    {
+        let enabled = match handler.repo.get_chat(chat_id.0).await {
+            Ok(Some(chat)) => chat.enabled,
+            Ok(None) => false,
+            Err(e) => {
+                error!("Failed to read chat availability: {:#}", e);
+                false
+            }
+        };
+        if !enabled {
+            storage.write().await.remove(&(chat_id, user_id));
+            bot.answer_callback_query(q.id)
+                .text("请先启用当前群聊，再修改设置")
+                .show_alert(true)
+                .await?;
+            return Ok(());
+        }
+    }
+
     match action {
         "blur:toggle" | "mention:toggle" => {
             let chat = match handler.repo.get_chat(chat_id.0).await {

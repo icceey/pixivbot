@@ -66,7 +66,7 @@ async fn fixture() -> (MockServer, ThrottledBot, BotHandler) {
             id,
             if id > 0 { "private" } else { "group" }.into(),
             None,
-            false,
+            id < 0,
             Default::default(),
         )
         .await
@@ -147,6 +147,9 @@ async fn role(repo: &Repo, id: i64) -> UserRole {
 async fn telegram_roles_are_scoped_and_queries_fail_closed() {
     for status in ["creator", "administrator", "member"] {
         let (server, bot, handler) = fixture().await;
+        for chat in [-100, -200] {
+            handler.repo.set_chat_enabled(chat, false).await.unwrap();
+        }
         Mock::given(path("/botfake_token/GetChatMember"))
             .and(body_partial_json(json!({"chat_id": -100, "user_id": 2})))
             .respond_with(ResponseTemplate::new(200).set_body_json(member(status, 2, "Alice")))
@@ -488,6 +491,18 @@ async fn settings_callback_uses_clicker_and_current_group() {
         assert_eq!(after != before, chat == -100);
     }
     assert_eq!(role(&handler.repo, 2).await, UserRole::User);
+    handler.repo.set_chat_enabled(-100, false).await.unwrap();
+    settings_click(
+        &bot,
+        &handler,
+        &storage,
+        -100,
+        1,
+        teloxide::types::MessageId(5),
+        "settings:edit:exclude",
+    )
+    .await;
+    assert!(storage.read().await.is_empty());
 }
 
 async fn settings_click(
@@ -874,37 +889,12 @@ async fn tag_dialogue_enforces_both_deadlines_and_renews_only_on_selection() {
     assert!(storage.read().await.is_empty());
 }
 
-#[tokio::test]
-async fn simultaneous_tag_appends_do_not_lose_committed_tags() {
-    use crate::db::types::{TagEditMode, Tags};
-    let repo = setup_test_db().await.unwrap();
-    repo.upsert_chat(-100, "group".into(), None, false, Default::default())
-        .await
-        .unwrap();
-    let edits = ["one", "two", "three", "four"].map(|tag| {
-        repo.edit_chat_tags(
-            -100,
-            false,
-            TagEditMode::Append,
-            Tags::from(vec![tag.into()]),
-        )
-    });
-    let [a, b, c, d] = edits;
-    let results = tokio::join!(a, b, c, d);
-    for result in [results.0, results.1, results.2, results.3] {
-        result.unwrap();
-    }
-    let mut tags = repo.get_chat(-100).await.unwrap().unwrap().excluded_tags.0;
-    tags.sort();
-    assert_eq!(tags, vec!["four", "one", "three", "two"]);
-}
-
 async fn dispatch_settings_text(
     bot: &ThrottledBot,
     handler: &BotHandler,
     storage: &crate::bot::state::SettingsStorage,
     text: &str,
-) {
+) -> bool {
     let mut msg = serde_json::to_value(message(-100, 1)).unwrap();
     msg["message_id"] = json!(9000);
     msg["text"] = json!(text);
@@ -926,18 +916,18 @@ async fn dispatch_settings_text(
             update
         ])
         .await;
-    assert!(
-        matches!(&result, std::ops::ControlFlow::Break(Ok(()))),
-        "{text}: {result:?}"
-    );
+    match result {
+        std::ops::ControlFlow::Continue(_) => false,
+        std::ops::ControlFlow::Break(Ok(())) => true,
+        std::ops::ControlFlow::Break(Err(error)) => panic!("{text}: {error}"),
+    }
 }
 
 // The real routing tree must intercept bare controls before mention gating can
 // turn them into tag data in groups requiring /command@bot.
 #[tokio::test]
 async fn active_settings_controls_bypass_mention_without_becoming_tags() {
-    let (_server, bot, handler) = fixture().await;
-    handler.repo.set_chat_enabled(-100, true).await.unwrap();
+    let (server, bot, handler) = fixture().await;
     let storage = crate::bot::state::new_settings_storage();
     for control in [
         "/cancel",
@@ -956,7 +946,7 @@ async fn active_settings_controls_bypass_mention_without_becoming_tags() {
             "settings:mode:replace",
         )
         .await;
-        dispatch_settings_text(&bot, &handler, &storage, control).await;
+        assert!(dispatch_settings_text(&bot, &handler, &storage, control).await);
         assert!(storage.read().await.is_empty());
         assert!(handler
             .repo
@@ -977,6 +967,29 @@ async fn active_settings_controls_bypass_mention_without_becoming_tags() {
         )
         .await;
         assert!(storage.read().await.is_empty());
+    }
+    for text in ["/settings", "/cancel", "ordinary chatter"] {
+        let selector = begin_tag_edit(&bot, &handler, &storage, false).await;
+        settings_click(
+            &bot,
+            &handler,
+            &storage,
+            -100,
+            1,
+            selector,
+            "settings:mode:replace",
+        )
+        .await;
+        storage
+            .write()
+            .await
+            .get_mut(&(ChatId(-100), UserId(1)))
+            .unwrap()
+            .created_at -= std::time::Duration::from_secs(181);
+        let before = server.received_requests().await.unwrap().len();
+        assert!(!dispatch_settings_text(&bot, &handler, &storage, text).await);
+        assert!(storage.read().await.is_empty());
+        assert_eq!(server.received_requests().await.unwrap().len(), before);
     }
 }
 

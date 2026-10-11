@@ -122,6 +122,7 @@ async fn ensure_user_and_chat(
 
     // Check if user already exists
     let user_model = match repo.get_user(user_id).await.context("Failed to get user")? {
+        Some(existing_user) if existing_user.username == username => existing_user,
         Some(existing_user) => repo
             .upsert_user(user_id, username, existing_user.role)
             .await

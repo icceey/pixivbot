@@ -138,7 +138,12 @@ fn build_handler_tree(
             let Some(user) = permissions::message_actor(&msg) else {
                 return false;
             };
-            storage.read().await.contains_key(&(msg.chat.id, user.id))
+            let key = (msg.chat.id, user.id);
+            let mut states = storage.write().await;
+            if states.get(&key).is_some_and(|state| state.is_expired()) {
+                states.remove(&key);
+            }
+            states.contains_key(&key)
         })
         .endpoint(handle_command);
 
@@ -278,9 +283,13 @@ where
         let Some(user) = permissions::message_actor(&msg) else {
             return false;
         };
-        let states = storage.read().await;
+        let key = (msg.chat.id, user.id);
+        let mut states = storage.write().await;
+        if states.get(&key).is_some_and(|state| state.is_expired()) {
+            states.remove(&key);
+        }
         states
-            .get(&(msg.chat.id, user.id))
+            .get(&key)
             .is_some_and(|state| matches!(state.phase, state::SettingsPhase::WaitingForTags { .. }))
     })
 }
