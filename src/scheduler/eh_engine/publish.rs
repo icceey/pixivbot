@@ -263,7 +263,8 @@ impl EhPublishWorker {
                 .as_deref()
                 .expect("Telegraph readiness checked before send");
             let link_text = format!(
-                "📄 [Telegraph 链接]({})",
+                "🖼️ [{}]({})",
+                teloxide::utils::markdown::escape(&delivery.title),
                 teloxide::utils::markdown::escape_link_url(telegraph_url)
             );
             if let Err(error) = self
