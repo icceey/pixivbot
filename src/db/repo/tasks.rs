@@ -60,15 +60,19 @@ impl Repo {
     pub async fn get_pending_tasks_by_type(
         &self,
         task_type: TaskType,
-        limit: u64,
+        limit: Option<u64>,
     ) -> Result<Vec<tasks::Model>> {
         let now = Local::now().naive_local();
 
-        tasks::Entity::find()
+        let query = tasks::Entity::find()
             .filter(tasks::Column::NextPollAt.lte(now))
             .filter(tasks::Column::Type.eq(task_type))
-            .order_by_asc(tasks::Column::NextPollAt)
-            .limit(limit)
+            .order_by_asc(tasks::Column::NextPollAt);
+        let query = match limit {
+            Some(limit) => query.limit(limit),
+            None => query,
+        };
+        query
             .all(&self.db)
             .await
             .context("Failed to get pending tasks by type")

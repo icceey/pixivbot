@@ -168,6 +168,15 @@ async fn main() -> Result<()> {
         image_size,
     );
 
+    // Initialize tag ranking engine
+    let pixiv_tag_engine = scheduler::PixivTagEngine::new(
+        repo.clone(),
+        pixiv_client.clone(),
+        notifier.clone(),
+        &scheduler_config,
+        image_size,
+    );
+
     // Initialize name update engine
     let name_update_engine = scheduler::NameUpdateEngine::new(
         repo.clone(),
@@ -175,7 +184,7 @@ async fn main() -> Result<()> {
         scheduler_config.author_name_update_time.clone(),
     );
 
-    info!("✅ Author, Ranking, and Name Update engines initialized");
+    info!("✅ Author, Ranking, Pixiv Tag, and Name Update engines initialized");
 
     // Spawn all engines in background
     let author_engine_handle = tokio::spawn(async move {
@@ -188,6 +197,10 @@ async fn main() -> Result<()> {
 
     let name_update_engine_handle = tokio::spawn(async move {
         name_update_engine.run().await;
+    });
+
+    let pixiv_tag_engine_handle = tokio::spawn(async move {
+        pixiv_tag_engine.run().await;
     });
 
     let booru_registry = booru::BooruSiteRegistry::from_configs(&config.booru.sites);
@@ -540,6 +553,7 @@ async fn main() -> Result<()> {
     bot_handle.abort();
     author_engine_handle.abort();
     ranking_engine_handle.abort();
+    pixiv_tag_engine_handle.abort();
     name_update_engine_handle.abort();
     if let Some(handle) = booru_engine_handle {
         handle.abort();

@@ -1,5 +1,8 @@
 use anyhow::{Context, Result};
 use sea_orm::DatabaseConnection;
+use std::collections::HashMap;
+use std::sync::Weak;
+use tokio::sync::Mutex;
 
 mod chats;
 pub mod eh_download_completions;
@@ -9,6 +12,8 @@ pub mod eh_gallery_push_ledger;
 pub mod eh_gallery_results;
 pub mod eh_gp_spend_attempts;
 mod messages;
+mod pixiv_push;
+pub mod pixiv_tag;
 mod stats;
 mod subscriptions;
 mod tasks;
@@ -16,11 +21,15 @@ mod users;
 
 pub struct Repo {
     db: DatabaseConnection,
+    pixiv_push_locks: Mutex<HashMap<i64, Weak<Mutex<()>>>>,
 }
 
 impl Repo {
     pub fn new(db: DatabaseConnection) -> Self {
-        Self { db }
+        Self {
+            db,
+            pixiv_push_locks: Mutex::new(HashMap::new()),
+        }
     }
 
     pub async fn ping(&self) -> Result<()> {
@@ -81,6 +90,17 @@ pub mod tests_helpers {
             )
             "#,
         ))
+        .await?;
+
+        db.execute_unprepared(
+            "CREATE TABLE pixiv_push_history (
+                chat_id INTEGER NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+                illust_id INTEGER NOT NULL,
+                sent_pages TEXT NOT NULL DEFAULT '[]',
+                done BOOLEAN NOT NULL DEFAULT 0,
+                PRIMARY KEY(chat_id, illust_id)
+            )",
+        )
         .await?;
 
         db.execute(Statement::from_string(
@@ -434,8 +454,28 @@ mod tests {
         .await
         .unwrap();
 
+        repo.save_pixiv_push_progress(old_chat_id, 1, &[0, 1], false, None)
+            .await
+            .unwrap();
+        repo.save_pixiv_push_progress(new_chat_id, 1, &[1, 2], false, None)
+            .await
+            .unwrap();
+        repo.save_pixiv_push_progress(old_chat_id, 2, &[0], false, None)
+            .await
+            .unwrap();
+        repo.save_pixiv_push_progress(new_chat_id, 2, &[], true, None)
+            .await
+            .unwrap();
         repo.migrate_chat(old_chat_id, new_chat_id).await.unwrap();
 
+        assert_eq!(
+            repo.pixiv_push_progress(new_chat_id, 1)
+                .await
+                .unwrap()
+                .sent_pages,
+            vec![0, 1, 2]
+        );
+        assert!(repo.pixiv_push_progress(new_chat_id, 2).await.unwrap().done);
         let new_chat = repo.get_chat(new_chat_id).await.unwrap().unwrap();
         assert!(new_chat.enabled);
         assert_eq!(new_chat.title, Some("Old Group".to_string()));

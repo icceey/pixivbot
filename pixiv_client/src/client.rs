@@ -175,6 +175,29 @@ impl PixivClient {
         self.get("/v1/user/illusts", &params).await
     }
 
+    /// 按精确标签查询指定日期范围，按作品发布时间从旧到新分页。
+    pub async fn search_illusts(
+        &self,
+        word: &str,
+        start_date: &str,
+        end_date: &str,
+        offset: u32,
+    ) -> Result<SearchIllusts> {
+        self.get(
+            "/v1/search/illust",
+            &[
+                ("word", word.to_owned()),
+                ("search_target", "exact_match_for_tags".to_owned()),
+                ("sort", "date_asc".to_owned()),
+                ("filter", "for_ios".to_owned()),
+                ("start_date", start_date.to_owned()),
+                ("end_date", end_date.to_owned()),
+                ("offset", offset.to_string()),
+            ],
+        )
+        .await
+    }
+
     /// 获取作品详情
     pub async fn illust_detail(&self, illust_id: u64) -> Result<IllustDetail> {
         let params = vec![("illust_id", illust_id.to_string())];

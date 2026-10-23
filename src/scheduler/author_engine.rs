@@ -4,8 +4,7 @@ use crate::db::types::{AuthorState, PendingIllust, SubscriptionState, TaskType};
 use crate::pixiv::client::PixivClient;
 use crate::scheduler::helpers::{
     apply_subscription_tag_filter, author_subscription_state, get_chat_if_should_notify,
-    process_illust_push, save_first_message_record, AuthorContext, PushResult,
-    INTER_SUBSCRIPTION_DELAY_MS,
+    process_illust_push, AuthorContext, PushResult, INTER_SUBSCRIPTION_DELAY_MS,
 };
 use anyhow::{Context, Result};
 use chrono::Local;
@@ -73,7 +72,7 @@ impl AuthorEngine {
         // Get one pending author task
         let tasks = self
             .repo
-            .get_pending_tasks_by_type(TaskType::Author, 1)
+            .get_pending_tasks_by_type(TaskType::Author, Some(1))
             .await?;
 
         let task = match tasks.first() {
@@ -224,23 +223,6 @@ impl AuthorEngine {
         Self::author_state(latest_illust_id, None)
     }
 
-    async fn save_push_message_record(
-        &self,
-        chat_id: ChatId,
-        subscription_id: i32,
-        illust_id: u64,
-        first_message_id: Option<i32>,
-    ) {
-        save_first_message_record(
-            &self.repo,
-            chat_id,
-            subscription_id,
-            first_message_id,
-            Some(illust_id as i64),
-        )
-        .await;
-    }
-
     fn pending_retry_state(
         latest_illust_id: u64,
         pending: &PendingIllust,
@@ -364,39 +346,29 @@ impl AuthorEngine {
 
         // Send remaining pages
         let push_result = process_illust_push(
+            &self.repo,
             &self.notifier,
             &self.pixiv_client,
-            ctx,
+            &ctx.chat,
             illust,
-            &pending.sent_pages,
+            ctx.subscription.id,
             self.image_size,
         )
         .await?;
 
         // Calculate new state based on result
         let new_state = match push_result {
-            PushResult::Success {
-                illust_id,
-                first_message_id,
-            } => {
+            PushResult::Success { illust_id } => {
                 info!(
                     "✅ Completed pending illust {} for chat {}",
                     illust_id, chat_id
                 );
-                self.save_push_message_record(
-                    chat_id,
-                    ctx.subscription.id,
-                    illust_id,
-                    first_message_id,
-                )
-                .await;
                 Self::clear_pending_state(illust_id)
             }
             PushResult::Partial {
                 illust_id,
                 sent_pages,
                 total_pages,
-                first_message_id,
             } => {
                 warn!(
                     "⚠️  Partially sent illust {} ({}/{} pages)",
@@ -404,13 +376,6 @@ impl AuthorEngine {
                     sent_pages.len(),
                     total_pages
                 );
-                self.save_push_message_record(
-                    chat_id,
-                    ctx.subscription.id,
-                    illust_id,
-                    first_message_id,
-                )
-                .await;
                 Self::partial_push_state(
                     state.latest_illust_id,
                     illust_id,
@@ -491,39 +456,29 @@ impl AuthorEngine {
 
         // Push this single illust
         let push_result = process_illust_push(
+            &self.repo,
             &self.notifier,
             &self.pixiv_client,
-            ctx,
+            &ctx.chat,
             illust,
-            &Vec::new(),
+            ctx.subscription.id,
             self.image_size,
         )
         .await?;
 
         // Calculate new state based on result
         let new_state = match push_result {
-            PushResult::Success {
-                illust_id,
-                first_message_id,
-            } => {
+            PushResult::Success { illust_id } => {
                 info!(
                     "✅ Successfully sent illust {} to chat {}",
                     illust_id, chat_id
                 );
-                self.save_push_message_record(
-                    chat_id,
-                    ctx.subscription.id,
-                    illust_id,
-                    first_message_id,
-                )
-                .await;
                 Self::clear_pending_state(illust_id)
             }
             PushResult::Partial {
                 illust_id,
                 sent_pages,
                 total_pages,
-                first_message_id,
             } => {
                 warn!(
                     "⚠️  Partially sent illust {} ({}/{} pages)",
@@ -531,13 +486,6 @@ impl AuthorEngine {
                     sent_pages.len(),
                     total_pages
                 );
-                self.save_push_message_record(
-                    chat_id,
-                    ctx.subscription.id,
-                    illust_id,
-                    first_message_id,
-                )
-                .await;
                 Self::partial_push_state(
                     last_illust_id.unwrap_or(0),
                     illust_id,

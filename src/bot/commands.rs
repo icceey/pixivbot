@@ -12,6 +12,10 @@ pub enum Command {
     Sub(String),
     #[command(description = "订阅排行榜\n  用法: /subrank [ch=<频道ID>] <mode>")]
     SubRank(String),
+    #[command(description = "订阅标签热榜\n  用法: /subtag <标签> bookmarks=300")]
+    SubTag(String),
+    #[command(description = "取消标签热榜\n  用法: /unsubtag <标签搜索词>")]
+    UnsubTag(String),
     #[command(description = "取消订阅作者\n  用法: /unsub [ch=<频道ID>] <author_id,...>")]
     Unsub(String),
     #[command(description = "取消订阅排行榜\n  用法: /unsubrank [ch=<频道ID>] <mode>")]
@@ -72,6 +76,8 @@ impl Command {
         let mut commands = vec![
             BotCommand::new("sub", "订阅作者 - /sub [ch=<频道ID>] <id,...>"),
             BotCommand::new("subrank", "订阅排行榜 - /subrank [ch=<频道ID>] <mode>"),
+            BotCommand::new("subtag", "订阅标签热榜 - /subtag <标签> bookmarks=300"),
+            BotCommand::new("unsubtag", "取消标签热榜 - /unsubtag <标签搜索词>"),
             BotCommand::new("list", "列出当前订阅 - /list [ch=<频道ID>]"),
             BotCommand::new("unsub", "取消订阅作者 - /unsub [ch=<频道ID>] <id,...>"),
             BotCommand::new(

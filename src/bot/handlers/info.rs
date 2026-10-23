@@ -74,6 +74,11 @@ impl BotHandler {
    \- 排除 AI 生成作品: `/subrank day \-AI生成`
    \- 也可在 /settings 的排除标签或敏感标签中添加 `AI生成`
 
+🔥 `/subtag <标签搜索词> bookmarks=300 [+tag \-tag]`
+   订阅标签近似热榜，观察发布后窗口内的作品，收藏达标后推送
+   观察窗口由配置文件统一设置，默认 7 天；重复命令可修改收藏阈值并保留推送进度
+   `/unsubtag <标签搜索词>` 取消订阅；支持前置 `ch=<频道ID>`
+
 🗑 `/unsub <author_id,...>`
    取消订阅作者
    \- 使用逗号分隔的作者 ID \(Pixiv 用户 ID\)

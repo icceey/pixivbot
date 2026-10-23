@@ -44,6 +44,7 @@ impl Notifier {
                     effective_cap.as_deref(),
                     has_spoiler,
                     keyboard,
+                    numbering.first_batch_number > 1,
                 )
                 .await
             {
@@ -100,7 +101,7 @@ impl Notifier {
                 CaptionStrategy::Shared(_) => None,
             };
 
-            let silent = batch_idx > 0;
+            let silent = continuation_numbering.display_batch_number(batch_idx) > 1;
 
             match self
                 .send_media_batch(
@@ -162,6 +163,7 @@ impl Notifier {
         caption: Option<&str>,
         has_spoiler: bool,
         keyboard: Option<InlineKeyboardMarkup>,
+        silent: bool,
     ) -> Result<i32> {
         info!(
             "Downloading and sending image to chat {}: {}",
@@ -175,7 +177,7 @@ impl Notifier {
             warn!("Failed to set chat action for chat {}: {:#}", chat_id, e);
         }
         let local_path = self.downloader.download(image_url).await?;
-        self.send_photo_file_with_id(chat_id, &local_path, caption, has_spoiler, keyboard)
+        self.send_photo_file_with_id(chat_id, &local_path, caption, has_spoiler, keyboard, silent)
             .await
     }
 }

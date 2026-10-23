@@ -7,7 +7,7 @@ use std::io::{Cursor, Read};
 use std::path::PathBuf;
 #[cfg(feature = "ffmpeg-codec")]
 use std::sync::OnceLock;
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::cache::FileCacheManager;
 
@@ -53,23 +53,20 @@ impl Downloader {
     }
 
     /// 批量下载多张图片 (用于多图作品)
-    /// 返回所有下载成功的文件路径
+    /// 保持输入顺序与数量；任一下载失败则整批重试，已下载文件会命中缓存。
+    /// Notifier 使用返回位置追踪原始页码，不能过滤失败项后压缩索引。
     pub async fn download_all(&self, urls: &[String]) -> Result<Vec<PathBuf>> {
         info!("Batch downloading {} images", urls.len());
 
         let mut paths = Vec::with_capacity(urls.len());
 
         for (idx, url) in urls.iter().enumerate() {
-            match self.download(url).await {
-                Ok(path) => {
-                    info!("Downloaded {}/{}: {:?}", idx + 1, urls.len(), path);
-                    paths.push(path);
-                }
-                Err(e) => {
-                    // 继续下载其他图片,不因一张失败而中断
-                    warn!("Failed to download image[{}] ({}): {:#}", idx + 1, url, e);
-                }
-            }
+            let path = self
+                .download(url)
+                .await
+                .with_context(|| format!("Failed to download image[{}]", idx))?;
+            info!("Downloaded {}/{}: {:?}", idx + 1, urls.len(), path);
+            paths.push(path);
         }
 
         if paths.is_empty() {

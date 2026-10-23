@@ -10,6 +10,8 @@ pub enum TaskType {
     Author,
     #[sea_orm(string_value = "ranking")]
     Ranking,
+    #[sea_orm(string_value = "pixiv_tag")]
+    PixivTag,
     #[sea_orm(string_value = "booru_tag")]
     BooruTag,
     #[sea_orm(string_value = "booru_pool")]
@@ -25,6 +27,7 @@ impl fmt::Display for TaskType {
         match self {
             TaskType::Author => write!(f, "author"),
             TaskType::Ranking => write!(f, "ranking"),
+            TaskType::PixivTag => write!(f, "pixiv_tag"),
             TaskType::BooruTag => write!(f, "booru_tag"),
             TaskType::BooruPool => write!(f, "booru_pool"),
             TaskType::BooruRanking => write!(f, "booru_ranking"),

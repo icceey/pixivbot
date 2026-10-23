@@ -131,13 +131,13 @@ impl BooruEngine {
     async fn tick(&self) -> Result<()> {
         let tag_task = self
             .repo
-            .get_pending_tasks_by_type(TaskType::BooruTag, 1)
+            .get_pending_tasks_by_type(TaskType::BooruTag, Some(1))
             .await?
             .into_iter()
             .next();
         let ranking_task = self
             .repo
-            .get_pending_tasks_by_type(TaskType::BooruRanking, 1)
+            .get_pending_tasks_by_type(TaskType::BooruRanking, Some(1))
             .await?
             .into_iter()
             .next();

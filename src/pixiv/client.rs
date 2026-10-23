@@ -3,6 +3,9 @@ use anyhow::Result;
 use pixiv_client::{self, Illust};
 use tracing::info;
 
+// Pixiv's publication dates use Japan Standard Time, independent of the host TZ.
+pub const SEARCH_TIMEZONE: chrono::FixedOffset = chrono::FixedOffset::east_opt(9 * 3600).unwrap();
+
 pub struct PixivClient {
     client: pixiv_client::PixivClient,
 }
@@ -46,6 +49,38 @@ impl PixivClient {
         info!("Fetched {} ranking illusts", illusts.len());
 
         Ok(illusts)
+    }
+
+    /// Search an inclusive date range from oldest to newest.
+    pub async fn search_illusts(
+        &self,
+        query: &str,
+        start: chrono::NaiveDate,
+        end: chrono::NaiveDate,
+        offset: u32,
+    ) -> Result<(Vec<Illust>, Option<u32>)> {
+        let start_date = start.format("%Y-%m-%d").to_string();
+        let end_date = end.format("%Y-%m-%d").to_string();
+        let response = self
+            .client
+            .search_illusts(query, &start_date, &end_date, offset)
+            .await?;
+        let next_offset = response
+            .next_url
+            .map(|next| -> Result<u32> {
+                let next = url::Url::parse(&next)?;
+                let offset_value = next
+                    .query_pairs()
+                    .find(|(key, _)| key == "offset")
+                    .ok_or_else(|| anyhow::anyhow!("Search pagination has no offset"))?
+                    .1;
+                let next_offset: u32 = offset_value.parse()?;
+                anyhow::ensure!(next_offset > offset, "Search pagination did not advance");
+                Ok(next_offset)
+            })
+            .transpose()?;
+        // Only reuse the offset, never fetch an arbitrary next_url with authentication.
+        Ok((response.illusts, next_offset))
     }
 
     /// Get illust detail by ID

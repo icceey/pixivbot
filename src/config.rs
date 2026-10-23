@@ -101,6 +101,17 @@ pub struct SchedulerConfig {
     /// Ranking task execution time in HH:MM format (default: "19:00")
     #[serde(default = "default_ranking_execution_time")]
     pub ranking_execution_time: String,
+    /// Shared observation window for Pixiv tag rankings, in days (default: 7).
+    #[serde(default = "default_pixiv_tag_window_days")]
+    pub pixiv_tag_window_days: u16,
+    #[serde(default = "default_pixiv_tag_scan_target_hours")]
+    pub pixiv_tag_scan_target_hours: u16,
+    #[serde(default = "default_pixiv_tag_scan_pages")]
+    pub pixiv_tag_scan_pages: u32,
+    #[serde(default = "default_pixiv_tag_scan_min_interval_minutes")]
+    pub pixiv_tag_scan_min_interval_minutes: u16,
+    #[serde(default = "default_pixiv_tag_scan_max_interval_minutes")]
+    pub pixiv_tag_scan_max_interval_minutes: u16,
     /// Author name update time in HH:MM format (default: "21:00")
     /// Updates author names daily to sync with Pixiv profile changes
     #[serde(default = "default_author_name_update_time")]
@@ -133,6 +144,26 @@ fn default_max_retry_count() -> i32 {
 
 fn default_ranking_execution_time() -> String {
     "19:00".to_string()
+}
+
+fn default_pixiv_tag_window_days() -> u16 {
+    7
+}
+
+fn default_pixiv_tag_scan_target_hours() -> u16 {
+    12
+}
+
+fn default_pixiv_tag_scan_pages() -> u32 {
+    3
+}
+
+fn default_pixiv_tag_scan_min_interval_minutes() -> u16 {
+    5
+}
+
+fn default_pixiv_tag_scan_max_interval_minutes() -> u16 {
+    24 * 60
 }
 
 fn default_author_name_update_time() -> String {
@@ -651,11 +682,24 @@ impl Config {
             .add_source(config::File::with_name("config.toml").required(false))
             .add_source(config::Environment::with_prefix("PIX").separator("__"));
 
-        builder
+        let config: Self = builder
             .build()
             .context("Failed to build configuration")?
             .try_deserialize()
-            .context("Failed to deserialize configuration")
+            .context("Failed to deserialize configuration")?;
+        anyhow::ensure!(
+            config.scheduler.pixiv_tag_window_days > 0,
+            "scheduler.pixiv_tag_window_days must be positive"
+        );
+        anyhow::ensure!(
+            config.scheduler.pixiv_tag_scan_target_hours > 0
+                && config.scheduler.pixiv_tag_scan_pages > 0
+                && config.scheduler.pixiv_tag_scan_min_interval_minutes > 0
+                && config.scheduler.pixiv_tag_scan_max_interval_minutes
+                    >= config.scheduler.pixiv_tag_scan_min_interval_minutes,
+            "Pixiv tag scan target, page budget and minimum interval must be positive; maximum interval must be >= minimum"
+        );
+        Ok(config)
     }
 
     pub fn log_level(&self) -> tracing::Level {

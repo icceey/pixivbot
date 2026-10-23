@@ -22,16 +22,12 @@ pub const INTER_SUBSCRIPTION_DELAY_MS: u64 = 2000;
 #[derive(Debug)]
 pub enum PushResult {
     /// All pages sent successfully
-    Success {
-        illust_id: u64,
-        first_message_id: Option<i32>,
-    },
+    Success { illust_id: u64 },
     /// Some pages failed, need to retry
     Partial {
         illust_id: u64,
         sent_pages: Vec<usize>,
         total_pages: usize,
-        first_message_id: Option<i32>,
     },
     /// Complete failure, retry later
     Failure { illust_id: u64 },
@@ -143,149 +139,152 @@ pub async fn get_chat_if_should_notify(
     }
 }
 
-/// Generic push executor: Send specific illust pages (excluding already sent pages)
+/// Shared author/tag sender. Rankings intentionally use their own send path.
 pub async fn process_illust_push(
+    repo: &Repo,
     notifier: &Notifier,
     pixiv: &Arc<RwLock<PixivClient>>,
-    ctx: &AuthorContext<'_>,
+    chat: &chats::Model,
     illust: &Illust,
-    already_sent_pages: &[usize],
+    subscription_id: i32,
     image_size: pixiv_client::ImageSize,
 ) -> Result<PushResult> {
-    // For ugoira works, delegate to the specialized handler
-    if illust.is_ugoira() {
-        return process_ugoira_push(notifier, pixiv, ctx, illust).await;
-    }
-
-    let chat_id = ChatId(ctx.subscription.chat_id);
-    let all_urls = illust.get_all_image_urls_with_size(image_size);
-    let total_pages = all_urls.len();
-
-    // Calculate pages to send
-    let pages_to_send: Vec<usize> = (0..total_pages)
-        .filter(|i| !already_sent_pages.contains(i))
-        .collect();
-
-    if pages_to_send.is_empty() {
+    let _guard = repo.lock_pixiv_push(chat.id).await;
+    let progress = repo.pixiv_push_progress(chat.id, illust.id).await?;
+    if progress.done {
+        info!(
+            "Skipping previously pushed illust {} for chat {}",
+            illust.id, chat.id
+        );
         return Ok(PushResult::Success {
             illust_id: illust.id,
-            first_message_id: None,
+        });
+    }
+    let mut sent_pages = progress.sent_pages;
+    sent_pages.sort_unstable();
+    sent_pages.dedup();
+
+    // For ugoira works, delegate to the specialized handler
+    if illust.is_ugoira() {
+        let result = process_ugoira_push(notifier, pixiv, chat, illust).await?;
+        if result.is_complete_failure() {
+            return Ok(PushResult::Failure {
+                illust_id: illust.id,
+            });
+        }
+        let message_id = result
+            .first_message_id
+            .context("Missing acknowledged animation message ID")?;
+        repo.save_pixiv_push_progress(
+            chat.id,
+            illust.id,
+            &[],
+            true,
+            Some((subscription_id, message_id)),
+        )
+        .await?;
+        return Ok(PushResult::Success {
+            illust_id: illust.id,
         });
     }
 
-    let urls_to_send: Vec<String> = pages_to_send
-        .iter()
-        .filter_map(|&i| all_urls.get(i).cloned())
-        .collect();
+    let chat_id = ChatId(chat.id);
+    let all_urls = illust.get_all_image_urls_with_size(image_size);
+    let total_pages = all_urls.len();
+    anyhow::ensure!(total_pages > 0, "Illustration has no pages");
 
-    // Prepare caption
-    let caption = if already_sent_pages.is_empty() {
-        caption::build_illust_caption(illust)
-    } else {
-        caption::build_continuation_caption(illust, already_sent_pages.len(), total_pages)
-    };
-
-    // Check spoiler setting
-    let has_spoiler = sensitive::should_blur(&ctx.chat, illust);
-
-    // Build download button config
-    // Skip download button for channel chats (channels don't support inline buttons)
-    let download_config = DownloadButtonConfig::for_pixiv_chat(illust.id, &ctx.chat);
-
-    // Send images with download button
-    let continuation_numbering = (!already_sent_pages.is_empty()).then(|| {
-        ContinuationNumbering::new(
-            (already_sent_pages.len() / caption::MAX_PER_GROUP) + 1,
-            total_pages.div_ceil(caption::MAX_PER_GROUP),
-        )
-    });
-
-    let send_result = notifier
-        .notify_with_images_and_button_and_continuation(
-            chat_id,
-            &urls_to_send,
-            Some(&caption),
-            has_spoiler,
-            &download_config,
-            continuation_numbering.unwrap_or_else(|| {
-                ContinuationNumbering::new(1, total_pages.div_ceil(caption::MAX_PER_GROUP))
-            }),
-        )
-        .await;
-
-    // Map send result to PushResult
-    let result = map_send_result_to_push_result(
-        illust.id,
-        send_result,
-        already_sent_pages,
-        &pages_to_send,
-        total_pages,
-    );
-
-    Ok(result)
-}
-
-/// Map BatchSendResult to PushResult
-fn map_send_result_to_push_result(
-    illust_id: u64,
-    send_result: BatchSendResult,
-    already_sent: &[usize],
-    attempted_pages: &[usize],
-    total_pages: usize,
-) -> PushResult {
-    let first_message_id = send_result.first_message_id;
-
-    if send_result.is_complete_success() {
-        // All attempted pages succeeded
-        let mut all_sent = already_sent.to_vec();
-        all_sent.extend(attempted_pages);
-        all_sent.sort();
-        all_sent.dedup();
-
-        if all_sent.len() == total_pages {
-            PushResult::Success {
-                illust_id,
-                first_message_id,
-            }
+    let has_spoiler = sensitive::should_blur(chat, illust);
+    let download_config = DownloadButtonConfig::for_pixiv_chat(illust.id, chat);
+    // Send one original page group at a time and commit its acknowledgement
+    // before starting another. Keep the chat lock for the entire work.
+    for batch_start in (0..total_pages).step_by(caption::MAX_PER_GROUP) {
+        let batch_end = (batch_start + caption::MAX_PER_GROUP).min(total_pages);
+        let attempted: Vec<_> = (batch_start..batch_end)
+            .filter(|page| !sent_pages.contains(page))
+            .collect();
+        if attempted.is_empty() {
+            continue;
+        }
+        let urls: Vec<_> = attempted
+            .iter()
+            .map(|&page| all_urls[page].clone())
+            .collect();
+        let caption = if sent_pages.is_empty() {
+            caption::build_illust_caption(illust)
         } else {
-            // Should not happen, but handle gracefully
-            PushResult::Partial {
-                illust_id,
-                sent_pages: all_sent,
-                total_pages,
-                first_message_id,
+            caption::build_continuation_caption(illust, sent_pages.len(), total_pages)
+        };
+        let result = notifier
+            .notify_with_images_and_button_and_continuation(
+                chat_id,
+                &urls,
+                Some(&caption),
+                has_spoiler,
+                &download_config,
+                ContinuationNumbering::new(
+                    batch_start / caption::MAX_PER_GROUP + 1,
+                    total_pages.div_ceil(caption::MAX_PER_GROUP),
+                ),
+            )
+            .await;
+        if !result.succeeded_indices.is_empty() {
+            for &index in &result.succeeded_indices {
+                sent_pages.push(
+                    *attempted
+                        .get(index)
+                        .context("Invalid acknowledged page index")?,
+                );
+            }
+            sent_pages.sort_unstable();
+            sent_pages.dedup();
+            let message_id = result
+                .first_message_id
+                .context("Missing acknowledged batch message ID")?;
+            let done = (0..total_pages).all(|page| sent_pages.contains(&page));
+            repo.save_pixiv_push_progress(
+                chat.id,
+                illust.id,
+                &sent_pages,
+                done,
+                Some((subscription_id, message_id)),
+            )
+            .await?;
+            if done {
+                return Ok(PushResult::Success {
+                    illust_id: illust.id,
+                });
             }
         }
-    } else if send_result.is_complete_failure() {
-        PushResult::Failure { illust_id }
-    } else {
-        // Partial success
-        let mut all_sent = already_sent.to_vec();
-        for &idx in &send_result.succeeded_indices {
-            if let Some(&page_idx) = attempted_pages.get(idx) {
-                all_sent.push(page_idx);
-            }
-        }
-        all_sent.sort();
-        all_sent.dedup();
-
-        PushResult::Partial {
-            illust_id,
-            sent_pages: all_sent,
-            total_pages,
-            first_message_id,
+        if !result.is_complete_success() {
+            return Ok(if sent_pages.is_empty() {
+                PushResult::Failure {
+                    illust_id: illust.id,
+                }
+            } else {
+                PushResult::Partial {
+                    illust_id: illust.id,
+                    sent_pages,
+                    total_pages,
+                }
+            });
         }
     }
+    // Imported author state may already contain every page.
+    repo.save_pixiv_push_progress(chat.id, illust.id, &[], true, None)
+        .await?;
+    Ok(PushResult::Success {
+        illust_id: illust.id,
+    })
 }
 
 /// Push a ugoira (animated) illust as an MP4 animation
 async fn process_ugoira_push(
     notifier: &Notifier,
     pixiv: &Arc<RwLock<PixivClient>>,
-    ctx: &AuthorContext<'_>,
+    chat: &chats::Model,
     illust: &Illust,
-) -> Result<PushResult> {
-    let chat_id = ChatId(ctx.subscription.chat_id);
+) -> Result<BatchSendResult> {
+    let chat_id = ChatId(chat.id);
 
     // Fetch ugoira metadata (ZIP URL + frame delays)
     let pixiv_guard = pixiv.read().await;
@@ -299,13 +298,13 @@ async fn process_ugoira_push(
     let caption = caption::build_ugoira_caption(illust);
 
     // Check spoiler setting
-    let has_spoiler = sensitive::should_blur(&ctx.chat, illust);
+    let has_spoiler = sensitive::should_blur(chat, illust);
 
     // Build download button config
-    let download_config = DownloadButtonConfig::for_pixiv_chat(illust.id, &ctx.chat);
+    let download_config = DownloadButtonConfig::for_pixiv_chat(illust.id, chat);
 
     // Send ugoira as MP4 animation
-    let send_result = notifier
+    Ok(notifier
         .notify_ugoira(
             chat_id,
             &metadata.zip_urls.medium,
@@ -314,17 +313,5 @@ async fn process_ugoira_push(
             has_spoiler,
             &download_config,
         )
-        .await;
-
-    // Ugoira is a single item, so treat it simply
-    if send_result.is_complete_failure() {
-        Ok(PushResult::Failure {
-            illust_id: illust.id,
-        })
-    } else {
-        Ok(PushResult::Success {
-            illust_id: illust.id,
-            first_message_id: send_result.first_message_id,
-        })
-    }
+        .await)
 }

@@ -305,6 +305,9 @@ impl BotHandler {
             TaskType::BooruTag => {
                 format!("Booru标签 `{}`", markdown::escape(&task_value))
             }
+            TaskType::PixivTag => {
+                format!("标签热榜 {}", markdown::escape(&task_value))
+            }
             TaskType::BooruPool => {
                 format!("Booru Pool `{}`", markdown::escape(&task_value))
             }
