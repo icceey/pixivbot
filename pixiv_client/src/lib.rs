@@ -10,4 +10,6 @@ mod error;
 mod models;
 
 pub use client::PixivClient;
-pub use models::{Illust, ImageSize, UgoiraFrame, UgoiraMetadata, UgoiraMetadataInfo, User};
+pub use models::{
+    Illust, ImageSize, SearchIllusts, UgoiraFrame, UgoiraMetadata, UgoiraMetadataInfo, User,
+};

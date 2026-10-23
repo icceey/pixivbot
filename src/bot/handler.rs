@@ -130,6 +130,8 @@ impl BotHandler {
             // Subscription commands (defined in handlers/subscription.rs)
             Command::Sub(args) => self.handle_sub_author(bot, chat_id, user_id, args).await,
             Command::SubRank(args) => self.handle_sub_ranking(bot, chat_id, user_id, args).await,
+            Command::SubTag(args) => self.handle_sub_tag(bot, chat_id, user_id, args).await,
+            Command::UnsubTag(args) => self.handle_unsub_tag(bot, chat_id, user_id, args).await,
             Command::Unsub(args) => self.handle_unsub_author(bot, chat_id, user_id, args).await,
             Command::UnsubRank(args) => {
                 self.handle_unsub_ranking(bot, chat_id, user_id, args).await

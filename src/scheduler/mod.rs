@@ -3,6 +3,7 @@ mod booru_engine;
 mod eh_engine;
 mod helpers;
 mod name_update_engine;
+mod pixiv_tag_engine;
 mod ranking_engine;
 
 pub use author_engine::AuthorEngine;
@@ -12,4 +13,5 @@ pub use eh_engine::{
     EhTelegraphRewriteWorker, EhUploadWorker,
 };
 pub use name_update_engine::NameUpdateEngine;
+pub use pixiv_tag_engine::PixivTagEngine;
 pub use ranking_engine::RankingEngine;

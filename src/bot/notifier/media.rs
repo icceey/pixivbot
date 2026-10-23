@@ -63,8 +63,12 @@ impl Notifier {
         caption: Option<&str>,
         has_spoiler: bool,
         keyboard: Option<InlineKeyboardMarkup>,
+        silent: bool,
     ) -> Result<i32> {
         let mut req = self.bot.send_photo(chat_id, InputFile::file(path));
+        if silent {
+            req = req.disable_notification(true);
+        }
         if let Some(c) = caption {
             req = req.caption(c).parse_mode(ParseMode::MarkdownV2);
         }

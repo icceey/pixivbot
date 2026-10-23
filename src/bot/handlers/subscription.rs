@@ -4,6 +4,7 @@ mod channel;
 mod ehentai;
 mod helpers;
 mod list;
+mod pixiv_tag;
 mod ranking;
 mod types;
 

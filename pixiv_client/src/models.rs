@@ -158,6 +158,13 @@ pub struct UserIllusts {
     pub next_url: Option<String>,
 }
 
+/// 标签搜索响应，包含作品统计和后续分页地址。
+#[derive(Debug, Clone, Deserialize)]
+pub struct SearchIllusts {
+    pub illusts: Vec<Illust>,
+    pub next_url: Option<String>,
+}
+
 /// 排行榜响应
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Ranking {

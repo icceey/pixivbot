@@ -63,7 +63,7 @@ impl EhEngine {
     pub(super) async fn tick(&self) -> Result<()> {
         let tasks = self
             .repo
-            .get_pending_tasks_by_type(TaskType::Ehentai, 1)
+            .get_pending_tasks_by_type(TaskType::Ehentai, Some(1))
             .await
             .context("Failed to fetch pending eh tasks")?;
 

@@ -19,6 +19,7 @@ mod m20260826_000000_eh_result_reuse_and_push_ledger;
 mod m20260827_000000_eh_legacy_artifact_handoff;
 mod m20260828_000000_eh_job_fingerprint_generations;
 mod m20260829_000000_eh_result_generation_order;
+mod m20261023_000000_pixiv_tag_ranking;
 
 pub struct Migrator;
 
@@ -45,6 +46,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260827_000000_eh_legacy_artifact_handoff::Migration),
             Box::new(m20260828_000000_eh_job_fingerprint_generations::Migration),
             Box::new(m20260829_000000_eh_result_generation_order::Migration),
+            Box::new(m20261023_000000_pixiv_tag_ranking::Migration),
         ]
     }
 }

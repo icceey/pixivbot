@@ -135,6 +135,7 @@ impl BotHandler {
                         let type_emoji = match task.r#type {
                             TaskType::Author => "🎨",
                             TaskType::Ranking => "📊",
+                            TaskType::PixivTag => "🔥",
                             TaskType::BooruTag | TaskType::BooruPool | TaskType::BooruRanking => {
                                 unreachable!("booru task types are handled above")
                             }
@@ -164,6 +165,23 @@ impl BotHandler {
                                     )
                                 }
                             }
+                        } else if task.r#type == TaskType::PixivTag {
+                            let settings = match self.repo.pixiv_tag_settings(sub.id).await {
+                                Ok(Some(settings)) => format!(
+                                    "收藏 ≥ {}，观察窗口由服务器统一配置",
+                                    settings.min_bookmarks
+                                ),
+                                Ok(None) => "配置缺失".to_string(),
+                                Err(e) => {
+                                    error!("Failed to read tag settings: {:#}", e);
+                                    "配置暂时无法读取".to_string()
+                                }
+                            };
+                            format!(
+                                "标签热榜 `{}`：{}",
+                                escape_markdown_code(&task.value),
+                                markdown::escape(&settings)
+                            )
                         } else {
                             format!("ID: `{}`", escape_markdown_code(&task.value))
                         };
@@ -200,6 +218,16 @@ impl BotHandler {
                 } else {
                     vec!["/unsub <id>".to_string(), "/unsubrank <mode>".to_string()]
                 };
+                if page_subscriptions
+                    .iter()
+                    .any(|(_, task)| task.r#type == TaskType::PixivTag)
+                {
+                    unsubscribe_hints.push(if is_channel {
+                        format!("/unsubtag ch={} <标签搜索词>", target_chat_id.0)
+                    } else {
+                        "/unsubtag <标签搜索词>".to_string()
+                    });
+                }
                 if page_has_booru_subscription {
                     unsubscribe_hints.push(if is_channel {
                         format!("/bunsub ch={} <ID>", target_chat_id.0)
@@ -284,7 +312,7 @@ fn booru_list_display(
         TaskType::BooruTag => "🏷",
         TaskType::BooruPool => "📦",
         TaskType::BooruRanking => booru_ranking_list_emoji(task_value),
-        TaskType::Author | TaskType::Ranking | TaskType::Ehentai => {
+        TaskType::Author | TaskType::Ranking | TaskType::PixivTag | TaskType::Ehentai => {
             unreachable!("not a booru task type")
         }
     };
@@ -300,7 +328,7 @@ fn booru_list_display(
             TaskType::BooruTag => "标签",
             TaskType::BooruPool => "Pool",
             TaskType::BooruRanking => "排行",
-            TaskType::Author | TaskType::Ranking | TaskType::Ehentai => {
+            TaskType::Author | TaskType::Ranking | TaskType::PixivTag | TaskType::Ehentai => {
                 unreachable!("not a booru task type")
             }
         };
