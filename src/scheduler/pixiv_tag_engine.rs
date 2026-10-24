@@ -90,11 +90,12 @@ impl PixivTagEngine {
                     .repo
                     .pixiv_tag_scan(task.id, oldest, self.window_days)
                     .await?;
+                let previous = scan.clone();
                 let result = self.execute_task(&task, &mut scan, now).await;
                 let interval = if result.is_err() {
                     chrono::Duration::seconds(self.min_interval_sec)
                 } else {
-                    self.scan_interval(&scan)
+                    self.scan_interval(&previous, &scan, now)
                 };
                 self.repo
                     .update_task_after_poll(task.id, Local::now() + interval)
@@ -109,13 +110,38 @@ impl PixivTagEngine {
         self.send_due().await
     }
 
-    fn scan_interval(&self, scan: &TagScan) -> chrono::Duration {
-        let p = scan.pages_scanned.max(scan.total_pages).max(1) as f64;
-        let target = f64::from(self.scan_target_hours);
-        let a = p / self.window_hours as f64;
-        let p_eff = p + target * a;
-        let runs = (p_eff / f64::from(self.scan_pages)).ceil();
-        let seconds = (target * 3600.0 / runs)
+    fn scan_interval(
+        &self,
+        previous: &TagScan,
+        scan: &TagScan,
+        now: DateTime<Utc>,
+    ) -> chrono::Duration {
+        let window_seconds = self.window_hours * 3600;
+        let window_start = now.timestamp() - window_seconds;
+        let end = if scan.complete {
+            now.timestamp()
+        } else {
+            scan.cursor_time
+                .unwrap_or(window_start)
+                .min(now.timestamp())
+        };
+        let start = previous.cursor_time.unwrap_or_else(|| {
+            if previous.cursor_offset == 0 {
+                previous
+                    .cursor_date
+                    .and_hms_opt(0, 0, 0)
+                    .unwrap()
+                    .and_local_timezone(SEARCH_TIMEZONE)
+                    .unwrap()
+                    .timestamp()
+            } else {
+                // An existing cursor without a timestamp needs one page checkpoint.
+                end
+            }
+        });
+        let covered_seconds = (end - start.max(window_start)).clamp(0, window_seconds);
+        let seconds = (covered_seconds as f64 * f64::from(self.scan_target_hours) * 3600.0
+            / window_seconds as f64)
             .clamp(self.min_interval_sec as f64, self.max_interval_sec as f64);
         chrono::Duration::seconds(seconds.ceil() as i64)
     }
@@ -345,7 +371,9 @@ fn advance_scan(
         "Pixiv search did not return the requested ascending date range"
     );
     let mut checkpoint = scan.clone();
-    checkpoint.pages_scanned += i64::from(!observations.is_empty());
+    if let Some((_, timestamp)) = observations.last() {
+        checkpoint.cursor_time = Some(*timestamp);
+    }
     checkpoint.complete = next.is_none();
     if let Some(next) = next {
         checkpoint.cursor_offset = i64::from(next);
@@ -359,8 +387,6 @@ fn advance_scan(
                     .count(),
             )?;
         }
-    } else {
-        checkpoint.total_pages = checkpoint.pages_scanned;
     }
     Ok(checkpoint)
 }

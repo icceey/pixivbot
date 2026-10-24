@@ -108,12 +108,10 @@ async fn page_checkpoint_and_candidates_commit_together_and_resume_after_reopen(
         .await
         .is_err());
     assert!(repo.pixiv_tag_candidates(task.id).await.unwrap().is_empty());
+    let rolled_back = repo.pixiv_tag_scan(task.id, oldest, 7).await.unwrap();
     assert_eq!(
-        repo.pixiv_tag_scan(task.id, oldest, 7)
-            .await
-            .unwrap()
-            .cursor_offset,
-        0
+        (rolled_back.cursor_offset, rolled_back.cursor_time),
+        (0, None)
     );
     repo.db()
         .execute_unprepared("DROP TRIGGER fail_page")
@@ -129,12 +127,85 @@ async fn page_checkpoint_and_candidates_commit_together_and_resume_after_reopen(
         (
             resumed.cursor_date,
             resumed.cursor_offset,
-            resumed.pages_scanned
+            resumed.cursor_time
         ),
-        (checkpoint.cursor_date, 1, 1)
+        (checkpoint.cursor_date, 1, Some(boundary))
     );
     assert_eq!(repo.pixiv_tag_candidates(task.id).await.unwrap().len(), 2);
     repo.db().clone().close().await.unwrap();
+}
+
+#[tokio::test]
+async fn scan_timing_uses_publication_progress_within_the_window() {
+    let repo = Arc::new(open_repo("sqlite::memory:").await);
+    let (task, _, _) = subscribe(&repo).await;
+    let cache = tempfile::tempdir().unwrap();
+    let notifier = Notifier::new(
+        Bot::new("fake_token").throttle(Limits::default()),
+        Arc::new(Downloader::new(
+            reqwest::Client::new(),
+            FileCacheManager::new(cache.path(), 7),
+        )),
+    );
+    let engine = PixivTagEngine::new(
+        repo.clone(),
+        Arc::new(RwLock::new(
+            PixivClient::new(PixivConfig {
+                refresh_token: "unused".to_string(),
+            })
+            .unwrap(),
+        )),
+        notifier,
+        &serde_json::from_value(serde_json::json!({})).unwrap(),
+        ImageSize::Large,
+    );
+    let now = DateTime::parse_from_rfc3339("2026-10-24T12:00:00+09:00")
+        .unwrap()
+        .with_timezone(&Utc);
+    let oldest = NaiveDate::from_ymd_opt(2026, 10, 17).unwrap();
+    let today = now.with_timezone(&SEARCH_TIMEZONE).date_naive();
+    let midnight = oldest
+        .and_hms_opt(0, 0, 0)
+        .unwrap()
+        .and_local_timezone(SEARCH_TIMEZONE)
+        .unwrap()
+        .timestamp();
+    let initial = repo.pixiv_tag_scan(task.id, oldest, 7).await.unwrap();
+    let mut scan = initial.clone();
+    let illust = illustration(1, "https://example.test", 1);
+    for offset in 1..=3 {
+        scan = advance_scan(
+            &scan,
+            &[(illust.clone(), midnight + offset * 1200)],
+            Some(offset as u32),
+            today,
+        )
+        .unwrap();
+    }
+    // Three pages before the rolling window must not cause an hours-long pause.
+    assert_eq!(
+        engine.scan_interval(&initial, &scan, now),
+        chrono::Duration::minutes(5)
+    );
+    let previous = scan.clone();
+    scan = advance_scan(
+        &scan,
+        &[(illust.clone(), midnight + 15 * 3600 + 1800)],
+        Some(4),
+        today,
+    )
+    .unwrap();
+    // Only the 3.5 hours after the window starts count, not the earlier results.
+    assert_eq!(
+        engine.scan_interval(&previous, &scan, now),
+        chrono::Duration::minutes(15)
+    );
+    let previous = scan.clone();
+    scan = advance_scan(&scan, &[(illust, midnight + 19 * 3600)], Some(5), today).unwrap();
+    assert_eq!(
+        engine.scan_interval(&previous, &scan, now),
+        chrono::Duration::minutes(15)
+    );
 }
 
 #[tokio::test]

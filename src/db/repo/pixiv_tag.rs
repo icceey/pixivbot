@@ -19,8 +19,7 @@ pub struct TagSettings {
 pub struct TagScan {
     pub cursor_date: NaiveDate,
     pub cursor_offset: i64,
-    pub pages_scanned: i64,
-    pub total_pages: i64,
+    pub cursor_time: Option<i64>,
     pub complete: bool,
 }
 
@@ -106,13 +105,8 @@ impl Repo {
                 DbBackend::Sqlite,
                 "INSERT INTO pixiv_tag_scans(task_id, cursor_date, window_days)
              VALUES (?, ?, ?) ON CONFLICT(task_id) DO UPDATE SET
-             cursor_date=excluded.cursor_date, cursor_offset=0,
-             pages_scanned=CASE WHEN pixiv_tag_scans.complete=1
-                 OR pixiv_tag_scans.window_days<>excluded.window_days THEN 0
-                 ELSE pixiv_tag_scans.pages_scanned END,
+             cursor_date=excluded.cursor_date, cursor_offset=0, cursor_time=NULL,
              complete=0,
-             total_pages=CASE WHEN pixiv_tag_scans.window_days<>excluded.window_days THEN 0
-                 ELSE MAX(pixiv_tag_scans.total_pages, pixiv_tag_scans.pages_scanned) END,
              window_days=excluded.window_days
              WHERE pixiv_tag_scans.complete=1 OR pixiv_tag_scans.cursor_date<excluded.cursor_date
                 OR pixiv_tag_scans.window_days<>excluded.window_days",
@@ -125,7 +119,7 @@ impl Repo {
             .await?;
         TagScan::find_by_statement(Statement::from_sql_and_values(
             DbBackend::Sqlite,
-            "SELECT cursor_date, cursor_offset, pages_scanned, total_pages, complete
+            "SELECT cursor_date, cursor_offset, cursor_time, complete
              FROM pixiv_tag_scans WHERE task_id=?",
             [task_id.into()],
         ))
@@ -160,13 +154,12 @@ impl Repo {
         }
         txn.execute(Statement::from_sql_and_values(
             DbBackend::Sqlite,
-            "UPDATE pixiv_tag_scans SET cursor_date=?, cursor_offset=?, pages_scanned=?,
-                 total_pages=?, complete=? WHERE task_id=?",
+            "UPDATE pixiv_tag_scans SET cursor_date=?, cursor_offset=?, cursor_time=?,
+                 complete=? WHERE task_id=?",
             [
                 scan.cursor_date.into(),
                 scan.cursor_offset.into(),
-                scan.pages_scanned.into(),
-                scan.total_pages.into(),
+                scan.cursor_time.into(),
                 scan.complete.into(),
                 task_id.into(),
             ],
