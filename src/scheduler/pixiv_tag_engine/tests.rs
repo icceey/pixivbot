@@ -136,7 +136,7 @@ async fn page_checkpoint_and_candidates_commit_together_and_resume_after_reopen(
 }
 
 #[tokio::test]
-async fn scan_timing_uses_publication_progress_within_the_window() {
+async fn scan_timing_catches_up_with_the_advancing_window() {
     let repo = Arc::new(open_repo("sqlite::memory:").await);
     let (task, _, _) = subscribe(&repo).await;
     let cache = tempfile::tempdir().unwrap();
@@ -156,13 +156,17 @@ async fn scan_timing_uses_publication_progress_within_the_window() {
             .unwrap(),
         )),
         notifier,
-        &serde_json::from_value(serde_json::json!({})).unwrap(),
+        &serde_json::from_value(serde_json::json!({
+            "pixiv_tag_window_days": 1,
+            "pixiv_tag_scan_target_hours": 24
+        }))
+        .unwrap(),
         ImageSize::Large,
     );
-    let now = DateTime::parse_from_rfc3339("2026-10-24T12:00:00+09:00")
+    let mut now = DateTime::parse_from_rfc3339("2026-10-24T12:00:00+09:00")
         .unwrap()
         .with_timezone(&Utc);
-    let oldest = NaiveDate::from_ymd_opt(2026, 10, 17).unwrap();
+    let oldest = NaiveDate::from_ymd_opt(2026, 10, 23).unwrap();
     let today = now.with_timezone(&SEARCH_TIMEZONE).date_naive();
     let midnight = oldest
         .and_hms_opt(0, 0, 0)
@@ -170,7 +174,7 @@ async fn scan_timing_uses_publication_progress_within_the_window() {
         .and_local_timezone(SEARCH_TIMEZONE)
         .unwrap()
         .timestamp();
-    let initial = repo.pixiv_tag_scan(task.id, oldest, 7).await.unwrap();
+    let initial = repo.pixiv_tag_scan(task.id, oldest, 1).await.unwrap();
     let mut scan = initial.clone();
     let illust = illustration(1, "https://example.test", 1);
     for offset in 1..=3 {
@@ -198,14 +202,26 @@ async fn scan_timing_uses_publication_progress_within_the_window() {
     // Only the 3.5 hours after the window starts count, not the earlier results.
     assert_eq!(
         engine.scan_interval(&previous, &scan, now),
-        chrono::Duration::minutes(15)
+        chrono::Duration::minutes(105)
     );
-    let previous = scan.clone();
-    scan = advance_scan(&scan, &[(illust, midnight + 19 * 3600)], Some(5), today).unwrap();
-    assert_eq!(
-        engine.scan_interval(&previous, &scan, now),
-        chrono::Duration::minutes(15)
-    );
+    now += engine.scan_interval(&previous, &scan, now);
+    // Each batch covers one publication hour; new works arrive during every wait.
+    for _ in 0..48 {
+        let previous = scan.clone();
+        let end = (scan.cursor_time.unwrap() + 3600).min(now.timestamp());
+        scan = advance_scan(
+            &scan,
+            &[(illust.clone(), end)],
+            (end < now.timestamp()).then_some(scan.cursor_offset as u32 + 1),
+            now.with_timezone(&SEARCH_TIMEZONE).date_naive(),
+        )
+        .unwrap();
+        if scan.complete {
+            break;
+        }
+        now += engine.scan_interval(&previous, &scan, now);
+    }
+    assert!(scan.complete);
 }
 
 #[tokio::test]

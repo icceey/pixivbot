@@ -26,7 +26,7 @@ flowchart LR
 
 ## Pixiv and Booru subscriptions
 
-Pixiv author subscriptions track new works per author. Tag subscriptions share a search cursor by query and queue works that reach each subscription's bookmark threshold. Search dates use Japan Standard Time; the date, offset, and last publication timestamp are checkpointed together. Each batch's publication time span within the observation window determines its share of the target scan duration, clamped to the configured polling interval bounds.
+Pixiv author subscriptions track new works per author. Tag subscriptions share a search cursor by query and queue works that reach each subscription's bookmark threshold. Search dates use Japan Standard Time; the date, offset, and last publication timestamp are checkpointed together. Each batch's wait is `covered_seconds × target_seconds / (window_seconds + target_seconds)`, accounting for works published during the scan and clamped to the configured polling interval bounds.
 
 Author and tag deliveries share per-chat work history. A chat lock covers reading progress, sending the work, and saving acknowledgements. Each Telegram batch contains at most 10 images; successful page indices and the batch's reply mapping commit together. Ranking deliveries retain separate progress. Telegram acknowledgements lost before a database commit can cause the last batch to be retried.
 

@@ -140,8 +140,10 @@ impl PixivTagEngine {
             }
         });
         let covered_seconds = (end - start.max(window_start)).clamp(0, window_seconds);
-        let seconds = (covered_seconds as f64 * f64::from(self.scan_target_hours) * 3600.0
-            / window_seconds as f64)
+        let target_seconds = i64::from(self.scan_target_hours) * 3600;
+        // Account for works published while the scan is in progress.
+        let seconds = (covered_seconds as f64 * target_seconds as f64
+            / (window_seconds + target_seconds) as f64)
             .clamp(self.min_interval_sec as f64, self.max_interval_sec as f64);
         chrono::Duration::seconds(seconds.ceil() as i64)
     }
