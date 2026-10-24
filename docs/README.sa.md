@@ -63,8 +63,9 @@ Rust-आधारितः Pixiv Telegram यन्त्रमानवः।
 यदि भवान् स्वयन्त्रे सीधे चालयितुम् इच्छति:
 
 1. **पूर्वापेक्षाः**:
-    - Rust (नवीनतमः स्थिरः)
+    - Rust 1.94 (`rust-toolchain.toml`)
     - SQLite
+    - FFmpeg विकासपुस्तकालयाः तथा `pkg-config`
 
 2. **प्रतिलिप्यताम् विन्यस्यताम् च**:
 
@@ -78,7 +79,7 @@ Rust-आधारितः Pixiv Telegram यन्त्रमानवः।
 3. **निर्मीयताम् चाल्यताम् च**:
 
    ```bash
-   cargo run --release
+   cargo run --release --features ffmpeg-codec
    ```
 
 ## आवश्यकटोकनानि प्राप्यन्ताम्
@@ -108,7 +109,7 @@ refresh token प्राप्य, तत् `config.toml` मध्ये `pi
 | विन्यासकुञ्जी | पर्यावरणचलकः | विवरणम् | पूर्वनिर्धारितम् |
 |---|---|---|---|
 | `telegram.bot_token` | `PIX__TELEGRAM__BOT_TOKEN` | Telegram Bot API Token | `""` |
-| `telegram.owner_id` | `PIX__TELEGRAM__OWNER_ID` | स्वामिउपयोक्तृपरिचयः | `0` |
+| `telegram.owner_id` | `PIX__TELEGRAM__OWNER_ID` | स्वामिउपयोक्तृपरिचयः; अनिर्दिष्टे प्रथमोपयोक्ता स्वामी भवितुमर्हति | अनिर्दिष्टम् |
 | `telegram.bot_mode` | `PIX__TELEGRAM__BOT_MODE` | `public` अथवा `private` | `"private"` |
 | `pixiv.refresh_token` | `PIX__PIXIV__REFRESH_TOKEN` | Pixiv OAuth Refresh Token | `""` |
 | `database.url` | `PIX__DATABASE__URL` | दत्तांशसञ्चयसम्बन्धURL | `sqlite:./data/pixivbot.db?mode=rwc` |
@@ -146,11 +147,11 @@ refresh token प्राप्य, तत् `config.toml` मध्ये `pi
 
 ## योगदानम्
 
-विकासमार्गदर्शनार्थं [CONTRIBUTING.md](CONTRIBUTING.md) पश्यताम्।
+विकासमार्गदर्शनार्थं [CONTRIBUTING.md](../CONTRIBUTING.md) पश्यताम्।
 
 ## अनुज्ञापत्रम्
 
-[MIT](LICENSE)
+[MIT](../LICENSE)
 
 ## कृतज्ञता
 

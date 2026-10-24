@@ -139,7 +139,7 @@ pub async fn get_chat_if_should_notify(
     }
 }
 
-/// Shared author/tag sender. Rankings intentionally use their own send path.
+/// Send a work with per-chat deduplication and batch checkpoints.
 pub async fn process_illust_push(
     repo: &Repo,
     notifier: &Notifier,
@@ -215,28 +215,26 @@ pub async fn process_illust_push(
             caption::build_continuation_caption(illust, sent_pages.len(), total_pages)
         };
         let result = notifier
-            .notify_with_images_and_button_and_continuation(
+            .notify_with_images(
                 chat_id,
                 &urls,
                 Some(&caption),
                 has_spoiler,
                 &download_config,
-                ContinuationNumbering::new(
+                Some(ContinuationNumbering::new(
                     batch_start / caption::MAX_PER_GROUP + 1,
                     total_pages.div_ceil(caption::MAX_PER_GROUP),
-                ),
+                )),
             )
             .await;
         if !result.succeeded_indices.is_empty() {
-            for &index in &result.succeeded_indices {
-                sent_pages.push(
-                    *attempted
-                        .get(index)
-                        .context("Invalid acknowledged page index")?,
-                );
-            }
+            sent_pages.extend(
+                result
+                    .succeeded_indices
+                    .iter()
+                    .map(|&index| attempted[index]),
+            );
             sent_pages.sort_unstable();
-            sent_pages.dedup();
             let message_id = result
                 .first_message_id
                 .context("Missing acknowledged batch message ID")?;

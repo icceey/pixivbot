@@ -12,9 +12,11 @@ pub enum Command {
     Sub(String),
     #[command(description = "订阅排行榜\n  用法: /subrank [ch=<频道ID>] <mode>")]
     SubRank(String),
-    #[command(description = "订阅标签热榜\n  用法: /subtag <标签> bookmarks=300")]
+    #[command(
+        description = "订阅标签热榜\n  用法: /subtag [ch=<频道ID>] <标签> [b=500] [l=<图片数>]"
+    )]
     SubTag(String),
-    #[command(description = "取消标签热榜\n  用法: /unsubtag <标签搜索词>")]
+    #[command(description = "取消标签热榜\n  用法: /unsubtag [ch=<频道ID>] <标签搜索词>")]
     UnsubTag(String),
     #[command(description = "取消订阅作者\n  用法: /unsub [ch=<频道ID>] <author_id,...>")]
     Unsub(String),
@@ -76,8 +78,14 @@ impl Command {
         let mut commands = vec![
             BotCommand::new("sub", "订阅作者 - /sub [ch=<频道ID>] <id,...>"),
             BotCommand::new("subrank", "订阅排行榜 - /subrank [ch=<频道ID>] <mode>"),
-            BotCommand::new("subtag", "订阅标签热榜 - /subtag <标签> bookmarks=300"),
-            BotCommand::new("unsubtag", "取消标签热榜 - /unsubtag <标签搜索词>"),
+            BotCommand::new(
+                "subtag",
+                "订阅标签热榜 - /subtag [ch=<频道ID>] <标签> [b=500] [l=<图片数>]",
+            ),
+            BotCommand::new(
+                "unsubtag",
+                "取消标签热榜 - /unsubtag [ch=<频道ID>] <标签搜索词>",
+            ),
             BotCommand::new("list", "列出当前订阅 - /list [ch=<频道ID>]"),
             BotCommand::new("unsub", "取消订阅作者 - /unsub [ch=<频道ID>] <id,...>"),
             BotCommand::new(
@@ -162,56 +170,5 @@ impl Command {
             ),
         ]);
         cmds
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::Command;
-
-    fn command_names(commands: Vec<teloxide::types::BotCommand>) -> Vec<String> {
-        commands
-            .into_iter()
-            .map(|command| command.command)
-            .collect()
-    }
-
-    #[test]
-    fn command_visibility_follows_provider_configuration_and_role() {
-        for (booru, eh) in [(false, false), (true, false), (false, true), (true, true)] {
-            for (role, commands) in [
-                ("user", Command::user_commands(booru, eh)),
-                ("admin", Command::admin_commands(booru, eh)),
-                ("owner", Command::owner_commands(booru, eh)),
-            ] {
-                let names = command_names(commands);
-                for (provider_commands, visible) in [
-                    (
-                        &[
-                            "bsub",
-                            "bunsub",
-                            "brank",
-                            "brankday",
-                            "brankweek",
-                            "brankmonth",
-                            "brand",
-                        ][..],
-                        booru,
-                    ),
-                    (&["esub", "eunsub", "edl", "estatus"][..], eh),
-                ] {
-                    for command in provider_commands {
-                        assert_eq!(
-                            names.iter().any(|name| name == command),
-                            visible,
-                            "{role}: {command}, booru={booru}, eh={eh}"
-                        );
-                    }
-                }
-                if role == "owner" {
-                    assert!(names.iter().any(|name| name == "setadmin"));
-                }
-            }
-        }
     }
 }

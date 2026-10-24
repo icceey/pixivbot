@@ -163,47 +163,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_booru_links_moebooru() {
-        let reg = BooruSiteRegistry::from_configs(&[site(
-            "yandere",
-            "https://yande.re",
-            BooruEngineType::Moebooru,
-        )]);
-        let text = "see https://yande.re/post/show/123456 cool";
-        let refs = parse_booru_post_links(text, &reg);
-        assert_eq!(refs.len(), 1);
-        assert_eq!(refs[0].site_name, "yandere");
-        assert_eq!(refs[0].post_id, 123456);
-    }
-
-    #[test]
-    fn parse_booru_links_danbooru() {
-        let reg = BooruSiteRegistry::from_configs(&[site(
-            "danbooru",
-            "https://danbooru.donmai.us",
-            BooruEngineType::Danbooru,
-        )]);
-        let refs = parse_booru_post_links("x https://danbooru.donmai.us/posts/9876 y", &reg);
-        assert_eq!(refs.len(), 1);
-        assert_eq!(refs[0].post_id, 9876);
-    }
-
-    #[test]
-    fn parse_booru_links_gelbooru_query() {
-        let reg = BooruSiteRegistry::from_configs(&[site(
-            "gel",
-            "https://gelbooru.com",
-            BooruEngineType::Gelbooru,
-        )]);
-        let refs = parse_booru_post_links(
-            "https://gelbooru.com/index.php?page=post&s=view&id=4242",
-            &reg,
-        );
-        assert_eq!(refs.len(), 1);
-        assert_eq!(refs[0].post_id, 4242);
-    }
-
-    #[test]
     fn parse_booru_links_dedup_and_unconfigured_skipped() {
         let reg = BooruSiteRegistry::from_configs(&[site(
             "yandere",

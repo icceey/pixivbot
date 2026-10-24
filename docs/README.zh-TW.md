@@ -63,8 +63,9 @@
 如果你更喜歡直接在機器上執行：
 
 1. **前置要求**：
-    - Rust（最新穩定版）
+    - Rust 1.94（`rust-toolchain.toml`）
     - SQLite
+    - FFmpeg 開發庫和 `pkg-config`
 
 2. **複製並設定**：
 
@@ -78,7 +79,7 @@
 3. **建置並執行**：
 
    ```bash
-   cargo run --release
+   cargo run --release --features ffmpeg-codec
    ```
 
 ## 取得所需權杖
@@ -108,7 +109,7 @@
 | 設定鍵 | 環境變數 | 說明 | 預設值 |
 |---|---|---|---|
 | `telegram.bot_token` | `PIX__TELEGRAM__BOT_TOKEN` | Telegram Bot API Token | `""` |
-| `telegram.owner_id` | `PIX__TELEGRAM__OWNER_ID` | 擁有者使用者 ID | `0` |
+| `telegram.owner_id` | `PIX__TELEGRAM__OWNER_ID` | 擁有者使用者 ID；未設定時首位互動使用者可成為擁有者 | 未設定 |
 | `telegram.bot_mode` | `PIX__TELEGRAM__BOT_MODE` | `public` 或 `private` | `"private"` |
 | `pixiv.refresh_token` | `PIX__PIXIV__REFRESH_TOKEN` | Pixiv OAuth Refresh Token | `""` |
 | `database.url` | `PIX__DATABASE__URL` | 資料庫連線 URL | `sqlite:./data/pixivbot.db?mode=rwc` |
@@ -146,11 +147,11 @@
 
 ## 貢獻
 
-有關開發指南，請參閱 [CONTRIBUTING.md](CONTRIBUTING.md)。
+有關開發指南，請參閱 [CONTRIBUTING.md](../CONTRIBUTING.md)。
 
 ## 授權條款
 
-[MIT](LICENSE)
+[MIT](../LICENSE)
 
 ## 致謝
 

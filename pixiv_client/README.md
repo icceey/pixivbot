@@ -18,16 +18,19 @@
 
 - OAuth 认证 (`auth.rs`)
 - 获取画师作品列表 (`user_illusts`)
+- 按标签和日期搜索作品 (`search_illusts`)
 - 获取作品详情 (`illust_detail`)
 - 获取排行榜 (`illust_ranking`)
+- 获取用户详情 (`user_detail`)
+- 获取动图元数据 (`ugoira_metadata`)
 
 使用 `reqwest` 作为 HTTP 客户端，提供异步 API 调用。
 
 ## 文件结构
 
 ```
-pixiv_client/
-├── mod.rs      # 模块定义
+pixiv_client/src/
+├── lib.rs      # 模块定义
 ├── error.rs    # 错误类型
 ├── models.rs   # 数据模型
 ├── auth.rs     # OAuth 认证

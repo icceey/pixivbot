@@ -39,13 +39,8 @@ impl BatchResult {
         !self.success.is_empty()
     }
 
-    /// 构建成功/失败列表的响应消息
-    pub(crate) fn build_response(&self, success_prefix: &str, failure_prefix: &str) -> String {
-        self.build_response_with_suffix(success_prefix, failure_prefix, None)
-    }
-
     /// 构建成功/失败列表的响应消息，在成功列表后添加可选后缀
-    pub(crate) fn build_response_with_suffix(
+    pub(crate) fn build_response(
         &self,
         success_prefix: &str,
         failure_prefix: &str,

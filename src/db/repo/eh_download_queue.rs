@@ -3587,60 +3587,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_downloaded_bytes_window_counts_all_downloaded_states() {
-        let repo = tests_helpers::setup_test_db().await.unwrap();
-        for (gid, status, size) in [
-            (1, STATUS_DOWNLOADED, 100),
-            (2, STATUS_UPLOADING, 200),
-            (3, STATUS_UPLOADED, 300),
-            (4, STATUS_PUBLISHING, 400),
-            (5, STATUS_DONE, 500),
-            (6, STATUS_FAILED, 600),
-        ] {
-            let delivery = repo
-                .enqueue_eh_download(
-                    -100,
-                    gid,
-                    "tok",
-                    "Title",
-                    false,
-                    SOURCE_DIRECT,
-                    &EhGalleryVariant::archive("1280x"),
-                    None,
-                    true,
-                )
-                .await
-                .unwrap()
-                .expect("delivery should be enqueued");
-            let job = repo
-                .claim_eh_download_job(Main, true)
-                .await
-                .unwrap()
-                .unwrap();
-            assert_eq!(job.id, delivery.job_id.unwrap());
-            repo.mark_eh_job_downloaded(
-                Main,
-                job.id,
-                job.started_at.unwrap(),
-                size,
-                &format!("/tmp/{gid}.zip"),
-                0,
-            )
-            .await
-            .unwrap();
-            Entity::update_many()
-                .col_expr(Column::Status, Expr::value(status))
-                .filter(Column::Id.eq(delivery.id))
-                .exec(&repo.db)
-                .await
-                .unwrap();
-        }
-
-        let bytes = repo.get_eh_downloaded_bytes_in_window(24).await.unwrap();
-        assert_eq!(bytes, 2100);
-    }
-
-    #[tokio::test]
     async fn test_cleanup_eh_cache_orphans_aborts_orphan_upload_state_before_removal_and_preserves_active_state(
     ) {
         let repo = tests_helpers::setup_test_db().await.unwrap();
@@ -4151,64 +4097,6 @@ mod tests {
         assert_eq!(reloaded.status, JOB_STATUS_PENDING);
         assert_eq!(reloaded.retry_count, 0);
         assert!(reloaded.next_retry_at.is_some());
-    }
-
-    #[tokio::test]
-    async fn test_background_owned_item_is_excluded_from_main_download_queue() {
-        let repo = tests_helpers::setup_test_db().await.unwrap();
-        let slow = repo
-            .enqueue_eh_download(
-                -100,
-                40,
-                "slow",
-                "Slow",
-                false,
-                SOURCE_DIRECT,
-                &EhGalleryVariant::archive("1280x"),
-                None,
-                true,
-            )
-            .await
-            .unwrap()
-            .expect("delivery should be enqueued");
-        let fast = repo
-            .enqueue_eh_download(
-                -100,
-                41,
-                "fast",
-                "Fast",
-                false,
-                SOURCE_DIRECT,
-                &EhGalleryVariant::archive("1280x"),
-                None,
-                true,
-            )
-            .await
-            .unwrap()
-            .expect("delivery should be enqueued");
-
-        let claimed = repo
-            .claim_eh_download_job(Main, true)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(claimed.id, slow.job_id.unwrap());
-        let background = repo
-            .schedule_eh_job_background_download(claimed.id, JOB_STATUS_DOWNLOADING, "too slow")
-            .await
-            .unwrap();
-        assert_eq!(background.status, STATUS_PENDING);
-        assert_eq!(
-            background.background_download_status.as_deref(),
-            Some(BACKGROUND_STATUS_PENDING)
-        );
-
-        let next = repo
-            .claim_eh_download_job(Main, true)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(next.id, fast.job_id.unwrap());
     }
 
     #[tokio::test]

@@ -42,6 +42,7 @@ pub async fn run(
     pixiv_client: Arc<tokio::sync::RwLock<PixivClient>>,
     notifier: notifier::Notifier,
     sensitive_tags: Vec<String>,
+    pixiv_tag_min_bookmarks: i64,
     image_size: pixiv_client::ImageSize,
     download_original_threshold: u8,
     cache_dir: String,
@@ -78,6 +79,7 @@ pub async fn run(
         pixiv_client.clone(),
         notifier.clone(),
         sensitive_tags,
+        pixiv_tag_min_bookmarks,
         config.owner_id,
         is_public_mode,
         image_size,
@@ -94,7 +96,7 @@ pub async fn run(
     info!("✅ Bot initialized, starting command handler");
 
     // Initialize settings dialogue storage
-    let settings_storage = state::new_settings_storage();
+    let settings_storage = SettingsStorage::default();
 
     // 设置命令可见性
     setup_commands(&bot, &repo, has_booru, has_ehentai).await;
@@ -150,7 +152,6 @@ fn build_handler_tree(
         .chain(middleware::filter_chat_accessible())
         .endpoint(handle_command);
 
-    // 常规命令 - 保持原有的聊天可访问性检查，并添加 @mention 要求检查
     let command_handler = Message::filter_text()
         .chain(middleware::filter_hybrid_command::<Command, HandlerResult>())
         .chain(middleware::filter_user_chat())
@@ -162,7 +163,6 @@ fn build_handler_tree(
         .endpoint(handle_command);
 
     let message_handler = Message::filter_text()
-        .chain(middleware::filter_relevant_message::<HandlerResult>())
         .chain(middleware::filter_user_chat())
         .chain(middleware::filter_message_mention_requirement::<
             HandlerResult,

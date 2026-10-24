@@ -38,22 +38,17 @@ cache_dir = "data/cache"
 max_retry_count = 3
 # Ranking task execution time in HH:MM format (default: "19:00" local time)
 ranking_execution_time = "19:00"
-# 标签热榜观察窗口，单位为天，须为正整数；统一应用于所有标签订阅。
-# 通过 /subtag <标签> bookmarks=300 按订阅设置收藏阈值，命令不能覆盖观察窗口。
+# Pixiv tag observation window in days (positive integer)
 pixiv_tag_window_days = 7
-# 目标在多少小时内完成一轮扫描；每次唤醒的搜索请求上限。均须为正整数。
+# Default bookmark threshold for tag subscriptions (positive integer)
+pixiv_tag_min_bookmarks = 500
+# Target scan duration in hours; polling intervals adapt to the observed page count
 pixiv_tag_scan_target_hours = 12
+# Maximum search pages per task execution (positive integer)
 pixiv_tag_scan_pages = 3
-# 根据任务页数自动计算扫描间隔，单位分钟；须满足 0 < min <= max。
-# 下限 5 分钟，上限 24 小时。12 小时是估算目标，仍受下限和实际执行耗时约束。
+# Scan interval bounds in minutes (0 < min <= max)
 pixiv_tag_scan_min_interval_minutes = 5
 pixiv_tag_scan_max_interval_minutes = 1440
-# tick 每轮取出全部到期标签任务，逐个执行；无到期任务时不请求 Pixiv。
-# 以日期 + 日期内 offset 从旧到新扫描，进度持久化；每次结束日期取当前日期。
-# 扫到最新后，下次从 now-window 日期重扫；游标落后于窗口则截回窗口起点。
-# 收藏数随搜索结果更新，不再逐作品定时查询详情。
-# 达标作品持久化排队；发送队列每个 tick 独立检查，不等待下一次搜索。
-# 失败从 5 分钟开始退避重试（最长 6 小时），每个订阅每 tick 最多处理 5 个作品。
 # Author name update time in HH:MM format (default: "21:00" local time)
 # Updates subscribed author names daily to sync with Pixiv profile changes
 author_name_update_time = "21:00"

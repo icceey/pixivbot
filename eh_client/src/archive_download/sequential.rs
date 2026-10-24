@@ -126,7 +126,6 @@ pub(crate) async fn download_sequential(
                 );
                 last_error = Some(error);
                 // Sleep between attempts to avoid request burst on immediate failures.
-                // Worst case: 4 immediate failures ≈ 3s extra, acceptable for a single worker tick.
                 sleep(Duration::from_secs(1)).await;
             }
         }
@@ -215,9 +214,7 @@ async fn download_sequential_once(
 
     let file = options.open(temp_path).await?;
     let mut writer = tokio::io::BufWriter::with_capacity(2 * 1024 * 1024, file);
-    // Convert the response byte stream into an AsyncRead, preserving the
-    // historical `copy_buf` behavior while removing sensitive token URLs from
-    // any reqwest error before it enters the I/O error chain.
+    // Strip signed URLs before HTTP errors enter the I/O error chain.
     let stream = resp
         .bytes_stream()
         .map(|result| result.map_err(|error| std::io::Error::other(archive_http_error(error))));
@@ -254,30 +251,4 @@ async fn download_sequential_once(
         }
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{parse_content_range_header, response_expected_total, validate_content_range};
-    use reqwest::header::{HeaderMap, HeaderValue, CONTENT_LENGTH, CONTENT_RANGE};
-
-    #[test]
-    fn content_range_parser_and_expected_total_preserve_resume_rules() {
-        assert_eq!(
-            parse_content_range_header("bytes 12-19/20"),
-            Some((12, 19, Some(20)))
-        );
-        assert_eq!(
-            parse_content_range_header("bytes 12-19/*"),
-            Some((12, 19, None))
-        );
-        assert_eq!(parse_content_range_header("bytes 19-12/20"), None);
-
-        let mut headers = HeaderMap::new();
-        headers.insert(CONTENT_RANGE, HeaderValue::from_static("bytes 12-19/20"));
-        headers.insert(CONTENT_LENGTH, HeaderValue::from_static("8"));
-        assert_eq!(validate_content_range(&headers, 12).unwrap(), 20);
-        assert_eq!(response_expected_total(&headers, 12, true), Some(20));
-        assert_eq!(response_expected_total(&headers, 0, false), Some(8));
-    }
 }

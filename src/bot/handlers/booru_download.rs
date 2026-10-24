@@ -3,8 +3,7 @@ use crate::bot::link_handler::BooruPostRef;
 use crate::bot::notifier::ThrottledBot;
 use crate::bot::BotHandler;
 use anyhow::{Context, Result};
-use std::future::Future;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use teloxide::prelude::*;
 use teloxide::types::ChatAction;
 use teloxide::utils::markdown;
@@ -98,11 +97,12 @@ impl BotHandler {
                         files.len(),
                         chrono::Local::now().format("%Y%m%d_%H%M%S")
                     );
-                    let send_result = remove_file_after(
-                        &zip_path,
-                        self.send_document(&bot, chat_id, &zip_path, &zip_name, &caption),
-                    )
-                    .await;
+                    let send_result = self
+                        .send_document(&bot, chat_id, &zip_path, &zip_name, &caption)
+                        .await;
+                    if let Err(e) = tokio::fs::remove_file(&zip_path).await {
+                        warn!("Failed to remove temp ZIP file: {:#}", e);
+                    }
                     if let Err(e) = send_result {
                         warn!("Failed to send booru zip: {:#}", e);
                     }
@@ -185,17 +185,6 @@ fn booru_post_image_urls(post: &booru_client::BooruPost) -> Vec<&str> {
         .into_iter()
         .flatten()
         .collect()
-}
-
-async fn remove_file_after<T, E, Fut>(path: &Path, operation: Fut) -> std::result::Result<T, E>
-where
-    Fut: Future<Output = std::result::Result<T, E>>,
-{
-    let result = operation.await;
-    if let Err(e) = tokio::fs::remove_file(path).await {
-        warn!("Failed to remove temp ZIP file: {:#}", e);
-    }
-    result
 }
 
 fn build_booru_caption(titles: &[String], failed: &[String]) -> String {

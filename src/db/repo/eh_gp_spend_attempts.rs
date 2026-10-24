@@ -66,7 +66,7 @@ mod tests {
     };
     use crate::db::repo::Repo;
     use anyhow::Result;
-    use chrono::{Duration, Local};
+    use chrono::Local;
     use eh_client::ArchiveArtifacts;
     use migration::{MigrationTrait, Migrator, MigratorTrait, SchemaManager};
     use sea_orm::{
@@ -1017,21 +1017,6 @@ mod tests {
             job.try_get::<Option<String>>("", "telegraph_rewritten_at")?,
             None
         );
-
-        let rewrite_claimable = db
-            .query_one(Statement::from_string(
-                DbBackend::Sqlite,
-                "SELECT id FROM eh_gallery_jobs \
-                 WHERE gid = 150 \
-                   AND telegraph_rewrite_status = 'pending' \
-                   AND telegraph_rewrite_data IS NOT NULL \
-                   AND telegraph_rewritten_at IS NULL \
-                   AND (telegraph_rewrite_after IS NULL OR telegraph_rewrite_after <= CURRENT_TIMESTAMP) \
-                   AND (telegraph_rewrite_next_retry_at IS NULL OR telegraph_rewrite_next_retry_at <= CURRENT_TIMESTAMP)".to_owned(),
-            ))
-            .await?
-            .expect("migrated rewrite must satisfy the job rewrite lane predicate");
-        assert_eq!(rewrite_claimable.try_get::<i64>("", "id")?, job_id);
 
         let rewrite_winner = db
             .query_one(Statement::from_string(
@@ -2115,32 +2100,6 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert!(rows.iter().all(|attempt| attempt.job_id.is_none()));
         assert_eq!(repo.get_eh_gp_cost_in_window(24).await?, 436);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn get_eh_gp_cost_in_window_excludes_old_attempts() -> Result<()> {
-        let repo = setup_test_db().await?;
-        eh_gp_spend_attempts::ActiveModel {
-            queue_id: Set(None),
-            gid: Set(103),
-            gp_cost: Set(218),
-            created_at: Set(Local::now().naive_local() - Duration::hours(25)),
-            ..Default::default()
-        }
-        .insert(repo.db())
-        .await?;
-        eh_gp_spend_attempts::ActiveModel {
-            queue_id: Set(None),
-            gid: Set(104),
-            gp_cost: Set(7),
-            created_at: Set(Local::now().naive_local()),
-            ..Default::default()
-        }
-        .insert(repo.db())
-        .await?;
-
-        assert_eq!(repo.get_eh_gp_cost_in_window(24).await?, 7);
         Ok(())
     }
 

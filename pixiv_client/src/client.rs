@@ -4,7 +4,6 @@ use crate::auth;
 use crate::error::{Error, Result};
 use crate::models::*;
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, USER_AGENT};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
@@ -29,7 +28,7 @@ impl TokenInfo {
 /// Pixiv API 客户端
 pub struct PixivClient {
     client: reqwest::Client,
-    token_info: Arc<RwLock<Option<TokenInfo>>>,
+    token_info: RwLock<Option<TokenInfo>>,
     refresh_token: String,
 }
 
@@ -42,7 +41,7 @@ impl PixivClient {
 
         Ok(Self {
             client,
-            token_info: Arc::new(RwLock::new(None)),
+            token_info: RwLock::new(None),
             refresh_token,
         })
     }

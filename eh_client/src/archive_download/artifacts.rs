@@ -25,13 +25,11 @@ impl ArchiveArtifacts {
 
     pub fn from_member(path: &Path) -> Option<Self> {
         let name = path.file_name()?.to_str()?;
-        let final_name = if let Some(name) = name.strip_suffix(".zip.original") {
-            format!("{name}.zip")
-        } else if let Some(name) = name.strip_suffix(".zip.parts") {
-            format!("{name}.zip")
-        } else if let Some(name) = name.strip_suffix(".zip.uploads") {
-            format!("{name}.zip")
-        } else if let Some(name) = name.strip_suffix(".zip.part") {
+        let final_name = if let Some(name) =
+            [".zip.original", ".zip.parts", ".zip.uploads", ".zip.part"]
+                .into_iter()
+                .find_map(|suffix| name.strip_suffix(suffix))
+        {
             format!("{name}.zip")
         } else if name.ends_with(".zip") {
             name.to_owned()

@@ -29,18 +29,10 @@ const MAX_GRACE_SEND_ATTEMPTS: u8 = 3;
 
 const MAX_RANKING_SEND_ATTEMPTS: u8 = 3;
 
-// Cap grace-window pushes per subscription per tick. Without this, when a large
-// fetched window suddenly qualifies (e.g. score threshold met on many posts at
-// once, or a new subscription with grace mode), to_push could include dozens of
-// posts and block the per-subscription send loop for minutes. The remainder
-// stays in candidate_posts and is naturally retried on the next tick.
+// Bound each subscription's send time; remaining candidates stay queued.
 const MAX_GRACE_PUSH_PER_TICK: usize = 5;
 
-// Same rationale for ranking tasks: with ranking_top_n defaulting to 20, a
-// fresh subscription would otherwise send all 20 in one tick (~40s with
-// INTER_SUBSCRIPTION_DELAY_MS), monopolizing the scheduler and blocking other
-// booru tasks. Unpushed posts naturally re-appear next tick if they're still
-// in the ranking (filtered by `!state.pushed_ids.contains`).
+// Remaining ranking posts are reconsidered on the next tick.
 const MAX_RANKING_PUSH_PER_TICK: usize = 5;
 
 fn booru_post_image_urls(post: &booru_client::BooruPost) -> Vec<Cow<'_, str>> {
@@ -974,12 +966,13 @@ impl BooruEngine {
             let image_url = url.into_owned();
             let send_result = self
                 .notifier
-                .notify_with_images_and_button(
+                .notify_with_images(
                     chat_id,
                     &[image_url],
                     Some(&caption_text),
                     has_spoiler,
                     &DownloadButtonConfig::for_booru_chat(site_name, first.id, chat),
+                    None,
                 )
                 .await;
             if send_result.is_complete_success() {
@@ -1030,12 +1023,13 @@ impl BooruEngine {
             let image_url = url.into_owned();
             let send_result = self
                 .notifier
-                .notify_with_images_and_button(
+                .notify_with_images(
                     chat_id,
                     &[image_url],
                     Some(&caption_text),
                     has_spoiler,
                     &DownloadButtonConfig::for_booru_chat(site_name, post.id, chat),
+                    None,
                 )
                 .await;
             if send_result.is_complete_success() {

@@ -9,7 +9,7 @@ use crate::scheduler::helpers::{
     apply_subscription_tag_filter, get_chat_if_should_notify, process_illust_push, PushResult,
     INTER_SUBSCRIPTION_DELAY_MS,
 };
-use anyhow::{Context, Result};
+use anyhow::Result;
 use chrono::{DateTime, Days, Local, NaiveDate, Utc};
 use pixiv_client::{Illust, ImageSize};
 use std::sync::Arc;
@@ -136,8 +136,7 @@ impl PixivTagEngine {
             return Ok(());
         }
 
-        // Config edits may qualify cached works, but only while they are still
-        // inside the current window. Already queued work is independent of this.
+        // New subscriptions and lower thresholds can qualify cached works.
         for candidate in self.repo.pixiv_tag_candidates(task.id).await? {
             let illust = serde_json::from_str(&candidate.illust)?;
             self.enqueue_eligible(
@@ -157,7 +156,6 @@ impl PixivTagEngine {
         scan_result
     }
 
-    /// Drain due sends every tick, regardless of when a tag is next searched.
     async fn send_due(&self) -> Result<()> {
         for sub in self
             .repo
@@ -203,7 +201,11 @@ impl PixivTagEngine {
             return Ok(());
         }
         for (sub, settings) in subscriptions {
-            if illust.total_bookmarks < settings.min_bookmarks as u64 {
+            if illust.total_bookmarks < settings.min_bookmarks as u64
+                || settings
+                    .max_pages
+                    .is_some_and(|limit| i64::from(illust.page_count) > limit)
+            {
                 continue;
             }
             let Some(chat) = get_chat_if_should_notify(&self.repo, sub.chat_id).await? else {
@@ -267,14 +269,19 @@ impl PixivTagEngine {
         mut delivery: TagDelivery,
     ) -> Result<()> {
         let illust: Illust = serde_json::from_str(&delivery.illust)?;
-        if apply_subscription_tag_filter(sub, chat, [&illust]).is_empty() {
+        let Some(settings) = self.repo.pixiv_tag_settings(sub.id).await? else {
+            return Ok(());
+        };
+        if apply_subscription_tag_filter(sub, chat, [&illust]).is_empty()
+            || settings
+                .max_pages
+                .is_some_and(|limit| i64::from(illust.page_count) > limit)
+        {
             self.repo
                 .save_pixiv_tag_delivery(&delivery, true, Utc::now().timestamp())
                 .await?;
             return Ok(());
         }
-        // Send this work's remaining pages exactly like an author subscription,
-        // including all of its Telegram-sized batches, before the next work.
         let result = process_illust_push(
             &self.repo,
             &self.notifier,
@@ -298,8 +305,6 @@ impl PixivTagEngine {
         } else {
             delivery.attempts.saturating_add(1)
         };
-        // Keep failed work indefinitely, with bounded exponential backoff; success
-        // on another work is not blocked by an unavailable image or Telegram chat.
         let delay = if !done {
             (300_i64 * (1_i64 << delivery.attempts.saturating_sub(1).min(7))).min(21600)
         } else {
@@ -326,12 +331,12 @@ fn advance_scan(
     let dates = observations
         .iter()
         .map(|(_, timestamp)| {
-            Ok(DateTime::from_timestamp(*timestamp, 0)
-                .context("Invalid publication time")?
+            DateTime::from_timestamp(*timestamp, 0)
+                .unwrap()
                 .with_timezone(&SEARCH_TIMEZONE)
-                .date_naive())
+                .date_naive()
         })
-        .collect::<Result<Vec<_>>>()?;
+        .collect::<Vec<_>>();
     anyhow::ensure!(
         dates
             .iter()

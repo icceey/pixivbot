@@ -2,7 +2,7 @@ use crate::db::repo::Repo;
 use crate::db::types::TaskType;
 use crate::pixiv::client::PixivClient;
 use anyhow::{Context, Result};
-use chrono::{Local, NaiveTime, TimeZone, Timelike};
+use chrono::{Local, NaiveTime, TimeZone};
 use std::sync::Arc;
 use tokio::time::{sleep, Duration};
 use tracing::{error, info, warn};
@@ -69,9 +69,8 @@ impl NameUpdateEngine {
 
     /// Calculate next execution time based on current time
     fn calculate_next_execution_time(&self) -> Result<chrono::DateTime<Local>> {
-        let (h, m) = self.parse_execution_time()?;
-
-        let target_time = NaiveTime::from_hms_opt(h, m, 0).context("Invalid time configuration")?;
+        let target_time = NaiveTime::parse_from_str(&self.execution_time, "%H:%M")
+            .context("Invalid execution time format (expected HH:MM)")?;
 
         let now = Local::now();
         let target_date = if now.time() < target_time {
@@ -84,14 +83,6 @@ impl NameUpdateEngine {
         Local::from_local_datetime(&Local, &target_naive)
             .single()
             .context("Ambiguous or invalid local time (e.g. skipped by DST)")
-    }
-
-    /// Parse execution time string (HH:MM format) into (hour, minute)
-    fn parse_execution_time(&self) -> Result<(u32, u32)> {
-        let time = NaiveTime::parse_from_str(&self.execution_time, "%H:%M")
-            .context("Invalid execution time format (expected HH:MM)")?;
-
-        Ok((time.hour(), time.minute()))
     }
 
     /// Update all author names by fetching latest from Pixiv API

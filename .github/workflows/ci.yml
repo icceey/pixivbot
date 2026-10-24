@@ -31,14 +31,8 @@ jobs:
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
 
-      - name: Check Formatting
-        run: cargo fmt --all -- --check
+      - name: Check, lint, test and build
+        run: make ci
 
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
-
-      - name: Run Tests
-        run: cargo test --workspace --all-targets
-
-      - name: Build Release
-        run: cargo build --release --workspace
+      - name: Test ugoira encoding
+        run: cargo test -p pixivbot --features ffmpeg-codec pixiv::downloader::tests

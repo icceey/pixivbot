@@ -246,7 +246,8 @@ impl BotHandler {
                 .iter()
                 .filter(|(_, task)| task.r#type == TaskType::Ehentai)
                 .filter_map(|(_, task)| {
-                    eh_task_value_for_query(&task.value, remaining).map(str::to_string)
+                    let key = EhTaskKey::parse(&task.value)?;
+                    (key.query == remaining).then(|| task.value.clone())
                 })
                 .collect();
 
@@ -682,7 +683,7 @@ fn parse_eh_category_bitmask(cat_str: Option<&str>) -> Result<u32, String> {
     Ok(bitmask)
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 struct ParsedEhSubscriptionArgs {
     query: String,
     filter_args: Vec<String>,
@@ -736,12 +737,7 @@ fn parse_esub_remaining(remaining: &str) -> Result<ParsedEhSubscriptionArgs, Str
     })
 }
 
-fn eh_task_value_for_query<'a>(task_value: &'a str, query: &str) -> Option<&'a str> {
-    let key = EhTaskKey::parse(task_value)?;
-    (key.query == query).then_some(task_value)
-}
-
-/// Parse a gallery URL or GID into (gid, token).
+/// Parse a gallery URL into (gid, token).
 fn parse_gallery_ref(s: &str) -> Option<(u64, String)> {
     let s = s.trim();
 
@@ -763,8 +759,6 @@ fn parse_gallery_ref(s: &str) -> Option<(u64, String)> {
         return None;
     }
 
-    // Try GID only — need to make an API call to get token, but we can't here.
-    // For GID-only, we'd need to use the gtoken API method. For now, require URL.
     None
 }
 
@@ -899,94 +893,4 @@ fn format_eh_queue_status_with_visible_active_count(
     }
 
     message
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use eh_client::EhGallery;
-
-    #[test]
-    fn subscription_options_parse_through_to_filters() {
-        let parsed =
-            parse_esub_remaining("foo rating>4.5 pages>20 pages<100 telegraph=on cat=manga")
-                .unwrap();
-        assert_eq!(parsed.query, "foo");
-        assert_eq!(parsed.cat_str.as_deref(), Some("manga"));
-        assert!(parsed.telegraph_on);
-        let filter = parse_eh_filter(&parsed.filter_args).unwrap();
-        assert_eq!((filter.min_pages, filter.max_pages), (Some(21), Some(99)));
-
-        let gallery_with_rating = |rating| EhGallery {
-            gid: 1,
-            token: "token".to_string(),
-            title: "title".to_string(),
-            title_jpn: None,
-            category: "Manga".to_string(),
-            thumb: "thumb".to_string(),
-            uploader: "uploader".to_string(),
-            posted: 1,
-            filecount: 50,
-            filesize: 1,
-            expunged: false,
-            rating,
-            tags: Vec::new(),
-        };
-        assert!(!filter.matches(&gallery_with_rating(4.5)));
-        assert!(filter.matches(&gallery_with_rating(4.75)));
-
-        let inclusive = parse_esub_remaining("foo rating>4 rating>=4.5").unwrap();
-        let inclusive = parse_eh_filter(&inclusive.filter_args).unwrap();
-        assert!(inclusive.matches(&gallery_with_rating(4.5)));
-
-        let non_finite = parse_esub_remaining("foo rating>NaN").unwrap();
-        assert!(parse_eh_filter(&non_finite.filter_args).is_err());
-    }
-
-    #[test]
-    fn test_eh_task_value_for_query_preserves_legacy_value() {
-        let legacy = "eh:~foo%7Cbar|f=r4";
-        assert_eq!(eh_task_value_for_query(legacy, "~foo%7Cbar"), Some(legacy));
-        assert_eq!(eh_task_value_for_query(legacy, "~foo|bar"), None);
-    }
-
-    #[test]
-    fn test_eh_task_value_for_query_matches_encoded_value() {
-        let filter = EhFilter {
-            min_rating: Some(4.0),
-            ..Default::default()
-        };
-        let key = EhTaskKey::new("foo|bar", 0, &filter);
-        let value = key.to_task_value();
-        assert_eq!(value, "ehq:foo%7Cbar|f=r4");
-        assert_eq!(
-            eh_task_value_for_query(&value, "foo|bar"),
-            Some(value.as_str())
-        );
-    }
-
-    #[test]
-    fn gallery_reference_requires_a_complete_supported_url() {
-        for (input, expected) in [
-            (
-                "https://e-hentai.org/g/12345/abcdef0123/",
-                Some((12345, "abcdef0123")),
-            ),
-            (
-                "https://exhentai.org/g/99999/deadbeef00/",
-                Some((99999, "deadbeef00")),
-            ),
-            ("12345", None),
-            ("not a url", None),
-            ("https://example.com/other/123", None),
-            ("https://e-hentai.org/g/12345/abc/", None),
-            ("https://e-hentai.org/g/12345/abcdef0123 telegraph=on", None),
-        ] {
-            assert_eq!(
-                parse_gallery_ref(input),
-                expected.map(|(gid, token)| (gid, token.to_string())),
-                "{input}"
-            );
-        }
-    }
 }

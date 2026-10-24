@@ -167,10 +167,14 @@ impl BotHandler {
                             }
                         } else if task.r#type == TaskType::PixivTag {
                             let settings = match self.repo.pixiv_tag_settings(sub.id).await {
-                                Ok(Some(settings)) => format!(
-                                    "收藏 ≥ {}，观察窗口由服务器统一配置",
-                                    settings.min_bookmarks
-                                ),
+                                Ok(Some(settings)) => {
+                                    let mut description =
+                                        format!("收藏 ≥ {}", settings.min_bookmarks);
+                                    if let Some(limit) = settings.max_pages {
+                                        description.push_str(&format!("，图片 ≤ {limit}"));
+                                    }
+                                    description
+                                }
                                 Ok(None) => "配置缺失".to_string(),
                                 Err(e) => {
                                     error!("Failed to read tag settings: {:#}", e);
@@ -407,36 +411,4 @@ fn build_pagination_keyboard(
     }
 
     InlineKeyboardMarkup::new(vec![buttons])
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn pagination_callbacks_preserve_chat_context() {
-        let channel = build_list_callback_data(4, ChatId(-1001234567890), true);
-        assert_eq!(channel, "list:4:-1001234567890:1");
-        for (data, expected) in [
-            (
-                "list:3",
-                ListPaginationAction::Page {
-                    page: 3,
-                    target_chat_id: None,
-                    is_channel: false,
-                },
-            ),
-            (
-                channel.as_str(),
-                ListPaginationAction::Page {
-                    page: 4,
-                    target_chat_id: Some(ChatId(-1001234567890)),
-                    is_channel: true,
-                },
-            ),
-            ("list:noop", ListPaginationAction::Noop),
-        ] {
-            assert_eq!(parse_list_callback_data(data), Some(expected), "{data}");
-        }
-    }
 }

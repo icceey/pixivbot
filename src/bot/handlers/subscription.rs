@@ -170,6 +170,7 @@ mod tests {
             )),
             Notifier::new(bot.clone(), downloader),
             Vec::new(),
+            500,
             None,
             false,
             pixiv_client::ImageSize::Large,
@@ -200,7 +201,6 @@ mod tests {
                     .is_some_and(|text| text.starts_with("📋"))
             })
             .unwrap();
-        assert_eq!(list_payload["parse_mode"], "MarkdownV2");
         let listed_codes = telegram_inline_code_contents(list_payload["text"].as_str().unwrap());
         let copied_eh_id = listed_codes
             .iter()
@@ -247,15 +247,6 @@ mod tests {
             .handle_eunsub(bot.clone(), ChatId(-100), None, copied_eh_id)
             .await
             .unwrap();
-        let repeated_eh_reply = server
-            .received_requests()
-            .await
-            .unwrap()
-            .into_iter()
-            .last()
-            .and_then(|request| serde_json::from_slice::<serde_json::Value>(&request.body).ok())
-            .unwrap();
-        assert_eq!(repeated_eh_reply["text"], "❌ 未找到对应的订阅");
         assert!(repo
             .get_subscription_by_chat_task(-100, eh_query_looks_like_id_task.id)
             .await

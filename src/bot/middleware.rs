@@ -6,7 +6,7 @@ use std::sync::Arc;
 use teloxide::dispatching::DpHandlerDescription;
 use teloxide::dptree::{self, Handler};
 use teloxide::prelude::*;
-use teloxide::types::{Me, MessageEntity, MessageEntityKind, MessageEntityRef, UserId};
+use teloxide::types::{Me, MessageEntityKind, MessageEntityRef};
 use teloxide::utils::command::BotCommands;
 use tracing::{error, info};
 
@@ -170,93 +170,6 @@ fn is_chat_accessible(chat_id: ChatId, ctx: &UserChatContext) -> bool {
     ctx.chat.enabled || (chat_id.is_user() && ctx.user.role.is_admin())
 }
 
-// ============================================================================
-// 可测试的辅助函数
-// ============================================================================
-
-/// 判断命令是否应该被接受（基于 @mention 要求）
-///
-/// 此函数封装了 mention 过滤的核心逻辑，便于单元测试。
-///
-/// # 参数
-/// - `is_private`: 是否为私聊
-/// - `require_mention_in_group`: 全局配置是否要求群组中 @bot
-/// - `allow_without_mention`: chat 级别设置是否允许不带 @bot
-/// - `is_bare_command`: 命令是否为裸命令（不带 @bot）
-///
-/// # 返回
-/// - `true`: 命令应该被接受
-/// - `false`: 命令应该被过滤
-#[inline]
-fn should_accept_command(
-    is_private: bool,
-    require_mention_in_group: bool,
-    allow_without_mention: bool,
-    is_bare_command: bool,
-) -> bool {
-    // 私聊：总是接受
-    if is_private {
-        return true;
-    }
-
-    // 群组：全局配置不需要 @bot，接受所有格式
-    if !require_mention_in_group {
-        return true;
-    }
-
-    // 全局配置需要 @bot，检查 chat 级别设置
-    if allow_without_mention {
-        // chat 允许不带 @bot
-        return true;
-    }
-
-    // 需要 @bot：只接受带 @bot 的命令
-    !is_bare_command
-}
-
-/// 判断消息是否应该被处理（基于 @mention 要求）
-///
-/// 此函数封装了消息 mention 过滤的核心逻辑，便于单元测试。
-///
-/// # 参数
-/// - `is_private`: 是否为私聊
-/// - `require_mention_in_group`: 全局配置是否要求群组中 @bot
-/// - `allow_without_mention`: chat 级别设置是否允许不带 @bot
-/// - `is_reply_to_bot`: 消息是否为回复 bot 的消息
-/// - `is_mentioned`: 消息是否显式 @ 了 bot
-///
-/// # 返回
-/// - `true`: 消息应该被处理
-/// - `false`: 消息应该被忽略
-#[inline]
-fn should_process_message(
-    is_private: bool,
-    require_mention_in_group: bool,
-    allow_without_mention: bool,
-    is_reply_to_bot: bool,
-    is_mentioned: bool,
-) -> bool {
-    // 私聊：总是处理
-    if is_private {
-        return true;
-    }
-
-    // 群组：全局配置不需要 @bot，处理所有消息
-    if !require_mention_in_group {
-        return true;
-    }
-
-    // 全局配置需要 @bot，检查 chat 级别设置
-    if allow_without_mention {
-        // chat 允许不带 @bot
-        return true;
-    }
-
-    // 需要 @bot：处理回复 bot 或显式 @bot 的消息
-    is_reply_to_bot || is_mentioned
-}
-
-#[inline]
 fn message_mentions_bot(message: &Message, me: &Me) -> bool {
     let Some(text) = message.text() else {
         return false;
@@ -265,17 +178,11 @@ fn message_mentions_bot(message: &Message, me: &Me) -> bool {
         return false;
     };
 
-    entities_mention_bot(text, entities, me.user.username.as_deref(), me.user.id)
-}
-
-#[inline]
-fn entities_mention_bot(
-    text: &str,
-    entities: &[MessageEntity],
-    bot_username: Option<&str>,
-    bot_id: UserId,
-) -> bool {
-    let bot_mention = bot_username.map(|username| format!("@{username}"));
+    let bot_mention = me
+        .user
+        .username
+        .as_ref()
+        .map(|username| format!("@{username}"));
 
     MessageEntityRef::parse(text, entities)
         .into_iter()
@@ -283,7 +190,7 @@ fn entities_mention_bot(
             MessageEntityKind::Mention => bot_mention
                 .as_ref()
                 .is_some_and(|mention| entity.text().eq_ignore_ascii_case(mention)),
-            MessageEntityKind::TextMention { user } => user.id == bot_id,
+            MessageEntityKind::TextMention { user } => user.id == me.user.id,
             _ => false,
         })
 }
@@ -292,51 +199,17 @@ fn entities_mention_bot(
 // 消息过滤器
 // ============================================================================
 
-/// 混合命令过滤器
-///
-/// 根据聊天类型应用不同的命令解析策略：
-/// - **私聊**: 接受 `/cmd` 和 `/cmd@bot` (宽松)
-/// - **群组**:
-///   - 如果全局 `require_mention_in_group` 为 false: 接受 `/cmd` 和 `/cmd@bot` (宽松)
-///   - 如果全局 `require_mention_in_group` 为 true: 先宽松解析，由后续过滤器根据 chat 设置决定
-///
-/// **依赖要求:**
-/// - `Message` - 当前消息
-/// - `Me` - Bot 信息
-/// - `String` - 消息文本
-/// - `BotHandler` - Bot 处理器（获取配置）
-///
-/// **注入依赖:**
-/// - `C` - 解析后的命令类型
+/// 解析裸命令及发给当前 Bot 的命令；mention 要求由聊天设置过滤器判断。
 #[must_use]
 pub fn filter_hybrid_command<C, Output>() -> Handler<'static, Output, DpHandlerDescription>
 where
     C: BotCommands + Send + Sync + 'static,
     Output: Send + Sync + 'static,
 {
-    dptree::filter_map(
-        move |message: Message, me: Me, text: String, handler: super::BotHandler| {
-            let bot_name = me.user.username.expect("Bots must have a username");
-
-            // 解析命令（验证格式正确性）
-            let cmd = C::parse(&text, &bot_name).ok()?;
-
-            // 私聊：接受所有格式
-            if message.chat.is_private() {
-                return Some(cmd);
-            }
-
-            // 群组：根据全局配置决定
-            if !handler.require_mention_in_group {
-                // 全局配置不需要 @bot，接受所有格式
-                return Some(cmd);
-            }
-
-            // 全局配置需要 @bot，但需要考虑 chat 级别设置
-            // 这里先宽松解析，由后续 filter_mention_requirement 根据 chat 设置过滤
-            Some(cmd)
-        },
-    )
+    dptree::filter_map(move |me: Me, text: String| {
+        let bot_name = me.user.username.expect("Bots must have a username");
+        C::parse(&text, &bot_name).ok()
+    })
 }
 
 /// 检查命令的 @mention 要求
@@ -348,7 +221,6 @@ where
 /// - `UserChatContext` - 用户和聊天上下文
 /// - `C` - 解析后的命令
 /// - `Message` - 当前消息
-/// - `Me` - Bot 信息
 /// - `BotHandler` - Bot 处理器（获取配置）
 ///
 /// **注入依赖:**
@@ -371,51 +243,14 @@ where
             // - 带 @bot 的命令 "/start@mybot" 解析失败 → is_bare_command = false
             let is_bare_command = C::parse(&text, "").is_ok();
 
-            let should_accept = should_accept_command(
-                message.chat.is_private(),
-                handler.require_mention_in_group,
-                ctx.chat.allow_without_mention,
-                is_bare_command,
-            );
+            let should_accept = message.chat.is_private()
+                || !handler.require_mention_in_group
+                || ctx.chat.allow_without_mention
+                || !is_bare_command;
 
             should_accept.then_some(cmd)
         },
     )
-}
-
-/// 过滤相关消息
-///
-/// 根据聊天类型判断消息是否需要处理：
-/// - **私聊**: 总是相关
-/// - **群组**:
-///   - 如果全局 `require_mention_in_group` 为 false: 所有消息都相关
-///   - 如果全局 `require_mention_in_group` 为 true: 先宽松检查，由后续过滤器根据 chat 设置决定
-///
-/// **依赖要求:**
-/// - `Message` - 当前消息
-/// - `Me` - Bot 信息
-/// - `BotHandler` - Bot 处理器（获取配置）
-#[must_use]
-pub fn filter_relevant_message<Output>() -> Handler<'static, Output, DpHandlerDescription>
-where
-    Output: Send + Sync + 'static,
-{
-    dptree::filter_map(move |message: Message, handler: super::BotHandler| {
-        // 私聊总是处理
-        if message.chat.is_private() {
-            return Some(message);
-        }
-
-        // 群组：根据全局配置决定
-        if !handler.require_mention_in_group {
-            // 不需要 @bot，处理所有消息
-            return Some(message);
-        }
-
-        // 全局配置需要 @bot，但需要考虑 chat 级别设置
-        // 这里先宽松检查，由后续 filter_message_mention_requirement 根据 chat 设置过滤
-        Some(message)
-    })
 }
 
 /// 检查消息的 @mention 要求
@@ -447,13 +282,11 @@ where
 
             let is_mentioned = message_mentions_bot(&message, &me);
 
-            let should_process = should_process_message(
-                message.chat.is_private(),
-                handler.require_mention_in_group,
-                ctx.chat.allow_without_mention,
-                is_reply_to_bot,
-                is_mentioned,
-            );
+            let should_process = message.chat.is_private()
+                || !handler.require_mention_in_group
+                || ctx.chat.allow_without_mention
+                || is_reply_to_bot
+                || is_mentioned;
 
             if should_process {
                 message.text().map(|t| t.to_string())
@@ -462,50 +295,4 @@ where
             }
         },
     )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn command_and_message_gating_follow_chat_mention_policy() {
-        for (private, require_mention, allow_without_mention, ordinary_allowed) in [
-            (true, true, false, true),
-            (true, false, false, true),
-            (true, false, true, true),
-            (false, false, false, true),
-            (false, false, true, true),
-            (false, true, true, true),
-            (false, true, false, false),
-        ] {
-            let context = (private, require_mention, allow_without_mention);
-            assert_eq!(
-                should_accept_command(private, require_mention, allow_without_mention, true),
-                ordinary_allowed,
-                "bare command: {context:?}"
-            );
-            assert!(
-                should_accept_command(private, require_mention, allow_without_mention, false),
-                "addressed command: {context:?}"
-            );
-            for (reply, mention, expected) in [
-                (false, false, ordinary_allowed),
-                (true, false, true),
-                (false, true, true),
-            ] {
-                assert_eq!(
-                    should_process_message(
-                        private,
-                        require_mention,
-                        allow_without_mention,
-                        reply,
-                        mention
-                    ),
-                    expected,
-                    "message: {context:?}, reply={reply}, mention={mention}"
-                );
-            }
-        }
-    }
 }

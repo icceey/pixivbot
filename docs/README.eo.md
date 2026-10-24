@@ -63,8 +63,9 @@ Ni rekomendas uzi Docker por disponigo ĉar ĝi aŭtomate traktas dependecojn ka
 Se vi preferas ruli rekte sur via maŝino:
 
 1. **Antaŭkondiĉoj**:
-    - Rust (plej nova stabila)
+    - Rust 1.94 (`rust-toolchain.toml`)
     - SQLite
+    - FFmpeg-disvolvaj bibliotekoj kaj `pkg-config`
 
 2. **Klonu kaj Agordu**:
 
@@ -78,7 +79,7 @@ Se vi preferas ruli rekte sur via maŝino:
 3. **Konstruu kaj Rulu**:
 
    ```bash
-   cargo run --release
+   cargo run --release --features ffmpeg-codec
    ```
 
 ## Akiri Necesajn Ĵetonojn
@@ -108,7 +109,7 @@ Subtenataj agordaj opcioj en `config.toml` aŭ per Mediaj Variabloj (prefikso `P
 | Agorda Ŝlosilo | Media Variablo | Priskribo | Defaŭlto |
 |---|---|---|---|
 | `telegram.bot_token` | `PIX__TELEGRAM__BOT_TOKEN` | Telegram Bot API Token | `""` |
-| `telegram.owner_id` | `PIX__TELEGRAM__OWNER_ID` | Posedanta Uzanto-ID | `0` |
+| `telegram.owner_id` | `PIX__TELEGRAM__OWNER_ID` | Posedanta Uzanto-ID; se nedifinita, la unua uzanto povas fariĝi posedanto | Nedifinita |
 | `telegram.bot_mode` | `PIX__TELEGRAM__BOT_MODE` | `public` aŭ `private` | `"private"` |
 | `pixiv.refresh_token` | `PIX__PIXIV__REFRESH_TOKEN` | Pixiv OAuth Refresh Token | `""` |
 | `database.url` | `PIX__DATABASE__URL` | Datumbaza Konekta URL | `sqlite:./data/pixivbot.db?mode=rwc` |
@@ -146,11 +147,11 @@ Subtenataj agordaj opcioj en `config.toml` aŭ per Mediaj Variabloj (prefikso `P
 
 ## Kontribuado
 
-Vidu [CONTRIBUTING.md](CONTRIBUTING.md) por programadaj gvidlinioj.
+Vidu [CONTRIBUTING.md](../CONTRIBUTING.md) por programadaj gvidlinioj.
 
 ## Permesilo
 
-[MIT](LICENSE)
+[MIT](../LICENSE)
 
 ## Dankoj
 

@@ -34,11 +34,11 @@
 
 ## Workspace
 
-- Workspace crates are root `pixivbot` app, `pixiv_client` low-level Pixiv API client, `booru_client` booru API client, and `migration` SeaORM migrations.
+- Workspace crates are root `pixivbot` app, the `pixiv_client`, `booru_client`, and `eh_client` service clients, and `migration` SeaORM migrations.
 - Root `pixivbot` owns Telegram bot wiring, scheduler engines, persistence, Pixiv downloads, and booru integration.
 - `pixiv_client` is the low-level Pixiv API client; `booru_client` is the booru API client; keep protocol/client changes inside those crates when possible.
 - `migration` owns SeaORM migrations and is invoked from the app at startup, not by an external migration runner.
-- `src/main.rs` is the real wiring entrypoint: load config, run migrations, build `Repo`/Pixiv client/downloader/notifier, spawn author/ranking/name-update/optional booru engines, then start Telegram.
+- `src/main.rs` is the wiring entrypoint: load config, run migrations, build shared dependencies, start author/ranking/tag/name-update engines and optional Booru/EH workers, then start Telegram.
 
 ## Configuration
 
@@ -91,7 +91,7 @@
 
 ## Scheduler State
 
-- `src/scheduler` owns `AuthorEngine`, `RankingEngine`, `NameUpdateEngine`, and optional `BooruEngine`; scheduler decisions should not move into Telegram handlers.
+- `src/scheduler` owns the Pixiv author/ranking/tag/name-update engines and optional Booru/EH workers; scheduler decisions should not move into Telegram handlers.
 - `get_chat_if_should_notify()` skips disabled chats except admin/owner private chats; reuse it for scheduler notification eligibility.
 - Author tasks fetch one Pixiv author list once, then process each subscription independently; pending `PendingIllust { sent_pages, retry_count }` is retried before new work.
 - Ranking tasks run at configured local `HH:MM` and process all ranking tasks, not just currently pending DB tasks.

@@ -1,4 +1,4 @@
-//! Per-user, per-chat settings dialogues. Deadlines use Tokio's controllable clock.
+//! Per-user, per-chat settings dialogues.
 use crate::db::types::TagEditMode;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -39,7 +39,3 @@ impl SettingsState {
 }
 
 pub type SettingsStorage = Arc<RwLock<HashMap<(ChatId, UserId), SettingsState>>>;
-
-pub fn new_settings_storage() -> SettingsStorage {
-    Arc::new(RwLock::new(HashMap::new()))
-}

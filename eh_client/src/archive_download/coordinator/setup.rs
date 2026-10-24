@@ -21,11 +21,6 @@ impl MultipartCoordinator {
         mut seed: Option<SeedResponse>,
         resuming_persisted_manifest: bool,
     ) -> Result<Self> {
-        if max_concurrency == 0 {
-            return Err(Error::Other(
-                "archive download max_concurrency must be at least 1".into(),
-            ));
-        }
         manifest.parts.sort_by_key(|part| part.start);
         let validator = Validator::from_manifest(&manifest);
         let mut runtime_parts = HashMap::new();

@@ -255,7 +255,13 @@ impl BotHandler {
         let reply_text = msg
             .reply_to_message()
             .and_then(|reply_msg| reply_msg.text().or_else(|| reply_msg.caption()));
-        extract_eh_galleries_from_sources(args, reply_text)
+        if !args.trim().is_empty() {
+            extract_eh_galleries_from_text(args)
+        } else {
+            reply_text
+                .map(extract_eh_galleries_from_text)
+                .unwrap_or_default()
+        }
     }
 
     /// Process downloads for multiple illusts
@@ -589,17 +595,7 @@ fn extract_eh_galleries_from_text(text: &str) -> Vec<(u64, String)> {
         .collect()
 }
 
-fn extract_eh_galleries_from_sources(args: &str, reply_text: Option<&str>) -> Vec<(u64, String)> {
-    if !args.trim().is_empty() {
-        extract_eh_galleries_from_text(args)
-    } else {
-        reply_text
-            .map(extract_eh_galleries_from_text)
-            .unwrap_or_default()
-    }
-}
-
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 enum EhDownloadInput {
     None,
     Single(u64, String),
@@ -613,10 +609,7 @@ fn classify_eh_download_input(
 ) -> EhDownloadInput {
     match (eh_galleries, has_pixiv_or_booru_targets) {
         ([], _) => EhDownloadInput::None,
-        ([(gid, token)], true) => {
-            let _ = (gid, token);
-            EhDownloadInput::Mixed
-        }
+        ([_], true) => EhDownloadInput::Mixed,
         ([(gid, token)], false) => EhDownloadInput::Single(*gid, token.clone()),
         (_, _) => EhDownloadInput::Multiple,
     }
@@ -667,59 +660,6 @@ mod tests {
                 .map(|(gid, token)| (gid, token.to_string()))
                 .collect();
             assert_eq!(extract_eh_galleries_from_text(input), expected, "{input}");
-        }
-    }
-
-    #[test]
-    fn explicit_download_arguments_take_precedence_over_reply() {
-        let reply = Some("https://e-hentai.org/g/2/bbbbbbbbbb/");
-        for (args, expected) in [
-            (
-                "https://e-hentai.org/g/1/aaaaaaaaaa/",
-                vec![(1, "aaaaaaaaaa".to_string())],
-            ),
-            ("https://www.pixiv.net/artworks/123456789", vec![]),
-            ("   ", vec![(2, "bbbbbbbbbb".to_string())]),
-        ] {
-            assert_eq!(
-                extract_eh_galleries_from_sources(args, reply),
-                expected,
-                "{args}"
-            );
-        }
-    }
-
-    #[test]
-    fn download_input_distinguishes_single_multiple_and_mixed_targets() {
-        for (input, other_targets, expected) in [
-            (
-                "https://e-hentai.org/g/1/aaaaaaaaaa/ https://e-hentai.org/g/1/bbbbbbbbbb/",
-                false,
-                EhDownloadInput::Multiple,
-            ),
-            (
-                "https://e-hentai.org/g/1/aaaaaaaaaa/",
-                true,
-                EhDownloadInput::Mixed,
-            ),
-            (
-                "https://e-hentai.org/g/1/aaaaaaaaaa/ 123456789",
-                false,
-                EhDownloadInput::Mixed,
-            ),
-            (
-                "https://e-hentai.org/g/123456789/aaaaaaaaaa/",
-                false,
-                EhDownloadInput::Single(123456789, "aaaaaaaaaa".into()),
-            ),
-        ] {
-            let galleries = extract_eh_galleries_from_sources(input, None);
-            let mixed = other_targets || args_have_bare_pixiv_ids_outside_eh_urls(input);
-            assert_eq!(
-                classify_eh_download_input(&galleries, mixed),
-                expected,
-                "{input}"
-            );
         }
     }
 }

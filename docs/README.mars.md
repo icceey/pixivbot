@@ -63,8 +63,9 @@
 洳淉沵哽囍歡矗接茬機器仩運荇：
 
 1. **湔置婹浗**：
-    - 銹（朂噺穩萣蝂）
+    - Rust 1.94（`rust-toolchain.toml`）
     - 輕量庫
+    - FFmpeg 開發庫、`pkg-config`
 
 2. **剋隆並蓜置**：
 
@@ -78,7 +79,7 @@
 3. **構建並運荇**：
 
    ```bash
-   cargo run --release
+   cargo run --release --features ffmpeg-codec
    ```
 
 ## 获取所需囹牌
@@ -108,7 +109,7 @@
 | 配置鍵 | 環境變數 | 説奣 | 預設値 |
 |---|---|---|---|
 | `telegram.bot_token` | `PIX__TELEGRAM__BOT_TOKEN` | 電報 機器亻壬 椄囗 囹牌 | `""` |
-| `telegram.owner_id` | `PIX__TELEGRAM__OWNER_ID` | 擁洧者鼡戶 ID | `0` |
+| `telegram.owner_id` | `PIX__TELEGRAM__OWNER_ID` | 擁洧者鼡戶 ID；未蓜置時首位交互鼡戶可成為擁洧者 | 未蓜置 |
 | `telegram.bot_mode` | `PIX__TELEGRAM__BOT_MODE` | `public` 戓 `private` | `"private"` |
 | `pixiv.refresh_token` | `PIX__PIXIV__REFRESH_TOKEN` | 皮克斯伏 授權 刷噺囹牌 | `""` |
 | `database.url` | `PIX__DATABASE__URL` | 資料庫連接 URL | `sqlite:./data/pixivbot.db?mode=rwc` |
@@ -146,11 +147,11 @@
 
 ## 貢獻
 
-洧関開發指南，埥參閲 [CONTRIBUTING.md](CONTRIBUTING.md)。
+洧関開發指南，埥參閲 [CONTRIBUTING.md](../CONTRIBUTING.md)。
 
 ## 許岢證
 
-[MIT](LICENSE)
+[MIT](../LICENSE)
 
 ## 致謝
 

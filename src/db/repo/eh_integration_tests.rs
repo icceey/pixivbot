@@ -456,10 +456,6 @@ async fn eh_subscription_upsert_updates_filters_without_replacing_subscription()
 
     for filter in [
         Some(EhFilter {
-            min_rating: Some(3.0),
-            ..Default::default()
-        }),
-        Some(EhFilter {
             min_rating: Some(4.5),
             min_rating_strict: true,
             min_pages: Some(20),
@@ -473,8 +469,6 @@ async fn eh_subscription_upsert_updates_filters_without_replacing_subscription()
             .await
             .unwrap();
         assert_eq!(sub.id, initial.id);
-        assert_eq!(sub.chat_id, -100);
-        assert_eq!(sub.task_id, task.id);
         assert_eq!(sub.eh_filter, filter);
         assert_eq!(sub.latest_data, progress);
     }

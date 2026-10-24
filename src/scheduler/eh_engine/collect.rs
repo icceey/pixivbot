@@ -96,7 +96,7 @@ impl EhEngine {
 
         let mut prepared_subs = Vec::new();
         for sub in subs {
-            let state = eh_tag_subscription_state(&sub).unwrap_or_else(EhTagState::cleared);
+            let state = eh_tag_subscription_state(&sub).unwrap_or_default();
             if state.pending_galleries.is_empty() {
                 prepared_subs.push((sub, self.config.max_push_per_tick));
                 continue;
@@ -174,7 +174,7 @@ impl EhEngine {
                 if oldest_ts > 0 && g.posted <= oldest_ts {
                     return false;
                 }
-                if agg_filter.has_rating_filter() && g.posted < scan_cutoff.max(oldest_ts) {
+                if agg_filter.min_rating.is_some() && g.posted < scan_cutoff.max(oldest_ts) {
                     return false;
                 }
                 true
@@ -364,7 +364,7 @@ impl EhEngine {
             info!("Skipping EH collect for removed subscription {}", sub.id);
             return Ok(());
         }
-        let mut state = eh_tag_subscription_state(sub).unwrap_or_else(EhTagState::cleared);
+        let mut state = eh_tag_subscription_state(sub).unwrap_or_default();
         let variant = EhGalleryVariant::for_request(
             self.client.is_logged_in(),
             SOURCE_SUBSCRIPTION,
@@ -517,7 +517,7 @@ impl EhEngine {
         sub: &crate::db::entities::subscriptions::Model,
         latest_ts: i64,
     ) {
-        let state = eh_tag_subscription_state(sub).unwrap_or_else(EhTagState::cleared);
+        let state = eh_tag_subscription_state(sub).unwrap_or_default();
         if state.latest_posted_ts == latest_ts {
             return;
         }

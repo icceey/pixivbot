@@ -63,8 +63,9 @@ We recommend using Docker for deployment as it handles dependencies and environm
 If you prefer running directly on your machine:
 
 1. **Prerequisites**:
-    - Rust 1.94+
+    - Rust 1.94 (`rust-toolchain.toml`)
     - SQLite
+    - FFmpeg development libraries and `pkg-config`
 
 2. **Clone and Configure**:
 
@@ -78,7 +79,7 @@ If you prefer running directly on your machine:
 3. **Build and Run**:
 
    ```bash
-   cargo run --release
+   cargo run --release --features ffmpeg-codec
    ```
 
 ## Getting Required Tokens
@@ -108,7 +109,7 @@ Supported configuration options in `config.toml` or via Environment Variables (p
 | Config Key | Env Var | Description | Default |
 |---|---|---|---|
 | `telegram.bot_token` | `PIX__TELEGRAM__BOT_TOKEN` | Telegram Bot API Token | `""` |
-| `telegram.owner_id` | `PIX__TELEGRAM__OWNER_ID` | Owner User ID | `0` |
+| `telegram.owner_id` | `PIX__TELEGRAM__OWNER_ID` | Owner User ID; the first user can become owner when unset | Unset |
 | `telegram.bot_mode` | `PIX__TELEGRAM__BOT_MODE` | `public` or `private` | `"private"` |
 | `pixiv.refresh_token` | `PIX__PIXIV__REFRESH_TOKEN` | Pixiv OAuth Refresh Token | `""` |
 | `database.url` | `PIX__DATABASE__URL` | Database Connection URL | `sqlite:./data/pixivbot.db?mode=rwc` |
@@ -146,11 +147,11 @@ Supported configuration options in `config.toml` or via Environment Variables (p
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for development guidelines.
+See [CONTRIBUTING.md](../CONTRIBUTING.md) for development guidelines.
 
 ## License
 
-[MIT](LICENSE)
+[MIT](../LICENSE)
 
 ## Acknowledgements
 

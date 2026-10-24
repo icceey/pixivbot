@@ -14,16 +14,13 @@ use teloxide::types::ParseMode;
 use teloxide::utils::markdown;
 use tracing::{error, info};
 
-// ============================================================================
-// BotHandler - Core Handler Structure
-// ============================================================================
-
 #[derive(Clone)]
 pub struct BotHandler {
     pub(crate) repo: Arc<Repo>,
     pub(crate) pixiv_client: Arc<tokio::sync::RwLock<PixivClient>>,
     pub(crate) notifier: Notifier,
     pub(crate) default_sensitive_tags: Vec<String>,
+    pub(crate) pixiv_tag_min_bookmarks: i64,
     pub(crate) owner_id: Option<i64>,
     pub(crate) is_public_mode: bool,
     pub(crate) image_size: pixiv_client::ImageSize,
@@ -42,16 +39,13 @@ pub struct BotHandler {
 }
 
 impl BotHandler {
-    // ------------------------------------------------------------------------
-    // Constructor
-    // ------------------------------------------------------------------------
-
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         repo: Arc<Repo>,
         pixiv_client: Arc<tokio::sync::RwLock<PixivClient>>,
         notifier: Notifier,
         default_sensitive_tags: Vec<String>,
+        pixiv_tag_min_bookmarks: i64,
         owner_id: Option<i64>,
         is_public_mode: bool,
         image_size: pixiv_client::ImageSize,
@@ -69,6 +63,7 @@ impl BotHandler {
             pixiv_client,
             notifier,
             default_sensitive_tags,
+            pixiv_tag_min_bookmarks,
             owner_id,
             is_public_mode,
             image_size,
@@ -82,10 +77,6 @@ impl BotHandler {
             has_telegraph,
         }
     }
-
-    // ------------------------------------------------------------------------
-    // Command Entry Point
-    // ------------------------------------------------------------------------
 
     pub async fn handle_command(
         &self,
@@ -105,12 +96,10 @@ impl BotHandler {
             user_id, chat_id, cmd
         );
 
-        // Route command to appropriate handler
         self.dispatch_command(bot, msg, chat_id, cmd, &ctx.user.role)
             .await
     }
 
-    /// Dispatch command to the appropriate handler
     async fn dispatch_command(
         &self,
         bot: ThrottledBot,
@@ -119,15 +108,12 @@ impl BotHandler {
         cmd: Command,
         user_role: &UserRole,
     ) -> ResponseResult<()> {
-        // Get user_id for subscription commands that may need it for channel validation
         let user_id = msg.from.as_ref().map(|u| u.id);
 
         match cmd {
-            // Help and Info commands (defined in handlers/info.rs)
             Command::Help => self.handle_help(bot, chat_id).await,
             Command::Info => self.handle_info(bot, chat_id).await,
 
-            // Subscription commands (defined in handlers/subscription.rs)
             Command::Sub(args) => self.handle_sub_author(bot, chat_id, user_id, args).await,
             Command::SubRank(args) => self.handle_sub_ranking(bot, chat_id, user_id, args).await,
             Command::SubTag(args) => self.handle_sub_tag(bot, chat_id, user_id, args).await,
@@ -139,18 +125,13 @@ impl BotHandler {
             Command::UnsubThis => self.handle_unsub_this(bot, msg, chat_id).await,
             Command::List(args) => self.handle_list(bot, chat_id, user_id, args).await,
 
-            // Chat settings command (defined in handlers/settings.rs)
-            // Note: The actual settings panel is shown via handle_settings which uses inline keyboards
-            // Callback queries for settings buttons are handled in the dispatcher
             Command::Settings => self.handle_settings(bot, chat_id).await,
 
             // Cancel command - handled via dialogue state, no-op here
             Command::Cancel => Ok(()),
 
-            // Download command (defined in handlers/download.rs)
             Command::Download(args) => self.handle_download(bot.clone(), msg, chat_id, args).await,
 
-            // Booru subscription commands (defined in handlers/subscription/booru.rs)
             Command::BSub(args) => self.handle_bsub(bot, chat_id, user_id, args).await,
             Command::BUnsub(args) => self.handle_bunsub(bot, chat_id, user_id, args).await,
             Command::BRank(args) => {
@@ -171,7 +152,6 @@ impl BotHandler {
             }
             Command::BRand(args) => self.handle_brand(bot, msg.chat.id, user_id, args).await,
 
-            // E-Hentai commands (defined in handlers/subscription/ehentai.rs)
             Command::ESub(args) => self.handle_esub(bot, chat_id, user_id, args).await,
             Command::EUnsub(args) => self.handle_eunsub(bot, chat_id, user_id, args).await,
             Command::EDl(args) => self.handle_edl(bot, msg, chat_id, args).await,
@@ -182,7 +162,6 @@ impl BotHandler {
             Command::EnableChat(args) => self.handle_enable_chat(bot, &msg, args, true).await,
             Command::DisableChat(args) => self.handle_enable_chat(bot, &msg, args, false).await,
 
-            // Owner commands (require owner role, defined in handlers/admin.rs)
             Command::SetAdmin(args) if user_role.is_owner() => {
                 self.handle_set_admin(bot, &msg, args, true).await
             }
@@ -195,16 +174,11 @@ impl BotHandler {
         }
     }
 
-    // ------------------------------------------------------------------------
-    // Message Handler (for Pixiv links)
-    // ------------------------------------------------------------------------
-
     /// 处理普通消息（检查 Pixiv 链接）
     ///
     /// - 作品链接 (https://www.pixiv.net/artworks/xxx): 一次性推送作品
     /// - 作者链接 (https://www.pixiv.net/users/xxx): 订阅作者
     ///
-    /// 群组中只在被 @ 时响应
     pub async fn handle_message(
         &self,
         bot: ThrottledBot,
@@ -212,10 +186,9 @@ impl BotHandler {
         text: &str,
         ctx: crate::bot::UserChatContext,
     ) -> ResponseResult<()> {
-        // 检查是否包含 Pixiv 链接
         let links = parse_pixiv_links(text);
         if links.is_empty() {
-            return Ok(()); // 没有链接，忽略
+            return Ok(());
         }
 
         let chat_id = msg.chat.id;
@@ -226,14 +199,12 @@ impl BotHandler {
             user_id, chat_id, links
         );
 
-        // 获取聊天设置（用于模糊敏感内容）
         let chat_settings = &ctx.chat;
 
-        // 处理每个链接
         for link in links {
             match link {
                 PixivLink::Illust(illust_id) => {
-                    self.handle_illust_link(bot.clone(), chat_id, illust_id, Some(chat_settings))
+                    self.handle_illust_link(bot.clone(), chat_id, illust_id, chat_settings)
                         .await?;
                 }
                 PixivLink::User(user_id) => {
@@ -251,11 +222,10 @@ impl BotHandler {
         bot: ThrottledBot,
         chat_id: ChatId,
         illust_id: u64,
-        chat_settings: Option<&crate::db::entities::chats::Model>,
+        chat_settings: &crate::db::entities::chats::Model,
     ) -> ResponseResult<()> {
         info!("Fetching illust {} for chat {}", illust_id, chat_id);
 
-        // 获取作品详情
         let pixiv = self.pixiv_client.read().await;
         let illust = match pixiv.get_illust_detail(illust_id).await {
             Ok(illust) => illust,
@@ -274,15 +244,8 @@ impl BotHandler {
             caption::build_illust_caption(&illust)
         };
 
-        // 检查是否有敏感标签 (使用 chat-level 设置)
-        let has_spoiler =
-            chat_settings.is_some_and(|chat| crate::utils::sensitive::should_blur(chat, &illust));
-
-        // Build download button config
-        // For one-off pushes via link, check chat type to skip channels
-        let download_config = chat_settings
-            .map(|chat| DownloadButtonConfig::for_pixiv_chat(illust.id, chat))
-            .unwrap_or_else(|| DownloadButtonConfig::pixiv(illust.id));
+        let has_spoiler = crate::utils::sensitive::should_blur(chat_settings, &illust);
+        let download_config = DownloadButtonConfig::for_pixiv_chat(illust.id, chat_settings);
 
         if illust.is_ugoira() {
             let pixiv = self.pixiv_client.read().await;
@@ -316,18 +279,17 @@ impl BotHandler {
             return Ok(());
         }
 
-        // 获取所有图片 URL (使用配置的尺寸)
         let image_urls = illust.get_all_image_urls_with_size(self.image_size);
 
-        // 发送图片
         let _ = self
             .notifier
-            .notify_with_images_and_button(
+            .notify_with_images(
                 chat_id,
                 &image_urls,
                 Some(&caption),
                 has_spoiler,
                 &download_config,
+                None,
             )
             .await;
 
@@ -343,7 +305,6 @@ impl BotHandler {
     ) -> ResponseResult<()> {
         info!("Subscribing to user {} for chat {}", user_id, chat_id);
 
-        // 获取用户详情
         let pixiv = self.pixiv_client.read().await;
         let author = match pixiv.get_user_detail(user_id).await {
             Ok(user) => user,
@@ -356,7 +317,6 @@ impl BotHandler {
         };
         drop(pixiv);
 
-        // 创建或获取任务
         match self
             .repo
             .get_or_create_task(
@@ -367,7 +327,6 @@ impl BotHandler {
             .await
         {
             Ok(task) => {
-                // 创建订阅
                 match self
                     .repo
                     .upsert_subscription(chat_id.0, task.id, TagFilter::default())

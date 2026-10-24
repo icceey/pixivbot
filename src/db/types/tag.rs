@@ -1,17 +1,9 @@
-//! Tag filter utilities for filtering Pixiv illusts.
-//!
-//! This module provides a unified `TagFilter` type that handles:
-//! - Parsing from command arguments (e.g., `/sub 123 +tag1 -tag2`)
-//! - Parsing from database JSON
-//! - Converting to JSON for database storage
-//! - Formatting for display in Telegram messages
-//! - Filtering Illust objects
+//! Persisted tag lists and subscription filters for Pixiv and booru posts.
 
 use crate::utils::tag;
 use pixiv_client::Illust;
 use sea_orm::FromJsonQueryResult;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use std::ops::{Deref, DerefMut};
 use teloxide::utils::markdown;
 
@@ -91,10 +83,6 @@ impl TagFilter {
 
     /// Create a TagFilter from chat excluded_tags (exclude only).
     pub fn from_excluded_tags(excluded_tags: &Tags) -> Self {
-        if excluded_tags.is_empty() {
-            return Self::default();
-        }
-
         Self {
             include: Vec::new(),
             exclude: excluded_tags.0.clone(),
@@ -104,17 +92,6 @@ impl TagFilter {
     /// Check if this filter has any restrictions.
     pub fn is_empty(&self) -> bool {
         self.include.is_empty() && self.exclude.is_empty()
-    }
-
-    /// Convert to JSON Value for database storage.
-    ///
-    /// Returns `None` if the filter is empty.
-    pub fn to_json(&self) -> Option<Value> {
-        if self.is_empty() {
-            None
-        } else {
-            serde_json::to_value(self).ok()
-        }
     }
 
     /// Format for display in Telegram messages (MarkdownV2 escaped).
