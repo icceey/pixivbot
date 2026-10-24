@@ -96,6 +96,8 @@ pub mod tests_helpers {
             "CREATE TABLE pixiv_push_history (
                 chat_id INTEGER NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
                 illust_id INTEGER NOT NULL,
+                published_at INTEGER NOT NULL,
+                author_id INTEGER,
                 sent_pages TEXT NOT NULL DEFAULT '[]',
                 done BOOLEAN NOT NULL DEFAULT 0,
                 PRIMARY KEY(chat_id, illust_id)
@@ -454,18 +456,46 @@ mod tests {
         .await
         .unwrap();
 
-        repo.save_pixiv_push_progress(old_chat_id, 1, &[0, 1], false, None)
-            .await
-            .unwrap();
-        repo.save_pixiv_push_progress(new_chat_id, 1, &[1, 2], false, None)
-            .await
-            .unwrap();
-        repo.save_pixiv_push_progress(old_chat_id, 2, &[0], false, None)
-            .await
-            .unwrap();
-        repo.save_pixiv_push_progress(new_chat_id, 2, &[], true, None)
-            .await
-            .unwrap();
+        repo.save_pixiv_push_progress(
+            old_chat_id,
+            1,
+            chrono::Utc::now().timestamp(),
+            &[0, 1],
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+        repo.save_pixiv_push_progress(
+            new_chat_id,
+            1,
+            chrono::Utc::now().timestamp(),
+            &[1, 2],
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+        repo.save_pixiv_push_progress(
+            old_chat_id,
+            2,
+            chrono::Utc::now().timestamp(),
+            &[0],
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+        repo.save_pixiv_push_progress(
+            new_chat_id,
+            2,
+            chrono::Utc::now().timestamp(),
+            &[],
+            true,
+            None,
+        )
+        .await
+        .unwrap();
         repo.migrate_chat(old_chat_id, new_chat_id).await.unwrap();
 
         assert_eq!(

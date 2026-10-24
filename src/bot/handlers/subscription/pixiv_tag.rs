@@ -6,7 +6,7 @@ use teloxide::prelude::*;
 use teloxide::types::UserId;
 use tracing::error;
 
-const USAGE: &str = "用法：/subtag [ch=<频道ID>] <标签或搜索词> [b=500] [l=<图片数>] [+tag -tag]";
+const USAGE: &str = "用法：/subtag [ch=<频道ID>] <单个精确标签> [b=500] [l=<图片数>] [+tag -tag]";
 
 fn parse_subscription(
     parsed: &ParsedArgs,
@@ -54,7 +54,7 @@ fn parse_subscription(
         }
     }
     if words.is_empty() {
-        return Err("请指定标签或搜索词");
+        return Err("请指定标签");
     }
     let query = words.join(" ");
     let min_bookmarks: i64 = bookmarks
@@ -95,8 +95,19 @@ impl BotHandler {
             match parse_subscription(&parsed, self.pixiv_tag_min_bookmarks) {
                 Ok(value) => value,
                 Err(reason) => {
-                    bot.send_message(chat_id, format!("❌ {reason}\n{USAGE}"))
-                        .await?;
+                    bot.send_message(
+                        chat_id,
+                        format!(
+                            "❌ {reason}\n{USAGE}\n\n参数：\n\
+                         - b / bookmarks：收藏数达到此值才会推送，默认{}。\n\
+                         - l / limit：图片数量超过此值的作品不推送，省略时不限数量。\n\
+                         - +tag：除了订阅的标签外，作品还需带有至少一个指定标签才推送。\n\
+                         - -tag：带有任意一个指定标签的作品不会推送。\n\
+                         收藏数和图片数量须为正整数。",
+                            self.pixiv_tag_min_bookmarks
+                        ),
+                    )
+                    .await?;
                     return Ok(());
                 }
             };

@@ -107,7 +107,10 @@ impl PixivTagEngine {
                 error!("Pixiv tag task {} failed: {:#}", task.id, e);
             }
         }
-        self.send_due().await
+        self.send_due().await?;
+        self.repo
+            .prune_pixiv_push_history(Utc::now().timestamp() - self.window_hours * 3600)
+            .await
     }
 
     fn scan_interval(

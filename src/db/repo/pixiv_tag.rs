@@ -2,7 +2,7 @@ use super::Repo;
 use crate::db::entities::subscriptions;
 use crate::db::types::TagFilter;
 use anyhow::{Context, Result};
-use chrono::{Local, NaiveDate};
+use chrono::{DateTime, Local, NaiveDate};
 use pixiv_client::Illust;
 use sea_orm::{
     sea_query::OnConflict, ColumnTrait, ConnectionTrait, DbBackend, EntityTrait, FromQueryResult,
@@ -204,13 +204,14 @@ impl Repo {
         illust: &Illust,
         now: i64,
     ) -> Result<()> {
+        let published_at = DateTime::parse_from_rfc3339(&illust.create_date)?.timestamp();
         self.db.execute(Statement::from_sql_and_values(DbBackend::Sqlite,
-            "INSERT INTO pixiv_tag_deliveries(subscription_id, illust_id, illust, next_attempt_at)
-             SELECT s.id, ?, ?, ? FROM subscriptions s WHERE s.id=?
+            "INSERT INTO pixiv_tag_deliveries(subscription_id, illust_id, illust, next_attempt_at, published_at)
+             SELECT s.id, ?, ?, ?, ? FROM subscriptions s WHERE s.id=?
              AND NOT EXISTS (SELECT 1 FROM pixiv_push_history h
                  WHERE h.chat_id=s.chat_id AND h.illust_id=? AND h.done=1)
              ON CONFLICT(subscription_id, illust_id) DO NOTHING",
-            [i64::try_from(illust.id)?.into(), serde_json::to_string(illust)?.into(), now.into(),
+            [i64::try_from(illust.id)?.into(), serde_json::to_string(illust)?.into(), now.into(), published_at.into(),
              sub_id.into(), i64::try_from(illust.id)?.into()],
         )).await?;
         Ok(())

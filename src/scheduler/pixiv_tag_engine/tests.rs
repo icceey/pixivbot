@@ -471,7 +471,14 @@ async fn acknowledged_pages_and_message_mapping_roll_back_together() {
         .await
         .unwrap();
     assert!(repo
-        .save_pixiv_push_progress(chat.id, 10, &[0], true, Some((sub.id, 100)))
+        .save_pixiv_push_progress(
+            chat.id,
+            10,
+            Utc::now().timestamp(),
+            &[0],
+            true,
+            Some((sub.id, 100))
+        )
         .await
         .is_err());
     assert!(!repo.pixiv_push_progress(chat.id, 10).await.unwrap().done);
@@ -484,15 +491,210 @@ async fn acknowledged_pages_and_message_mapping_roll_back_together() {
         .execute_unprepared("DROP TRIGGER fail_message")
         .await
         .unwrap();
-    repo.save_pixiv_push_progress(chat.id, 10, &[0], true, Some((sub.id, 100)))
-        .await
-        .unwrap();
+    repo.save_pixiv_push_progress(
+        chat.id,
+        10,
+        Utc::now().timestamp(),
+        &[0],
+        true,
+        Some((sub.id, 100)),
+    )
+    .await
+    .unwrap();
     assert!(repo.pixiv_push_progress(chat.id, 10).await.unwrap().done);
     assert!(repo
         .get_message_with_subscription(chat.id, 100)
         .await
         .unwrap()
         .is_some());
+}
+
+#[tokio::test]
+async fn expired_history_waits_for_pending_deliveries_and_author_checkpoints() {
+    let repo = Arc::new(open_repo("sqlite::memory:").await);
+    let (_, sub, chat) = subscribe(&repo).await;
+    let other_task = repo
+        .get_or_create_task(TaskType::PixivTag, "other".to_string(), None)
+        .await
+        .unwrap();
+    let other_sub = repo
+        .upsert_subscription(chat.id, other_task.id, TagFilter::default())
+        .await
+        .unwrap();
+    let author = repo
+        .get_or_create_task(TaskType::Author, "0001".to_string(), None)
+        .await
+        .unwrap();
+    let author_sub = repo
+        .upsert_subscription(chat.id, author.id, TagFilter::default())
+        .await
+        .unwrap();
+    let now = Utc::now().timestamp();
+    let published_at = now - 8 * 86400;
+    let mut illust = illustration(10, "https://example.test", 2);
+    illust.create_date = DateTime::from_timestamp(published_at, 0)
+        .unwrap()
+        .to_rfc3339();
+    for id in [sub.id, other_sub.id] {
+        repo.enqueue_pixiv_tag_delivery(id, &illust, now)
+            .await
+            .unwrap();
+    }
+    repo.save_pixiv_push_progress(chat.id, 10, published_at, &[], true, Some((sub.id, 100)))
+        .await
+        .unwrap();
+    let mut partial = illust.clone();
+    partial.id = 11;
+    partial.user.id = 2;
+    repo.enqueue_pixiv_tag_delivery(other_sub.id, &partial, now)
+        .await
+        .unwrap();
+    repo.begin_pixiv_push(chat.id, &partial).await.unwrap();
+    repo.save_pixiv_push_progress(chat.id, 11, published_at, &[0], false, None)
+        .await
+        .unwrap();
+    let mut author_state = AuthorState {
+        latest_illust_id: 9,
+        pending_illust: Some(PendingIllust {
+            illust_id: 10,
+            sent_pages: vec![0],
+            total_pages: 2,
+            retry_count: 1,
+        }),
+    };
+    let first = repo
+        .pixiv_tag_deliveries_due(sub.id, now)
+        .await
+        .unwrap()
+        .remove(0);
+    repo.save_pixiv_tag_delivery(&first, true, now)
+        .await
+        .unwrap();
+
+    repo.prune_pixiv_push_history(now - 7 * 86400)
+        .await
+        .unwrap();
+    assert!(repo.pixiv_push_progress(chat.id, 10).await.unwrap().done);
+    repo.update_subscription_latest_data(
+        author_sub.id,
+        Some(SubscriptionState::Author(author_state.clone())),
+    )
+    .await
+    .unwrap();
+    let pending = repo
+        .pixiv_tag_deliveries_due(other_sub.id, now)
+        .await
+        .unwrap()
+        .remove(0);
+    repo.save_pixiv_tag_delivery(&pending, true, now)
+        .await
+        .unwrap();
+    repo.prune_pixiv_push_history(now - 7 * 86400)
+        .await
+        .unwrap();
+    assert!(repo.pixiv_push_progress(chat.id, 10).await.unwrap().done);
+
+    author_state.pending_illust = None;
+    repo.update_subscription_latest_data(
+        author_sub.id,
+        Some(SubscriptionState::Author(author_state.clone())),
+    )
+    .await
+    .unwrap();
+    repo.prune_pixiv_push_history(now - 7 * 86400)
+        .await
+        .unwrap();
+    assert!(repo.pixiv_push_progress(chat.id, 10).await.unwrap().done);
+    let cache = tempfile::tempdir().unwrap();
+    let notifier = Notifier::new(
+        Bot::new("fake_token").throttle(Limits::default()),
+        Arc::new(Downloader::new(
+            reqwest::Client::new(),
+            FileCacheManager::new(cache.path(), 7),
+        )),
+    );
+    let pixiv = Arc::new(RwLock::new(
+        PixivClient::new(PixivConfig {
+            refresh_token: "unused".to_string(),
+        })
+        .unwrap(),
+    ));
+    assert!(matches!(
+        process_illust_push(
+            &repo,
+            &notifier,
+            &pixiv,
+            &chat,
+            &illust,
+            author_sub.id,
+            ImageSize::Large,
+        )
+        .await
+        .unwrap(),
+        PushResult::Success { .. }
+    ));
+    repo.db()
+        .execute_unprepared(
+            "CREATE TRIGGER fail_author_progress BEFORE UPDATE OF latest_data ON subscriptions
+         BEGIN SELECT RAISE(ABORT, 'injected cursor failure'); END;",
+        )
+        .await
+        .unwrap();
+    author_state.latest_illust_id = 10;
+    assert!(repo
+        .update_subscription_latest_data(
+            author_sub.id,
+            Some(SubscriptionState::Author(author_state.clone())),
+        )
+        .await
+        .is_err());
+    repo.prune_pixiv_push_history(now - 7 * 86400)
+        .await
+        .unwrap();
+    assert!(repo.pixiv_push_progress(chat.id, 10).await.unwrap().done);
+    repo.db()
+        .execute_unprepared("DROP TRIGGER fail_author_progress")
+        .await
+        .unwrap();
+    repo.update_subscription_latest_data(
+        author_sub.id,
+        Some(SubscriptionState::Author(author_state)),
+    )
+    .await
+    .unwrap();
+    repo.prune_pixiv_push_history(now - 7 * 86400)
+        .await
+        .unwrap();
+    assert!(!repo.pixiv_push_progress(chat.id, 10).await.unwrap().done);
+    assert_eq!(
+        repo.pixiv_push_progress(chat.id, 11)
+            .await
+            .unwrap()
+            .sent_pages,
+        vec![0]
+    );
+    repo.delete_subscription(other_sub.id).await.unwrap();
+    repo.prune_pixiv_push_history(now - 7 * 86400)
+        .await
+        .unwrap();
+    assert!(repo
+        .pixiv_push_progress(chat.id, 11)
+        .await
+        .unwrap()
+        .sent_pages
+        .is_empty());
+    let remaining = repo
+        .db()
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DbBackend::Sqlite,
+            "SELECT count(*) AS n FROM pixiv_tag_deliveries",
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get::<i64>("", "n")
+        .unwrap();
+    assert_eq!(remaining, 0);
 }
 
 #[tokio::test]
