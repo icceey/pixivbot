@@ -33,13 +33,6 @@ pub(super) fn make_telegraph_client(tg_server: &MockServer) -> Arc<TelegraphClie
     ))
 }
 
-pub(super) fn make_image_uploader(tg_server: &MockServer) -> Arc<dyn ImageUploader> {
-    Arc::new(PixiUploader::new_with_url(format!(
-        "{}/pixi/upload",
-        tg_server.uri()
-    )))
-}
-
 pub(super) fn make_config() -> EhentaiConfig {
     EhentaiConfig {
         download_rate_limit_gb: 7,
@@ -187,16 +180,6 @@ pub(super) fn create_test_zip_with_unsupported_encrypted_non_image(path: &std::p
     }
     assert!(modified_local && modified_central);
     std::fs::write(path, bytes).unwrap();
-}
-
-#[derive(Debug)]
-pub(super) struct MultipartFileCount(pub(super) usize);
-
-impl wiremock::Match for MultipartFileCount {
-    fn matches(&self, request: &wiremock::Request) -> bool {
-        let body = String::from_utf8_lossy(&request.body);
-        body.matches("name=\"files[]\"").count() == self.0
-    }
 }
 
 pub(super) async fn mock_tg_send_document(server: &MockServer) {
@@ -360,17 +343,6 @@ pub(super) async fn mock_eh_archive_download(
     Mock::given(method("GET"))
         .and(path(path_str))
         .respond_with(ResponseTemplate::new(200).set_body_bytes(zip_bytes))
-        .mount(server)
-        .await;
-}
-
-pub(super) async fn mock_telegraph_upload(server: &MockServer, expected_requests: u64) {
-    let body = serde_json::json!({"success": true, "direct_url": "https://i.pixi.mg/i/abc123.jpg"});
-    Mock::given(method("POST"))
-        .and(path("/pixi/upload"))
-        .and(MultipartFileCount(1))
-        .respond_with(ResponseTemplate::new(200).set_body_json(body))
-        .expect(expected_requests)
         .mount(server)
         .await;
 }
