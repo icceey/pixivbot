@@ -26,9 +26,9 @@ flowchart LR
 
 ## Pixiv and Booru subscriptions
 
-Pixiv author subscriptions track new works per author. Tag subscriptions share a search cursor by query and queue works that reach each subscription's bookmark threshold. Search dates use Japan Standard Time; the date and offset advance together across pages. Polling intervals adapt to the observed page count within the configured bounds.
+Pixiv author subscriptions track new works per author. Tag subscriptions share a search cursor by query and queue works that reach each subscription's bookmark threshold. Search dates use Japan Standard Time; the date, offset, and last publication timestamp are checkpointed together. Each batch's wait is `covered_seconds × target_seconds / (window_seconds + target_seconds)`, accounting for works published during the scan and clamped to the configured polling interval bounds.
 
-Author and tag deliveries share per-chat work history. A chat lock covers reading progress, sending the work, and saving acknowledgements. Each Telegram batch contains at most 10 images; successful page indices and the batch's reply mapping commit together. Ranking deliveries retain separate progress. Telegram acknowledgements lost before a database commit can cause the last batch to be retried.
+Author and tag deliveries share per-chat work history. A chat lock covers reading progress, sending the work, saving acknowledgements, and expiry cleanup. History and completed tag deliveries expire by publication time outside the configured observation window, after pending deliveries and author cursors release them. Each Telegram batch contains at most 10 images; successful page indices and the batch's reply mapping commit together. Ranking deliveries retain separate progress. Telegram acknowledgements lost before a database commit can cause the last batch to be retried.
 
 Booru sites share a registry of configured clients. Tag subscriptions process pending queues before advancing their cursors; tasks whose subscriptions all have pending queues skip fetching. Grace/ranking work is bounded per tick. Subscription filters and task keys determine which polling work can be shared.
 

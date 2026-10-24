@@ -2,7 +2,7 @@ use super::Repo;
 use crate::db::entities::subscriptions;
 use crate::db::types::TagFilter;
 use anyhow::{Context, Result};
-use chrono::{Local, NaiveDate};
+use chrono::{DateTime, Local, NaiveDate};
 use pixiv_client::Illust;
 use sea_orm::{
     sea_query::OnConflict, ColumnTrait, ConnectionTrait, DbBackend, EntityTrait, FromQueryResult,
@@ -19,8 +19,7 @@ pub struct TagSettings {
 pub struct TagScan {
     pub cursor_date: NaiveDate,
     pub cursor_offset: i64,
-    pub pages_scanned: i64,
-    pub total_pages: i64,
+    pub cursor_time: Option<i64>,
     pub complete: bool,
 }
 
@@ -106,13 +105,8 @@ impl Repo {
                 DbBackend::Sqlite,
                 "INSERT INTO pixiv_tag_scans(task_id, cursor_date, window_days)
              VALUES (?, ?, ?) ON CONFLICT(task_id) DO UPDATE SET
-             cursor_date=excluded.cursor_date, cursor_offset=0,
-             pages_scanned=CASE WHEN pixiv_tag_scans.complete=1
-                 OR pixiv_tag_scans.window_days<>excluded.window_days THEN 0
-                 ELSE pixiv_tag_scans.pages_scanned END,
+             cursor_date=excluded.cursor_date, cursor_offset=0, cursor_time=NULL,
              complete=0,
-             total_pages=CASE WHEN pixiv_tag_scans.window_days<>excluded.window_days THEN 0
-                 ELSE MAX(pixiv_tag_scans.total_pages, pixiv_tag_scans.pages_scanned) END,
              window_days=excluded.window_days
              WHERE pixiv_tag_scans.complete=1 OR pixiv_tag_scans.cursor_date<excluded.cursor_date
                 OR pixiv_tag_scans.window_days<>excluded.window_days",
@@ -125,7 +119,7 @@ impl Repo {
             .await?;
         TagScan::find_by_statement(Statement::from_sql_and_values(
             DbBackend::Sqlite,
-            "SELECT cursor_date, cursor_offset, pages_scanned, total_pages, complete
+            "SELECT cursor_date, cursor_offset, cursor_time, complete
              FROM pixiv_tag_scans WHERE task_id=?",
             [task_id.into()],
         ))
@@ -160,13 +154,12 @@ impl Repo {
         }
         txn.execute(Statement::from_sql_and_values(
             DbBackend::Sqlite,
-            "UPDATE pixiv_tag_scans SET cursor_date=?, cursor_offset=?, pages_scanned=?,
-                 total_pages=?, complete=? WHERE task_id=?",
+            "UPDATE pixiv_tag_scans SET cursor_date=?, cursor_offset=?, cursor_time=?,
+                 complete=? WHERE task_id=?",
             [
                 scan.cursor_date.into(),
                 scan.cursor_offset.into(),
-                scan.pages_scanned.into(),
-                scan.total_pages.into(),
+                scan.cursor_time.into(),
                 scan.complete.into(),
                 task_id.into(),
             ],
@@ -211,13 +204,14 @@ impl Repo {
         illust: &Illust,
         now: i64,
     ) -> Result<()> {
+        let published_at = DateTime::parse_from_rfc3339(&illust.create_date)?.timestamp();
         self.db.execute(Statement::from_sql_and_values(DbBackend::Sqlite,
-            "INSERT INTO pixiv_tag_deliveries(subscription_id, illust_id, illust, next_attempt_at)
-             SELECT s.id, ?, ?, ? FROM subscriptions s WHERE s.id=?
+            "INSERT INTO pixiv_tag_deliveries(subscription_id, illust_id, illust, next_attempt_at, published_at)
+             SELECT s.id, ?, ?, ?, ? FROM subscriptions s WHERE s.id=?
              AND NOT EXISTS (SELECT 1 FROM pixiv_push_history h
                  WHERE h.chat_id=s.chat_id AND h.illust_id=? AND h.done=1)
              ON CONFLICT(subscription_id, illust_id) DO NOTHING",
-            [i64::try_from(illust.id)?.into(), serde_json::to_string(illust)?.into(), now.into(),
+            [i64::try_from(illust.id)?.into(), serde_json::to_string(illust)?.into(), now.into(), published_at.into(),
              sub_id.into(), i64::try_from(illust.id)?.into()],
         )).await?;
         Ok(())

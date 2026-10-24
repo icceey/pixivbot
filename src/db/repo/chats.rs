@@ -248,14 +248,16 @@ impl Repo {
         // existing target history without losing pages or completed works.
         txn.execute(Statement::from_sql_and_values(
             self.db.get_database_backend(),
-            "INSERT INTO pixiv_push_history(chat_id, illust_id, sent_pages, done)
-             SELECT ?, illust_id, sent_pages, done FROM pixiv_push_history WHERE chat_id=?
+            "INSERT INTO pixiv_push_history(chat_id, illust_id, published_at, author_id, sent_pages, done)
+             SELECT ?, illust_id, published_at, author_id, sent_pages, done FROM pixiv_push_history WHERE chat_id=?
              ON CONFLICT(chat_id, illust_id) DO UPDATE SET
              sent_pages=CASE WHEN pixiv_push_history.done OR excluded.done THEN '[]' ELSE
                  (SELECT json_group_array(value) FROM (
                      SELECT value FROM json_each(pixiv_push_history.sent_pages)
                      UNION SELECT value FROM json_each(excluded.sent_pages) ORDER BY value)) END,
-             done=MAX(pixiv_push_history.done, excluded.done)",
+             done=MAX(pixiv_push_history.done, excluded.done),
+             published_at=MAX(pixiv_push_history.published_at, excluded.published_at),
+             author_id=COALESCE(pixiv_push_history.author_id, excluded.author_id)",
             [new_chat_id.into(), old_chat_id.into()],
         ))
         .await

@@ -21,6 +21,8 @@ mod m20260828_000000_eh_job_fingerprint_generations;
 mod m20260829_000000_eh_result_generation_order;
 mod m20261023_000000_pixiv_tag_ranking;
 mod m20261024_000000_pixiv_tag_page_limit;
+mod m20261024_000100_pixiv_tag_scan_time;
+mod m20261024_000200_pixiv_history_retention;
 
 pub struct Migrator;
 
@@ -49,6 +51,8 @@ impl MigratorTrait for Migrator {
             Box::new(m20260829_000000_eh_result_generation_order::Migration),
             Box::new(m20261023_000000_pixiv_tag_ranking::Migration),
             Box::new(m20261024_000000_pixiv_tag_page_limit::Migration),
+            Box::new(m20261024_000100_pixiv_tag_scan_time::Migration),
+            Box::new(m20261024_000200_pixiv_history_retention::Migration),
         ]
     }
 }

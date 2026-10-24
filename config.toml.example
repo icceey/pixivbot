@@ -42,7 +42,7 @@ ranking_execution_time = "19:00"
 pixiv_tag_window_days = 7
 # Default bookmark threshold for tag subscriptions (positive integer)
 pixiv_tag_min_bookmarks = 500
-# Target scan duration in hours; polling intervals adapt to the observed page count
+# Target scan duration in hours; polling intervals follow the publication time span scanned
 pixiv_tag_scan_target_hours = 12
 # Maximum search pages per task execution (positive integer)
 pixiv_tag_scan_pages = 3

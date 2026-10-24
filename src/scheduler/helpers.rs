@@ -150,7 +150,7 @@ pub async fn process_illust_push(
     image_size: pixiv_client::ImageSize,
 ) -> Result<PushResult> {
     let _guard = repo.lock_pixiv_push(chat.id).await;
-    let progress = repo.pixiv_push_progress(chat.id, illust.id).await?;
+    let progress = repo.begin_pixiv_push(chat.id, illust).await?;
     if progress.done {
         info!(
             "Skipping previously pushed illust {} for chat {}",
@@ -160,6 +160,7 @@ pub async fn process_illust_push(
             illust_id: illust.id,
         });
     }
+    let published_at = chrono::DateTime::parse_from_rfc3339(&illust.create_date)?.timestamp();
     let mut sent_pages = progress.sent_pages;
     sent_pages.sort_unstable();
     sent_pages.dedup();
@@ -178,6 +179,7 @@ pub async fn process_illust_push(
         repo.save_pixiv_push_progress(
             chat.id,
             illust.id,
+            published_at,
             &[],
             true,
             Some((subscription_id, message_id)),
@@ -242,6 +244,7 @@ pub async fn process_illust_push(
             repo.save_pixiv_push_progress(
                 chat.id,
                 illust.id,
+                published_at,
                 &sent_pages,
                 done,
                 Some((subscription_id, message_id)),
@@ -268,7 +271,7 @@ pub async fn process_illust_push(
         }
     }
     // Imported author state may already contain every page.
-    repo.save_pixiv_push_progress(chat.id, illust.id, &[], true, None)
+    repo.save_pixiv_push_progress(chat.id, illust.id, published_at, &[], true, None)
         .await?;
     Ok(PushResult::Success {
         illust_id: illust.id,

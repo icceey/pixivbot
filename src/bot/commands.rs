@@ -13,7 +13,7 @@ pub enum Command {
     #[command(description = "订阅排行榜\n  用法: /subrank [ch=<频道ID>] <mode>")]
     SubRank(String),
     #[command(
-        description = "订阅标签热榜\n  用法: /subtag [ch=<频道ID>] <标签> [b=500] [l=<图片数>]"
+        description = "订阅标签热榜\n  用法: /subtag [ch=<频道ID>] <单个精确标签> [b=500] [l=<图片数>] [+tag -tag]"
     )]
     SubTag(String),
     #[command(description = "取消标签热榜\n  用法: /unsubtag [ch=<频道ID>] <标签搜索词>")]
@@ -80,7 +80,7 @@ impl Command {
             BotCommand::new("subrank", "订阅排行榜 - /subrank [ch=<频道ID>] <mode>"),
             BotCommand::new(
                 "subtag",
-                "订阅标签热榜 - /subtag [ch=<频道ID>] <标签> [b=500] [l=<图片数>]",
+                "订阅标签热榜 - /subtag [ch=<频道ID>] <单个精确标签> [b=500] [l=<图片数>] [+tag -tag]",
             ),
             BotCommand::new(
                 "unsubtag",
