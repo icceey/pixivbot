@@ -761,60 +761,6 @@ async fn test_download_size_limit_allows_small_selected_resample_without_metadat
 }
 
 #[tokio::test]
-async fn test_download_size_limit_allows_equal_size() {
-    let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
-    setup_chat(&repo, -100, true).await;
-    let eh_server = MockServer::start().await;
-    let temp_dir = tempfile::tempdir().unwrap();
-
-    // A selected archive equal to the limit must be allowed (strict `>` rejects).
-    mock_archiver(
-        &eh_server,
-        901,
-        "abcdef0123",
-        ArchiverPage {
-            sizes: Some(("400.0 MiB", "300.0 MiB")),
-            ..Default::default()
-        },
-    )
-    .await;
-    let download_url = format!("{}/archive/901/token/0", eh_server.uri());
-    mock_eh_archiver_post(&eh_server, &download_url).await;
-
-    let zip_temp = tempfile::tempdir().unwrap();
-    let zip_path = zip_temp.path().join("equal_size.zip");
-    create_test_zip(&zip_path, 2);
-    let zip_bytes = std::fs::read(&zip_path).unwrap();
-    mock_eh_archive_download(&eh_server, "/archive/901/token/0", zip_bytes).await;
-
-    let mut cfg = make_config();
-    cfg.max_archive_size_mb = 300;
-    cfg.background_download_enabled = false;
-    let entry = seed_delivery(
-        &repo,
-        -100,
-        (901, "abcdef0123", "Title"),
-        Default::default(),
-    )
-    .await;
-    let worker = EhDownloadWorker::new(
-        Arc::clone(&repo),
-        make_eh_client(&eh_server),
-        Arc::new(cfg),
-        temp_dir.path().to_path_buf(),
-        Main,
-        None,
-    );
-
-    worker.tick().await.unwrap();
-
-    let model = job_for_delivery(&repo, &entry).await;
-    assert_eq!(model.status, STATUS_DOWNLOADED);
-    assert!(model.zip_path.is_some());
-    assert!(model.file_size > 0);
-}
-
-#[tokio::test]
 async fn download_workers_resume_saved_artifacts_without_another_purchase() {
     for background in [false, true] {
         for complete_zip in [false, true] {

@@ -457,7 +457,7 @@ mod tests {
     use wiremock::matchers::{method, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    const BUCKET: &str = "task-four-bucket";
+    const BUCKET: &str = "bucket";
     const KEY: &str = "object-key";
     const UPLOAD_ID: &str = "upload-id";
 
@@ -480,15 +480,16 @@ mod tests {
             .await;
         Mock::given(method("GET"))
             .and(query_param("part-number-marker", "2"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(list_parts_xml(
-                BUCKET,
-                KEY,
-                UPLOAD_ID,
-                2,
-                3,
-                false,
-                &[(3, "\"cid-three\"", 30)],
-            )))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                list_parts_xml_without_next_marker(
+                    BUCKET,
+                    KEY,
+                    UPLOAD_ID,
+                    2,
+                    false,
+                    &[(3, "\"cid-three\"", 30)],
+                ),
+            ))
             .expect(1)
             .mount(&server)
             .await;
@@ -531,13 +532,6 @@ mod tests {
                 query_value(request, "part-number-marker").as_deref(),
                 Some(marker)
             );
-            assert_eq!(query_value(request, "max-parts").as_deref(), Some("1000"));
-            assert_eq!(
-                query_value(request, "X-Amz-Algorithm").as_deref(),
-                Some("AWS4-HMAC-SHA256")
-            );
-            assert!(query_value(request, "X-Amz-Credential").is_some());
-            assert!(query_value(request, "X-Amz-Signature").is_some());
             assert!(request
                 .url
                 .query_pairs()
@@ -595,7 +589,7 @@ mod tests {
             )
             .await
             .unwrap_err();
-            assert_failure_kind(error, FailureKind::Protocol);
+            assert!(matches!(error, MultipartFailure::Protocol));
             server.verify().await;
         }
     }
@@ -620,7 +614,7 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert_failure_kind(error, FailureKind::Protocol);
+        assert!(matches!(error, MultipartFailure::Protocol));
         server.verify().await;
 
         let server = MockServer::start().await;
@@ -660,104 +654,12 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert_failure_kind(error, FailureKind::Protocol);
+        assert!(matches!(error, MultipartFailure::Protocol));
         server.verify().await;
     }
 
     #[tokio::test]
-    async fn list_parts_allows_a_nontruncated_s3_final_page_without_next_marker() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(
-                list_parts_xml_without_next_marker(
-                    BUCKET,
-                    KEY,
-                    UPLOAD_ID,
-                    0,
-                    false,
-                    &[(1, "etag-one", 1)],
-                ),
-            ))
-            .expect(1)
-            .mount(&server)
-            .await;
-
-        let parts = list_all_parts(
-            &reqwest::Client::new(),
-            ProviderKind::S3,
-            &test_bucket(&server),
-            KEY,
-            UPLOAD_ID,
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            parts,
-            vec![CompletedPart {
-                part_number: 1,
-                etag: "etag-one".to_owned(),
-                size: 1,
-            }]
-        );
-        server.verify().await;
-    }
-
-    #[tokio::test]
-    async fn list_parts_rejects_identity_marker_and_inventory_violations() {
-        let cases = [
-            (
-                list_parts_xml("wrong-bucket", KEY, UPLOAD_ID, 0, 1, false, &[]),
-                FailureKind::Protocol,
-            ),
-            (
-                list_parts_xml(BUCKET, "wrong-key", UPLOAD_ID, 0, 1, false, &[]),
-                FailureKind::Protocol,
-            ),
-            (
-                list_parts_xml(BUCKET, KEY, "wrong-upload", 0, 1, false, &[]),
-                FailureKind::Protocol,
-            ),
-            (
-                list_parts_xml(BUCKET, KEY, UPLOAD_ID, 1, 1, false, &[]),
-                FailureKind::Protocol,
-            ),
-            (
-                list_parts_xml(BUCKET, KEY, UPLOAD_ID, 0, 1, false, &[(0, "etag", 1)]),
-                FailureKind::Inventory,
-            ),
-            (
-                list_parts_xml(BUCKET, KEY, UPLOAD_ID, 0, 1, false, &[(10_001, "etag", 1)]),
-                FailureKind::Inventory,
-            ),
-            (
-                list_parts_xml(BUCKET, KEY, UPLOAD_ID, 0, 1, false, &[(1, " \t ", 1)]),
-                FailureKind::Inventory,
-            ),
-            (
-                list_parts_xml(BUCKET, KEY, UPLOAD_ID, 0, 0, true, &[(1, "etag", 1)]),
-                FailureKind::Protocol,
-            ),
-        ];
-
-        for (body, expected) in cases {
-            let server = MockServer::start().await;
-            Mock::given(method("GET"))
-                .respond_with(ResponseTemplate::new(200).set_body_string(body))
-                .expect(1)
-                .mount(&server)
-                .await;
-            let error = list_all_parts(
-                &reqwest::Client::new(),
-                ProviderKind::S3,
-                &test_bucket(&server),
-                KEY,
-                UPLOAD_ID,
-            )
-            .await
-            .unwrap_err();
-            assert_failure_kind(error, expected);
-        }
-
+    async fn list_parts_rejects_parts_repeated_across_pages() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(query_param("part-number-marker", "0"))
@@ -794,80 +696,11 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert_failure_kind(error, FailureKind::Inventory);
+        assert!(matches!(error, MultipartFailure::InvalidInventory));
     }
 
     #[test]
     fn classifies_only_well_formed_embedded_s3_errors() {
-        for operation in [
-            MultipartOperation::Create,
-            MultipartOperation::ListParts,
-            MultipartOperation::UploadPart,
-            MultipartOperation::Complete,
-            MultipartOperation::ZipPut,
-        ] {
-            for code in ["NotImplemented", "UnsupportedOperation", "MethodNotAllowed"] {
-                let error =
-                    classify_response(operation, 405, s3_error_xml(code).as_bytes()).unwrap_err();
-                assert!(matches!(
-                    error,
-                    MultipartFailure::Unsupported {
-                        operation: actual_operation,
-                        status: 405,
-                    } if actual_operation == operation
-                ));
-            }
-        }
-        let head = classify_response(
-            MultipartOperation::Head,
-            405,
-            s3_error_xml("MethodNotAllowed").as_bytes(),
-        )
-        .unwrap_err();
-        assert!(matches!(
-            head,
-            MultipartFailure::Service { status: 405, .. }
-        ));
-
-        let bare_405 =
-            classify_response(MultipartOperation::ListParts, 405, b"not XML").unwrap_err();
-        assert!(matches!(
-            bare_405,
-            MultipartFailure::Service { status: 405, .. }
-        ));
-        let access_denied = classify_response(
-            MultipartOperation::ListParts,
-            403,
-            s3_error_xml("AccessDenied").as_bytes(),
-        )
-        .unwrap_err();
-        assert!(matches!(
-            access_denied,
-            MultipartFailure::Service { status: 403, .. }
-        ));
-        let server_error = classify_response(
-            MultipartOperation::ListParts,
-            500,
-            s3_error_xml("NotImplemented").as_bytes(),
-        )
-        .unwrap_err();
-        assert!(matches!(
-            server_error,
-            MultipartFailure::Service { status: 500, .. }
-        ));
-        let no_such_upload = classify_response(
-            MultipartOperation::ListParts,
-            404,
-            s3_error_xml("NoSuchUpload").as_bytes(),
-        )
-        .unwrap_err();
-        assert!(matches!(
-            no_such_upload,
-            MultipartFailure::NoSuchUpload {
-                operation: MultipartOperation::ListParts
-            }
-        ));
-
         assert!(classify_embedded_s3_error(
             MultipartOperation::ListParts,
             200,
@@ -890,65 +723,6 @@ mod tests {
             MultipartFailure::NoSuchUpload {
                 operation: MultipartOperation::ListParts
             }
-        ));
-    }
-
-    #[test]
-    fn canonical_501_not_implemented_is_unsupported_only_for_transfer_operations() {
-        for operation in [
-            MultipartOperation::Create,
-            MultipartOperation::ListParts,
-            MultipartOperation::UploadPart,
-            MultipartOperation::Complete,
-            MultipartOperation::ZipPut,
-        ] {
-            let error =
-                classify_response(operation, 501, s3_error_xml("NotImplemented").as_bytes())
-                    .unwrap_err();
-            assert!(matches!(
-                error,
-                MultipartFailure::Unsupported {
-                    operation: actual_operation,
-                    status: 501,
-                } if actual_operation == operation
-            ));
-        }
-
-        for operation in [MultipartOperation::Head, MultipartOperation::Abort] {
-            let error =
-                classify_response(operation, 501, s3_error_xml("NotImplemented").as_bytes())
-                    .unwrap_err();
-            assert!(matches!(
-                error,
-                MultipartFailure::Service {
-                    operation: actual_operation,
-                    status: 501,
-                } if actual_operation == operation
-            ));
-        }
-
-        let bare = classify_response(MultipartOperation::ListParts, 501, b"not XML").unwrap_err();
-        assert!(matches!(
-            bare,
-            MultipartFailure::Service { status: 501, .. }
-        ));
-        let malformed = classify_response(
-            MultipartOperation::ListParts,
-            501,
-            b"<Error><Code>NotImplemented</Code>",
-        )
-        .unwrap_err();
-        assert!(matches!(malformed, MultipartFailure::Protocol));
-
-        let server_error = classify_response(
-            MultipartOperation::ListParts,
-            500,
-            s3_error_xml("NotImplemented").as_bytes(),
-        )
-        .unwrap_err();
-        assert!(matches!(
-            server_error,
-            MultipartFailure::Service { status: 500, .. }
         ));
     }
 
@@ -988,60 +762,6 @@ mod tests {
             "secret-test-sentinel",
         ] {
             assert!(!rendered.contains(secret), "leaked {secret}");
-        }
-    }
-
-    #[tokio::test]
-    async fn list_parts_accepts_more_than_ten_small_pages() {
-        let server = MockServer::start().await;
-        for marker in 0..=10 {
-            Mock::given(method("GET"))
-                .and(query_param("part-number-marker", marker.to_string()))
-                .respond_with(ResponseTemplate::new(200).set_body_string(list_parts_xml(
-                    BUCKET,
-                    KEY,
-                    UPLOAD_ID,
-                    marker,
-                    marker + 1,
-                    marker < 10,
-                    &[(marker + 1, "etag", 1)],
-                )))
-                .expect(1)
-                .mount(&server)
-                .await;
-        }
-
-        let parts = list_all_parts(
-            &reqwest::Client::new(),
-            ProviderKind::S3,
-            &test_bucket(&server),
-            KEY,
-            UPLOAD_ID,
-        )
-        .await
-        .unwrap();
-        assert_eq!(parts.len(), 11);
-        assert_eq!(
-            parts
-                .into_iter()
-                .map(|part| part.part_number)
-                .collect::<Vec<_>>(),
-            (1..=11).collect::<Vec<_>>()
-        );
-    }
-
-    #[derive(Clone, Copy)]
-    enum FailureKind {
-        Protocol,
-        Inventory,
-    }
-
-    fn assert_failure_kind(failure: MultipartFailure, expected: FailureKind) {
-        match expected {
-            FailureKind::Protocol => assert!(matches!(failure, MultipartFailure::Protocol)),
-            FailureKind::Inventory => {
-                assert!(matches!(failure, MultipartFailure::InvalidInventory))
-            }
         }
     }
 

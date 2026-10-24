@@ -66,7 +66,7 @@ Telegram 媒体组上限，定义在 `utils/caption.rs`。`numbering.rs` 和 `sc
 
 - `DownloadButtonConfig` 支持 Pixiv 和 Booru callback data；格式分别由 `DOWNLOAD_CALLBACK_PREFIX` 和 `BOORU_DOWNLOAD_CALLBACK_PREFIX` 控制。
 - Channel chat 不显示下载按钮；保持 `for_pixiv_chat()` / `for_booru_chat()` 的 channel 分支行为。
-- `notify_with_individual_captions_and_button()` 接收按钮配置是为了 API 一致性，榜单推送通常仍使用默认无按钮配置。
+- `notify_with_individual_captions()` 使用独立文案发送榜单，不显示下载按钮。
 
 ### Ugoira
 
@@ -76,7 +76,6 @@ Telegram 媒体组上限，定义在 `utils/caption.rs`。`numbering.rs` 和 `sc
 
 ## 修改建议
 
-- 发送行为变化优先补小型单元测试；现有测试覆盖续传 caption、下载按钮和 `BatchSendResult` 基本语义。
-- Caption 字符串使用 MarkdownV2，测试会断言精确字符串；改标点或转义也算行为变化。
+- Caption 字符串使用 MarkdownV2；改标点或转义也算行为变化。
 - 修改批次拆分、结果索引、`first_message_id` 或 continuation 逻辑时，同时检查 `src/scheduler/helpers.rs` 的映射和持久化状态。
 - 新增 Telegram 发送方法时，确保支持 `has_spoiler`、MarkdownV2 caption、必要的 reply markup，并返回可追踪 message id。

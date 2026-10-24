@@ -189,18 +189,6 @@ pub(super) fn create_test_zip_with_unsupported_encrypted_non_image(path: &std::p
     std::fs::write(path, bytes).unwrap();
 }
 
-pub(super) fn create_test_zip_with_sizes(path: &std::path::Path, image_sizes: &[usize]) {
-    let file = std::fs::File::create(path).unwrap();
-    let mut zip = zip::ZipWriter::new(file);
-    for (i, size) in image_sizes.iter().enumerate() {
-        let name = format!("page{:03}.jpg", i);
-        let options = zip::write::SimpleFileOptions::default();
-        zip.start_file(name, options).unwrap();
-        zip.write_all(&vec![b'a'; *size]).unwrap();
-    }
-    zip.finish().unwrap();
-}
-
 #[derive(Debug)]
 pub(super) struct MultipartFileCount(pub(super) usize);
 

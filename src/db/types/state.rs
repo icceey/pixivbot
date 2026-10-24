@@ -182,15 +182,6 @@ pub struct EhPendingGallery {
 }
 
 impl EhTagState {
-    pub fn cleared() -> Self {
-        Self {
-            pushed_gids: Vec::new(),
-            latest_posted_ts: 0,
-            pending_galleries: Vec::new(),
-            pending_high_water_ts: 0,
-        }
-    }
-
     /// Add a GID to the pushed set (dedup, preserves insertion order).
     pub fn add_pushed_gid(&mut self, gid: u64) {
         if !self.pushed_gids.contains(&gid) {

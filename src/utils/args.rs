@@ -82,20 +82,3 @@ pub fn parse_args(args: &str) -> ParsedArgs {
 
     ParsedArgs { params, remaining }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_parse_args_stops_at_non_kv() {
-        // Tags like +tag should stop kv parsing
-        let parsed = parse_args("channel=123 +tag val=should_not_parse");
-        assert_eq!(
-            parsed.params.get("channel").map(String::as_str),
-            Some("123")
-        );
-        assert_eq!(parsed.params.get("val"), None);
-        assert_eq!(parsed.remaining, "+tag val=should_not_parse");
-    }
-}

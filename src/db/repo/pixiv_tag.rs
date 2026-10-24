@@ -12,6 +12,7 @@ use sea_orm::{
 #[derive(Debug, FromQueryResult)]
 pub struct TagSettings {
     pub min_bookmarks: i64,
+    pub max_pages: Option<i64>,
 }
 
 #[derive(Debug, Clone, FromQueryResult)]
@@ -68,10 +69,14 @@ impl Repo {
             .context("Tag subscription disappeared")?;
         txn.execute(Statement::from_sql_and_values(
             DbBackend::Sqlite,
-            "INSERT INTO pixiv_tag_settings(subscription_id, min_bookmarks)
-             VALUES (?, ?) ON CONFLICT(subscription_id) DO UPDATE SET
-             min_bookmarks=excluded.min_bookmarks",
-            [sub.id.into(), settings.min_bookmarks.into()],
+            "INSERT INTO pixiv_tag_settings(subscription_id, min_bookmarks, max_pages)
+             VALUES (?, ?, ?) ON CONFLICT(subscription_id) DO UPDATE SET
+             min_bookmarks=excluded.min_bookmarks, max_pages=excluded.max_pages",
+            [
+                sub.id.into(),
+                settings.min_bookmarks.into(),
+                settings.max_pages.into(),
+            ],
         ))
         .await?;
         txn.commit().await?;
@@ -82,7 +87,7 @@ impl Repo {
         Ok(
             TagSettings::find_by_statement(Statement::from_sql_and_values(
                 DbBackend::Sqlite,
-                "SELECT min_bookmarks FROM pixiv_tag_settings WHERE subscription_id=?",
+                "SELECT min_bookmarks, max_pages FROM pixiv_tag_settings WHERE subscription_id=?",
                 [sub_id.into()],
             ))
             .one(&self.db)

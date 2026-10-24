@@ -6,9 +6,12 @@ Thank you for your interest in contributing to PixivBot! This document provides 
 
 ### Prerequisites
 
-- **Rust**: Ensure you have the latest stable version of Rust installed.
+- **Rust**: Install the toolchain pinned in `rust-toolchain.toml` (1.94).
 - **SQLite**: The project uses SQLite database.
 - **Make**: The project uses a `Makefile` for common tasks.
+- **FFmpeg development libraries and pkg-config**: Required for `ffmpeg-codec` builds.
+  On macOS, run `brew install ffmpeg pkg-config`; on Debian/Ubuntu, install
+  `libavcodec-dev libavformat-dev libavutil-dev libswscale-dev libswresample-dev pkg-config`.
 
 ### Getting Started
 
@@ -26,11 +29,10 @@ Thank you for your interest in contributing to PixivBot! This document provides 
    cp config.toml.example config.toml
    ```
 
-3. **Install Dependencies & Check**:
-   Use the provided Makefile to ensure your environment is ready.
+3. **Check the workspace**:
 
    ```bash
-   make dev  # Runs the bot in development mode
+   make ci
    ```
 
 ## Workflow & Standards
@@ -66,11 +68,14 @@ The project includes a `Makefile` to simplify development tasks:
 
 ### Project Structure
 
+See the [architecture overview](docs/architecture.md) for component and delivery flows.
+
 - `src/bot/`: Telegram bot logic, command handling, and dispatching.
 - `src/pixiv/`: High-level Pixiv business logic (downloading, caching).
-- `src/pixiv_client/`: Low-level Pixiv API client implementation.
+- `pixiv_client/`, `booru_client/`, `eh_client/`: Low-level service clients.
 - `src/db/`: Database entities (SeaORM) and repository layer.
 - `src/scheduler/`: Task scheduling engine.
+- `migration/`: Database schema migrations.
 
 ## Database Migrations
 
@@ -82,7 +87,7 @@ We use `sea-orm-migration` for database schema management.
 
 ## Testing
 
-- Add tests for new functionality, especially for logic that parses input or handles data transformation.
+- Add tests for concrete failure risks such as lost progress after restart, transaction rollback, or concurrent duplicate delivery. Reuse existing coverage and keep fixtures focused on those risks.
 - Run tests using `make test`.
 
 ## Pull Request Process
@@ -90,7 +95,7 @@ We use `sea-orm-migration` for database schema management.
 1. Ensure your code compiles and passes all checks (`make ci`).
 2. Update documentation (README.md) if you are changing command usage or configuration.
 3. Open a Pull Request against the `master` branch.
-4. Describe your changes detailedly in the PR description.
+4. Describe the resulting behavior and relevant validation in the PR description.
 
 ## License
 

@@ -125,11 +125,8 @@ impl BotHandler {
             Some(format!("\n{}", suffix_parts.join("\n")))
         };
 
-        let response = result.build_response_with_suffix(
-            "✅ 成功订阅:",
-            "❌ 订阅失败:",
-            filter_suffix.as_deref(),
-        );
+        let response =
+            result.build_response("✅ 成功订阅:", "❌ 订阅失败:", filter_suffix.as_deref());
 
         bot.send_message(chat_id, response)
             .parse_mode(ParseMode::MarkdownV2)
@@ -200,7 +197,7 @@ impl BotHandler {
             }
         }
 
-        let mut response = result.build_response("✅ 成功取消订阅:", "❌ 取消订阅失败:");
+        let mut response = result.build_response("✅ 成功取消订阅:", "❌ 取消订阅失败:", None);
         if is_channel && result.has_success() {
             response.push_str(&format!("\n📢 频道: `{}`", target_chat_id.0));
         }

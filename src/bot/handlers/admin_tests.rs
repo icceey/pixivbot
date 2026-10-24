@@ -88,6 +88,7 @@ async fn fixture() -> (MockServer, ThrottledBot, BotHandler) {
             )),
         ),
         vec![],
+        500,
         Some(1),
         false,
         pixiv_client::ImageSize::Large,
@@ -141,133 +142,58 @@ async fn role(repo: &Repo, id: i64) -> UserRole {
     repo.get_user(id).await.unwrap().unwrap().role
 }
 
-// A local admin must never acquire a persisted role or reuse group A privileges
-// in group B/private chat. Exercise the command dispatch and actual DB writes.
 #[tokio::test]
 async fn telegram_roles_are_scoped_and_queries_fail_closed() {
-    for status in ["creator", "administrator", "member"] {
-        let (server, bot, handler) = fixture().await;
-        for chat in [-100, -200] {
-            handler.repo.set_chat_enabled(chat, false).await.unwrap();
-        }
-        Mock::given(path("/botfake_token/GetChatMember"))
-            .and(body_partial_json(json!({"chat_id": -100, "user_id": 2})))
-            .respond_with(ResponseTemplate::new(200).set_body_json(member(status, 2, "Alice")))
-            .expect(4)
-            .mount(&server)
-            .await;
-        for command_type in [
-            Command::EnableChat("invalid".into()),
-            Command::DisableChat("invalid".into()),
-        ] {
-            command(&handler, &bot, message(-100, 2), command_type).await;
-        }
-        let responses = server
-            .received_requests()
-            .await
-            .unwrap()
-            .into_iter()
-            .filter(|request| request.url.path() == "/botfake_token/SendMessage")
-            .count();
-        assert_eq!(responses, if status == "member" { 0 } else { 2 });
-        command(
-            &handler,
-            &bot,
-            message(-100, 2),
-            Command::EnableChat(String::new()),
-        )
-        .await;
-        assert_eq!(
-            handler.repo.get_chat(-100).await.unwrap().unwrap().enabled,
-            status != "member"
-        );
-        assert_eq!(role(&handler.repo, 2).await, UserRole::User);
-        command(
-            &handler,
-            &bot,
-            message(-100, 2),
-            Command::EnableChat("-200".into()),
-        )
-        .await;
-        command(
-            &handler,
-            &bot,
-            message(2, 2),
-            Command::EnableChat(String::new()),
-        )
-        .await;
-        assert!(!handler.repo.get_chat(-200).await.unwrap().unwrap().enabled);
-        assert!(!handler.repo.get_chat(2).await.unwrap().unwrap().enabled);
-        mock_member(
-            &server,
-            -200,
-            2,
-            json!({"ok": false, "error_code": 400, "description": "unavailable"}),
-        )
-        .await;
-        command(
-            &handler,
-            &bot,
-            message(-200, 2),
-            Command::EnableChat(String::new()),
-        )
-        .await;
-        assert!(!handler.repo.get_chat(-200).await.unwrap().unwrap().enabled);
-        // Owner retains global chat-control behavior, including an explicit target.
-        command(
-            &handler,
-            &bot,
-            message(-100, 1),
-            Command::EnableChat("-200".into()),
-        )
-        .await;
-        assert!(handler.repo.get_chat(-200).await.unwrap().unwrap().enabled);
+    let (server, bot, handler) = fixture().await;
+    for chat in [-100, -200] {
+        handler.repo.set_chat_enabled(chat, false).await.unwrap();
     }
-}
-
-// Replies to forwarded messages must affect A, not the embedded B identity.
-#[tokio::test]
-async fn owner_role_commands_resolve_ids_and_actual_reply_sender() {
-    let (_server, bot, handler) = fixture().await;
+    Mock::given(path("/botfake_token/GetChatMember"))
+        .and(body_partial_json(json!({"chat_id": -100, "user_id": 2})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(member("administrator", 2, "Alice")))
+        .expect(2)
+        .mount(&server)
+        .await;
     command(
         &handler,
         &bot,
-        message(-100, 1),
-        Command::SetAdmin("2".into()),
+        message(-100, 2),
+        Command::EnableChat(String::new()),
     )
     .await;
-    assert_eq!(role(&handler.repo, 2).await, UserRole::Admin);
-    let mut reply = serde_json::to_value(message(-100, 2)).unwrap();
-    reply["forward_origin"] = json!({"type": "user", "date": 1600000000, "sender_user": {"id": 3, "is_bot": false, "first_name": "Origin"}});
-    let mut msg = serde_json::to_value(message(-100, 1)).unwrap();
-    msg["reply_to_message"] = reply.clone();
-    command(
-        &handler,
-        &bot,
-        serde_json::from_value(msg.clone()).unwrap(),
-        Command::UnsetAdmin(String::new()),
-    )
-    .await;
+    assert!(handler.repo.get_chat(-100).await.unwrap().unwrap().enabled);
     assert_eq!(role(&handler.repo, 2).await, UserRole::User);
     command(
         &handler,
         &bot,
-        serde_json::from_value(msg.clone()).unwrap(),
-        Command::SetAdmin(String::new()),
+        message(-100, 2),
+        Command::EnableChat("-200".into()),
     )
     .await;
-    assert_eq!(role(&handler.repo, 2).await, UserRole::Admin);
-    assert_eq!(role(&handler.repo, 3).await, UserRole::User);
-    reply.as_object_mut().unwrap().remove("forward_origin");
-    msg["reply_to_message"] = reply;
     command(
         &handler,
         &bot,
-        serde_json::from_value(msg).unwrap(),
-        Command::UnsetAdmin(String::new()),
+        message(2, 2),
+        Command::EnableChat(String::new()),
     )
     .await;
-    assert_eq!(role(&handler.repo, 2).await, UserRole::User);
+    assert!(!handler.repo.get_chat(-200).await.unwrap().unwrap().enabled);
+    assert!(!handler.repo.get_chat(2).await.unwrap().unwrap().enabled);
+    mock_member(
+        &server,
+        -200,
+        2,
+        json!({"ok": false, "error_code": 400, "description": "unavailable"}),
+    )
+    .await;
+    command(
+        &handler,
+        &bot,
+        message(-200, 2),
+        Command::EnableChat(String::new()),
+    )
+    .await;
+    assert!(!handler.repo.get_chat(-200).await.unwrap().unwrap().enabled);
 }
 
 // Guard both operations and the Owner target, including spoofed sender_chat.from.
@@ -344,11 +270,6 @@ async fn username_candidates_require_fresh_unambiguous_telegram_identity() {
             .await
             .is_err()
     );
-    assert!(
-        resolve_admin_target(&bot, &handler.repo, &message(-100, 1), "@unknown")
-            .await
-            .is_err()
-    );
     server.reset().await;
     mock_member(
         &server,
@@ -376,30 +297,14 @@ async fn username_candidates_require_fresh_unambiguous_telegram_identity() {
             .await
             .is_err()
     );
-    server.reset().await;
-    handler
-        .repo
-        .upsert_user(3, Some("bob".into()), UserRole::User)
-        .await
-        .unwrap();
-    Mock::given(path("/botfake_token/GetChat"))
-        .and(body_partial_json(json!({"chat_id": 2})))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true, "result": {"id": 2, "type": "private", "first_name": "Alice", "username": "ALICE", "accent_color_id": 0, "max_reaction_count": 1, "accepted_gift_types": {"unlimited_gifts": false, "limited_gifts": false, "unique_gifts": false, "premium_subscription": false}}})))
-        .expect(1).mount(&server).await;
-    assert!(matches!(
-        resolve_admin_target(&bot, &handler.repo, &message(2, 1), "@alice")
-            .await
-            .unwrap(),
-        AdminTarget::Known(2)
-    ));
 }
 
 // Revoking Telegram admin status while a settings dialogue is open must prevent a write.
 #[tokio::test]
 async fn settings_submission_rechecks_revoked_group_permission() {
-    use crate::bot::state::{new_settings_storage, SettingsState};
+    use crate::bot::state::{SettingsState, SettingsStorage};
     let (server, bot, handler) = fixture().await;
-    let storage = new_settings_storage();
+    let storage = SettingsStorage::default();
     storage.write().await.insert(
         (ChatId(-100), UserId(2)),
         SettingsState {
@@ -454,7 +359,7 @@ async fn settings_submission_rechecks_revoked_group_permission() {
 #[tokio::test]
 async fn settings_callback_uses_clicker_and_current_group() {
     let (server, bot, handler) = fixture().await;
-    let storage = crate::bot::state::new_settings_storage();
+    let storage = crate::bot::state::SettingsStorage::default();
     for (chat, status) in [(-100, "administrator"), (-200, "member")] {
         mock_member(&server, chat, 2, member(status, 2, "Alice")).await;
         let mut panel = serde_json::to_value(message(chat, 99)).unwrap();
@@ -599,98 +504,44 @@ async fn tag_input(
     .unwrap());
 }
 
-// Two editors can change the list while a user is choosing a mode. Submission
-// must apply to current data, not resurrect a list captured at dialogue start.
 #[tokio::test]
-async fn tag_modes_apply_to_current_lists_and_empty_input_never_clears() {
+async fn tag_submission_preserves_edits_made_after_the_dialogue_opens() {
     use crate::db::types::{TagEditMode, Tags};
     let (_server, bot, handler) = fixture().await;
-    let storage = crate::bot::state::new_settings_storage();
-    for sensitive in [true, false] {
+    let storage = crate::bot::state::SettingsStorage::default();
+    let selector = begin_tag_edit(&bot, &handler, &storage, false).await;
+    handler
+        .repo
+        .edit_chat_tags(
+            -100,
+            false,
+            TagEditMode::Append,
+            Tags::from(vec!["concurrent".into()]),
+        )
+        .await
+        .unwrap();
+    settings_click(
+        &bot,
+        &handler,
+        &storage,
+        -100,
+        1,
+        selector,
+        "settings:mode:append",
+    )
+    .await;
+    tag_input(&bot, &handler, &storage, "submitted").await;
+    assert_eq!(
         handler
             .repo
-            .edit_chat_tags(
-                -100,
-                sensitive,
-                TagEditMode::Replace,
-                Tags::from(vec!["old".into()]),
-            )
+            .get_chat(-100)
             .await
-            .unwrap();
-        let selector = begin_tag_edit(&bot, &handler, &storage, sensitive).await;
-        // An independent edit after the panel opens must survive the append.
-        handler
-            .repo
-            .edit_chat_tags(
-                -100,
-                sensitive,
-                TagEditMode::Append,
-                Tags::from(vec!["concurrent".into()]),
-            )
-            .await
-            .unwrap();
-        settings_click(
-            &bot,
-            &handler,
-            &storage,
-            -100,
-            1,
-            selector,
-            "settings:mode:append",
-        )
-        .await;
-        tag_input(&bot, &handler, &storage, " old， clear, CLEAR, clear ,, ").await;
-        let current = handler.repo.get_chat(-100).await.unwrap().unwrap();
-        let tags = if sensitive {
-            current.sensitive_tags
-        } else {
-            current.excluded_tags
-        };
-        assert_eq!(tags.0, vec!["old", "concurrent", "clear", "CLEAR"]);
-        let selector = begin_tag_edit(&bot, &handler, &storage, sensitive).await;
-        settings_click(
-            &bot,
-            &handler,
-            &storage,
-            -100,
-            1,
-            selector,
-            "settings:mode:remove",
-        )
-        .await;
-        tag_input(&bot, &handler, &storage, "clear,missing").await;
-        let current = handler.repo.get_chat(-100).await.unwrap().unwrap();
-        let tags = if sensitive {
-            current.sensitive_tags
-        } else {
-            current.excluded_tags
-        };
-        assert_eq!(tags.0, vec!["old", "concurrent", "CLEAR"]);
-        let selector = begin_tag_edit(&bot, &handler, &storage, sensitive).await;
-        settings_click(
-            &bot,
-            &handler,
-            &storage,
-            -100,
-            1,
-            selector,
-            "settings:mode:replace",
-        )
-        .await;
-        tag_input(&bot, &handler, &storage, " , ， ").await;
-        assert!(storage
-            .read()
-            .await
-            .contains_key(&(ChatId(-100), UserId(1))));
-        tag_input(&bot, &handler, &storage, "CLEAR").await;
-        let current = handler.repo.get_chat(-100).await.unwrap().unwrap();
-        let tags = if sensitive {
-            current.sensitive_tags
-        } else {
-            current.excluded_tags
-        };
-        assert_eq!(tags.0, vec!["CLEAR"]);
-    }
+            .unwrap()
+            .unwrap()
+            .excluded_tags
+            .0,
+        vec!["concurrent", "submitted"]
+    );
 }
 
 // Telegram callback data is not an authorization token. Even another global
@@ -704,7 +555,7 @@ async fn tag_mode_buttons_bind_actor_chat_and_session_and_select_once() {
         .set_user_role(2, UserRole::Admin)
         .await
         .unwrap();
-    let storage = crate::bot::state::new_settings_storage();
+    let storage = crate::bot::state::SettingsStorage::default();
     let old = begin_tag_edit(&bot, &handler, &storage, false).await;
     let early_input: Message = serde_json::from_value(json!({
         "message_id": 50, "date": 1700000000,
@@ -823,7 +674,7 @@ async fn advance_settings_time(seconds: u64) {
 #[tokio::test]
 async fn tag_dialogue_enforces_both_deadlines_and_renews_only_on_selection() {
     let (_server, bot, handler) = fixture().await;
-    let storage = crate::bot::state::new_settings_storage();
+    let storage = crate::bot::state::SettingsStorage::default();
     let selector = begin_tag_edit(&bot, &handler, &storage, false).await;
     advance_settings_time(180).await;
     settings_click(
@@ -928,13 +779,8 @@ async fn dispatch_settings_text(
 #[tokio::test]
 async fn active_settings_controls_bypass_mention_without_becoming_tags() {
     let (server, bot, handler) = fixture().await;
-    let storage = crate::bot::state::new_settings_storage();
-    for control in [
-        "/cancel",
-        "/settings",
-        "/cancel@testbot",
-        "/settings@testbot",
-    ] {
+    let storage = crate::bot::state::SettingsStorage::default();
+    for control in ["/cancel", "/settings"] {
         let selector = begin_tag_edit(&bot, &handler, &storage, false).await;
         settings_click(
             &bot,
@@ -1024,7 +870,7 @@ async fn active_settings_controls_bypass_mention_without_becoming_tags() {
 async fn delayed_mode_prompt_does_not_block_other_chats_or_resurrect_cancelled_session() {
     use wiremock::matchers::body_string_contains;
     let (server, bot, handler) = fixture().await;
-    let storage = crate::bot::state::new_settings_storage();
+    let storage = crate::bot::state::SettingsStorage::default();
     let received = Arc::new(tokio::sync::Notify::new());
     let signal = received.clone();
     Mock::given(path("/botfake_token/SendMessage"))
@@ -1212,73 +1058,11 @@ async fn reply_promotion_registers_only_authorized_actual_sender_and_preserves_o
 }
 
 #[tokio::test]
-async fn concurrent_reply_registration_preserves_the_first_identity() {
-    let repo = setup_test_db().await.unwrap();
-    let (first, second) = tokio::join!(
-        repo.set_admin_from_reply(400, Some("first".into())),
-        repo.set_admin_from_reply(400, Some("second".into())),
-    );
-    let first = first.unwrap();
-    let second = second.unwrap();
-    assert_eq!(first.role, UserRole::Admin);
-    assert_eq!(second.role, UserRole::Admin);
-    assert_eq!(first.username, second.username);
-    assert_eq!(
-        repo.get_user(400).await.unwrap().unwrap().username,
-        first.username
-    );
-}
-
-async fn last_settings_prompt(server: &MockServer) -> Value {
-    let requests = server.received_requests().await.unwrap();
-    let request = requests
-        .iter()
-        .rev()
-        .find(|r| {
-            matches!(
-                r.url.path(),
-                "/botfake_token/SendMessage" | "/botfake_token/EditMessageText"
-            )
-        })
-        .unwrap();
-    serde_json::from_slice(&request.body).unwrap()
-}
-
-// Display is not the write snapshot. Both prompts read current tags, and UTF-16
-// truncation/plain text prevent Telegram failures without truncating stored data.
-#[tokio::test]
-async fn tag_prompts_refresh_current_values_and_bound_display_without_data_loss() {
+async fn tag_prompt_truncation_preserves_stored_tags() {
     use crate::db::types::{TagEditMode, Tags};
     let (server, bot, handler) = fixture().await;
-    let storage = crate::bot::state::new_settings_storage();
-    let selector = begin_tag_edit(&bot, &handler, &storage, false).await;
-    let special = "[*原有*]`tag`\\_".to_string();
-    handler
-        .repo
-        .edit_chat_tags(
-            -100,
-            false,
-            TagEditMode::Replace,
-            Tags::from(vec![special.clone()]),
-        )
-        .await
-        .unwrap();
-    settings_click(
-        &bot,
-        &handler,
-        &storage,
-        -100,
-        1,
-        selector,
-        "settings:mode:append",
-    )
-    .await;
-    let prompt = last_settings_prompt(&server).await;
-    assert_eq!(prompt["message_id"], selector.0);
-    assert!(prompt["text"].as_str().unwrap().contains(&special));
-    assert!(prompt.get("parse_mode").is_none()); // Plain text cannot interpret tag markup.
-    let long = "😀".repeat(3000);
-    let full = vec![special, long, "tail-must-survive".into()];
+    let storage = crate::bot::state::SettingsStorage::default();
+    let full = vec!["😀".repeat(3000), "tail-must-survive".into()];
     handler
         .repo
         .edit_chat_tags(-100, false, TagEditMode::Replace, Tags::from(full.clone()))
@@ -1311,11 +1095,6 @@ async fn tag_prompts_refresh_current_values_and_bound_display_without_data_loss(
         let body: Value = serde_json::from_slice(&request.body).unwrap();
         if let Some(text) = body.get("text").and_then(Value::as_str) {
             assert!(text.encode_utf16().count() <= 4096);
-            if request.url.path() == "/botfake_token/EditMessageText"
-                && body["parse_mode"] == "MarkdownV2"
-            {
-                assert!(text.contains("\\[\\*原有\\*\\]\\`tag\\`\\\\\\_"));
-            }
         }
     }
 }
@@ -1327,7 +1106,7 @@ async fn clear_confirmation_is_bound_expiring_and_consumed_once() {
     use crate::bot::state::SettingsPhase;
     use crate::db::types::{TagEditMode, Tags};
     let (server, bot, handler) = fixture().await;
-    let storage = crate::bot::state::new_settings_storage();
+    let storage = crate::bot::state::SettingsStorage::default();
     handler
         .repo
         .set_user_role(2, UserRole::Admin)

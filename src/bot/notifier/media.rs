@@ -13,7 +13,6 @@ impl Notifier {
         chat_id: ChatId,
         paths: &[PathBuf],
         strategy: &CaptionStrategy<'_>,
-        batch_captions: Option<&[String]>,
         has_spoiler: bool,
         batch_idx: usize,
         continuation_numbering: ContinuationNumbering,
@@ -29,12 +28,8 @@ impl Notifier {
                     CaptionStrategy::Shared(base_cap) => {
                         shared_batch_caption(*base_cap, i, batch_idx, continuation_numbering)
                     }
-                    CaptionStrategy::Individual(_) => {
-                        if let Some(caps) = batch_captions {
-                            individual_batch_caption(&caps[i], i, batch_idx, continuation_numbering)
-                        } else {
-                            None
-                        }
+                    CaptionStrategy::Individual(captions) => {
+                        individual_batch_caption(&captions[i], i, batch_idx, continuation_numbering)
                     }
                 };
 

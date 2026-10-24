@@ -63,8 +63,9 @@
 Αν προτιμάτε να τρέξετε απευθείας στο μηχάνημά σας:
 
 1. **Προαπαιτούμενα**:
-    - Rust (τελευταία σταθερή έκδοση)
+    - Rust 1.94 (`rust-toolchain.toml`)
     - SQLite
+    - Βιβλιοθήκες ανάπτυξης FFmpeg και `pkg-config`
 
 2. **Κλωνοποίηση και Διαμόρφωση**:
 
@@ -78,7 +79,7 @@
 3. **Κατασκευή και Εκτέλεση**:
 
    ```bash
-   cargo run --release
+   cargo run --release --features ffmpeg-codec
    ```
 
 ## Λήψη Απαιτούμενων Tokens
@@ -108,7 +109,7 @@
 | Κλειδί Διαμόρφωσης | Μεταβλητή Περιβάλλοντος | Περιγραφή | Προεπιλογή |
 |---|---|---|---|
 | `telegram.bot_token` | `PIX__TELEGRAM__BOT_TOKEN` | Telegram Bot API Token | `""` |
-| `telegram.owner_id` | `PIX__TELEGRAM__OWNER_ID` | ID Χρήστη Ιδιοκτήτη | `0` |
+| `telegram.owner_id` | `PIX__TELEGRAM__OWNER_ID` | ID ιδιοκτήτη· αν δεν οριστεί, ο πρώτος χρήστης μπορεί να γίνει ιδιοκτήτης | Μη ορισμένο |
 | `telegram.bot_mode` | `PIX__TELEGRAM__BOT_MODE` | `public` ή `private` | `"private"` |
 | `pixiv.refresh_token` | `PIX__PIXIV__REFRESH_TOKEN` | Pixiv OAuth Refresh Token | `""` |
 | `database.url` | `PIX__DATABASE__URL` | URL Σύνδεσης Βάσης Δεδομένων | `sqlite:./data/pixivbot.db?mode=rwc` |
@@ -146,11 +147,11 @@
 
 ## Συνεισφορά
 
-Δείτε το [CONTRIBUTING.md](CONTRIBUTING.md) για οδηγίες ανάπτυξης.
+Δείτε το [CONTRIBUTING.md](../CONTRIBUTING.md) για οδηγίες ανάπτυξης.
 
 ## Άδεια
 
-[MIT](LICENSE)
+[MIT](../LICENSE)
 
 ## Ευχαριστίες
 

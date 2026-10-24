@@ -6,25 +6,44 @@ use teloxide::prelude::*;
 use teloxide::types::UserId;
 use tracing::error;
 
-const USAGE: &str = "用法：/subtag [ch=<频道ID>] <标签或搜索词> bookmarks=300 [+tag -tag]\n观察窗口统一由配置文件设置，不接受命令参数覆盖；收藏阈值为正整数。重复订阅更新配置并保留推送进度。";
+const USAGE: &str = "用法：/subtag [ch=<频道ID>] <标签或搜索词> [b=500] [l=<图片数>] [+tag -tag]";
 
 fn parse_subscription(
     parsed: &ParsedArgs,
+    default_min_bookmarks: i64,
 ) -> Result<(String, TagSettings, TagFilter), &'static str> {
-    let mut bookmarks = parsed.get("bookmarks");
-    if parsed
-        .params
-        .keys()
-        .any(|key| !matches!(key.as_str(), "ch" | "channel" | "bookmarks"))
-    {
+    let mut bookmarks = parsed.get_any(&["b", "bookmarks"]);
+    let mut limit = parsed.get_any(&["l", "limit"]);
+    if parsed.get("b").is_some() && parsed.get("bookmarks").is_some() {
+        return Err("收藏阈值参数重复");
+    }
+    if parsed.get("l").is_some() && parsed.get("limit").is_some() {
+        return Err("图片数量参数重复");
+    }
+    if parsed.params.keys().any(|key| {
+        !matches!(
+            key.as_str(),
+            "ch" | "channel" | "b" | "bookmarks" | "l" | "limit"
+        )
+    }) {
         return Err("存在未知参数");
     }
     let mut words = Vec::new();
     let mut filters = Vec::new();
     for word in parsed.remaining.split_whitespace() {
-        if let Some(value) = word.strip_prefix("bookmarks=") {
+        if let Some(value) = word
+            .strip_prefix("b=")
+            .or_else(|| word.strip_prefix("bookmarks="))
+        {
             if bookmarks.replace(value).is_some() {
                 return Err("收藏阈值参数重复");
+            }
+        } else if let Some(value) = word
+            .strip_prefix("l=")
+            .or_else(|| word.strip_prefix("limit="))
+        {
+            if limit.replace(value).is_some() {
+                return Err("图片数量参数重复");
             }
         } else if word.starts_with(['+', '-']) {
             filters.push(word);
@@ -38,19 +57,27 @@ fn parse_subscription(
         return Err("请指定标签或搜索词");
     }
     let query = words.join(" ");
-    if query.chars().count() > 128 {
-        return Err("标签搜索词不能超过 128 个字符");
-    }
     let min_bookmarks: i64 = bookmarks
-        .ok_or("请指定 bookmarks 收藏阈值")?
-        .parse()
-        .map_err(|_| "收藏阈值须为正整数")?;
+        .map(str::parse)
+        .transpose()
+        .map_err(|_| "收藏阈值须为正整数")?
+        .unwrap_or(default_min_bookmarks);
     if min_bookmarks <= 0 {
         return Err("收藏阈值须为正整数");
     }
+    let max_pages: Option<i64> = limit
+        .map(str::parse)
+        .transpose()
+        .map_err(|_| "图片数量须为正整数")?;
+    if max_pages.is_some_and(|value| value <= 0) {
+        return Err("图片数量须为正整数");
+    }
     Ok((
         query,
-        TagSettings { min_bookmarks },
+        TagSettings {
+            min_bookmarks,
+            max_pages,
+        },
         TagFilter::parse_from_args(&filters),
     ))
 }
@@ -64,14 +91,15 @@ impl BotHandler {
         args_str: String,
     ) -> ResponseResult<()> {
         let parsed = args::parse_args(&args_str);
-        let (query, settings, filter) = match parse_subscription(&parsed) {
-            Ok(value) => value,
-            Err(reason) => {
-                bot.send_message(chat_id, format!("❌ {reason}\n{USAGE}"))
-                    .await?;
-                return Ok(());
-            }
-        };
+        let (query, settings, filter) =
+            match parse_subscription(&parsed, self.pixiv_tag_min_bookmarks) {
+                Ok(value) => value,
+                Err(reason) => {
+                    bot.send_message(chat_id, format!("❌ {reason}\n{USAGE}"))
+                        .await?;
+                    return Ok(());
+                }
+            };
         let (target, is_channel) = match self
             .resolve_subscription_target(&bot, chat_id, user_id, &parsed)
             .await
@@ -95,13 +123,23 @@ impl BotHandler {
         .await;
         match result {
             Ok(()) => {
+                let limit = settings
+                    .max_pages
+                    .map(|limit| format!("，图片不超过 {limit} 张"))
+                    .unwrap_or_default();
                 let channel = if is_channel {
                     format!("\n📢 频道：{}", target.0)
                 } else {
                     String::new()
                 };
-                bot.send_message(chat_id, format!("✅ 已订阅标签热榜：{query}\n收藏达到 {} 时推送，观察窗口由服务器统一配置。{channel}\n已发送及待重试进度保留。",
-                    settings.min_bookmarks)).await?;
+                bot.send_message(
+                    chat_id,
+                    format!(
+                        "✅ 已订阅标签热榜：{query}\n收藏达到 {} 时推送{limit}{channel}",
+                        settings.min_bookmarks
+                    ),
+                )
+                .await?;
             }
             Err(e) => {
                 error!("Failed to save tag subscription: {:#}", e);

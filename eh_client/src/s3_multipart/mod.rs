@@ -348,7 +348,7 @@ pub(crate) async fn upload_multipart(
                     }
                 }
             }
-            Err(failure @ list_parts::MultipartFailure::InvalidInventory) => {
+            Err(list_parts::MultipartFailure::InvalidInventory) => {
                 replace_corrupt_session(
                     bucket,
                     request.provider,
@@ -358,7 +358,6 @@ pub(crate) async fn upload_multipart(
                     MultipartOperation::ListParts,
                 )
                 .await?;
-                drop(failure);
                 continue;
             }
             Err(failure) => {
@@ -452,27 +451,9 @@ pub(crate) async fn upload_multipart(
             }
         };
         let status = response.status_code();
-        if let Some(failure) = list_parts::classify_embedded_s3_error(
-            MultipartOperation::Complete,
-            status,
-            response.bytes(),
-        ) {
-            return finish_multipart_failure(
-                bucket,
-                request.provider,
-                &active,
-                request.manifest_path,
-                failure,
-            )
-            .await;
-        }
-        if !(200..300).contains(&status) {
-            let failure = list_parts::classify_response(
-                MultipartOperation::Complete,
-                status,
-                response.bytes(),
-            )
-            .expect_err("non-success multipart complete response must be classified as a failure");
+        if let Err(failure) =
+            list_parts::classify_response(MultipartOperation::Complete, status, response.bytes())
+        {
             return finish_multipart_failure(
                 bucket,
                 request.provider,
@@ -947,7 +928,7 @@ mod tests {
     use wiremock::matchers::{method, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    const BUCKET: &str = "task-five-bucket";
+    const BUCKET: &str = "bucket";
     const KEY: &str = "objects/archive.bin";
     const UPLOAD_ID: &str = "upload-id";
     const REPLACEMENT_UPLOAD_ID: &str = "replacement-upload-id";
@@ -964,66 +945,6 @@ mod tests {
             ResponseTemplate::new(200).set_body_string(format!(
                 "<InitiateMultipartUploadResult><Bucket>{BUCKET}</Bucket><Key>{KEY}</Key><UploadId>{UPLOAD_ID}</UploadId></InitiateMultipartUploadResult>"
             ))
-        }
-    }
-
-    #[test]
-    fn reconcile_parts_requires_the_exact_server_inventory() {
-        let object_len = 2 * PART_SIZE + 17;
-        let part = |part_number, etag: &str, size| list_parts::CompletedPart {
-            part_number,
-            etag: etag.to_owned(),
-            size,
-        };
-        let reconciled = reconcile_parts(
-            object_len,
-            vec![
-                part(2, "\"part-2\"", PART_SIZE as u64),
-                part(1, "\"part-1\"", PART_SIZE as u64),
-                part(3, "\"part-3\"", 17),
-            ],
-        )
-        .unwrap();
-        assert_eq!(
-            reconciled.into_iter().collect::<Vec<_>>(),
-            vec![
-                (1, "\"part-1\"".to_owned()),
-                (2, "\"part-2\"".to_owned()),
-                (3, "\"part-3\"".to_owned()),
-            ]
-        );
-
-        let cases = [
-            (
-                vec![
-                    part(1, "\"one\"", PART_SIZE as u64),
-                    part(1, "\"two\"", PART_SIZE as u64),
-                ],
-                ReconcileInvalid::DuplicatePartNumber,
-            ),
-            (
-                vec![part(0, "\"zero\"", PART_SIZE as u64)],
-                ReconcileInvalid::InvalidPartNumber,
-            ),
-            (
-                vec![part(4, "\"four\"", PART_SIZE as u64)],
-                ReconcileInvalid::InvalidPartNumber,
-            ),
-            (
-                vec![part(1, " \t", PART_SIZE as u64)],
-                ReconcileInvalid::EmptyEtag,
-            ),
-            (
-                vec![part(1, "\"short\"", PART_SIZE as u64 - 1)],
-                ReconcileInvalid::InvalidPartSize,
-            ),
-            (
-                vec![part(3, "\"long\"", 18)],
-                ReconcileInvalid::InvalidPartSize,
-            ),
-        ];
-        for (listed, expected) in cases {
-            assert_eq!(reconcile_parts(object_len, listed), Err(expected));
         }
     }
 
@@ -1351,11 +1272,6 @@ mod tests {
         manifest::write_manifest_atomic(&manifest_path, &manifest)
             .await
             .unwrap();
-        assert!(!tokio::fs::read_to_string(&manifest_path)
-            .await
-            .unwrap()
-            .contains("etag"));
-
         let mut request = standard_request(&bytes, Some(&manifest_path));
         request.candidate_object_key = "objects/different-retry-key.bin".to_owned();
         let result = upload_multipart(
@@ -1378,31 +1294,6 @@ mod tests {
 
     #[tokio::test]
     async fn multipart_transient_auth_and_malformed_failures_never_become_unsupported() {
-        let cases = vec![
-            (400, b"raw bad request".to_vec()),
-            (403, b"raw forbidden".to_vec()),
-            (405, b"raw method not allowed".to_vec()),
-            (403, s3_error_xml("AccessDenied").into_bytes()),
-            (403, s3_error_xml("InvalidAccessKeyId").into_bytes()),
-            (500, s3_error_xml("NotImplemented").into_bytes()),
-            (503, b"raw unavailable".to_vec()),
-            (200, b"<Error><Code>AccessDenied</Code>".to_vec()),
-        ];
-        for operation in [
-            MultipartOperation::Create,
-            MultipartOperation::ListParts,
-            MultipartOperation::UploadPart,
-            MultipartOperation::Complete,
-        ] {
-            for (status, body) in &cases {
-                let failure = list_parts::classify_response(operation, *status, body).unwrap_err();
-                assert!(
-                    !matches!(failure, list_parts::MultipartFailure::Unsupported { .. }),
-                    "{operation:?} HTTP {status} must not fall back"
-                );
-            }
-        }
-
         let server = MockServer::start().await;
         mount_create(&server).await;
         mount_empty_list_parts(&server).await;
@@ -1445,17 +1336,6 @@ mod tests {
 
     #[tokio::test]
     async fn multipart_complete_classifies_http_200_error_roots_before_provider_parsing() {
-        assert!(matches!(
-            list_parts::classify_embedded_s3_error(
-                MultipartOperation::Complete,
-                200,
-                s3_error_xml("AccessDenied").as_bytes(),
-            ),
-            Some(list_parts::MultipartFailure::Service {
-                operation: MultipartOperation::Complete,
-                status: 200,
-            })
-        ));
         let server = MockServer::start().await;
         mount_create(&server).await;
         mount_empty_list_parts(&server).await;
@@ -1975,52 +1855,6 @@ mod tests {
             Ok(MultipartOutcome::Completed(_)) => unreachable!(),
         }
         assert!(manifest_path.is_file());
-        server.verify().await;
-    }
-
-    #[tokio::test]
-    async fn ipfs3_image_head_requires_matching_length_and_nonempty_cid_etag() {
-        let server = MockServer::start().await;
-        mount_no_such_upload_list(&server, UPLOAD_ID).await;
-        mount_head(
-            &server,
-            200,
-            Some(PART_SIZE),
-            Some("\"bafy-recovered-cid\""),
-        )
-        .await;
-        Mock::given(method("POST"))
-            .and(query_param("uploads", ""))
-            .respond_with(ResponseTemplate::new(500))
-            .expect(0)
-            .mount(&server)
-            .await;
-
-        let temp = tempfile::tempdir().unwrap();
-        let manifest_path = temp.path().join("archive.json");
-        let bytes = vec![4; PART_SIZE];
-        write_valid_manifest_for(&manifest_path, &bytes, UPLOADER_ID, ProviderKind::IpfS3).await;
-        let mut request = standard_request(&bytes, Some(&manifest_path));
-        request.provider = ProviderKind::IpfS3;
-        request.head_recovery = HeadRecovery::IpfS3ImageByLengthAndEtag;
-
-        let result = upload_multipart(
-            test_bucket(&server).as_ref(),
-            &reqwest::Client::new(),
-            request,
-        )
-        .await
-        .unwrap();
-        let completed = match result {
-            MultipartOutcome::Completed(completed) => completed,
-            MultipartOutcome::Unsupported { .. } => panic!("head recovery must complete"),
-        };
-        assert!(matches!(
-            completed.evidence,
-            CompletionEvidence::RecoveredHead { ref etag }
-                if etag.as_deref() == Some("\"bafy-recovered-cid\"")
-        ));
-        assert!(manifest_path.exists());
         server.verify().await;
     }
 

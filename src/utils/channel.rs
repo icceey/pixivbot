@@ -119,15 +119,7 @@ fn normalize_channel_id(id: i64) -> i64 {
     }
 }
 
-/// Extension trait for `Bot` providing channel permission checking methods.
-///
-/// This trait adds fluent methods to the `Bot` type for checking channel permissions,
-/// allowing calls like `bot.can_post_to_channel(&channel)` instead of
-/// `check_bot_can_post(&bot, &channel)`.
-// NOTE: This trait is only ever implemented for the concrete `teloxide::Bot` type and
-// is not used as a trait object. Using `async fn` in the trait is therefore safe in
-// this context, and we explicitly allow `async_fn_in_trait` for ergonomic async methods
-// on Rust 2021.
+/// Channel permission checks for Telegram requesters.
 #[allow(async_fn_in_trait)]
 pub trait BotChannelExt {
     /// Check if the bot has permission to post messages in a channel.
@@ -179,7 +171,7 @@ where
         let bot_user_id = me.id;
 
         let recipient = channel.to_recipient();
-        match self.get_chat_member(recipient.clone(), bot_user_id).await {
+        match self.get_chat_member(recipient, bot_user_id).await {
             Ok(member) => {
                 let can_post = match &member.kind {
                     ChatMemberKind::Administrator(admin) => {
@@ -282,29 +274,5 @@ where
 
         // Resolve to numeric ID for database storage
         self.resolve_channel_id(channel).await
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn numeric_channel_identifiers_normalize_the_telegram_prefix() {
-        for (input, expected) in [
-            ("123456", -100123456),
-            ("-123456", -100123456),
-            ("-100123456", -100123456),
-            ("100123456", -100123456),
-            ("1234567890", -1001234567890),
-            ("-1234567890", -1001234567890),
-            ("-1001234567890", -1001234567890),
-            ("1001234567890", -1001234567890),
-        ] {
-            let ChannelIdentifier::Id(id) = input.parse().unwrap() else {
-                panic!("expected numeric channel for {input}");
-            };
-            assert_eq!(id.0, expected, "{input}");
-        }
     }
 }

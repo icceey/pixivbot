@@ -1,7 +1,7 @@
 # Makefile for pixivbot
 # 用于本地开发时快速检查是否符合 CI 要求
 
-.PHONY: all check test fmt fmt-check clippy build clean ci help
+.PHONY: all check test fmt fmt-check clippy build clean ci quick fix dev watch help
 
 # 默认目标：运行所有 CI 检查
 all: ci
@@ -11,9 +11,11 @@ help:
 	@echo "Available targets:"
 	@echo "  make all       - Run all CI checks (same as 'make ci')"
 	@echo "  make ci        - Run all CI checks: fmt-check, clippy, check, test, build"
+	@echo "  make quick     - Run fmt-check, clippy, and check"
 	@echo "  make check     - Run cargo check"
 	@echo "  make test      - Run cargo test"
 	@echo "  make fmt       - Format code with rustfmt"
+	@echo "  make fix       - Format code and apply clippy fixes"
 	@echo "  make fmt-check - Check code formatting (CI mode)"
 	@echo "  make clippy    - Run clippy linter (CI mode with -D warnings)"
 	@echo "  make build     - Build release binary"

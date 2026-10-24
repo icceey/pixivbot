@@ -266,19 +266,15 @@ impl BooruClient {
     ) -> Result<T> {
         let mut query_params: Vec<(&str, &str)> = params.to_vec();
 
-        let username_str;
-        let api_key_str;
         if let (Some(user), Some(key)) = (&self.username, &self.api_key) {
-            username_str = user.clone();
-            api_key_str = key.clone();
             match self.engine_type {
                 BooruEngineType::Moebooru => {
-                    query_params.push(("login", &username_str));
-                    query_params.push(("api_key", &api_key_str));
+                    query_params.push(("login", user));
+                    query_params.push(("api_key", key));
                 }
                 BooruEngineType::Gelbooru => {
-                    query_params.push(("user_id", &username_str));
-                    query_params.push(("api_key", &api_key_str));
+                    query_params.push(("user_id", user));
+                    query_params.push(("api_key", key));
                 }
                 BooruEngineType::Danbooru => {}
             }

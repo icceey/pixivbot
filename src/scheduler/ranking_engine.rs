@@ -8,7 +8,7 @@ use crate::scheduler::helpers::{
 };
 use crate::utils::caption::{build_ranking_caption, build_ranking_title};
 use anyhow::{Context, Result};
-use chrono::{Local, NaiveTime, TimeZone, Timelike};
+use chrono::{Local, NaiveTime, TimeZone};
 use pixiv_client::Illust;
 use std::sync::Arc;
 use teloxide::prelude::*;
@@ -82,9 +82,8 @@ impl RankingEngine {
 
     /// Calculate next execution time based on current time
     fn calculate_next_execution_time(&self) -> Result<chrono::DateTime<Local>> {
-        let (h, m) = self.parse_execution_time()?;
-
-        let target_time = NaiveTime::from_hms_opt(h, m, 0).context("Invalid time configuration")?;
+        let target_time = NaiveTime::parse_from_str(&self.execution_time, "%H:%M")
+            .with_context(|| format!("Invalid execution_time format '{}'", self.execution_time))?;
 
         let now = Local::now();
         let target_date = if now.time() < target_time {
@@ -97,14 +96,6 @@ impl RankingEngine {
         Local::from_local_datetime(&Local, &target_naive)
             .single()
             .context("Ambiguous or invalid local time (e.g. skipped by DST)")
-    }
-
-    /// Parse execution time string (HH:MM format) into (hour, minute)
-    fn parse_execution_time(&self) -> Result<(u32, u32)> {
-        let time = NaiveTime::parse_from_str(&self.execution_time, "%H:%M")
-            .with_context(|| format!("Invalid execution_time format '{}'", self.execution_time))?;
-
-        Ok((time.hour(), time.minute()))
     }
 
     /// Execute all pending ranking tasks
@@ -264,7 +255,6 @@ impl RankingEngine {
             return Ok(());
         }
 
-        // *** Process ALL filtered ranking illusts in batch ***
         info!(
             "Sending {} ranking illusts to chat {}",
             filtered_illusts.len(),
@@ -446,6 +436,8 @@ impl RankingEngine {
                         std::slice::from_ref(&image_url),
                         Some(&caption),
                         has_spoiler,
+                        &DownloadButtonConfig::default(),
+                        None,
                     )
                     .await
             };

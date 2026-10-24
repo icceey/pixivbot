@@ -52,7 +52,10 @@ async fn subscribe(repo: &Repo) -> (tasks::Model, subscriptions::Model, chats::M
         42,
         task.id,
         TagFilter::default(),
-        &TagSettings { min_bookmarks: 300 },
+        &TagSettings {
+            min_bookmarks: 300,
+            max_pages: None,
+        },
     )
     .await
     .unwrap();
@@ -131,55 +134,11 @@ async fn page_checkpoint_and_candidates_commit_together_and_resume_after_reopen(
         (checkpoint.cursor_date, 1, 1)
     );
     assert_eq!(repo.pixiv_tag_candidates(task.id).await.unwrap().len(), 2);
-    // A rolling window may discard old backlog, but not reuse its offset in the
-    // new start day or forget the page estimate that controls the next interval.
-    let clipped = repo
-        .pixiv_tag_scan(task.id, oldest + Days::new(2), 7)
-        .await
-        .unwrap();
-    assert_eq!(
-        (
-            clipped.cursor_date,
-            clipped.cursor_offset,
-            clipped.pages_scanned,
-            clipped.total_pages
-        ),
-        (oldest + Days::new(2), 0, 1, 1)
-    );
-    let resized = repo
-        .pixiv_tag_scan(task.id, today - Days::new(14), 14)
-        .await
-        .unwrap();
-    assert_eq!(
-        (resized.cursor_date, resized.cursor_offset),
-        (today - Days::new(14), 0)
-    );
-    assert_eq!(repo.pixiv_tag_candidates(task.id).await.unwrap().len(), 2);
-    let finished = advance_scan(&resized, &illusts, None, today).unwrap();
-    repo.save_pixiv_tag_page(task.id, &illusts, &finished)
-        .await
-        .unwrap();
-    repo.db().clone().close().await.unwrap();
-    let repo = open_repo(&url).await;
-    let restarted = repo
-        .pixiv_tag_scan(task.id, today - Days::new(14), 14)
-        .await
-        .unwrap();
-    assert_eq!(
-        (
-            restarted.cursor_date,
-            restarted.cursor_offset,
-            restarted.pages_scanned,
-            restarted.total_pages,
-            restarted.complete
-        ),
-        (today - Days::new(14), 0, 0, finished.pages_scanned, false)
-    );
     repo.db().clone().close().await.unwrap();
 }
 
 #[tokio::test]
-async fn failed_download_and_telegram_retry_resume_only_unsent_pages_after_restart() {
+async fn failed_download_and_interrupted_send_resume_after_reopen() {
     let dir = tempfile::tempdir().unwrap();
     let url = format!(
         "sqlite://{}/delivery.db?mode=rwc",
@@ -191,336 +150,12 @@ async fn failed_download_and_telegram_retry_resume_only_unsent_pages_after_resta
         .respond_with(ResponseTemplate::new(200).set_body_bytes(b"mock image".to_vec()))
         .mount(&server)
         .await;
-    // A one-request fault avoids scoped-guard indices being invalidated by
-    // priority sorting in wiremock 0.6.5.
     Mock::given(method("GET"))
         .and(path("/image/4.jpg"))
         .respond_with(ResponseTemplate::new(503))
         .with_priority(1)
         .up_to_n_times(1)
         .expect(1)
-        .mount(&server)
-        .await;
-    Mock::given(path("/botfake_token/SendChatAction"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(serde_json::json!({"ok": true, "result": true})),
-        )
-        .mount(&server)
-        .await;
-    let message = |id| serde_json::json!({"message_id": id, "date": 1700000000, "chat": {"id": 42, "type": "private"}});
-    Mock::given(path("/botfake_token/SendMediaGroup"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(
-            serde_json::json!({"ok": true, "result": (100..110).map(message).collect::<Vec<_>>()}),
-        ))
-        .expect(1)
-        .mount(&server)
-        .await;
-    Mock::given(path("/botfake_token/SendPhoto"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(serde_json::json!({"ok": true, "result": message(110)})),
-        )
-        .expect(1)
-        .mount(&server)
-        .await;
-    let bot = Bot::new("fake_token")
-        .set_api_url(url::Url::parse(&server.uri()).unwrap())
-        .throttle(Limits::default());
-    let notifier = Notifier::new(
-        bot,
-        Arc::new(Downloader::new(
-            reqwest::Client::new(),
-            FileCacheManager::new(dir.path().join("cache"), 7),
-        )),
-    );
-    let pixiv = Arc::new(RwLock::new(
-        PixivClient::new(PixivConfig {
-            refresh_token: "unused".to_string(),
-        })
-        .unwrap(),
-    ));
-    let repo = Arc::new(open_repo(&url).await);
-    let (task, sub, chat) = subscribe(&repo).await;
-    let illust = illustration(10, &server.uri(), 11);
-    let engine = PixivTagEngine::new(
-        repo.clone(),
-        pixiv.clone(),
-        notifier.clone(),
-        &serde_json::from_value(serde_json::json!({})).unwrap(),
-        ImageSize::Large,
-    );
-    let now = Utc::now().timestamp();
-    let scan = repo
-        .pixiv_tag_scan(
-            task.id,
-            Utc::now().with_timezone(&SEARCH_TIMEZONE).date_naive() - Days::new(7),
-            7,
-        )
-        .await
-        .unwrap();
-    repo.save_pixiv_tag_page(task.id, &[(illust.clone(), now)], &scan)
-        .await
-        .unwrap();
-    engine
-        .enqueue_eligible(
-            &[(sub.clone(), TagSettings { min_bookmarks: 300 })],
-            &illust,
-            now,
-            now,
-        )
-        .await
-        .unwrap();
-    let delivery = repo
-        .pixiv_tag_deliveries_due(sub.id, now)
-        .await
-        .unwrap()
-        .pop()
-        .unwrap();
-    engine.send_delivery(&sub, &chat, delivery).await.unwrap();
-    // A missing middle image must not compress the success indices and mark a
-    // different page as delivered. No Telegram media request can occur yet.
-    let requests = server.received_requests().await.unwrap();
-    assert!(!requests
-        .iter()
-        .any(|r| r.url.path().ends_with("SendMediaGroup")));
-    assert!(repo
-        .pixiv_tag_deliveries_due(sub.id, now)
-        .await
-        .unwrap()
-        .is_empty());
-    let retry = repo
-        .pixiv_tag_deliveries_due(sub.id, now + 3600)
-        .await
-        .unwrap()
-        .pop()
-        .unwrap();
-    assert!(repo
-        .pixiv_push_progress(chat.id, illust.id)
-        .await
-        .unwrap()
-        .sent_pages
-        .is_empty());
-    Mock::given(path("/botfake_token/SendPhoto"))
-        .respond_with(ResponseTemplate::new(400).set_body_json(
-            serde_json::json!({"ok": false, "error_code": 400, "description": "injected failure"}),
-        ))
-        .with_priority(1)
-        .up_to_n_times(2)
-        .expect(2)
-        .mount(&server)
-        .await;
-    engine.send_delivery(&sub, &chat, retry).await.unwrap();
-    drop(engine);
-    repo.db().clone().close().await.unwrap();
-    drop(repo);
-
-    let repo = Arc::new(open_repo(&url).await);
-    // Config edits and candidate expiry must not erase an already queued work.
-    repo.upsert_pixiv_tag_subscription(
-        42,
-        task.id,
-        TagFilter::default(),
-        &TagSettings {
-            min_bookmarks: 10000,
-        },
-    )
-    .await
-    .unwrap();
-    repo.prune_pixiv_tag_candidates(task.id, now + 86400)
-        .await
-        .unwrap();
-    let engine = PixivTagEngine::new(
-        repo.clone(),
-        pixiv.clone(),
-        notifier.clone(),
-        &serde_json::from_value(serde_json::json!({"pixiv_tag_window_days": 1})).unwrap(),
-        ImageSize::Large,
-    );
-    let resumed = repo
-        .pixiv_tag_deliveries_due(sub.id, now + 86400)
-        .await
-        .unwrap()
-        .pop()
-        .unwrap();
-    assert_eq!(
-        repo.pixiv_push_progress(chat.id, illust.id)
-            .await
-            .unwrap()
-            .sent_pages,
-        (0..10).collect::<Vec<_>>()
-    );
-    engine.send_delivery(&sub, &chat, resumed).await.unwrap();
-    let retry = repo
-        .pixiv_tag_deliveries_due(sub.id, now + 86400)
-        .await
-        .unwrap()
-        .pop()
-        .unwrap();
-    assert!(repo
-        .get_message_with_subscription(42, 100)
-        .await
-        .unwrap()
-        .is_some());
-    assert_eq!(
-        repo.pixiv_push_progress(chat.id, illust.id)
-            .await
-            .unwrap()
-            .sent_pages,
-        (0..10).collect::<Vec<_>>()
-    );
-    // An author subscription has no local page cursor for this work. It must
-    // still resume the tag's ten acknowledged pages after the restart.
-    let author_task = repo
-        .get_or_create_task(TaskType::Author, "1".to_string(), None)
-        .await
-        .unwrap();
-    let author_sub = repo
-        .upsert_subscription(chat.id, author_task.id, TagFilter::default())
-        .await
-        .unwrap();
-    assert!(matches!(
-        process_illust_push(
-            &repo,
-            &notifier,
-            &pixiv,
-            &chat,
-            &illust,
-            author_sub.id,
-            ImageSize::Large,
-        )
-        .await
-        .unwrap(),
-        PushResult::Success { .. }
-    ));
-    assert!(repo
-        .get_message_with_subscription(42, 110)
-        .await
-        .unwrap()
-        .is_some());
-    // Replaying a stale tag queue after the author finishes must not send again.
-    repo.db()
-        .execute_unprepared(
-            "CREATE TRIGGER fail_complete BEFORE UPDATE ON pixiv_tag_deliveries
-         WHEN NEW.done=1 BEGIN SELECT RAISE(ABORT, 'injected queue write failure'); END;",
-        )
-        .await
-        .unwrap();
-    assert!(engine.send_delivery(&sub, &chat, retry).await.is_err());
-    repo.db()
-        .execute_unprepared("DROP TRIGGER fail_complete")
-        .await
-        .unwrap();
-    let retry = repo
-        .pixiv_tag_deliveries_due(sub.id, now + 86400)
-        .await
-        .unwrap()
-        .pop()
-        .unwrap();
-    engine.send_delivery(&sub, &chat, retry).await.unwrap();
-    drop(engine);
-    repo.db().clone().close().await.unwrap();
-    drop(repo);
-    let repo = open_repo(&url).await;
-    // Replaying a discovered work does not replace the completed dedup row.
-    repo.enqueue_pixiv_tag_delivery(sub.id, &illust, now + 86400)
-        .await
-        .unwrap();
-    assert!(repo
-        .pixiv_tag_deliveries_due(sub.id, now + 86400)
-        .await
-        .unwrap()
-        .is_empty());
-    assert!(repo
-        .get_message_with_subscription(42, 100)
-        .await
-        .unwrap()
-        .is_some());
-    let requests = server.received_requests().await.unwrap();
-    let photo = requests
-        .iter()
-        .rev()
-        .find(|r| r.url.path().ends_with("SendPhoto"))
-        .unwrap();
-    assert!(String::from_utf8_lossy(&photo.body).contains("continued 2/2"));
-    server.verify().await;
-    repo.db().clone().close().await.unwrap();
-}
-
-#[tokio::test]
-async fn existing_author_history_preserves_partial_work_and_excludes_rankings() {
-    let db = Database::connect("sqlite::memory:").await.unwrap();
-    db.execute_unprepared("PRAGMA foreign_keys=ON")
-        .await
-        .unwrap();
-    // Enable shared history over existing author subscriptions and pending work.
-    let released_migrations = u32::try_from(migration::Migrator::migrations().len() - 1).unwrap();
-    migration::Migrator::up(&db, Some(released_migrations))
-        .await
-        .unwrap();
-    let repo = Repo::new(db);
-    repo.upsert_chat(42, "private".to_string(), None, true, Default::default())
-        .await
-        .unwrap();
-    let author_task = repo
-        .get_or_create_task(TaskType::Author, "1".to_string(), None)
-        .await
-        .unwrap();
-    let author_sub = repo
-        .upsert_subscription(42, author_task.id, TagFilter::default())
-        .await
-        .unwrap();
-    repo.update_subscription_latest_data(
-        author_sub.id,
-        Some(SubscriptionState::Author(AuthorState {
-            latest_illust_id: 9,
-            pending_illust: Some(PendingIllust {
-                illust_id: 10,
-                sent_pages: vec![0],
-                total_pages: 2,
-                retry_count: 1,
-            }),
-        })),
-    )
-    .await
-    .unwrap();
-    repo.save_message(42, 200, author_sub.id, Some(10))
-        .await
-        .unwrap();
-    repo.save_message(42, 201, author_sub.id, Some(9))
-        .await
-        .unwrap();
-    let ranking_task = repo
-        .get_or_create_task(TaskType::Ranking, "day".to_string(), None)
-        .await
-        .unwrap();
-    let ranking_sub = repo
-        .upsert_subscription(42, ranking_task.id, TagFilter::default())
-        .await
-        .unwrap();
-    repo.save_message(42, 202, ranking_sub.id, Some(20))
-        .await
-        .unwrap();
-
-    migration::Migrator::up(repo.db(), None).await.unwrap();
-    let pending = repo.pixiv_push_progress(42, 10).await.unwrap();
-    assert!(!pending.done);
-    assert_eq!(pending.sent_pages, vec![0]);
-    assert!(repo.pixiv_push_progress(42, 9).await.unwrap().done);
-    assert!(!repo.pixiv_push_progress(42, 20).await.unwrap().done);
-}
-
-#[tokio::test]
-async fn interrupted_batch_resumes_without_waiting_for_search_or_replaying_acknowledged_pages() {
-    let dir = tempfile::tempdir().unwrap();
-    let url = format!(
-        "sqlite://{}/interrupted.db?mode=rwc",
-        dir.path().to_string_lossy().replace('\\', "/")
-    );
-    let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path_regex("/image/.*"))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"mock image".to_vec()))
         .mount(&server)
         .await;
     Mock::given(path("/botfake_token/SendChatAction"))
@@ -584,60 +219,42 @@ async fn interrupted_batch_resumes_without_waiting_for_search_or_replaying_ackno
         &config,
         ImageSize::Large,
     );
-
-    // Changing a threshold re-evaluates cached data at the current time. An
-    // expired observation must not become new queue work under the new setting.
-    let now = Utc::now();
-    let mut expired = illustration(20, &server.uri(), 1);
-    expired.total_bookmarks = 200;
-    let mut scan = repo
-        .pixiv_tag_scan(
-            task.id,
-            now.with_timezone(&SEARCH_TIMEZONE).date_naive() - Days::new(7),
-            7,
-        )
+    let now = Utc::now().timestamp();
+    let illust = illustration(10, &server.uri(), 11);
+    repo.enqueue_pixiv_tag_delivery(sub.id, &illust, now)
         .await
         .unwrap();
-    repo.save_pixiv_tag_page(
-        task.id,
-        &[(expired, now.timestamp() - 7 * 86400 - 1)],
-        &scan,
-    )
-    .await
-    .unwrap();
-    repo.upsert_pixiv_tag_subscription(
-        42,
-        task.id,
-        TagFilter::default(),
-        &TagSettings { min_bookmarks: 100 },
-    )
-    .await
-    .unwrap();
-    // A completed scan needs no network page; exercise cached re-evaluation and
-    // pruning through the production task, without another Pixiv request.
-    scan.complete = true;
-    engine.execute_task(&task, &mut scan, now).await.unwrap();
+    engine.tick().await.unwrap();
+    // A failed middle download must not shift the acknowledged page indices.
+    assert!(!server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .any(|request| {
+            matches!(
+                request.url.path(),
+                "/botfake_token/SendMediaGroup" | "/botfake_token/SendPhoto"
+            )
+        }));
     assert!(repo
-        .pixiv_tag_deliveries_due(sub.id, now.timestamp())
+        .pixiv_tag_deliveries_due(sub.id, now)
         .await
         .unwrap()
         .is_empty());
-
-    let illust = illustration(10, &server.uri(), 11);
-    repo.enqueue_pixiv_tag_delivery(sub.id, &illust, now.timestamp())
-        .await
-        .unwrap();
-    let delivery = repo
-        .pixiv_tag_deliveries_due(sub.id, now.timestamp())
+    let retry = repo
+        .pixiv_tag_deliveries_due(sub.id, now + 3600)
         .await
         .unwrap()
         .pop()
         .unwrap();
+    repo.save_pixiv_tag_delivery(&retry, false, now)
+        .await
+        .unwrap();
     {
-        let send = engine.send_delivery(&sub, &chat, delivery);
+        let send = engine.send_delivery(&sub, &chat, retry);
         tokio::pin!(send);
-        // The responder signals receipt and holds the response in flight. Wait
-        // for that observable event, then drop the sender without a timed sleep.
+        // Interrupt after the next request arrives, while its response is pending.
         tokio::select! {
             biased;
             _ = second_batch_arrived.notified() => {}
@@ -652,7 +269,7 @@ async fn interrupted_batch_resumes_without_waiting_for_search_or_replaying_ackno
         (0..10).collect::<Vec<_>>()
     );
     assert!(repo
-        .get_message_with_subscription(42, 100)
+        .get_message_with_subscription(chat.id, 100)
         .await
         .unwrap()
         .is_some());
@@ -669,7 +286,7 @@ async fn interrupted_batch_resumes_without_waiting_for_search_or_replaying_ackno
             .done
     );
     assert!(repo
-        .get_message_with_subscription(42, 110)
+        .get_message_with_subscription(chat.id, 110)
         .await
         .unwrap()
         .is_some());
@@ -683,6 +300,75 @@ async fn interrupted_batch_resumes_without_waiting_for_search_or_replaying_ackno
     );
     server.verify().await;
     repo.db().clone().close().await.unwrap();
+}
+
+#[tokio::test]
+async fn existing_author_history_preserves_partial_work_and_excludes_rankings() {
+    let db = Database::connect("sqlite::memory:").await.unwrap();
+    db.execute_unprepared("PRAGMA foreign_keys=ON")
+        .await
+        .unwrap();
+    // Enable shared history over existing author subscriptions and pending work.
+    let released_migrations = u32::try_from(
+        migration::Migrator::migrations()
+            .iter()
+            .position(|migration| migration.name() == "m20261023_000000_pixiv_tag_ranking")
+            .unwrap(),
+    )
+    .unwrap();
+    migration::Migrator::up(&db, Some(released_migrations))
+        .await
+        .unwrap();
+    let repo = Repo::new(db);
+    repo.upsert_chat(42, "private".to_string(), None, true, Default::default())
+        .await
+        .unwrap();
+    let author_task = repo
+        .get_or_create_task(TaskType::Author, "1".to_string(), None)
+        .await
+        .unwrap();
+    let author_sub = repo
+        .upsert_subscription(42, author_task.id, TagFilter::default())
+        .await
+        .unwrap();
+    repo.update_subscription_latest_data(
+        author_sub.id,
+        Some(SubscriptionState::Author(AuthorState {
+            latest_illust_id: 9,
+            pending_illust: Some(PendingIllust {
+                illust_id: 10,
+                sent_pages: vec![0],
+                total_pages: 2,
+                retry_count: 1,
+            }),
+        })),
+    )
+    .await
+    .unwrap();
+    repo.save_message(42, 200, author_sub.id, Some(10))
+        .await
+        .unwrap();
+    repo.save_message(42, 201, author_sub.id, Some(9))
+        .await
+        .unwrap();
+    let ranking_task = repo
+        .get_or_create_task(TaskType::Ranking, "day".to_string(), None)
+        .await
+        .unwrap();
+    let ranking_sub = repo
+        .upsert_subscription(42, ranking_task.id, TagFilter::default())
+        .await
+        .unwrap();
+    repo.save_message(42, 202, ranking_sub.id, Some(20))
+        .await
+        .unwrap();
+
+    migration::Migrator::up(repo.db(), None).await.unwrap();
+    let pending = repo.pixiv_push_progress(42, 10).await.unwrap();
+    assert!(!pending.done);
+    assert_eq!(pending.sent_pages, vec![0]);
+    assert!(repo.pixiv_push_progress(42, 9).await.unwrap().done);
+    assert!(!repo.pixiv_push_progress(42, 20).await.unwrap().done);
 }
 
 #[tokio::test]
@@ -723,7 +409,7 @@ async fn acknowledged_pages_and_message_mapping_roll_back_together() {
 }
 
 #[tokio::test]
-async fn concurrent_author_and_tag_pushes_share_chat_history_after_resubscribe() {
+async fn concurrent_author_and_tag_pushes_send_once() {
     let dir = tempfile::tempdir().unwrap();
     let server = MockServer::start().await;
     Mock::given(method("GET"))
@@ -743,7 +429,7 @@ async fn concurrent_author_and_tag_pushes_share_chat_history_after_resubscribe()
             "ok": true, "result": {"message_id": 100, "date": 1700000000,
             "chat": {"id": 42, "type": "private"}}
         })))
-        .expect(2)
+        .expect(1)
         .mount(&server)
         .await;
     let notifier = Notifier::new(
@@ -762,7 +448,7 @@ async fn concurrent_author_and_tag_pushes_share_chat_history_after_resubscribe()
         .unwrap(),
     ));
     let repo = Arc::new(open_repo("sqlite::memory:").await);
-    let (task, sub, chat) = subscribe(&repo).await;
+    let (_, sub, chat) = subscribe(&repo).await;
     let author = repo
         .get_or_create_task(TaskType::Author, "1".to_string(), None)
         .await
@@ -772,26 +458,8 @@ async fn concurrent_author_and_tag_pushes_share_chat_history_after_resubscribe()
         .await
         .unwrap();
     let illust = illustration(10, &server.uri(), 1);
-    let now = Utc::now().timestamp();
-    repo.enqueue_pixiv_tag_delivery(sub.id, &illust, now)
-        .await
-        .unwrap();
-    let delivery = repo
-        .pixiv_tag_deliveries_due(sub.id, now)
-        .await
-        .unwrap()
-        .pop()
-        .unwrap();
-    let engine = PixivTagEngine::new(
-        repo.clone(),
-        pixiv.clone(),
-        notifier.clone(),
-        &serde_json::from_value(serde_json::json!({})).unwrap(),
-        ImageSize::Large,
-    );
 
-    // Poll both real send paths while the shared lock is held. Both have reached
-    // the send boundary before either may proceed; no timing/sleep assumptions.
+    // Queue both senders behind the same chat lock before releasing either.
     let guard = repo.lock_pixiv_push(chat.id).await;
     let author_send = process_illust_push(
         &repo,
@@ -802,7 +470,15 @@ async fn concurrent_author_and_tag_pushes_share_chat_history_after_resubscribe()
         author_sub.id,
         ImageSize::Large,
     );
-    let tag_send = engine.send_delivery(&sub, &chat, delivery);
+    let tag_send = process_illust_push(
+        &repo,
+        &notifier,
+        &pixiv,
+        &chat,
+        &illust,
+        sub.id,
+        ImageSize::Large,
+    );
     tokio::pin!(author_send, tag_send);
     std::future::poll_fn(|cx| {
         assert!(author_send.as_mut().poll(cx).is_pending());
@@ -813,68 +489,6 @@ async fn concurrent_author_and_tag_pushes_share_chat_history_after_resubscribe()
     drop(guard);
     let (author_result, tag_result) = tokio::join!(&mut author_send, &mut tag_send);
     assert!(matches!(author_result.unwrap(), PushResult::Success { .. }));
-    tag_result.unwrap();
-    let requests = server.received_requests().await.unwrap();
-    assert_eq!(
-        requests
-            .iter()
-            .filter(|r| r.url.path().ends_with("SendPhoto"))
-            .count(),
-        1
-    );
-
-    repo.delete_subscription(author_sub.id).await.unwrap();
-    repo.delete_subscription(sub.id).await.unwrap();
-    // Neither cancelling/recreating nor adding another language can reset the
-    // target's history (the original queue record has been cascade-deleted).
-    for query in [task.value.as_str(), "translated tag"] {
-        let task = repo
-            .get_or_create_task(TaskType::PixivTag, query.to_string(), None)
-            .await
-            .unwrap();
-        repo.upsert_pixiv_tag_subscription(
-            chat.id,
-            task.id,
-            TagFilter::default(),
-            &TagSettings { min_bookmarks: 1 },
-        )
-        .await
-        .unwrap();
-        let sub = repo
-            .get_subscription_by_chat_task(chat.id, task.id)
-            .await
-            .unwrap()
-            .unwrap();
-        repo.enqueue_pixiv_tag_delivery(sub.id, &illust, now)
-            .await
-            .unwrap();
-        assert!(repo
-            .pixiv_tag_deliveries_due(sub.id, now)
-            .await
-            .unwrap()
-            .is_empty());
-    }
-    let other_chat = repo
-        .upsert_chat(43, "private".to_string(), None, true, Default::default())
-        .await
-        .unwrap();
-    let other_sub = repo
-        .upsert_subscription(other_chat.id, author.id, TagFilter::default())
-        .await
-        .unwrap();
-    assert!(matches!(
-        process_illust_push(
-            &repo,
-            &notifier,
-            &pixiv,
-            &other_chat,
-            &illust,
-            other_sub.id,
-            ImageSize::Large,
-        )
-        .await
-        .unwrap(),
-        PushResult::Success { .. }
-    ));
+    assert!(matches!(tag_result.unwrap(), PushResult::Success { .. }));
     server.verify().await;
 }

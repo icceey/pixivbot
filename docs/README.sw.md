@@ -63,8 +63,9 @@ Tunapendekeza kutumia Docker kwa usambazaji kwa sababu inashughulikia tegemezi n
 Ikiwa unapendelea kuendesha moja kwa moja kwenye mashine yako:
 
 1. **Mahitaji ya Awali**:
-    - Rust (sasisho la hivi karibuni)
+    - Rust 1.94 (`rust-toolchain.toml`)
     - SQLite
+    - Maktaba za ukuzaji za FFmpeg na `pkg-config`
 
 2. **Nakili na Sanidi**:
 
@@ -78,7 +79,7 @@ Ikiwa unapendelea kuendesha moja kwa moja kwenye mashine yako:
 3. **Jenga na Endesha**:
 
    ```bash
-   cargo run --release
+   cargo run --release --features ffmpeg-codec
    ```
 
 ## Kupata Tokeni Zinazohitajika
@@ -108,7 +109,7 @@ Chaguo za usanidi zinazosaidiwa katika `config.toml` au kupitia Vigeuzi vya Mazi
 | Ufunguo wa Usanidi | Kibadilishaji cha Mazingira | Maelezo | Chaguo-msingi |
 |---|---|---|---|
 | `telegram.bot_token` | `PIX__TELEGRAM__BOT_TOKEN` | Telegram Bot API Token | `""` |
-| `telegram.owner_id` | `PIX__TELEGRAM__OWNER_ID` | Kitambulisho cha Mtumiaji Mmiliki | `0` |
+| `telegram.owner_id` | `PIX__TELEGRAM__OWNER_ID` | Kitambulisho cha mmiliki; kisipowekwa, mtumiaji wa kwanza anaweza kuwa mmiliki | Haijawekwa |
 | `telegram.bot_mode` | `PIX__TELEGRAM__BOT_MODE` | `public` au `private` | `"private"` |
 | `pixiv.refresh_token` | `PIX__PIXIV__REFRESH_TOKEN` | Pixiv OAuth Refresh Token | `""` |
 | `database.url` | `PIX__DATABASE__URL` | URL ya Muunganisho wa Hifadhidata | `sqlite:./data/pixivbot.db?mode=rwc` |
@@ -146,11 +147,11 @@ Chaguo za usanidi zinazosaidiwa katika `config.toml` au kupitia Vigeuzi vya Mazi
 
 ## Kuchangia
 
-Tazama [CONTRIBUTING.md](CONTRIBUTING.md) kwa miongozo ya maendeleo.
+Tazama [CONTRIBUTING.md](../CONTRIBUTING.md) kwa miongozo ya maendeleo.
 
 ## Leseni
 
-[MIT](LICENSE)
+[MIT](../LICENSE)
 
 ## Shukrani
 

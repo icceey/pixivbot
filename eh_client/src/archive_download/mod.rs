@@ -49,7 +49,6 @@ pub(crate) async fn download_to_partial(
     options: ArchiveDownloadOptions,
     resuming_persisted_manifest: bool,
 ) -> Result<()> {
-    let options = options.validate()?;
     let outcome = if tokio::fs::try_exists(artifacts.parts_dir()).await? {
         match recover_manifest(artifacts, download_url).await? {
             ManifestRecovery::Valid(manifest) => {

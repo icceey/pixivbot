@@ -79,7 +79,6 @@ impl PixivClient {
                 Ok(next_offset)
             })
             .transpose()?;
-        // Only reuse the offset, never fetch an arbitrary next_url with authentication.
         Ok((response.illusts, next_offset))
     }
 

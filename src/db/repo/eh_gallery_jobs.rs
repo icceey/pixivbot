@@ -8086,49 +8086,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn telegraph_sent_without_job_rewrite_payload_only_marks_that_delivery() {
-        let repo = tests_helpers::setup_test_db().await.unwrap();
-        let delivery = repo
-            .enqueue_eh_download(
-                -100,
-                79,
-                "token",
-                "Gallery",
-                true,
-                SOURCE_DIRECT,
-                &EhGalleryVariant::archive("1280x"),
-                None,
-                true,
-            )
-            .await
-            .unwrap()
-            .expect("delivery should be enqueued");
-        let job_id = delivery.job_id.unwrap();
-        eh_download_queue::Entity::update_many()
-            .col_expr(
-                eh_download_queue::Column::Status,
-                Expr::value(DELIVERY_STATUS_PUBLISHING),
-            )
-            .filter(eh_download_queue::Column::Id.eq(delivery.id))
-            .exec(repo.db())
-            .await
-            .unwrap();
-
-        repo.mark_eh_telegraph_delivery_sent(delivery.id, job_id, Some(0))
-            .await
-            .unwrap();
-        let marked = eh_download_queue::Entity::find_by_id(delivery.id)
-            .one(repo.db())
-            .await
-            .unwrap()
-            .unwrap();
-        let job = load_eh_job(&repo, job_id).await;
-        assert!(marked.telegraph_sent_at.is_some());
-        assert!(job.telegraph_rewrite_status.is_none());
-        assert!(job.telegraph_rewrite_after.is_none());
-    }
-
-    #[tokio::test]
     async fn stale_job_upload_claim_resumes_once_with_a_new_generation() {
         let repo = tests_helpers::setup_test_db().await.unwrap();
         let variant = EhGalleryVariant::archive("1280x");

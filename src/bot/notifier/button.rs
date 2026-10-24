@@ -16,27 +16,11 @@ pub struct DownloadButtonConfig {
 }
 
 impl DownloadButtonConfig {
-    pub fn pixiv(illust_id: u64) -> Self {
+    pub fn for_pixiv_chat(illust_id: u64, chat: &crate::db::entities::chats::Model) -> Self {
         Self {
             target: Some(DownloadTarget::Pixiv(illust_id)),
-            is_channel: false,
+            is_channel: chat.r#type == "channel",
         }
-    }
-
-    pub fn booru(site_name: impl Into<String>, post_id: u64) -> Self {
-        Self {
-            target: Some(DownloadTarget::Booru {
-                site_name: site_name.into(),
-                post_id,
-            }),
-            is_channel: false,
-        }
-    }
-
-    pub fn for_pixiv_chat(illust_id: u64, chat: &crate::db::entities::chats::Model) -> Self {
-        let mut cfg = Self::pixiv(illust_id);
-        cfg.is_channel = chat.r#type == "channel";
-        cfg
     }
 
     pub fn for_booru_chat(
@@ -44,9 +28,13 @@ impl DownloadButtonConfig {
         post_id: u64,
         chat: &crate::db::entities::chats::Model,
     ) -> Self {
-        let mut cfg = Self::booru(site_name, post_id);
-        cfg.is_channel = chat.r#type == "channel";
-        cfg
+        Self {
+            target: Some(DownloadTarget::Booru {
+                site_name: site_name.into(),
+                post_id,
+            }),
+            is_channel: chat.r#type == "channel",
+        }
     }
 
     pub(super) fn build_keyboard(&self) -> Option<InlineKeyboardMarkup> {

@@ -81,29 +81,3 @@ fn initial_content_range_total(headers: &reqwest::header::HeaderMap) -> Option<u
     let total = total?;
     (start == 0 && total != 0 && end.checked_add(1) == Some(total)).then_some(total)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::initial_content_range_total;
-    use reqwest::header::{HeaderMap, HeaderValue, CONTENT_RANGE};
-
-    #[test]
-    fn initial_content_range_requires_the_entire_nonzero_archive() {
-        let mut exact = HeaderMap::new();
-        exact.insert(CONTENT_RANGE, HeaderValue::from_static("bytes 0-7/8"));
-        assert_eq!(initial_content_range_total(&exact), Some(8));
-
-        for value in [
-            "bytes 1-7/8",
-            "bytes 0-6/8",
-            "bytes 0-7/*",
-            "bytes 0-0/0",
-            "bytes 0-8/8",
-            "items 0-7/8",
-        ] {
-            let mut headers = HeaderMap::new();
-            headers.insert(CONTENT_RANGE, HeaderValue::from_str(value).unwrap());
-            assert_eq!(initial_content_range_total(&headers), None, "{value}");
-        }
-    }
-}

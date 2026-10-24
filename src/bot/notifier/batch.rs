@@ -80,7 +80,6 @@ impl Notifier {
             }
         };
 
-        let chunks: Vec<_> = local_paths.chunks(MAX_PER_GROUP).collect();
         let continuation_numbering =
             continuation_numbering.unwrap_or_else(|| ContinuationNumbering::for_item_count(total));
         let total_batches = continuation_numbering.total_batches;
@@ -90,15 +89,15 @@ impl Notifier {
         let mut current_idx = 0;
         let mut first_message_id: Option<i32> = None;
 
-        for (batch_idx, path_chunk) in chunks.into_iter().enumerate() {
+        for (batch_idx, path_chunk) in local_paths.chunks(MAX_PER_GROUP).enumerate() {
             let batch_size = path_chunk.len();
             let batch_end_idx = current_idx + batch_size;
 
-            let batch_captions_slice = match &caption_strategy {
+            let batch_caption_strategy = match &caption_strategy {
                 CaptionStrategy::Individual(all_captions) => {
-                    Some(&all_captions[current_idx..batch_end_idx])
+                    CaptionStrategy::Individual(&all_captions[current_idx..batch_end_idx])
                 }
-                CaptionStrategy::Shared(_) => None,
+                CaptionStrategy::Shared(caption) => CaptionStrategy::Shared(*caption),
             };
 
             let silent = continuation_numbering.display_batch_number(batch_idx) > 1;
@@ -107,8 +106,7 @@ impl Notifier {
                 .send_media_batch(
                     chat_id,
                     path_chunk,
-                    &caption_strategy,
-                    batch_captions_slice,
+                    &batch_caption_strategy,
                     has_spoiler,
                     batch_idx,
                     continuation_numbering,

@@ -15,59 +15,38 @@ use tracing::{error, info, warn};
 use tracing_subscriber::fmt::time::ChronoLocal;
 use tracing_subscriber::{prelude::*, EnvFilter};
 
-fn should_build_eh_image_uploader(
-    eh_enabled: bool,
-    telegraph_enabled: bool,
-    provider: eh_client::ImageUploadProvider,
-) -> bool {
-    eh_enabled
-        && (telegraph_enabled
-            || matches!(
-                provider,
-                eh_client::ImageUploadProvider::S3 | eh_client::ImageUploadProvider::IpfS3
-            ))
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Load configuration
     let config = Config::load()?;
 
-    // Initialize variables
     let log_level = config.log_level();
     let log_dir = &config.logging.dir;
 
-    // Create log directory if it doesn't exist
     std::fs::create_dir_all(log_dir)?;
 
     // Setup file appender (single file, no rotation)
     let file_appender = tracing_appender::rolling::never(log_dir, "pixivbot.log");
     let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
 
-    // Use local time for log timestamps
     let local_timer = ChronoLocal::rfc_3339();
 
-    // Setup stdout layer with local time
     let stdout_layer = tracing_subscriber::fmt::layer()
         .with_line_number(true)
         .with_file(true)
         .with_target(false)
         .with_timer(local_timer.clone());
 
-    // Setup file layer with local time
     let file_layer = tracing_subscriber::fmt::layer()
         .with_ansi(false)
         .with_timer(local_timer)
         .with_writer(non_blocking);
 
-    // Filter layer based on config
     let filter_layer = EnvFilter::from_default_env()
         .add_directive(log_level.into())
         .add_directive("sqlx=warn".parse().unwrap())
         .add_directive("sea_orm=warn".parse().unwrap())
         .add_directive("hyper_util=warn".parse().unwrap());
 
-    // Combine layers
     tracing_subscriber::registry()
         .with(filter_layer)
         .with(stdout_layer)
@@ -85,10 +64,8 @@ async fn main() -> Result<()> {
     migration::Migrator::up(&db, None).await?;
     info!("✅ Database migrations completed");
 
-    // Initialize repository
     let repo = std::sync::Arc::new(db::repo::Repo::new(db.clone()));
 
-    // Test database connection
     repo.ping().await?;
     info!("✅ Database ping successful");
 
@@ -137,8 +114,6 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Wrap bot with Throttle adaptor for automatic rate limiting
-    // This replaces manual sleep() calls throughout the codebase
     let bot = bot.throttle(teloxide::adaptors::throttle::Limits::default());
     info!("✅ Telegram bot initialized with automatic rate limiting");
 
@@ -291,11 +266,12 @@ async fn main() -> Result<()> {
 
     // The provider Abort capability must exist before startup takes ownership
     // of orphaned or durable cleanup generations.
-    let eh_image_uploader = if should_build_eh_image_uploader(
-        eh_client.is_some(),
-        telegraph_client.is_some(),
-        config.image_upload.provider,
-    ) {
+    let eh_image_uploader = if eh_client.is_some()
+        && (telegraph_client.is_some()
+            || matches!(
+                config.image_upload.provider,
+                eh_client::ImageUploadProvider::S3 | eh_client::ImageUploadProvider::IpfS3
+            )) {
         Some(config.image_upload.build_uploader().await?)
     } else {
         None
@@ -530,6 +506,7 @@ async fn main() -> Result<()> {
             pixiv_client.clone(),
             notifier.clone(),
             sensitive_tags_for_bot,
+            config.scheduler.pixiv_tag_min_bookmarks,
             image_size_for_bot,
             download_threshold_for_bot,
             cache_dir_for_bot,
@@ -555,25 +532,18 @@ async fn main() -> Result<()> {
     ranking_engine_handle.abort();
     pixiv_tag_engine_handle.abort();
     name_update_engine_handle.abort();
-    if let Some(handle) = booru_engine_handle {
-        handle.abort();
-    }
-    if let Some(handle) = eh_engine_handle {
-        handle.abort();
-    }
-    if let Some(handle) = eh_download_worker_handle {
-        handle.abort();
-    }
-    if let Some(handle) = eh_background_download_worker_handle {
-        handle.abort();
-    }
-    if let Some(handle) = eh_upload_worker_handle {
-        handle.abort();
-    }
-    if let Some(handle) = eh_publish_worker_handle {
-        handle.abort();
-    }
-    if let Some(handle) = eh_telegraph_rewrite_worker_handle {
+    for handle in [
+        booru_engine_handle,
+        eh_engine_handle,
+        eh_download_worker_handle,
+        eh_background_download_worker_handle,
+        eh_upload_worker_handle,
+        eh_publish_worker_handle,
+        eh_telegraph_rewrite_worker_handle,
+    ]
+    .into_iter()
+    .flatten()
+    {
         handle.abort();
     }
 

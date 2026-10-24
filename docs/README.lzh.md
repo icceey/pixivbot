@@ -63,8 +63,9 @@
 若汝欲直接於機上行之：
 
 1. **前置要求**：
-    - 锈（最新穩定版）
+    - Rust 1.94（`rust-toolchain.toml`）
     - SQLite
+    - FFmpeg 開發庫、`pkg-config`
 
 2. **複製並設**：
 
@@ -78,7 +79,7 @@
 3. **構建並行**：
 
    ```bash
-   cargo run --release
+   cargo run --release --features ffmpeg-codec
    ```
 
 ## 取所需令符
@@ -108,7 +109,7 @@
 | 設定鍵 | 環境變數 | 說明 | 預設值 |
 |---|---|---|---|
 | `telegram.bot_token` | `PIX__TELEGRAM__BOT_TOKEN` | 雷迅机关接口令符 | `""` |
-| `telegram.owner_id` | `PIX__TELEGRAM__OWNER_ID` | 擁有者使用者 ID | `0` |
+| `telegram.owner_id` | `PIX__TELEGRAM__OWNER_ID` | 擁有者使用者 ID；未設則首位交互者可為主 | 未設 |
 | `telegram.bot_mode` | `PIX__TELEGRAM__BOT_MODE` | `public` 或 `private` | `"private"` |
 | `pixiv.refresh_token` | `PIX__PIXIV__REFRESH_TOKEN` | 匹克携福授权刷新令符 | `""` |
 | `database.url` | `PIX__DATABASE__URL` | 資料庫連線 URL | `sqlite:./data/pixivbot.db?mode=rwc` |
@@ -146,11 +147,11 @@
 
 ## 貢獻
 
-開發指南，見 [CONTRIBUTING.md](CONTRIBUTING.md)。
+開發指南，見 [CONTRIBUTING.md](../CONTRIBUTING.md)。
 
 ## 許可
 
-[MIT](LICENSE)
+[MIT](../LICENSE)
 
 ## 致謝
 

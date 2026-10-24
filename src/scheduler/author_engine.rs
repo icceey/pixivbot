@@ -159,7 +159,11 @@ impl AuthorEngine {
                 Ok(Some(new_state)) => {
                     // Worker returned new state, persist it
                     if let Err(e) = self
-                        .update_subscription_state(subscription.id, new_state)
+                        .repo
+                        .update_subscription_latest_data(
+                            subscription.id,
+                            Some(SubscriptionState::Author(new_state)),
+                        )
                         .await
                     {
                         error!(
@@ -197,30 +201,11 @@ impl AuthorEngine {
         Ok(())
     }
 
-    /// Update subscription state in database
-    async fn update_subscription_state(
-        &self,
-        subscription_id: i32,
-        state: AuthorState,
-    ) -> Result<()> {
-        self.repo
-            .update_subscription_latest_data(
-                subscription_id,
-                Some(SubscriptionState::Author(state)),
-            )
-            .await?;
-        Ok(())
-    }
-
-    fn author_state(latest_illust_id: u64, pending_illust: Option<PendingIllust>) -> AuthorState {
+    fn clear_pending_state(latest_illust_id: u64) -> AuthorState {
         AuthorState {
             latest_illust_id,
-            pending_illust,
+            pending_illust: None,
         }
-    }
-
-    fn clear_pending_state(latest_illust_id: u64) -> AuthorState {
-        Self::author_state(latest_illust_id, None)
     }
 
     fn pending_retry_state(
@@ -228,15 +213,15 @@ impl AuthorEngine {
         pending: &PendingIllust,
         retry_count: u8,
     ) -> AuthorState {
-        Self::author_state(
+        AuthorState {
             latest_illust_id,
-            Some(PendingIllust {
+            pending_illust: Some(PendingIllust {
                 illust_id: pending.illust_id,
                 sent_pages: pending.sent_pages.clone(),
                 total_pages: pending.total_pages,
                 retry_count,
             }),
-        )
+        }
     }
 
     fn partial_push_state(
@@ -246,15 +231,15 @@ impl AuthorEngine {
         total_pages: usize,
         retry_count: u8,
     ) -> AuthorState {
-        Self::author_state(
+        AuthorState {
             latest_illust_id,
-            Some(PendingIllust {
+            pending_illust: Some(PendingIllust {
                 illust_id,
                 sent_pages,
                 total_pages,
                 retry_count,
             }),
-        )
+        }
     }
 
     // ==================== Dispatcher ====================
@@ -332,17 +317,6 @@ impl AuthorEngine {
             pending.retry_count,
             self.max_retry_count
         );
-
-        // Calculate remaining pages
-        let total_pages = illust.get_all_image_urls_with_size(self.image_size).len();
-        let remaining_pages: Vec<usize> = (0..total_pages)
-            .filter(|i| !pending.sent_pages.contains(i))
-            .collect();
-
-        if remaining_pages.is_empty() {
-            // All pages already sent, mark as complete
-            return Ok(Some(Self::clear_pending_state(pending.illust_id)));
-        }
 
         // Send remaining pages
         let push_result = process_illust_push(
@@ -449,7 +423,7 @@ impl AuthorEngine {
             return Ok(newest_illust_id.map(Self::clear_pending_state));
         }
 
-        // *** KEY CHANGE: Only process the OLDEST new illust (last in the filtered list) ***
+        // Process the oldest matching work first so the cursor advances in order.
         let illust = filtered_illusts
             .last()
             .expect("filtered_illusts is not empty");

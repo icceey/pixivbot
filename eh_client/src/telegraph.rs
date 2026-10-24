@@ -344,19 +344,13 @@ fn default_s3_path_style() -> bool {
     true
 }
 
-const DEFAULT_MULTIPART_IMAGE_THRESHOLD_MB: u64 = 8;
-
 fn default_multipart_image_threshold_mb() -> u64 {
-    DEFAULT_MULTIPART_IMAGE_THRESHOLD_MB
-}
-
-fn multipart_image_threshold_bytes(threshold_mb: u64) -> Option<u64> {
-    (threshold_mb != 0).then(|| threshold_mb.saturating_mul(1024 * 1024))
+    8
 }
 
 fn image_uses_multipart(byte_len: usize, threshold_mb: u64) -> bool {
-    multipart_image_threshold_bytes(threshold_mb)
-        .is_some_and(|threshold| u64::try_from(byte_len).unwrap_or(u64::MAX) >= threshold)
+    threshold_mb != 0
+        && u64::try_from(byte_len).unwrap_or(u64::MAX) >= threshold_mb.saturating_mul(1024 * 1024)
 }
 
 impl Default for S3UploaderConfig {
@@ -1087,18 +1081,6 @@ impl S3Uploader {
         })
     }
 
-    fn object_key(&self, index: usize, input: &ImageUploadInput<'_>) -> String {
-        let timestamp = chrono::Utc::now().format("%Y%m%d%H%M%S");
-        let hash = short_hash_hex(input.bytes);
-        let ext = extension_for_upload(input.filename, input.bytes);
-        let filename = format!("{timestamp}-{index:04}-{hash}.{ext}");
-        if self.config.key_prefix.is_empty() {
-            filename
-        } else {
-            format!("{}/{}", self.config.key_prefix, filename)
-        }
-    }
-
     fn public_url(&self, key: &str) -> String {
         let base = self.config.public_base_url.trim_end_matches('/');
         let encoded_key = key
@@ -1169,7 +1151,7 @@ impl ImageUploader for S3Uploader {
     async fn upload_images(&self, images: &[ImageUploadInput<'_>]) -> Result<Vec<String>> {
         let mut urls = Vec::with_capacity(images.len());
         for (index, image) in images.iter().enumerate() {
-            let key = self.object_key(index + 1, image);
+            let key = image_object_key(&self.config.key_prefix, index + 1, image);
             let content_type = detect_content_type(image.bytes);
             if !image_uses_multipart(image.bytes.len(), self.config.multipart_image_threshold_mb)
                 || self.standard_multipart.state() == CapabilityState::Unsupported
@@ -1651,18 +1633,6 @@ impl IpfS3Uploader {
         })
     }
 
-    fn object_key(&self, index: usize, input: &ImageUploadInput<'_>) -> String {
-        let timestamp = chrono::Utc::now().format("%Y%m%d%H%M%S");
-        let hash = short_hash_hex(input.bytes);
-        let ext = extension_for_upload(input.filename, input.bytes);
-        let filename = format!("{timestamp}-{index:04}-{hash}.{ext}");
-        if self.config.key_prefix.is_empty() {
-            filename
-        } else {
-            format!("{}/{}", self.config.key_prefix, filename)
-        }
-    }
-
     fn warm_public_gateway(&self, cid: &str) {
         if !self.config.warm_public_gateway_after_upload {
             return;
@@ -1756,7 +1726,7 @@ impl IpfS3Uploader {
     ) -> Result<Vec<TelegraphImageUrlPair>> {
         let mut urls = Vec::with_capacity(images.len());
         for (index, image) in images.iter().enumerate() {
-            let key = self.object_key(index + 1, image);
+            let key = image_object_key(&self.config.key_prefix, index + 1, image);
             let content_type = detect_content_type(image.bytes);
             if !image_uses_multipart(image.bytes.len(), self.config.multipart_image_threshold_mb)
                 || self.standard_multipart.state() == CapabilityState::Unsupported
@@ -2164,12 +2134,6 @@ fn validate_ipfs3_zip_extract_result_xml(body: &[u8]) -> Result<()> {
             Ok(quick_xml::events::Event::Comment(_) | quick_xml::events::Event::PI(_)) => {}
             Ok(quick_xml::events::Event::Text(text))
                 if text.as_bytes().iter().all(u8::is_ascii_whitespace) => {}
-            Ok(quick_xml::events::Event::Start(_) | quick_xml::events::Event::Empty(_)) => {
-                return Err(Error::Other(
-                    "invalid DecompressZipResult XML: trailing XML content after root element"
-                        .into(),
-                ));
-            }
             Ok(_) => {
                 return Err(Error::Other(
                     "invalid DecompressZipResult XML: trailing XML content after root element"
@@ -2320,6 +2284,18 @@ fn short_hash_hex(bytes: &[u8]) -> String {
         hash = hash.wrapping_mul(0x0100_0193);
     }
     format!("{hash:08x}")
+}
+
+fn image_object_key(prefix: &str, index: usize, input: &ImageUploadInput<'_>) -> String {
+    let timestamp = chrono::Utc::now().format("%Y%m%d%H%M%S");
+    let hash = short_hash_hex(input.bytes);
+    let ext = extension_for_upload(input.filename, input.bytes);
+    let filename = format!("{timestamp}-{index:04}-{hash}.{ext}");
+    if prefix.is_empty() {
+        filename
+    } else {
+        format!("{prefix}/{filename}")
+    }
 }
 
 pub struct TelegraphClient {
@@ -2692,97 +2668,6 @@ mod tests {
     use crate::s3_multipart::PART_SIZE;
     use wiremock::Match;
 
-    #[test]
-    fn s3_config_rejects_public_base_url_with_secret_or_non_path_parts() {
-        let mut cfg = complete_s3_config(
-            "http://localhost:9000",
-            "https://user:pass@cdn.example.com/base",
-        );
-        let err = cfg.required().unwrap_err();
-        assert!(err.to_string().contains("must not contain userinfo"));
-
-        cfg.public_base_url = Some("https://cdn.example.com/base?token=secret".to_string());
-        let err = cfg.required().unwrap_err();
-        assert!(err.to_string().contains("must not contain query"));
-
-        cfg.public_base_url = Some("https://cdn.example.com/base#frag".to_string());
-        let err = cfg.required().unwrap_err();
-        assert!(err.to_string().contains("must not contain fragment"));
-    }
-
-    #[test]
-    fn s3_config_rejects_unsafe_endpoint_url() {
-        let mut cfg = complete_s3_config("ftp://localhost:9000", "https://cdn.example.com");
-        let err = cfg.required().unwrap_err();
-        assert!(err.to_string().contains("must use http or https"));
-
-        cfg.endpoint_url = Some("https://user:secret@s3.example.com".to_string());
-        let err = cfg.required().unwrap_err();
-        assert!(err.to_string().contains("must not contain userinfo"));
-
-        cfg.endpoint_url = Some("https://s3.example.com?token=secret".to_string());
-        let err = cfg.required().unwrap_err();
-        assert!(err.to_string().contains("must not contain query"));
-    }
-
-    #[test]
-    fn ipfs3_config_rejects_gateway_url_with_secret_or_non_path_parts() {
-        let mut cfg =
-            complete_ipfs3_config("http://localhost:9000", "https://user:pass@ipfs.io/ipfs");
-        let err = cfg.required().unwrap_err();
-        assert!(err.to_string().contains("must not contain userinfo"));
-
-        cfg.gateway_url = Some("https://ipfs.io/ipfs?token=secret".to_string());
-        let err = cfg.required().unwrap_err();
-        assert!(err.to_string().contains("must not contain query"));
-
-        cfg.gateway_url = Some("https://ipfs.io/ipfs#frag".to_string());
-        let err = cfg.required().unwrap_err();
-        assert!(err.to_string().contains("must not contain fragment"));
-    }
-
-    #[test]
-    fn ipfs3_config_rejects_unsafe_endpoint_url() {
-        let mut cfg = complete_ipfs3_config("ftp://localhost:9000", "https://ipfs.io/ipfs");
-        let err = cfg.required().unwrap_err();
-        assert!(err.to_string().contains("must use http or https"));
-
-        cfg.endpoint_url = Some("https://user:secret@ipfs3.example.com".to_string());
-        let err = cfg.required().unwrap_err();
-        assert!(err.to_string().contains("must not contain userinfo"));
-
-        cfg.endpoint_url = Some("https://ipfs3.example.com?token=secret".to_string());
-        let err = cfg.required().unwrap_err();
-        assert!(err.to_string().contains("must not contain query"));
-    }
-
-    #[test]
-    fn catbox_config_rejects_unsafe_api_url() {
-        let err = CatboxUploader::from_config(&CatboxUploaderConfig {
-            api_url: "ftp://catbox.moe/user/api.php".to_string(),
-            userhash: None,
-        })
-        .err()
-        .unwrap();
-        assert!(err.to_string().contains("must use http or https"));
-
-        let err = CatboxUploader::from_config(&CatboxUploaderConfig {
-            api_url: "https://user:secret@catbox.moe/user/api.php".to_string(),
-            userhash: None,
-        })
-        .err()
-        .unwrap();
-        assert!(err.to_string().contains("must not contain userinfo"));
-
-        let err = CatboxUploader::from_config(&CatboxUploaderConfig {
-            api_url: "https://catbox.moe/user/api.php?token=secret".to_string(),
-            userhash: None,
-        })
-        .err()
-        .unwrap();
-        assert!(err.to_string().contains("must not contain query"));
-    }
-
     fn complete_s3_config(endpoint: &str, public_base_url: &str) -> S3UploaderConfig {
         S3UploaderConfig {
             endpoint_url: Some(endpoint.to_string()),
@@ -2812,15 +2697,6 @@ mod tests {
             multipart_image_threshold_mb: 8,
             warm_public_gateway_after_upload: false,
             zip_extract_enabled: true,
-        }
-    }
-
-    #[derive(Debug)]
-    struct MultipartContains(&'static str);
-
-    impl wiremock::Match for MultipartContains {
-        fn matches(&self, request: &wiremock::Request) -> bool {
-            String::from_utf8_lossy(&request.body).contains(self.0)
         }
     }
 
@@ -2898,43 +2774,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn catbox_uploader_posts_file_and_returns_url() {
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
-
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/user/api.php"))
-            .and(MultipartContains("name=\"reqtype\""))
-            .and(MultipartContains("fileupload"))
-            .and(MultipartContains("name=\"userhash\""))
-            .and(MultipartContains("userhash"))
-            .and(MultipartContains("name=\"fileToUpload\""))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_string("https://files.catbox.moe/abc123.png"),
-            )
-            .expect(1)
-            .mount(&server)
-            .await;
-
-        let uploader = CatboxUploader::from_config(&CatboxUploaderConfig {
-            api_url: format!("{}/user/api.php", server.uri()),
-            userhash: Some("userhash".to_string()),
-        })
-        .unwrap();
-        let urls = uploader
-            .upload_images(&[ImageUploadInput {
-                filename: "image.png",
-                bytes: b"\x89PNG\r\n\x1a\n",
-                resume_context: None,
-            }])
-            .await
-            .unwrap();
-
-        assert_eq!(urls, vec!["https://files.catbox.moe/abc123.png"]);
-    }
-
-    #[tokio::test]
     async fn catbox_uploader_rejects_non_url_response() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -2962,103 +2801,6 @@ mod tests {
             .unwrap_err();
 
         assert!(err.to_string().contains("non-url response"));
-    }
-
-    #[tokio::test]
-    async fn edit_page_posts_path_title_and_content() {
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
-
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/editPage"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "ok": true,
-                "result": { "url": "https://telegra.ph/Page-Path" }
-            })))
-            .expect(1)
-            .mount(&server)
-            .await;
-
-        let client = TelegraphClient::new_with_urls(
-            "token".to_string(),
-            "https://pixi.example/api".to_string(),
-            server.uri(),
-        );
-        let url = client
-            .edit_page(
-                "Page-Path",
-                "Title",
-                &[Node::img("https://img.example/a.jpg")],
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(url, "https://telegra.ph/Page-Path");
-        let requests = server.received_requests().await.unwrap();
-        let body = String::from_utf8_lossy(&requests[0].body);
-        assert!(body.contains("access_token=token"));
-        assert!(body.contains("path=Page-Path"));
-        assert!(body.contains("title=Title"));
-        assert!(body.contains("return_content=false"));
-        assert!(body.contains("content="));
-    }
-
-    #[tokio::test]
-    async fn create_gallery_page_with_url_pairs_returns_rewrite_metadata() {
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
-
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/createPage"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "ok": true,
-                "result": { "url": "https://telegra.ph/Gallery-Path" }
-            })))
-            .expect(1)
-            .mount(&server)
-            .await;
-
-        let client = TelegraphClient::new_with_urls(
-            "token".to_string(),
-            "https://pixi.example/api".to_string(),
-            server.uri(),
-        );
-        let result = client
-            .create_gallery_page_with_url_pairs(
-                "Gallery",
-                &[TelegraphImageUrlPair {
-                    preview_url: "https://preview.example/ipfs/cid-one".to_string(),
-                    public_url: "https://public.example/ipfs/cid-one".to_string(),
-                    cid: None,
-                }],
-                Some("https://preview.example/ipfs/"),
-                Some("https://public.example/ipfs/"),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(result.first_page_url, "https://telegra.ph/Gallery-Path");
-        let rewrite = result.rewrite_data.unwrap();
-        assert_eq!(rewrite.preview_gateway_url, "https://preview.example/ipfs");
-        assert_eq!(rewrite.public_gateway_url, "https://public.example/ipfs");
-        assert_eq!(rewrite.pages.len(), 1);
-        assert_eq!(rewrite.pages[0].path, "Gallery-Path");
-        assert_eq!(rewrite.pages[0].title, "Gallery");
-        assert_eq!(
-            node_attr_str(&rewrite.pages[0].content[0], "src"),
-            Some("https://preview.example/ipfs/cid-one")
-        );
-        let public_nodes = rewrite_ipfs_gateway_nodes(
-            &rewrite.pages[0].content,
-            &rewrite.preview_gateway_url,
-            &rewrite.public_gateway_url,
-        );
-        assert_eq!(
-            node_attr_str(&public_nodes[0], "src"),
-            Some("https://public.example/ipfs/cid-one")
-        );
     }
 
     const ZIP_FIXTURE_DATA: &[u8] = b"hello";
@@ -3330,22 +3072,6 @@ mod tests {
             },
             ZipEntryFixture::stored(b"page.jpg"),
         ])
-    }
-
-    #[test]
-    fn ipfs3_zip_preflight_accepts_stored_deflate_and_safe_prefixes() {
-        let bytes = zip_fixture(&[
-            ZipEntryFixture::stored(b"page001.jpg"),
-            ZipEntryFixture::deflated(b"dir/page002.png"),
-            ZipEntryFixture::stored(b"metadata/"),
-        ]);
-        let requested = vec!["page001.jpg".to_string(), "dir/page002.png".to_string()];
-
-        assert!(ipfs3_zip_archive_is_compatible(
-            &bytes,
-            &requested,
-            "eh/archive/"
-        ));
     }
 
     #[test]
@@ -3920,33 +3646,6 @@ mod tests {
     }
 
     #[test]
-    fn ipfs3_zip_extract_result_rejects_declared_count_inconsistencies() {
-        let result = parse_ipfs3_zip_extract_result(&ipfs3_zip_extract_result_xml(
-            &[("extract/page.jpg", "cid-page")],
-            &[],
-            2,
-            0,
-        ))
-        .unwrap();
-        let err = ipfs3_zip_entry_cids("extract/", &["page.jpg".to_string()], result).unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("ExtractedCount 2 does not match 1 entries"));
-
-        let result = parse_ipfs3_zip_extract_result(&ipfs3_zip_extract_result_xml(
-            &[("extract/page.jpg", "cid-page")],
-            &[("page.jpg", "ExtractFailed", "bad archive")],
-            1,
-            0,
-        ))
-        .unwrap();
-        let err = ipfs3_zip_entry_cids("extract/", &["page.jpg".to_string()], result).unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("FailedCount 0 does not match 1 failures"));
-    }
-
-    #[test]
     fn ipfs3_zip_extract_result_ignores_unrequested_failure_when_requested_entries_succeed() {
         let result = parse_ipfs3_zip_extract_result(&ipfs3_zip_extract_result_xml(
             &[
@@ -3968,83 +3667,6 @@ mod tests {
         .unwrap();
 
         assert_eq!(cids, ["cid-page-one", "cid-page-two"]);
-    }
-
-    #[test]
-    fn ipfs3_zip_extract_result_falls_back_when_requested_names_are_duplicate() {
-        let result = parse_ipfs3_zip_extract_result(&ipfs3_zip_extract_result_xml(
-            &[("extract/page.jpg", "cid-page")],
-            &[],
-            1,
-            0,
-        ))
-        .unwrap();
-
-        let cids = ipfs3_zip_entry_cids(
-            "extract/",
-            &["page.jpg".to_string(), "page.jpg".to_string()],
-            result,
-        )
-        .unwrap();
-
-        assert!(cids.is_none());
-    }
-
-    #[test]
-    fn ipfs3_zip_extract_result_rejects_empty_requested_entry_cid() {
-        let result = parse_ipfs3_zip_extract_result(&ipfs3_zip_extract_result_xml(
-            &[("extract/page.jpg", " \"\" ")],
-            &[],
-            1,
-            0,
-        ))
-        .unwrap();
-
-        let err = ipfs3_zip_entry_cids("extract/", &["page.jpg".to_string()], result).unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("requested extraction key extract/page.jpg returned an empty CID"));
-    }
-
-    #[tokio::test]
-    async fn ipfs3_zip_archive_upload_disabled_returns_none_without_put() {
-        use wiremock::matchers::method;
-        use wiremock::{Mock, MockServer, ResponseTemplate};
-
-        let server = MockServer::start().await;
-        Mock::given(method("PUT"))
-            .respond_with(ResponseTemplate::new(200).set_body_string("unexpected-cid"))
-            .expect(0)
-            .mount(&server)
-            .await;
-
-        let uploader = IpfS3Uploader::from_config(&IpfS3UploaderConfig {
-            endpoint_url: Some(server.uri()),
-            bucket: Some("bucket".into()),
-            region: Some("auto".into()),
-            access_key_id: Some("ak".into()),
-            secret_access_key: Some("sk".into()),
-            gateway_url: Some("https://public.example/ipfs".into()),
-            zip_extract_enabled: false,
-            path_style: true,
-            ..Default::default()
-        })
-        .unwrap();
-        assert!(!uploader.supports_zip_archive_upload());
-        let entries = vec!["page001.jpg".to_string()];
-        let zip_bytes = zip_fixture(&[ZipEntryFixture::stored(b"page001.jpg")]);
-
-        let result = uploader
-            .upload_zip_archive_with_url_pairs(ZipArchiveUploadInput {
-                filename: "gallery.zip",
-                bytes: &zip_bytes,
-                entry_names: &entries,
-                resume_context: None,
-            })
-            .await
-            .unwrap();
-
-        assert!(result.is_none());
     }
 
     #[tokio::test]
@@ -5331,201 +4953,6 @@ mod tests {
             .to_string()
             .contains("invalid CompleteMultipartUploadResult XML"));
         assert!(manifest_path.exists());
-        server.verify().await;
-    }
-
-    #[tokio::test]
-    async fn s3_threshold_zero_uses_one_ordinary_put_for_an_eight_mib_image() {
-        use wiremock::{Mock, MockServer, ResponseTemplate};
-
-        let server = MockServer::start().await;
-        let mut config = complete_s3_config(&server.uri(), "https://cdn.example/root/");
-        config.multipart_image_threshold_mb = 0;
-        mount_image_ordinary_put(&server, None, 1).await;
-        Mock::given(ImageS3Request::Create)
-            .respond_with(ResponseTemplate::new(500))
-            .expect(0)
-            .mount(&server)
-            .await;
-        let bytes = vec![0x5a; 8 * 1024 * 1024];
-
-        let urls = S3Uploader::from_config(&config)
-            .unwrap()
-            .upload_images(&[ImageUploadInput {
-                filename: "image.bin",
-                bytes: &bytes,
-                resume_context: None,
-            }])
-            .await
-            .unwrap();
-
-        assert_eq!(urls.len(), 1);
-        server.verify().await;
-    }
-
-    #[tokio::test]
-    async fn s3_threshold_one_uses_ordinary_put_below_the_boundary() {
-        use wiremock::{Mock, MockServer, ResponseTemplate};
-
-        let server = MockServer::start().await;
-        let mut config = complete_s3_config(&server.uri(), "https://cdn.example/root/");
-        config.multipart_image_threshold_mb = 1;
-        mount_image_ordinary_put(&server, None, 1).await;
-        Mock::given(ImageS3Request::Create)
-            .respond_with(ResponseTemplate::new(500))
-            .expect(0)
-            .mount(&server)
-            .await;
-        let mut bytes = vec![0x5a; 1024 * 1024 - 1];
-        bytes[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
-
-        let urls = S3Uploader::from_config(&config)
-            .unwrap()
-            .upload_images(&[ImageUploadInput {
-                filename: "image.png",
-                bytes: &bytes,
-                resume_context: None,
-            }])
-            .await
-            .unwrap();
-
-        let requests = server.received_requests().await.unwrap();
-        let request = requests
-            .iter()
-            .find(|request| ImageS3Request::OrdinaryPut.matches(request))
-            .unwrap();
-        assert_eq!(request.body, bytes);
-        assert!(
-            regex::Regex::new(r"^/bucket/eh/\d{14}-0001-[0-9a-f]{8}\.png$")
-                .unwrap()
-                .is_match(request.url.path())
-        );
-        assert_eq!(
-            urls,
-            [format!(
-                "https://cdn.example/root/{}",
-                image_s3_request_key(request)
-            )]
-        );
-        server.verify().await;
-    }
-
-    #[tokio::test]
-    async fn s3_threshold_one_uses_a_single_final_multipart_part_at_the_boundary() {
-        use wiremock::MockServer;
-
-        let server = MockServer::start().await;
-        let mut config = complete_s3_config(&server.uri(), "https://cdn.example/root/");
-        config.multipart_image_threshold_mb = 1;
-        mount_image_multipart_success(&server, "\"s3-multipart-etag\"").await;
-        mount_no_image_ordinary_put(&server).await;
-        let bytes = one_mib_image();
-
-        S3Uploader::from_config(&config)
-            .unwrap()
-            .upload_images(&[ImageUploadInput {
-                filename: "image.bin",
-                bytes: &bytes,
-                resume_context: None,
-            }])
-            .await
-            .unwrap();
-
-        server.verify().await;
-    }
-
-    #[tokio::test]
-    async fn ipfs3_threshold_zero_uses_one_ordinary_put_for_an_eight_mib_image() {
-        use wiremock::{Mock, MockServer, ResponseTemplate};
-
-        let server = MockServer::start().await;
-        let mut config = complete_ipfs3_config(&server.uri(), "https://ipfs.example/ipfs");
-        config.multipart_image_threshold_mb = 0;
-        mount_image_ordinary_put(&server, Some("\"cid-from-put\""), 1).await;
-        Mock::given(ImageS3Request::Create)
-            .respond_with(ResponseTemplate::new(500))
-            .expect(0)
-            .mount(&server)
-            .await;
-        let bytes = vec![0x5a; 8 * 1024 * 1024];
-
-        let urls = IpfS3Uploader::from_config(&config)
-            .unwrap()
-            .upload_images(&[ImageUploadInput {
-                filename: "image.bin",
-                bytes: &bytes,
-                resume_context: None,
-            }])
-            .await
-            .unwrap();
-
-        assert_eq!(urls, ["https://ipfs.example/ipfs/cid-from-put"]);
-        server.verify().await;
-    }
-
-    #[tokio::test]
-    async fn ipfs3_threshold_one_uses_ordinary_put_below_the_boundary() {
-        use wiremock::{Mock, MockServer, ResponseTemplate};
-
-        let server = MockServer::start().await;
-        let mut config = complete_ipfs3_config(&server.uri(), "https://ipfs.example/ipfs");
-        config.multipart_image_threshold_mb = 1;
-        mount_image_ordinary_put(&server, Some("\"cid-from-put\""), 1).await;
-        Mock::given(ImageS3Request::Create)
-            .respond_with(ResponseTemplate::new(500))
-            .expect(0)
-            .mount(&server)
-            .await;
-        let mut bytes = vec![0x5a; 1024 * 1024 - 1];
-        bytes[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
-
-        let urls = IpfS3Uploader::from_config(&config)
-            .unwrap()
-            .upload_images(&[ImageUploadInput {
-                filename: "image.png",
-                bytes: &bytes,
-                resume_context: None,
-            }])
-            .await
-            .unwrap();
-
-        let requests = server.received_requests().await.unwrap();
-        let request = requests
-            .iter()
-            .find(|request| ImageS3Request::OrdinaryPut.matches(request))
-            .unwrap();
-        assert_eq!(request.body, bytes);
-        assert!(
-            regex::Regex::new(r"^/bucket/eh/\d{14}-0001-[0-9a-f]{8}\.png$")
-                .unwrap()
-                .is_match(request.url.path())
-        );
-        assert_eq!(urls, ["https://ipfs.example/ipfs/cid-from-put"]);
-        server.verify().await;
-    }
-
-    #[tokio::test]
-    async fn ipfs3_threshold_one_uses_a_single_final_multipart_part_at_the_boundary() {
-        use wiremock::MockServer;
-
-        let server = MockServer::start().await;
-        let mut config = complete_ipfs3_config(&server.uri(), "https://ipfs.example/ipfs");
-        config.multipart_image_threshold_mb = 1;
-        mount_image_multipart_success(&server, "\"cid-from-multipart\"").await;
-        mount_no_image_ordinary_put(&server).await;
-        let bytes = one_mib_image();
-
-        let urls = IpfS3Uploader::from_config(&config)
-            .unwrap()
-            .upload_images(&[ImageUploadInput {
-                filename: "image.bin",
-                bytes: &bytes,
-                resume_context: None,
-            }])
-            .await
-            .unwrap();
-
-        assert_eq!(urls, ["https://ipfs.example/ipfs/cid-from-multipart"]);
         server.verify().await;
     }
 

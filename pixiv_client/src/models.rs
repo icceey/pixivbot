@@ -117,7 +117,7 @@ impl Illust {
             // 多图: 从 meta_pages 获取每页的图片
             self.meta_pages
                 .iter()
-                .map(|page| self.select_image_url(&page.image_urls, size))
+                .map(|page| Self::select_image_url(&page.image_urls, size))
                 .collect()
         } else {
             // 单图: 根据 size 选择对应的 URL
@@ -135,7 +135,7 @@ impl Illust {
     }
 
     /// 从 ImageUrls 中选择指定尺寸的 URL
-    fn select_image_url(&self, urls: &ImageUrls, size: ImageSize) -> String {
+    fn select_image_url(urls: &ImageUrls, size: ImageSize) -> String {
         match size {
             ImageSize::Original => urls.original.clone().unwrap_or_else(|| urls.large.clone()),
             ImageSize::Large => urls.large.clone(),
@@ -158,7 +158,7 @@ pub struct UserIllusts {
     pub next_url: Option<String>,
 }
 
-/// 标签搜索响应，包含作品统计和后续分页地址。
+/// 标签搜索响应
 #[derive(Debug, Clone, Deserialize)]
 pub struct SearchIllusts {
     pub illusts: Vec<Illust>,

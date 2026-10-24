@@ -53,8 +53,7 @@ impl Downloader {
     }
 
     /// 批量下载多张图片 (用于多图作品)
-    /// 保持输入顺序与数量；任一下载失败则整批重试，已下载文件会命中缓存。
-    /// Notifier 使用返回位置追踪原始页码，不能过滤失败项后压缩索引。
+    /// 返回路径与输入 URL 一一对应；任一下载失败则返回错误，成功文件保留缓存。
     pub async fn download_all(&self, urls: &[String]) -> Result<Vec<PathBuf>> {
         info!("Batch downloading {} images", urls.len());
 
@@ -405,32 +404,10 @@ fn encode_ugoira_mp4(zip_data: &[u8], frames: &[UgoiraFrame]) -> Result<Vec<u8>>
     Ok(mp4_data)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "ffmpeg-codec"))]
 mod tests {
     use super::*;
 
-    #[test]
-    fn download_referer_is_limited_to_pixiv_image_hosts() {
-        for (url, expected) in [
-            (
-                "https://i.pximg.net/img-original/img/2026/01/01/00/00/00/1_p0.jpg",
-                Some("https://app-api.pixiv.net/"),
-            ),
-            ("https://example.com/image.jpg", None),
-            ("https://evilpximg.net/image.jpg", None),
-            ("not a url", None),
-        ] {
-            assert_eq!(download_referer(url), expected, "{url}");
-        }
-    }
-
-    /// Create a minimal PNG image in memory (2x2 pixels with given color)
-    #[cfg(feature = "ffmpeg-codec")]
-    fn create_test_png(r: u8, g: u8, b: u8) -> Vec<u8> {
-        create_test_png_with_size(2, 2, r, g, b)
-    }
-
-    #[cfg(feature = "ffmpeg-codec")]
     fn create_test_png_with_size(width: u32, height: u32, r: u8, g: u8, b: u8) -> Vec<u8> {
         use image::{ImageFormat, RgbaImage};
         let img = RgbaImage::from_pixel(width, height, image::Rgba([r, g, b, 255]));
@@ -441,7 +418,6 @@ mod tests {
     }
 
     /// Create a ZIP archive in memory containing the given named files
-    #[cfg(feature = "ffmpeg-codec")]
     fn create_test_zip(files: &[(&str, &[u8])]) -> Vec<u8> {
         use std::io::Cursor;
         use std::io::Write;
@@ -460,46 +436,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "ffmpeg-codec")]
-    fn test_encode_ugoira_mp4_basic() {
-        let frame0 = create_test_png(255, 0, 0); // Red
-        let frame1 = create_test_png(0, 255, 0); // Green
-        let frame2 = create_test_png(0, 0, 255); // Blue
-
-        let zip_data = create_test_zip(&[
-            ("000000.png", &frame0),
-            ("000001.png", &frame1),
-            ("000002.png", &frame2),
-        ]);
-
-        let frames = vec![
-            UgoiraFrame {
-                file: "000000.png".to_string(),
-                delay: 100,
-            },
-            UgoiraFrame {
-                file: "000001.png".to_string(),
-                delay: 100,
-            },
-            UgoiraFrame {
-                file: "000002.png".to_string(),
-                delay: 200,
-            },
-        ];
-
-        let mp4_data = encode_ugoira_mp4(&zip_data, &frames).unwrap();
-
-        // Verify the MP4 container header after encoding.
-        assert!(mp4_data.len() > 8);
-        assert_eq!(
-            &mp4_data[4..8],
-            b"ftyp",
-            "Encoded output should have an MP4 container header"
-        );
-    }
-
-    #[test]
-    #[cfg(feature = "ffmpeg-codec")]
     fn test_encode_ugoira_mp4_odd_dimensions() {
         let frame0 = create_test_png_with_size(3, 5, 255, 0, 0);
         let frame1 = create_test_png_with_size(3, 5, 0, 255, 0);

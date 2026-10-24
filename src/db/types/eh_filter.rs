@@ -58,11 +58,6 @@ impl EhFilter {
         sig
     }
 
-    /// True when a minimum-rating filter is set, which triggers configured scan-window mode.
-    pub fn has_rating_filter(&self) -> bool {
-        self.min_rating.is_some()
-    }
-
     /// Check if a gallery matches all filter criteria.
     pub fn matches(&self, gallery: &EhGallery) -> bool {
         if let Some(min_rating) = self.min_rating {

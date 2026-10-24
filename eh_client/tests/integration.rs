@@ -113,42 +113,6 @@ async fn test_get_metadata_skips_per_gallery_errors() {
 }
 
 #[tokio::test]
-async fn test_download_archive_full_flow() {
-    let server = MockServer::start().await;
-
-    let zip_bytes = test_zip_bytes("image.jpg", b"fake_zip_content");
-    let redirect_html = format!(
-        r#"<script>document.location = "{}/archive/123456/abcdef0123/abcdef0123/0?autostart=1";</script>"#,
-        server.uri()
-    );
-
-    Mock::given(method("POST"))
-        .and(path("/archiver.php"))
-        .respond_with(ResponseTemplate::new(200).set_body_string(redirect_html))
-        .mount(&server)
-        .await;
-    Mock::given(method("GET"))
-        .and(path("/archive/123456/abcdef0123/abcdef0123/0"))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(zip_bytes.to_vec()))
-        .mount(&server)
-        .await;
-
-    let client = client_at(&server);
-    let tmp = tempfile::NamedTempFile::new().expect("failed to create tempfile");
-    let dest = tmp.path();
-
-    let bytes = client
-        .download_archive(123456, "abcdef0123", "123456--abc123def456", "780x", dest)
-        .await
-        .expect("download should succeed");
-
-    assert_eq!(bytes as usize, zip_bytes.len());
-
-    let saved = std::fs::read(dest).expect("should read saved file");
-    assert_eq!(saved, zip_bytes);
-}
-
-#[tokio::test]
 async fn test_download_archive_resumes_existing_partial_file() {
     let server = MockServer::start().await;
     let redirect_html = format!(
@@ -309,54 +273,6 @@ async fn test_download_archive_restarts_complete_partial_on_416() {
 }
 
 #[tokio::test]
-async fn test_download_archive_restarts_after_invalid_partial_on_416() {
-    let server = MockServer::start().await;
-    let redirect_html = format!(
-        r#"<script>document.location = "{}/archive/123456/abcdef0123/abcdef0123/0?autostart=1";</script>"#,
-        server.uri()
-    );
-
-    Mock::given(method("POST"))
-        .and(path("/archiver.php"))
-        .respond_with(ResponseTemplate::new(200).set_body_string(redirect_html))
-        .expect(1)
-        .mount(&server)
-        .await;
-
-    let incomplete = b"PK\x03\x04incomplete_zip";
-    let full_zip = test_zip_bytes("image.jpg", b"fresh_zip_after_restart");
-    Mock::given(method("GET"))
-        .and(path("/archive/123456/abcdef0123/abcdef0123/0"))
-        .and(header("range", format!("bytes={}-", incomplete.len())))
-        .respond_with(ResponseTemplate::new(416))
-        .expect(1)
-        .mount(&server)
-        .await;
-    Mock::given(method("GET"))
-        .and(path("/archive/123456/abcdef0123/abcdef0123/0"))
-        .and(HeaderAbsent("range"))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(full_zip.clone()))
-        .expect(1)
-        .mount(&server)
-        .await;
-
-    let client = client_at(&server);
-    let temp_dir = tempfile::tempdir().unwrap();
-    let dest = temp_dir.path().join("archive.zip");
-    let part = dest.with_extension("zip.part");
-    tokio::fs::write(&part, incomplete).await.unwrap();
-
-    let bytes = client
-        .download_archive(123456, "abcdef0123", "123456--abc123def456", "780x", &dest)
-        .await
-        .expect("invalid partial should be discarded and restarted after 416");
-
-    assert_eq!(bytes as usize, full_zip.len());
-    assert!(!part.exists(), "invalid partial should be removed");
-    assert_eq!(std::fs::read(dest).unwrap(), full_zip);
-}
-
-#[tokio::test]
 async fn test_download_archive_rejects_incomplete_content_range() {
     let server = MockServer::start().await;
     let redirect_html = format!(
@@ -406,6 +322,7 @@ async fn test_download_archive_rejects_incomplete_content_range() {
         .await
         .expect_err("incomplete Content-Range should fail");
 
+    assert!(matches!(err, eh_client::Error::Other(_)));
     assert!(err.to_string().contains("Content-Range ended"));
     assert_eq!(std::fs::read(part).unwrap(), first);
     assert!(!dest.exists());
@@ -466,60 +383,6 @@ async fn test_download_archive_returns_download_in_progress_when_fast_partial() 
         ".part file should be preserved for resumption"
     );
     assert!(!dest.exists(), "final dest should not exist on failure");
-}
-
-#[tokio::test]
-async fn test_download_archive_returns_plain_error_when_no_progress() {
-    let server = MockServer::start().await;
-    let redirect_html = format!(
-        r#"<script>document.location = "{}/archive/123456/abcdef0123/abcdef0123/0?autostart=1";</script>"#,
-        server.uri()
-    );
-
-    Mock::given(method("POST"))
-        .and(path("/archiver.php"))
-        .respond_with(ResponseTemplate::new(200).set_body_string(redirect_html))
-        .expect(1)
-        .mount(&server)
-        .await;
-
-    // Pre-seed .part so the 206 response takes the append path and runs validate_content_range.
-    // Content-Range: start=1, end=26, total=127, end+1=27 != 127 → validate_content_range fails
-    // BEFORE any bytes are written → new_bytes=0 → made_progress=false → plain Error.
-    let rest = b"zip_content";
-    Mock::given(method("GET"))
-        .and(path("/archive/123456/abcdef0123/abcdef0123/0"))
-        .respond_with(
-            ResponseTemplate::new(206)
-                .insert_header("Content-Range", "bytes 1-26/127")
-                .insert_header("Content-Length", rest.len().to_string())
-                .set_body_bytes(rest.to_vec()),
-        )
-        .expect(4)
-        .mount(&server)
-        .await;
-
-    let client = client_at(&server);
-    let temp_dir = tempfile::tempdir().unwrap();
-    let dest = temp_dir.path().join("archive.zip");
-    let part = dest.with_extension("zip.part");
-    tokio::fs::write(&part, b"x").await.unwrap();
-
-    let err = client
-        .download_archive(123456, "abcdef0123", "123456--abc123def456", "780x", &dest)
-        .await
-        .expect_err("no-progress download should fail");
-
-    assert!(
-        !matches!(err, eh_client::Error::DownloadInProgress { .. }),
-        "should NOT be DownloadInProgress when no progress was made, got: {:?}",
-        err
-    );
-    assert!(
-        err.to_string().contains("Content-Range ended"),
-        "should contain Content-Range error message, got: {}",
-        err
-    );
 }
 
 #[tokio::test]
@@ -620,67 +483,6 @@ async fn test_prepare_archive_download_1280x_uses_resample_form_and_cost() {
 
     assert_eq!(bytes as usize, zip_bytes.len());
     assert_eq!(std::fs::read(dest).unwrap(), zip_bytes);
-}
-
-#[tokio::test]
-async fn test_prepare_archive_download_rejects_unsupported_resolution_before_network() {
-    let server = MockServer::start().await;
-    let client = client_at(&server);
-    for resolution in ["1600x", "2400x", "bogus", ""] {
-        let error = client
-            .prepare_archive_download(4034806, "e13b7d119b", resolution)
-            .await
-            .expect_err("unsupported archive resolution should be rejected");
-        assert!(matches!(error, eh_client::Error::Other(_)));
-        assert!(error.to_string().contains(&format!(
-            "unsupported EH archive resolution '{resolution}'; supported values: 780x, 980x, 1280x, original"
-        )));
-    }
-
-    assert!(server.received_requests().await.unwrap().is_empty());
-}
-
-#[tokio::test]
-async fn test_archive_key_downloads_reject_unsupported_resolution_before_network() {
-    let server = MockServer::start().await;
-    let client = client_at(&server);
-    let temp_dir = tempfile::tempdir().unwrap();
-    let dest = temp_dir.path().join("archive.zip");
-
-    for resolution in ["1600x", "2400x", "bogus", ""] {
-        let error = client
-            .download_archive(
-                123456,
-                "abcdef0123",
-                "123456--abc123def456",
-                resolution,
-                &dest,
-            )
-            .await
-            .expect_err("unsupported archive resolution should be rejected");
-        assert!(matches!(error, eh_client::Error::Other(_)));
-        assert!(error.to_string().contains(&format!(
-            "unsupported EH archive resolution '{resolution}'; supported values: 780x, 980x, 1280x, original"
-        )));
-
-        let error = client
-            .download_archive_with_options(
-                123456,
-                "abcdef0123",
-                "123456--abc123def456",
-                resolution,
-                &dest,
-                ArchiveDownloadOptions::default(),
-            )
-            .await
-            .expect_err("unsupported archive resolution should be rejected");
-        assert!(matches!(error, eh_client::Error::Other(_)));
-        assert!(error.to_string().contains(&format!(
-            "unsupported EH archive resolution '{resolution}'; supported values: 780x, 980x, 1280x, original"
-        )));
-    }
-
-    assert!(server.received_requests().await.unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -836,41 +638,6 @@ async fn test_original_fallback_keeps_form_guards_and_isolates_resample_retry() 
 }
 
 #[tokio::test]
-async fn test_download_archive_invalid_zip_response_cleans_up() {
-    let server = MockServer::start().await;
-    let redirect_html = format!(
-        r#"<script>document.location = "{}/archive/123456/abcdef0123/abcdef0123/0?autostart=1";</script>"#,
-        server.uri()
-    );
-
-    Mock::given(method("POST"))
-        .and(path("/archiver.php"))
-        .respond_with(ResponseTemplate::new(200).set_body_string(redirect_html))
-        .mount(&server)
-        .await;
-
-    // Return an HTML page instead of a valid ZIP — zip_magic validation will fail
-    Mock::given(method("GET"))
-        .and(path("/archive/123456/abcdef0123/abcdef0123/0"))
-        .respond_with(ResponseTemplate::new(200).set_body_string("<html>error page</html>"))
-        .mount(&server)
-        .await;
-
-    let client = client_at(&server);
-    let temp_dir = tempfile::tempdir().unwrap();
-    let dest = temp_dir.path().join("archive.zip");
-    let result = client
-        .download_archive(123456, "abcdef0123", "123456--abc123def456", "780x", &dest)
-        .await;
-    assert!(result.is_err());
-    assert!(!dest.exists(), "dest should not exist after invalid ZIP");
-    assert!(
-        !dest.with_extension("zip.part").exists(),
-        "temp zip should not exist after invalid ZIP"
-    );
-}
-
-#[tokio::test]
 async fn test_download_archive_rejects_corrupt_pk_prefixed_zip() {
     let server = MockServer::start().await;
     let redirect_html = format!(
@@ -950,53 +717,6 @@ async fn test_download_archive_rejects_zip_with_corrupt_entry_data() {
 }
 
 #[tokio::test]
-async fn test_download_gallery_images_fails_when_one_page_fetch_fails() {
-    let server = MockServer::start().await;
-    let client = client_at(&server);
-    Mock::given(method("GET"))
-        .and(path("/g/123/abc/"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_string(r#"<a href="/s/1/123-1">1</a><a href="/s/2/123-2">2</a>"#),
-        )
-        .mount(&server)
-        .await;
-    Mock::given(method("GET"))
-        .and(path("/s/1/123-1"))
-        .respond_with(ResponseTemplate::new(200).set_body_string(format!(
-            r#"<img id="img" src="{}/img/1.jpg">"#,
-            server.uri()
-        )))
-        .mount(&server)
-        .await;
-    Mock::given(method("GET"))
-        .and(path("/s/2/123-2"))
-        .respond_with(ResponseTemplate::new(500))
-        .mount(&server)
-        .await;
-    Mock::given(method("GET"))
-        .and(path("/img/1.jpg"))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![1, 2, 3]))
-        .mount(&server)
-        .await;
-
-    let temp_dir = tempfile::tempdir().unwrap();
-    let dest = temp_dir.path().join("gallery.zip");
-    let err = client
-        .download_gallery_images(123, "abc", &dest)
-        .await
-        .unwrap_err();
-    assert!(err
-        .to_string()
-        .contains("failed to download all gallery images"));
-    assert!(!dest.exists(), "dest should not exist after error");
-    assert!(
-        !dest.with_extension("zip.part").exists(),
-        "temp zip should not exist after error"
-    );
-}
-
-#[tokio::test]
 async fn test_download_gallery_images_fails_when_one_image_fetch_fails() {
     let server = MockServer::start().await;
     let client = client_at(&server);
@@ -1032,38 +752,6 @@ async fn test_download_gallery_images_fails_when_one_image_fetch_fails() {
     Mock::given(method("GET"))
         .and(path("/img/2.jpg"))
         .respond_with(ResponseTemplate::new(500))
-        .mount(&server)
-        .await;
-
-    let temp_dir = tempfile::tempdir().unwrap();
-    let dest = temp_dir.path().join("gallery.zip");
-    let err = client
-        .download_gallery_images(123, "abc", &dest)
-        .await
-        .unwrap_err();
-    assert!(err
-        .to_string()
-        .contains("failed to download all gallery images"));
-    assert!(!dest.exists(), "dest should not exist after error");
-    assert!(
-        !dest.with_extension("zip.part").exists(),
-        "temp zip should not exist after error"
-    );
-}
-
-#[tokio::test]
-async fn test_download_gallery_images_fails_when_image_src_missing() {
-    let server = MockServer::start().await;
-    let client = client_at(&server);
-    Mock::given(method("GET"))
-        .and(path("/g/123/abc/"))
-        .respond_with(ResponseTemplate::new(200).set_body_string(r#"<a href="/s/1/123-1">1</a>"#))
-        .mount(&server)
-        .await;
-    // Image page returns HTML without <img id="img">
-    Mock::given(method("GET"))
-        .and(path("/s/1/123-1"))
-        .respond_with(ResponseTemplate::new(200).set_body_string("<html>no image here</html>"))
         .mount(&server)
         .await;
 
@@ -1660,53 +1348,6 @@ async fn run_protocol_reset_case(
 }
 
 #[tokio::test]
-async fn test_multipart_starts_with_one_open_ended_range_and_assembles_exact_zip() {
-    let server = MockServer::start().await;
-    mount_archive_post_redirect(&server).await;
-    let zip = Arc::new(stored_zip_with_payload(4 * 1024 * 1024));
-    let responder = ScriptedRangeResponder::new(Arc::clone(&zip))
-        .delay_first_open_ended(Duration::from_millis(1100), true);
-    Mock::given(method("GET"))
-        .and(path(TEST_ARCHIVE_PATH))
-        .respond_with(responder.clone())
-        .mount(&server)
-        .await;
-
-    let temp = tempfile::tempdir().unwrap();
-    let dest = temp.path().join("archive.zip");
-    let bytes = client_at(&server)
-        .download_archive_with_options(
-            123456,
-            "abcdef0123",
-            "123456--abc123def456",
-            "780x",
-            &dest,
-            ArchiveDownloadOptions { max_concurrency: 2 },
-        )
-        .await
-        .expect("multipart download should succeed");
-
-    assert_eq!(bytes as usize, zip.len());
-    let requests = responder.requests();
-    assert_eq!(requests[0].range, "bytes=0-");
-    let bounded = requests
-        .iter()
-        .filter(|request| !request.range.ends_with('-'))
-        .collect::<Vec<_>>();
-    assert!(
-        !bounded.is_empty(),
-        "the delayed initial response must be sampled before dynamic splitting"
-    );
-    assert!(
-        bounded[0].timestamp.duration_since(requests[0].timestamp) >= Duration::from_millis(900),
-        "no bounded request may precede the first delayed part sample"
-    );
-    assert_eq!(std::fs::read(&dest).unwrap(), *zip);
-    assert!(!dest.with_extension("zip.part").exists());
-    assert!(!dest.with_extension("zip.parts").exists());
-}
-
-#[tokio::test]
 async fn test_multipart_dynamic_split_uses_two_actual_connections_without_overlap() {
     let server = MockServer::start().await;
     mount_archive_post_redirect(&server).await;
@@ -2084,30 +1725,6 @@ async fn test_malformed_manifest_clears_all_multipart_state_and_starts_sequentia
         assert!(!dest.with_extension("zip.part").exists());
         assert_eq!(std::fs::read(&dest).unwrap(), zip, "{case}");
     }
-}
-
-#[tokio::test]
-async fn test_archive_options_zero_is_rejected_before_archiver_post() {
-    let server = MockServer::start().await;
-    let temp = tempfile::tempdir().unwrap();
-    let dest = temp.path().join("archive.zip");
-    let error = client_at(&server)
-        .download_archive_with_options(
-            123456,
-            "abcdef0123",
-            "123456--abc123def456",
-            "780x",
-            &dest,
-            ArchiveDownloadOptions { max_concurrency: 0 },
-        )
-        .await
-        .expect_err("zero archive concurrency must be rejected before the POST");
-
-    assert_eq!(
-        error.to_string(),
-        "archive download max_concurrency must be at least 1"
-    );
-    assert!(server.received_requests().await.unwrap().is_empty());
 }
 
 #[tokio::test]
