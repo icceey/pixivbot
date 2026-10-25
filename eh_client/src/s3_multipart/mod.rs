@@ -435,9 +435,25 @@ pub(crate) async fn upload_multipart(
                 etag: quick_xml::escape::escape(&etag).into_owned(),
             })
             .collect();
-        let response = match bucket
-            .complete_multipart_upload(&active.object_key, &active.upload_id, completed_parts)
-            .await
+        // Preserve provider-specific bodies such as ipfS3 DecompressZipResult for our parsers.
+        let response = match async {
+            use s3::request::Request;
+
+            let command = s3::command::Command::CompleteMultipartUpload {
+                upload_id: &active.upload_id,
+                data: s3::serde_types::CompleteMultipartUploadData {
+                    parts: completed_parts,
+                },
+            };
+            let complete_request = s3::request::tokio_backend::ReqwestRequest::new(
+                bucket,
+                &active.object_key,
+                command,
+            )
+            .await?;
+            complete_request.response_data(false).await
+        }
+        .await
         {
             Ok(response) => response,
             Err(error) => {
