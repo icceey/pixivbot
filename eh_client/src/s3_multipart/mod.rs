@@ -799,13 +799,17 @@ async fn abort_session(
                 if let Some(date) = date {
                     headers.insert(DATE, date);
                 }
-                Ok(bucket
+                let builder = bucket
                     .http_client()
                     .delete(request.url()?)
                     .headers(headers)
-                    .body(Vec::<u8>::new())
-                    .send()
-                    .await?)
+                    .body(Vec::<u8>::new());
+                let builder = if let Some(timeout) = bucket.request_timeout() {
+                    builder.timeout(timeout)
+                } else {
+                    builder
+                };
+                Ok(builder.send().await?)
             }
             .await;
             match send {
