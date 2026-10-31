@@ -6,64 +6,75 @@ use teloxide::prelude::*;
 use teloxide::types::UserId;
 use tracing::error;
 
-const USAGE: &str = "用法：/subtag [ch=<频道ID>] <单个精确标签> [b=500] [l=<图片数>] [+tag -tag]";
+const USAGE: &str = "用法：/subtag [ch=<频道ID>] <单个精确标签> [v=<浏览量>] [b=<收藏量>] [p=<收藏率>] [l=<图片数>] [+tag -tag]";
 
 fn parse_subscription(
     parsed: &ParsedArgs,
-    default_min_bookmarks: i64,
 ) -> Result<(String, TagSettings, TagFilter), &'static str> {
-    let mut bookmarks = parsed.get_any(&["b", "bookmarks"]);
-    let mut limit = parsed.get_any(&["l", "limit"]);
-    if parsed.get("b").is_some() && parsed.get("bookmarks").is_some() {
-        return Err("收藏阈值参数重复");
-    }
-    if parsed.get("l").is_some() && parsed.get("limit").is_some() {
-        return Err("图片数量参数重复");
-    }
-    if parsed.params.keys().any(|key| {
-        !matches!(
-            key.as_str(),
-            "ch" | "channel" | "b" | "bookmarks" | "l" | "limit"
-        )
-    }) {
-        return Err("存在未知参数");
-    }
+    let mut params: Vec<_> = parsed
+        .params
+        .iter()
+        .filter(|(key, _)| !matches!(key.as_str(), "ch" | "channel"))
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect();
     let mut words = Vec::new();
     let mut filters = Vec::new();
     for word in parsed.remaining.split_whitespace() {
-        if let Some(value) = word
-            .strip_prefix("b=")
-            .or_else(|| word.strip_prefix("bookmarks="))
-        {
-            if bookmarks.replace(value).is_some() {
-                return Err("收藏阈值参数重复");
-            }
-        } else if let Some(value) = word
-            .strip_prefix("l=")
-            .or_else(|| word.strip_prefix("limit="))
-        {
-            if limit.replace(value).is_some() {
-                return Err("图片数量参数重复");
-            }
-        } else if word.starts_with(['+', '-']) {
+        if word.starts_with(['+', '-']) {
             filters.push(word);
-        } else if word.contains('=') {
-            return Err("存在未知参数");
+        } else if let Some(param) = word.split_once('=') {
+            params.push(param);
         } else {
             words.push(word);
+        }
+    }
+    let mut views = None;
+    let mut bookmarks = None;
+    let mut rate = None;
+    let mut limit = None;
+    for (key, value) in params {
+        let (param, duplicate_error) = match key {
+            "v" => (&mut views, "浏览量参数重复"),
+            "b" | "bookmarks" => (&mut bookmarks, "收藏阈值参数重复"),
+            "p" => (&mut rate, "收藏率参数重复"),
+            "l" | "limit" => (&mut limit, "图片数量参数重复"),
+            _ => return Err("存在未知参数"),
+        };
+        if param.replace(value).is_some() {
+            return Err(duplicate_error);
         }
     }
     if words.is_empty() {
         return Err("请指定标签");
     }
     let query = words.join(" ");
-    let min_bookmarks: i64 = bookmarks
+    let mut min_views: Option<i64> = views
         .map(str::parse)
         .transpose()
-        .map_err(|_| "收藏阈值须为正整数")?
-        .unwrap_or(default_min_bookmarks);
-    if min_bookmarks <= 0 {
+        .map_err(|_| "浏览量须为正整数")?;
+    if min_views.is_some_and(|value| value <= 0) {
+        return Err("浏览量须为正整数");
+    }
+    let min_bookmarks: Option<i64> = bookmarks
+        .map(str::parse)
+        .transpose()
+        .map_err(|_| "收藏阈值须为正整数")?;
+    if min_bookmarks.is_some_and(|value| value <= 0) {
         return Err("收藏阈值须为正整数");
+    }
+    let mut min_bookmark_rate: Option<f64> = rate
+        .map(str::parse)
+        .transpose()
+        .map_err(|_| "收藏率须为 0 到 1 之间的小数，例如 p=0.15 表示 15%")?;
+    if min_bookmark_rate.is_some_and(|value| !(0.0..=1.0).contains(&value)) {
+        return Err("收藏率须为 0 到 1 之间的小数，例如 p=0.15 表示 15%");
+    }
+    if min_views.is_none() && min_bookmarks.is_none() {
+        if min_bookmark_rate.is_some() {
+            return Err("请至少设置浏览量 v 或收藏量 b");
+        }
+        min_views = Some(3000);
+        min_bookmark_rate = Some(0.15);
     }
     let max_pages: Option<i64> = limit
         .map(str::parse)
@@ -75,11 +86,30 @@ fn parse_subscription(
     Ok((
         query,
         TagSettings {
+            min_views,
             min_bookmarks,
+            min_bookmark_rate,
             max_pages,
         },
         TagFilter::parse_from_args(&filters),
     ))
+}
+
+pub(super) fn format_settings(settings: &TagSettings) -> String {
+    let mut conditions = Vec::new();
+    if let Some(min) = settings.min_views {
+        conditions.push(format!("浏览 ≥ {min}"));
+    }
+    if let Some(min) = settings.min_bookmarks {
+        conditions.push(format!("收藏 ≥ {min}"));
+    }
+    if let Some(min) = settings.min_bookmark_rate {
+        conditions.push(format!("收藏率 ≥ {min}"));
+    }
+    if let Some(limit) = settings.max_pages {
+        conditions.push(format!("图片 ≤ {limit}"));
+    }
+    conditions.join("，")
 }
 
 impl BotHandler {
@@ -91,25 +121,26 @@ impl BotHandler {
         args_str: String,
     ) -> ResponseResult<()> {
         let parsed = args::parse_args(&args_str);
-        let (query, settings, filter) =
-            match parse_subscription(&parsed, self.pixiv_tag_min_bookmarks) {
-                Ok(value) => value,
-                Err(reason) => {
-                    bot.send_message(
-                        chat_id,
-                        format!(
-                            "❌ {reason}\n{USAGE}\n\n参数：\n\
-                         - b / bookmarks：收藏数达到此值才会推送，默认{}。\n\
+        let (query, settings, filter) = match parse_subscription(&parsed) {
+            Ok(value) => value,
+            Err(reason) => {
+                bot.send_message(
+                    chat_id,
+                    format!(
+                        "❌ {reason}\n{USAGE}\n\n参数：\n\
+                         - v：最低浏览量，须为正整数。\n\
+                         - b / bookmarks：最低收藏量，须为正整数，省略时不过滤收藏量。\n\
+                         - p：最低收藏率（收藏量 / 浏览量），范围 0 到 1，0.15 表示 15%，可省略。\n\
+                         - v 和 b 至少设置一项；未指定 v、b、p 时默认 v=3000、p=0.15。所有条件需同时满足。\n\
                          - l / limit：图片数量超过此值的作品不推送，省略时不限数量。\n\
                          - +tag：除了订阅的标签外，作品还需带有至少一个指定标签才推送。\n\
-                         - -tag：带有任意一个指定标签的作品不会推送。",
-                            self.pixiv_tag_min_bookmarks
-                        ),
-                    )
-                    .await?;
-                    return Ok(());
-                }
-            };
+                         - -tag：带有任意一个指定标签的作品不会推送。"
+                    ),
+                )
+                .await?;
+                return Ok(());
+            }
+        };
         let (target, is_channel) = match self
             .resolve_subscription_target(&bot, chat_id, user_id, &parsed)
             .await
@@ -133,10 +164,6 @@ impl BotHandler {
         .await;
         match result {
             Ok(()) => {
-                let limit = settings
-                    .max_pages
-                    .map(|limit| format!("，图片不超过 {limit} 张"))
-                    .unwrap_or_default();
                 let channel = if is_channel {
                     format!("\n📢 频道：{}", target.0)
                 } else {
@@ -145,8 +172,8 @@ impl BotHandler {
                 bot.send_message(
                     chat_id,
                     format!(
-                        "✅ 已订阅标签热榜：{query}\n收藏达到 {} 时推送{limit}{channel}",
-                        settings.min_bookmarks
+                        "✅ 已订阅标签热榜：{query}\n筛选条件：{}{channel}",
+                        format_settings(&settings)
                     ),
                 )
                 .await?;

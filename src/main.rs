@@ -506,7 +506,6 @@ async fn main() -> Result<()> {
             pixiv_client.clone(),
             notifier.clone(),
             sensitive_tags_for_bot,
-            config.scheduler.pixiv_tag_min_bookmarks,
             image_size_for_bot,
             download_threshold_for_bot,
             cache_dir_for_bot,

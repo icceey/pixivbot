@@ -1,4 +1,4 @@
-use super::{ListPaginationAction, PAGE_SIZE};
+use super::{pixiv_tag::format_settings, ListPaginationAction, PAGE_SIZE};
 use crate::bot::notifier::ThrottledBot;
 use crate::bot::BotHandler;
 use crate::db::types::{BooruRankingMode, BooruTaskKey, TaskType};
@@ -167,14 +167,7 @@ impl BotHandler {
                             }
                         } else if task.r#type == TaskType::PixivTag {
                             let settings = match self.repo.pixiv_tag_settings(sub.id).await {
-                                Ok(Some(settings)) => {
-                                    let mut description =
-                                        format!("收藏 ≥ {}", settings.min_bookmarks);
-                                    if let Some(limit) = settings.max_pages {
-                                        description.push_str(&format!("，图片 ≤ {limit}"));
-                                    }
-                                    description
-                                }
+                                Ok(Some(settings)) => format_settings(&settings),
                                 Ok(None) => "配置缺失".to_string(),
                                 Err(e) => {
                                     error!("Failed to read tag settings: {:#}", e);

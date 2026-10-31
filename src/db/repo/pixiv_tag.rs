@@ -11,7 +11,9 @@ use sea_orm::{
 
 #[derive(Debug, FromQueryResult)]
 pub struct TagSettings {
-    pub min_bookmarks: i64,
+    pub min_bookmarks: Option<i64>,
+    pub min_views: Option<i64>,
+    pub min_bookmark_rate: Option<f64>,
     pub max_pages: Option<i64>,
 }
 
@@ -68,12 +70,15 @@ impl Repo {
             .context("Tag subscription disappeared")?;
         txn.execute(Statement::from_sql_and_values(
             DbBackend::Sqlite,
-            "INSERT INTO pixiv_tag_settings(subscription_id, min_bookmarks, max_pages)
-             VALUES (?, ?, ?) ON CONFLICT(subscription_id) DO UPDATE SET
-             min_bookmarks=excluded.min_bookmarks, max_pages=excluded.max_pages",
+            "INSERT INTO pixiv_tag_settings(subscription_id, min_bookmarks, min_views, min_bookmark_rate, max_pages)
+             VALUES (?, ?, ?, ?, ?) ON CONFLICT(subscription_id) DO UPDATE SET
+             min_bookmarks=excluded.min_bookmarks, min_views=excluded.min_views,
+             min_bookmark_rate=excluded.min_bookmark_rate, max_pages=excluded.max_pages",
             [
                 sub.id.into(),
                 settings.min_bookmarks.into(),
+                settings.min_views.into(),
+                settings.min_bookmark_rate.into(),
                 settings.max_pages.into(),
             ],
         ))
@@ -86,7 +91,8 @@ impl Repo {
         Ok(
             TagSettings::find_by_statement(Statement::from_sql_and_values(
                 DbBackend::Sqlite,
-                "SELECT min_bookmarks, max_pages FROM pixiv_tag_settings WHERE subscription_id=?",
+                "SELECT min_bookmarks, min_views, min_bookmark_rate, max_pages
+                 FROM pixiv_tag_settings WHERE subscription_id=?",
                 [sub_id.into()],
             ))
             .one(&self.db)
@@ -242,6 +248,18 @@ impl Repo {
             .all(&self.db)
             .await?,
         )
+    }
+
+    pub async fn delete_pixiv_tag_delivery(&self, delivery: &TagDelivery) -> Result<()> {
+        self.db
+            .execute(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "DELETE FROM pixiv_tag_deliveries
+                 WHERE subscription_id=? AND illust_id=? AND done=0",
+                [delivery.subscription_id.into(), delivery.illust_id.into()],
+            ))
+            .await?;
+        Ok(())
     }
 
     /// Update the queue after the sender has saved shared progress and messages.

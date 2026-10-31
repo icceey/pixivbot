@@ -88,7 +88,6 @@ async fn fixture() -> (MockServer, ThrottledBot, BotHandler) {
             )),
         ),
         vec![],
-        500,
         Some(1),
         false,
         pixiv_client::ImageSize::Large,

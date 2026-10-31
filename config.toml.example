@@ -40,8 +40,6 @@ max_retry_count = 3
 ranking_execution_time = "19:00"
 # Pixiv tag observation window in days (positive integer)
 pixiv_tag_window_days = 7
-# Default bookmark threshold for tag subscriptions (positive integer)
-pixiv_tag_min_bookmarks = 500
 # Target scan duration in hours; polling intervals follow the publication time span scanned
 pixiv_tag_scan_target_hours = 12
 # Maximum search pages per task execution (positive integer)

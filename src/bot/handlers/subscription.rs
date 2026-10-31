@@ -170,7 +170,6 @@ mod tests {
             )),
             Notifier::new(bot.clone(), downloader),
             Vec::new(),
-            500,
             None,
             false,
             pixiv_client::ImageSize::Large,

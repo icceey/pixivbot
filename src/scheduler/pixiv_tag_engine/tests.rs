@@ -53,7 +53,9 @@ async fn subscribe(repo: &Repo) -> (tasks::Model, subscriptions::Model, chats::M
         task.id,
         TagFilter::default(),
         &TagSettings {
-            min_bookmarks: 300,
+            min_views: None,
+            min_bookmarks: Some(300),
+            min_bookmark_rate: None,
             max_pages: None,
         },
     )
@@ -133,6 +135,83 @@ async fn page_checkpoint_and_candidates_commit_together_and_resume_after_reopen(
     );
     assert_eq!(repo.pixiv_tag_candidates(task.id).await.unwrap().len(), 2);
     repo.db().clone().close().await.unwrap();
+}
+
+#[tokio::test]
+async fn filtered_deliveries_can_qualify_again_after_candidate_refresh() {
+    let repo = Arc::new(open_repo("sqlite::memory:").await);
+    let (task, sub, chat) = subscribe(&repo).await;
+    let cache = tempfile::tempdir().unwrap();
+    let server = MockServer::start().await;
+    let engine = PixivTagEngine::new(
+        repo.clone(),
+        Arc::new(RwLock::new(
+            PixivClient::new(PixivConfig {
+                refresh_token: "unused".to_string(),
+            })
+            .unwrap(),
+        )),
+        Notifier::new(
+            Bot::new("fake_token")
+                .set_api_url(url::Url::parse(&server.uri()).unwrap())
+                .throttle(Limits::default()),
+            Arc::new(Downloader::new(
+                reqwest::Client::new(),
+                FileCacheManager::new(cache.path(), 7),
+            )),
+        ),
+        &serde_json::from_value(serde_json::json!({})).unwrap(),
+        ImageSize::Large,
+    );
+    let mut illust = illustration(10, &server.uri(), 1);
+    let now = Utc::now();
+    let published_at = DateTime::parse_from_rfc3339(&illust.create_date)
+        .unwrap()
+        .timestamp();
+    let oldest = now.with_timezone(&SEARCH_TIMEZONE).date_naive() - Days::new(7);
+    let mut scan = repo.pixiv_tag_scan(task.id, oldest, 7).await.unwrap();
+    scan.complete = true;
+    repo.save_pixiv_tag_page(task.id, &[(illust.clone(), published_at)], &scan)
+        .await
+        .unwrap();
+    engine.execute_task(&task, &mut scan, now).await.unwrap();
+    let delivery = repo
+        .pixiv_tag_deliveries_due(sub.id, now.timestamp())
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    repo.upsert_pixiv_tag_subscription(
+        chat.id,
+        task.id,
+        TagFilter::default(),
+        &TagSettings {
+            min_views: Some(3000),
+            min_bookmarks: None,
+            min_bookmark_rate: Some(0.15),
+            max_pages: None,
+        },
+    )
+    .await
+    .unwrap();
+    engine.send_delivery(&sub, &chat, delivery).await.unwrap();
+    assert!(repo
+        .pixiv_tag_deliveries_due(sub.id, now.timestamp())
+        .await
+        .unwrap()
+        .is_empty());
+
+    illust.total_view = 4000;
+    illust.total_bookmarks = 700;
+    repo.save_pixiv_tag_page(task.id, &[(illust, published_at)], &scan)
+        .await
+        .unwrap();
+    engine.execute_task(&task, &mut scan, now).await.unwrap();
+    let deliveries = repo
+        .pixiv_tag_deliveries_due(sub.id, now.timestamp())
+        .await
+        .unwrap();
+    assert_eq!(deliveries.len(), 1);
 }
 
 #[tokio::test]
