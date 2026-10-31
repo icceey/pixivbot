@@ -232,11 +232,7 @@ impl PixivTagEngine {
             return Ok(());
         }
         for (sub, settings) in subscriptions {
-            if illust.total_bookmarks < settings.min_bookmarks as u64
-                || settings
-                    .max_pages
-                    .is_some_and(|limit| i64::from(illust.page_count) > limit)
-            {
+            if !matches_settings(illust, settings) {
                 continue;
             }
             let Some(chat) = get_chat_if_should_notify(&self.repo, sub.chat_id).await? else {
@@ -303,14 +299,10 @@ impl PixivTagEngine {
         let Some(settings) = self.repo.pixiv_tag_settings(sub.id).await? else {
             return Ok(());
         };
-        if apply_subscription_tag_filter(sub, chat, [&illust]).is_empty()
-            || settings
-                .max_pages
-                .is_some_and(|limit| i64::from(illust.page_count) > limit)
+        if !matches_settings(&illust, &settings)
+            || apply_subscription_tag_filter(sub, chat, [&illust]).is_empty()
         {
-            self.repo
-                .save_pixiv_tag_delivery(&delivery, true, Utc::now().timestamp())
-                .await?;
+            self.repo.delete_pixiv_tag_delivery(&delivery).await?;
             return Ok(());
         }
         let result = process_illust_push(
@@ -345,6 +337,21 @@ impl PixivTagEngine {
             .save_pixiv_tag_delivery(&delivery, done, Utc::now().timestamp() + delay)
             .await
     }
+}
+
+fn matches_settings(illust: &Illust, settings: &TagSettings) -> bool {
+    settings
+        .min_views
+        .is_none_or(|min| illust.total_view >= min as u64)
+        && settings
+            .min_bookmarks
+            .is_none_or(|min| illust.total_bookmarks >= min as u64)
+        && settings.min_bookmark_rate.is_none_or(|min| {
+            illust.total_view > 0 && illust.total_bookmarks as f64 / illust.total_view as f64 >= min
+        })
+        && settings
+            .max_pages
+            .is_none_or(|limit| i64::from(illust.page_count) <= limit)
 }
 
 /// Rebase the offset when a page crosses a date boundary. Reusing the old

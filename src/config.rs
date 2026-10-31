@@ -104,8 +104,6 @@ pub struct SchedulerConfig {
     /// Shared observation window for Pixiv tag rankings, in days (default: 7).
     #[serde(default = "default_pixiv_tag_window_days")]
     pub pixiv_tag_window_days: u16,
-    #[serde(default = "default_pixiv_tag_min_bookmarks")]
-    pub pixiv_tag_min_bookmarks: i64,
     #[serde(default = "default_pixiv_tag_scan_target_hours")]
     pub pixiv_tag_scan_target_hours: u16,
     #[serde(default = "default_pixiv_tag_scan_pages")]
@@ -150,10 +148,6 @@ fn default_ranking_execution_time() -> String {
 
 fn default_pixiv_tag_window_days() -> u16 {
     7
-}
-
-fn default_pixiv_tag_min_bookmarks() -> i64 {
-    500
 }
 
 fn default_pixiv_tag_scan_target_hours() -> u16 {
@@ -693,10 +687,6 @@ impl Config {
         anyhow::ensure!(
             config.scheduler.pixiv_tag_window_days > 0,
             "scheduler.pixiv_tag_window_days must be positive"
-        );
-        anyhow::ensure!(
-            config.scheduler.pixiv_tag_min_bookmarks > 0,
-            "scheduler.pixiv_tag_min_bookmarks must be positive"
         );
         anyhow::ensure!(
             config.scheduler.pixiv_tag_scan_target_hours > 0
