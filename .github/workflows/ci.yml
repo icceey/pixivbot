@@ -28,8 +28,19 @@ jobs:
           toolchain: 1.94
           components: clippy, rustfmt
 
+      - name: Identify native build environment
+        id: native
+        run: |
+          . /etc/os-release
+          ffmpeg_versions=$(pkg-config --modversion libavcodec libavformat libavutil libswscale libswresample | paste -sd-)
+          echo "cache-key=${ID}-${VERSION_ID}-ffmpeg-${ffmpeg_versions}" >> "$GITHUB_OUTPUT"
+
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
+        with:
+          # Cached FFmpeg bindings must match the installed libraries, even when
+          # ubuntu-latest moves to a new image with the same Rust toolchain.
+          key: ${{ steps.native.outputs.cache-key }}
 
       - name: Check, lint, test and build
         run: make ci
