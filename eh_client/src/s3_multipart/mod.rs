@@ -5,7 +5,10 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU8, Ordering};
 
-pub(crate) const PART_SIZE: usize = 8 * 1024 * 1024;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt};
+
+pub(crate) const MIN_PART_SIZE: u64 = 5 * 1024 * 1024;
+pub(crate) const MAX_PART_SIZE: u64 = 5 * 1024 * 1024 * 1024;
 pub(crate) const MAX_PARTS: usize = 10_000;
 pub(crate) const IPFS3_DECOMPRESS_TAGGING: &str =
     "ipfs-s3%3Apin=true&ipfs-s3%3Aduration=1d&ipfs-s3%3Acontent=decompressed";
@@ -33,6 +36,85 @@ pub(crate) fn fingerprint_fields(fields: &[impl AsRef<str>]) -> String {
 
 pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
+}
+
+/// Sign the known payload hash without materializing the file in rust-s3's
+/// PutObject body. Keep its endpoint, credentials, headers and timeout behavior.
+pub(crate) async fn put_object_stream(
+    bucket: &s3::Bucket,
+    key: &str,
+    file: &tokio::fs::File,
+    len: u64,
+    sha256: &str,
+    content_type: &str,
+) -> Result<s3::request::ResponseData, s3::error::S3Error> {
+    use hmac::Mac;
+    use s3::request::Request;
+
+    let request = s3::request::tokio_backend::ReqwestRequest::new(
+        bucket,
+        key,
+        s3::command::Command::PutObject {
+            content: &[],
+            content_type,
+            custom_headers: None,
+            multipart: None,
+        },
+    )
+    .await?;
+    let mut headers = request.headers().await?;
+    headers.remove(AUTHORIZATION);
+    // The empty placeholder body must not supply the streamed body's MD5.
+    // SigV4's payload hash still authenticates the entire file.
+    headers.remove("content-md5");
+    let date = headers.remove(DATE);
+    headers.insert(CONTENT_LENGTH, len.to_string().parse()?);
+    headers.insert(
+        HeaderName::from_static("x-amz-content-sha256"),
+        sha256.parse()?,
+    );
+    let url = request.url()?;
+    let canonical = s3::signing::canonical_request("PUT", &url, &headers, sha256)?;
+    let string_to_sign = request.string_to_sign(&canonical)?;
+    let mut hmac = s3::signing::HmacSha256::new_from_slice(&request.signing_key().await?)?;
+    hmac.update(string_to_sign.as_bytes());
+    let authorization = s3::signing::authorization_header(
+        &bucket.access_key().await?.ok_or_else(|| {
+            s3::error::S3Error::HttpFailWithBody(401, "missing S3 access key".into())
+        })?,
+        &request.datetime(),
+        &bucket.region(),
+        &s3::signing::signed_header_string(&headers),
+        &hex::encode(hmac.finalize().into_bytes()),
+    )?;
+    headers.insert(AUTHORIZATION, authorization.parse()?);
+    if let Some(date) = date {
+        headers.insert(DATE, date);
+    }
+    let mut reader = file.try_clone().await?;
+    reader.rewind().await?;
+    let body = reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::new(reader.take(len)));
+    let builder = bucket.http_client().put(url).headers(headers).body(body);
+    let builder = if let Some(timeout) = bucket.request_timeout() {
+        builder.timeout(timeout)
+    } else {
+        builder
+    };
+    // A lost single-PUT response is ambiguous; do not automatically replay it.
+    let response = builder.send().await?;
+    let status = response.status().as_u16();
+    let headers = response
+        .headers()
+        .iter()
+        .map(|(key, value)| {
+            (
+                key.to_string(),
+                value.to_str().unwrap_or_default().to_owned(),
+            )
+        })
+        .collect();
+    let body = response.bytes().await?;
+    Ok(s3::request::ResponseData::new(body, status, headers))
 }
 
 pub(crate) fn uploader_identity_fingerprint(
@@ -112,12 +194,18 @@ impl MultipartCapability {
     }
 }
 
+pub(crate) trait UploadReader: AsyncRead + AsyncSeek + Unpin + Send {}
+impl<T: AsyncRead + AsyncSeek + Unpin + Send> UploadReader for T {}
+
 pub(crate) struct MultipartUploadRequest<'a> {
     pub provider: ProviderKind,
     pub uploader_identity_sha256: &'a str,
     pub candidate_object_key: String,
     pub logical_object_id: &'a str,
-    pub bytes: &'a [u8],
+    pub reader: Box<dyn UploadReader + 'a>,
+    pub object_len: u64,
+    pub object_sha256: String,
+    pub part_size: u64,
     pub content_type: &'a str,
     pub manifest_path: Option<&'a Path>,
     pub create_extension: CreateExtension,
@@ -153,6 +241,7 @@ struct ActiveSession {
     object_key: String,
     upload_id: String,
     from_valid_manifest: bool,
+    part_size: u64,
 }
 
 enum CreateSessionResult {
@@ -165,25 +254,31 @@ enum HeadDecision {
     Replace,
 }
 
-fn part_count(len: usize) -> crate::Result<usize> {
+fn part_count(len: u64, part_size: u64) -> crate::Result<usize> {
+    if !(MIN_PART_SIZE..=MAX_PART_SIZE).contains(&part_size) {
+        return Err(crate::Error::Other(
+            "multipart part size must be between 5 and 5120 MiB".into(),
+        ));
+    }
     if len == 0 {
         return Err(crate::Error::Other(
             "multipart upload object is empty".into(),
         ));
     }
-    let count = len.div_ceil(PART_SIZE);
-    if count > MAX_PARTS {
+    let count = len.div_ceil(part_size);
+    if count > MAX_PARTS as u64 {
         return Err(crate::Error::Other(format!(
             "multipart upload needs {count} parts, exceeding the 10000-part limit"
         )));
     }
-    Ok(count)
+    Ok(count as usize)
 }
 
-fn expected_part_size(object_len: usize, part_number: u32) -> Option<usize> {
-    let part_number = usize::try_from(part_number).ok()?;
-    let start = part_number.checked_sub(1)?.checked_mul(PART_SIZE)?;
-    (start < object_len).then(|| (object_len - start).min(PART_SIZE))
+fn expected_part_size(object_len: u64, part_size: u64, part_number: u32) -> Option<u64> {
+    let start = u64::from(part_number)
+        .checked_sub(1)?
+        .checked_mul(part_size)?;
+    (start < object_len).then(|| (object_len - start).min(part_size))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -195,10 +290,12 @@ enum ReconcileInvalid {
 }
 
 fn reconcile_parts(
-    object_len: usize,
+    object_len: u64,
+    part_size: u64,
     listed: Vec<list_parts::CompletedPart>,
 ) -> Result<BTreeMap<u32, String>, ReconcileInvalid> {
-    let total_parts = part_count(object_len).map_err(|_| ReconcileInvalid::InvalidPartNumber)?;
+    let total_parts =
+        part_count(object_len, part_size).map_err(|_| ReconcileInvalid::InvalidPartNumber)?;
     let mut reconciled = BTreeMap::new();
     for part in listed {
         let part_number =
@@ -210,8 +307,8 @@ fn reconcile_parts(
             return Err(ReconcileInvalid::EmptyEtag);
         }
         if part.size
-            != expected_part_size(object_len, part.part_number)
-                .ok_or(ReconcileInvalid::InvalidPartNumber)? as u64
+            != expected_part_size(object_len, part_size, part.part_number)
+                .ok_or(ReconcileInvalid::InvalidPartNumber)?
         {
             return Err(ReconcileInvalid::InvalidPartSize);
         }
@@ -225,10 +322,8 @@ fn reconcile_parts(
 pub(crate) async fn upload_multipart(
     bucket: &s3::Bucket,
     http: &reqwest::Client,
-    request: MultipartUploadRequest<'_>,
+    mut request: MultipartUploadRequest<'_>,
 ) -> crate::Result<MultipartOutcome> {
-    let total_parts = part_count(request.bytes.len())?;
-    let object_sha256 = sha256_hex(request.bytes);
     let requested_entries_sha256 = match &request.create_extension {
         CreateExtension::None => None,
         CreateExtension::IpfS3DecompressZip {
@@ -239,8 +334,8 @@ pub(crate) async fn upload_multipart(
         provider: request.provider,
         uploader_identity_sha256: request.uploader_identity_sha256,
         logical_object_id: request.logical_object_id,
-        object_sha256: &object_sha256,
-        object_len: request.bytes.len() as u64,
+        object_sha256: &request.object_sha256,
+        object_len: request.object_len,
         content_type: request.content_type,
         requested_entries_sha256,
     };
@@ -251,6 +346,7 @@ pub(crate) async fn upload_multipart(
                 object_key: manifest.object_key,
                 upload_id: manifest.upload_id,
                 from_valid_manifest: true,
+                part_size: manifest.part_size,
             }),
             manifest::ManifestLoad::Missing => None,
             manifest::ManifestLoad::MalformedJson => {
@@ -300,6 +396,7 @@ pub(crate) async fn upload_multipart(
                 &request.create_extension,
                 request.manifest_path,
                 &manifest_identity,
+                request.part_size,
             )
             .await?
             {
@@ -310,6 +407,7 @@ pub(crate) async fn upload_multipart(
             },
         };
 
+        let total_parts = part_count(request.object_len, active.part_size)?;
         let listed_parts = match list_parts::list_all_parts(
             http,
             request.provider,
@@ -326,7 +424,7 @@ pub(crate) async fn upload_multipart(
                 match recover_lost_complete(
                     bucket,
                     &active.object_key,
-                    request.bytes.len(),
+                    request.object_len,
                     request.head_recovery,
                 )
                 .await?
@@ -371,7 +469,7 @@ pub(crate) async fn upload_multipart(
                 .await;
             }
         };
-        let mut parts = match reconcile_parts(request.bytes.len(), listed_parts) {
+        let mut parts = match reconcile_parts(request.object_len, active.part_size, listed_parts) {
             Ok(parts) => parts,
             Err(_) => {
                 replace_corrupt_session(
@@ -386,15 +484,80 @@ pub(crate) async fn upload_multipart(
                 continue;
             }
         };
-        for part_number in 1..=u32::try_from(total_parts).expect("multipart part count is bounded")
-        {
+        let mut chunk = Vec::new();
+        // Verify the fingerprint and pin each part's bytes before sending any
+        // data. A later file mutation must not poison a resumable session, even
+        // if this attempt is interrupted before Complete.
+        let fingerprints = async {
+            request.reader.rewind().await?;
+            let mut digest = Sha256::new();
+            let mut fingerprints = Vec::<[u8; 32]>::with_capacity(total_parts);
+            for part_number in 1..=total_parts as u32 {
+                let len = expected_part_size(request.object_len, active.part_size, part_number)
+                    .expect("multipart part number is in the upload plan");
+                let len = usize::try_from(len).map_err(|_| {
+                    crate::Error::Other("multipart part size exceeds platform limits".into())
+                })?;
+                chunk.resize(len, 0);
+                request.reader.read_exact(&mut chunk).await?;
+                digest.update(&chunk);
+                fingerprints.push(Sha256::digest(&chunk).into());
+            }
+            let mut extra = [0];
+            if request.reader.read(&mut extra).await? != 0
+                || hex::encode(digest.finalize()) != request.object_sha256
+            {
+                return Err(crate::Error::Other(
+                    "multipart upload source changed after fingerprinting".into(),
+                ));
+            }
+            Ok::<_, crate::Error>(fingerprints)
+        }
+        .await;
+        let fingerprints = match fingerprints {
+            Ok(fingerprints) => fingerprints,
+            Err(error) => {
+                return finish_multipart_failure(
+                    bucket,
+                    request.provider,
+                    &active,
+                    request.manifest_path,
+                    list_parts::MultipartFailure::Client(error),
+                )
+                .await
+            }
+        };
+        for (index, fingerprint) in fingerprints.iter().enumerate() {
+            let part_number = index as u32 + 1;
             if parts.contains_key(&part_number) {
                 continue;
             }
-            let part_size = expected_part_size(request.bytes.len(), part_number)
-                .expect("multipart part number is in the upload plan");
-            let start = (part_number as usize - 1) * PART_SIZE;
-            let chunk = &request.bytes[start..start + part_size];
+            let part_size = expected_part_size(request.object_len, active.part_size, part_number)
+                .expect("multipart part number is in the upload plan")
+                as usize;
+            chunk.resize(part_size, 0);
+            let start = u64::from(part_number - 1) * active.part_size;
+            let read = async {
+                request.reader.seek(std::io::SeekFrom::Start(start)).await?;
+                request.reader.read_exact(&mut chunk).await?;
+                if <[u8; 32]>::from(Sha256::digest(&chunk)) != *fingerprint {
+                    return Err(crate::Error::Other(
+                        "multipart upload source changed after fingerprinting".into(),
+                    ));
+                }
+                Ok::<_, crate::Error>(())
+            }
+            .await;
+            if let Err(error) = read {
+                return finish_multipart_failure(
+                    bucket,
+                    request.provider,
+                    &active,
+                    request.manifest_path,
+                    list_parts::MultipartFailure::Client(error),
+                )
+                .await;
+            }
             let mut retries = 0;
             let etag = loop {
                 match upload_part(
@@ -402,7 +565,7 @@ pub(crate) async fn upload_multipart(
                     &active.object_key,
                     &active.upload_id,
                     part_number,
-                    chunk,
+                    &chunk,
                     request.content_type,
                 )
                 .await
@@ -631,7 +794,9 @@ async fn create_session(
     create_extension: &CreateExtension,
     manifest_path: Option<&Path>,
     manifest_identity: &manifest::ManifestIdentity<'_>,
+    part_size: u64,
 ) -> crate::Result<CreateSessionResult> {
+    part_count(manifest_identity.object_len, part_size)?;
     let mut create_bucket = bucket.clone();
     if manifest_identity.provider == ProviderKind::IpfS3 {
         // ipfS3 restores Content-Length from this signed header when a proxy
@@ -690,6 +855,7 @@ async fn create_session(
                 manifest_identity,
                 object_key.to_owned(),
                 created.upload_id.clone(),
+                part_size,
             )?;
             manifest::write_manifest_atomic(path, &manifest).await
         }
@@ -709,6 +875,7 @@ async fn create_session(
         object_key: object_key.to_owned(),
         upload_id: created.upload_id,
         from_valid_manifest: false,
+        part_size,
     }))
 }
 
@@ -836,7 +1003,7 @@ async fn remove_manifest_for_replacement(manifest_path: Option<&Path>) -> crate:
 async fn recover_lost_complete(
     bucket: &s3::Bucket,
     object_key: &str,
-    expected_len: usize,
+    expected_len: u64,
     recovery: HeadRecovery,
 ) -> crate::Result<HeadDecision> {
     if recovery == HeadRecovery::Never {
@@ -856,7 +1023,6 @@ async fn recover_lost_complete(
             "S3 multipart Head service request failed (HTTP {status})"
         )));
     }
-    let expected_len = u64::try_from(expected_len).unwrap_or(u64::MAX);
     let content_length = head
         .content_length
         .and_then(|length| u64::try_from(length).ok())
@@ -948,6 +1114,7 @@ mod tests {
     use wiremock::matchers::{method, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    const PART_SIZE: usize = 8 * 1024 * 1024;
     const BUCKET: &str = "bucket";
     const KEY: &str = "objects/archive.bin";
     const UPLOAD_ID: &str = "upload-id";
@@ -991,11 +1158,16 @@ mod tests {
         }
         mount_complete(&server).await;
 
-        let bytes = vec![7; 2 * PART_SIZE + 17];
+        let part_size = MIN_PART_SIZE as usize;
+        let bytes = (0..2 * part_size + 17)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        let mut request = standard_request(&bytes, None);
+        request.part_size = part_size as u64;
         let result = upload_multipart(
             test_bucket(&server).as_ref(),
             &reqwest::Client::new(),
-            standard_request(&bytes, None),
+            request,
         )
         .await
         .unwrap();
@@ -1027,6 +1199,17 @@ mod tests {
                 (3, "\"part-3\"".to_owned()),
             ]
         );
+        for request in requests.iter().filter(|request| request.method == "PUT") {
+            let number = query_value(request, "partNumber")
+                .unwrap()
+                .parse::<usize>()
+                .unwrap();
+            let start = (number - 1) * part_size;
+            assert_eq!(
+                request.body,
+                bytes[start..bytes.len().min(start + part_size)]
+            );
+        }
         assert_no_decompress_query(&requests);
         server.verify().await;
     }
@@ -1113,12 +1296,18 @@ mod tests {
     async fn multipart_restart_lists_server_parts_and_uploads_only_the_missing_tail() {
         let temp = tempfile::tempdir().unwrap();
         let manifest_path = temp.path().join("archive.json");
-        let bytes = vec![7; 2 * PART_SIZE + 17];
+        let bytes = (0..2 * PART_SIZE + 17)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        let source_path = temp.path().join("archive.bin");
+        tokio::fs::write(&source_path, &bytes).await.unwrap();
+        let mut request = standard_request(&bytes, Some(&manifest_path));
+        request.reader = Box::new(tokio::fs::File::open(&source_path).await.unwrap());
         let server = RawMultipartServer::start(bytes.len(), 3, vec![1, 2]);
         let first = upload_multipart(
             test_bucket_for_endpoint(&server.endpoint).as_ref(),
             &reqwest::Client::new(),
-            standard_request(&bytes, Some(&manifest_path)),
+            request,
         )
         .await;
         assert!(first.is_err());
@@ -1126,6 +1315,10 @@ mod tests {
         let first_request_count = server.requests().len();
 
         let mut resumed_request = standard_request(&bytes, Some(&manifest_path));
+        // A restart can change configuration, but the existing session's
+        // server parts still have the original 8 MiB boundaries.
+        resumed_request.part_size = MIN_PART_SIZE;
+        resumed_request.reader = Box::new(tokio::fs::File::open(&source_path).await.unwrap());
         resumed_request.candidate_object_key = "objects/different-retry-key.bin".to_owned();
         let resumed = upload_multipart(
             test_bucket_for_endpoint(&server.endpoint).as_ref(),
@@ -1178,11 +1371,103 @@ mod tests {
                 .map(|request| request.body.len()),
             Some(17)
         );
+        assert_eq!(
+            requests[first_request_count + 1].body,
+            bytes[2 * PART_SIZE..]
+        );
         assert_eq!(completed.object_key, KEY);
         assert!(manifest_path.is_file());
 
         completed.remove_manifest().await.unwrap();
         assert!(!manifest_path.exists());
+    }
+
+    #[tokio::test]
+    async fn changed_file_part_cannot_poison_a_resumable_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let manifest_path = temp.path().join("archive.json");
+        let source_path = temp.path().join("archive.bin");
+        let bytes = vec![7; PART_SIZE + 17];
+        tokio::fs::write(&source_path, &bytes).await.unwrap();
+        let server = MockServer::start().await;
+        mount_create(&server).await;
+        let uploaded_first = Arc::new(AtomicBool::new(false));
+        let listed_first = uploaded_first.clone();
+        Mock::given(method("GET"))
+            .respond_with(move |_: &wiremock::Request| {
+                let parts = if listed_first.load(Ordering::SeqCst) {
+                    vec![(1, "\"part-1\"".to_owned(), PART_SIZE as u64)]
+                } else {
+                    Vec::new()
+                };
+                ResponseTemplate::new(200)
+                    .set_body_string(list_parts_response_for(BUCKET, KEY, UPLOAD_ID, &parts))
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+        let changed_path = source_path.clone();
+        Mock::given(method("PUT"))
+            .and(query_param("partNumber", "1"))
+            .respond_with(move |_: &wiremock::Request| {
+                use std::io::Seek;
+                let mut file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&changed_path)
+                    .unwrap();
+                file.seek(std::io::SeekFrom::Start(PART_SIZE as u64))
+                    .unwrap();
+                file.write_all(&[8; 17]).unwrap();
+                uploaded_first.store(true, Ordering::SeqCst);
+                ResponseTemplate::new(200).insert_header("ETag", "\"part-1\"")
+            })
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(query_param("partNumber", "2"))
+            .and(wiremock::matchers::body_bytes(vec![7; 17]))
+            .respond_with(ResponseTemplate::new(200).insert_header("ETag", "\"part-2\""))
+            .expect(1)
+            .mount(&server)
+            .await;
+        mount_complete(&server).await;
+
+        let mut request = standard_request(&bytes, Some(&manifest_path));
+        request.reader = Box::new(tokio::fs::File::open(&source_path).await.unwrap());
+        let error = match upload_multipart(
+            test_bucket(&server).as_ref(),
+            &reqwest::Client::new(),
+            request,
+        )
+        .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("changed source must not upload the modified part"),
+        };
+        assert!(error.to_string().contains("source changed"), "{error}");
+        assert!(manifest_path.is_file());
+        assert_request_sequence(
+            &server.received_requests().await.unwrap(),
+            &["POST", "GET", "PUT"],
+        );
+
+        tokio::fs::write(&source_path, &bytes).await.unwrap();
+        let mut request = standard_request(&bytes, Some(&manifest_path));
+        request.reader = Box::new(tokio::fs::File::open(&source_path).await.unwrap());
+        let resumed = upload_multipart(
+            test_bucket(&server).as_ref(),
+            &reqwest::Client::new(),
+            request,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(resumed, MultipartOutcome::Completed(_)));
+        assert_request_sequence(
+            &server.received_requests().await.unwrap(),
+            &["POST", "GET", "PUT", "GET", "PUT", "POST"],
+        );
+        server.verify().await;
     }
 
     #[tokio::test]
@@ -1287,8 +1572,13 @@ mod tests {
             content_type: "application/octet-stream",
             requested_entries_sha256: None,
         };
-        let manifest =
-            manifest::new_manifest(&identity, KEY.to_owned(), UPLOAD_ID.to_owned()).unwrap();
+        let manifest = manifest::new_manifest(
+            &identity,
+            KEY.to_owned(),
+            UPLOAD_ID.to_owned(),
+            PART_SIZE as u64,
+        )
+        .unwrap();
         manifest::write_manifest_atomic(&manifest_path, &manifest)
             .await
             .unwrap();
@@ -1692,6 +1982,7 @@ mod tests {
                 &old_identity,
                 old_object_key.clone(),
                 old_upload_id.clone(),
+                PART_SIZE as u64,
             )
             .unwrap();
             manifest::write_manifest_atomic(&manifest_path, &old_manifest)
@@ -1818,6 +2109,7 @@ mod tests {
             object_key: KEY.to_owned(),
             upload_id: UPLOAD_ID.to_owned(),
             from_valid_manifest: true,
+            part_size: PART_SIZE as u64,
         };
 
         let result = finish_multipart_failure(
@@ -1853,6 +2145,7 @@ mod tests {
             object_key: KEY.to_owned(),
             upload_id: UPLOAD_ID.to_owned(),
             from_valid_manifest: true,
+            part_size: PART_SIZE as u64,
         };
 
         let result = finish_multipart_failure(
@@ -2140,6 +2433,7 @@ mod tests {
             &old_identity,
             old_object_key.to_owned(),
             old_upload_id.to_owned(),
+            PART_SIZE as u64,
         )
         .unwrap();
         let mismatched_path = uploads_dir.join("archive.json");
@@ -2435,7 +2729,10 @@ mod tests {
             uploader_identity_sha256: UPLOADER_ID,
             candidate_object_key: KEY.to_owned(),
             logical_object_id: "gallery-123",
-            bytes,
+            reader: Box::new(std::io::Cursor::new(bytes)),
+            object_len: bytes.len() as u64,
+            object_sha256: sha256_hex(bytes),
+            part_size: PART_SIZE as u64,
             content_type: "application/octet-stream",
             manifest_path,
             create_extension: CreateExtension::None,
@@ -2463,8 +2760,13 @@ mod tests {
             content_type: "application/octet-stream",
             requested_entries_sha256: None,
         };
-        let manifest =
-            manifest::new_manifest(&identity, KEY.to_owned(), UPLOAD_ID.to_owned()).unwrap();
+        let manifest = manifest::new_manifest(
+            &identity,
+            KEY.to_owned(),
+            UPLOAD_ID.to_owned(),
+            PART_SIZE as u64,
+        )
+        .unwrap();
         manifest::write_manifest_atomic(path, &manifest)
             .await
             .unwrap();
@@ -2627,7 +2929,12 @@ mod tests {
                             (
                                 *part_number,
                                 format!("\"part-{part_number}\""),
-                                expected_part_size(state.object_len, *part_number).unwrap() as u64,
+                                expected_part_size(
+                                    state.object_len as u64,
+                                    PART_SIZE as u64,
+                                    *part_number,
+                                )
+                                .unwrap(),
                             )
                         })
                         .collect::<Vec<_>>()
