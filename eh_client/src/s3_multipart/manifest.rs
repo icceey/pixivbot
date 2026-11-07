@@ -1,4 +1,4 @@
-use super::{is_safe_session_value, ProviderKind, PART_SIZE};
+use super::{is_safe_session_value, part_count, ProviderKind};
 use crate::error::Error;
 use serde::{Deserialize, Serialize};
 use std::io::{ErrorKind, Write};
@@ -146,6 +146,7 @@ pub(super) fn new_manifest(
     identity: &ManifestIdentity<'_>,
     object_key: String,
     upload_id: String,
+    part_size: u64,
 ) -> crate::Result<MultipartManifest> {
     validate_identity(identity)?;
     if !is_safe_session_value(&object_key) || !is_safe_session_value(&upload_id) {
@@ -179,7 +180,7 @@ pub(super) fn new_manifest(
         object_sha256: identity.object_sha256.to_owned(),
         object_len: identity.object_len,
         content_type: identity.content_type.to_owned(),
-        part_size: PART_SIZE as u64,
+        part_size,
         upload_id,
         zip_extraction_prefix,
         requested_entries_sha256,
@@ -249,7 +250,7 @@ fn validate_manifest(
     if manifest.content_type != identity.content_type {
         return Err(ManifestMismatch::ContentType);
     }
-    if manifest.part_size != PART_SIZE as u64 {
+    if part_count(manifest.object_len, manifest.part_size).is_err() {
         return Err(ManifestMismatch::PartSize);
     }
 

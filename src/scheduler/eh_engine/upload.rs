@@ -352,16 +352,9 @@ impl EhUploadWorker {
         // archive, upload it once and build Telegraph URLs from its per-entry
         // extraction CIDs. A `None` response falls through to per-image upload.
         if self.image_uploader.supports_zip_archive_upload() {
-            let zip_bytes = tokio::fs::read(zip_path)
-                .await
-                .context("Failed to read zip for archive upload")?;
             let archive_manifest_path = artifacts.uploads_dir().join("archive.json");
             let archive_input = ZipArchiveUploadInput {
-                filename: zip_path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("gallery.zip"),
-                bytes: zip_bytes.as_slice(),
+                path: zip_path,
                 entry_names: &entry_names,
                 resume_context: Some(UploadResumeContext {
                     manifest_path: &archive_manifest_path,
