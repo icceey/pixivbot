@@ -121,6 +121,8 @@ download_original_threshold = 1
 # key_prefix = "eh"
 # path_style = true
 # multipart_image_threshold_mb = 8
+# # Multipart part size in MiB (5..=5120); existing uploads keep their saved size.
+# multipart_part_size_mb = 8
 #
 # [image_upload.ipfs3]
 # # ipfS3 is an S3-compatible gateway in front of IPFS (Kubo). It returns the
@@ -145,6 +147,8 @@ download_original_threshold = 1
 # key_prefix = "eh"
 # path_style = true
 # multipart_image_threshold_mb = 8
+# # Multipart part size in MiB (5..=5120); existing uploads keep their saved size.
+# multipart_part_size_mb = 8
 # # Send non-blocking HEAD requests to gateway_url after upload to warm IPFS gateway cache.
 # warm_public_gateway_after_upload = false
 # # ZIP extraction is enabled by default. If your ipfS3 deployment supports the
@@ -217,6 +221,10 @@ download_original_threshold = 1
 # # This controls delivery futures only; the existing Throttle<Bot> remains the
 # # Telegram rate-limit authority.
 # publish_concurrency = 2
+# # Whole-delivery deadline, including throttling and chat-lock waits (seconds, 1..=86400).
+# # Stale publish claims recover at this age; already persisted sent markers are kept.
+# # Telegram may have accepted a timed-out request: retries can duplicate an unmarked send.
+# publish_timeout_sec = 600
 # # Max EH retries after the initial attempt (default: 10).
 # # Retry delay doubles from 2 minutes, capped at 24 hours.
 # max_retry_count = 10

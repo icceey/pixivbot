@@ -116,7 +116,7 @@ mod tests {
             .unwrap();
 
         let error = repo
-            .mark_eh_archive_delivery_sent(delivery.id)
+            .mark_eh_archive_delivery_sent(&delivery)
             .await
             .expect_err("ledger failure must fail the production archive marker");
         assert!(error.to_string().contains("push ledger"));
@@ -136,9 +136,7 @@ mod tests {
         let repo = setup_test_db().await.unwrap();
         let delivery = seed_publishing_delivery(&repo, 403).await;
 
-        repo.mark_eh_archive_delivery_sent(delivery.id)
-            .await
-            .unwrap();
+        repo.mark_eh_archive_delivery_sent(&delivery).await.unwrap();
         let first = ledger_for(&repo, delivery.chat_id, delivery.gid)
             .await
             .expect("first production archive marker must write the push ledger");
@@ -167,9 +165,7 @@ mod tests {
             .await
             .unwrap();
 
-        repo.mark_eh_archive_delivery_sent(delivery.id)
-            .await
-            .unwrap();
+        repo.mark_eh_archive_delivery_sent(&delivery).await.unwrap();
         let latest = ledger_for(&repo, delivery.chat_id, delivery.gid)
             .await
             .expect("second production archive marker must retain the push ledger row");

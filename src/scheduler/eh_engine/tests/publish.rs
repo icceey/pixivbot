@@ -34,6 +34,8 @@ async fn publish_send_serializes_concurrent_enqueue_into_a_clean_next_wave() {
     .with_test_send_hook(EhPublishSendHook {
         entered: Arc::clone(&send_entered),
         release: Arc::clone(&release_send),
+        panic_after_release: false,
+        before_done: None,
         after_done: Some(EhPublishCompletionHook {
             entered: Arc::clone(&done_entered),
             release: Arc::clone(&release_done),
@@ -115,7 +117,7 @@ async fn publish_send_serializes_concurrent_enqueue_into_a_clean_next_wave() {
     assert_ne!(new_wave.job_id, Some(old_job.id));
     assert!(new_wave.archive_sent_at.is_none());
     assert!(new_wave.telegraph_sent_at.is_none());
-    assert!(new_wave.started_at.is_none());
+    assert_eq!(new_wave.started_at, old_wave.started_at);
     assert!(new_wave.completed_at.is_none());
     assert_eq!(new_wave.retry_count, 0);
     assert_eq!(
@@ -181,7 +183,7 @@ async fn markerless_publish_claim_rebinds_to_direct_original_before_chat_lock() 
     assert_eq!(rebound.title, "Requested original");
     assert!(rebound.archive_sent_at.is_none());
     assert!(rebound.telegraph_sent_at.is_none());
-    assert!(rebound.started_at.is_none());
+    assert_eq!(rebound.started_at, old_claim.delivery.started_at);
     assert!(rebound.completed_at.is_none());
     assert!(rebound.error.is_none());
     assert_eq!(rebound.retry_count, 0);
@@ -271,7 +273,7 @@ async fn marker_bearing_subscription_fingerprint_rebind_makes_stale_publish_clai
         .await
         .unwrap()
         .expect("old fingerprint delivery should be claimed for publish");
-    repo.mark_eh_archive_delivery_sent(old_claim.delivery.id)
+    repo.mark_eh_archive_delivery_sent(&old_claim.delivery)
         .await
         .unwrap();
 
@@ -375,6 +377,8 @@ async fn publish_tick_drains_started_sibling_before_returning_refill_claim_error
     .with_test_send_hook(EhPublishSendHook {
         entered: Arc::clone(&send_entered),
         release: Arc::clone(&release_send),
+        panic_after_release: false,
+        before_done: None,
         after_done: None,
     });
     let tick = tokio::spawn(async move { worker.tick().await });
@@ -862,7 +866,7 @@ async fn direct_archive_only_variant_after_partial_publish_starts_a_clean_delive
     assert!(forced.archive_sent_at.is_none());
     assert!(forced.telegraph_sent_at.is_none());
     assert_eq!(forced.retry_count, 0);
-    assert!(forced.started_at.is_none());
+    assert_eq!(forced.started_at, partial.started_at);
     assert!(forced.completed_at.is_none());
     assert!(forced.next_retry_at.is_none());
     assert_eq!(forced.source, SOURCE_DIRECT);
@@ -956,6 +960,8 @@ async fn publish_worker_claims_at_most_two_deliveries_and_refills() {
     .with_test_send_hook(EhPublishSendHook {
         entered: Arc::clone(&send_entered),
         release: Arc::clone(&release_send),
+        panic_after_release: false,
+        before_done: None,
         after_done: None,
     });
 
@@ -1595,4 +1601,228 @@ async fn old_publish_claim_cannot_reset_a_newer_same_path_job_generation() {
             .status,
         DELIVERY_STATUS_WAITING
     );
+}
+
+// A request has actually reached Telegram before the deadline expires. The
+// archive marker must survive, and both the only worker slot and chat lock must
+// become available to a later delivery without restarting the worker.
+#[tokio::test]
+async fn hung_telegraph_send_releases_chat_and_preserves_archive_progress() {
+    let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+    setup_chat(&repo, -100, true).await;
+    let tg_server = MockServer::start().await;
+    let eh_server = MockServer::start().await;
+    let temp = tempfile::tempdir().unwrap();
+    let zip_path = temp.path().join("deadline.zip");
+    create_test_zip(&zip_path, 1);
+    let (job, first) = seed_downloaded_job_with_deliveries(
+        &repo,
+        960,
+        "first",
+        "First",
+        &zip_path,
+        &[(-100, true, "First")],
+    )
+    .await;
+    eh_gallery_jobs::Entity::update_many()
+        .set(eh_gallery_jobs::ActiveModel {
+            telegraph_status: Set(TELEGRAPH_STATUS_READY.to_string()),
+            telegraph_url: Set(Some("https://telegra.ph/deadline".to_string())),
+            ..Default::default()
+        })
+        .filter(eh_gallery_jobs::Column::Id.eq(job.id))
+        .exec(repo.db())
+        .await
+        .unwrap();
+    let (_, second) = seed_downloaded_job_with_deliveries(
+        &repo,
+        961,
+        "second",
+        "Second",
+        &zip_path,
+        &[(-100, false, "Second")],
+    )
+    .await;
+    mock_tg_send_document(&tg_server).await;
+    let request_received = Arc::new(tokio::sync::Notify::new());
+    let received = Arc::clone(&request_received);
+    Mock::given(method("POST"))
+        .and(path("/botfake_token/SendMessage"))
+        .respond_with(move |_: &wiremock::Request| {
+            received.notify_one();
+            ResponseTemplate::new(200).set_delay(Duration::from_secs(3600))
+        })
+        .mount(&tg_server)
+        .await;
+    let mut config = make_config();
+    config.publish_concurrency = 1;
+    config.publish_timeout_sec = 5;
+    let worker = EhPublishWorker::new(
+        Arc::clone(&repo),
+        make_notifier(&tg_server),
+        make_eh_client(&eh_server),
+        None,
+        Arc::new(config),
+    );
+    let tick = tokio::spawn(async move { worker.tick().await });
+    tokio::time::timeout(Duration::from_secs(5), request_received.notified())
+        .await
+        .unwrap();
+    // Pause only after the real request is observed, so virtual time cannot
+    // expire the deadline while network/SQLite setup is still in flight.
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(5)).await;
+    tokio::time::resume();
+    let error = tokio::time::timeout(Duration::from_secs(10), tick)
+        .await
+        .expect("stalled delivery must not hold the tick forever")
+        .unwrap()
+        .unwrap_err();
+    assert!(format!("{:#}", error).contains("timed out"));
+    let failed = eh_download_queue::Entity::find_by_id(first[0].id)
+        .one(repo.db())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(failed.status, DELIVERY_STATUS_WAITING);
+    assert_eq!(failed.retry_count, 1);
+    assert!(failed.archive_sent_at.is_some());
+    assert!(failed.telegraph_sent_at.is_none());
+    let completed = eh_download_queue::Entity::find_by_id(second[0].id)
+        .one(repo.db())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(completed.status, STATUS_DONE);
+    assert_eq!(
+        tg_server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| request.url.path().ends_with("/SendDocument"))
+            .count(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn panicked_publish_task_releases_claim_for_retry() {
+    let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+    setup_chat(&repo, -100, true).await;
+    let tg_server = MockServer::start().await;
+    let eh_server = MockServer::start().await;
+    let temp = tempfile::tempdir().unwrap();
+    let zip_path = temp.path().join("panic.zip");
+    create_test_zip(&zip_path, 1);
+    let (_, deliveries) = seed_downloaded_job_with_deliveries(
+        &repo,
+        962,
+        "panic",
+        "Panic",
+        &zip_path,
+        &[(-100, false, "Panic")],
+    )
+    .await;
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let worker = EhPublishWorker::new(
+        Arc::clone(&repo),
+        make_notifier(&tg_server),
+        make_eh_client(&eh_server),
+        None,
+        Arc::new(make_config()),
+    )
+    .with_test_send_hook(EhPublishSendHook {
+        entered: Arc::clone(&entered),
+        release: Arc::clone(&release),
+        panic_after_release: true,
+        before_done: None,
+        after_done: None,
+    });
+    let tick = tokio::spawn(async move { worker.tick().await });
+    tokio::time::timeout(Duration::from_secs(5), entered.notified())
+        .await
+        .unwrap();
+    release.notify_one();
+    let error = tokio::time::timeout(Duration::from_secs(5), tick)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert!(format!("{:#}", error).contains("panicked"));
+    let delivery = eh_download_queue::Entity::find_by_id(deliveries[0].id)
+        .one(repo.db())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(delivery.status, DELIVERY_STATUS_WAITING);
+    assert_eq!(delivery.retry_count, 1);
+    assert!(delivery.next_retry_at.is_some());
+    assert!(tg_server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn interrupted_completion_does_not_fail_a_fully_sent_delivery() {
+    let repo = Arc::new(tests_helpers::setup_test_db().await.unwrap());
+    setup_chat(&repo, -100, true).await;
+    let tg_server = MockServer::start().await;
+    let eh_server = MockServer::start().await;
+    let temp = tempfile::tempdir().unwrap();
+    let zip_path = temp.path().join("completion.zip");
+    create_test_zip(&zip_path, 1);
+    let (_, deliveries) = seed_downloaded_job_with_deliveries(
+        &repo,
+        963,
+        "completion",
+        "Completion",
+        &zip_path,
+        &[(-100, false, "Completion")],
+    )
+    .await;
+    mock_tg_send_document(&tg_server).await;
+    let sent = Arc::new(tokio::sync::Notify::new());
+    let send_release = Arc::new(tokio::sync::Notify::new());
+    send_release.notify_one();
+    let mut config = make_config();
+    config.max_retry_count = 0;
+    config.publish_timeout_sec = 5;
+    let worker = EhPublishWorker::new(
+        Arc::clone(&repo),
+        make_notifier(&tg_server),
+        make_eh_client(&eh_server),
+        None,
+        Arc::new(config),
+    )
+    .with_test_send_hook(EhPublishSendHook {
+        entered: Arc::new(tokio::sync::Notify::new()),
+        release: send_release,
+        panic_after_release: false,
+        after_done: None,
+        before_done: Some(EhPublishCompletionHook {
+            entered: Arc::clone(&sent),
+            release: Arc::new(tokio::sync::Notify::new()),
+        }),
+    });
+    let tick = tokio::spawn(async move { worker.tick().await });
+    tokio::time::timeout(Duration::from_secs(5), sent.notified())
+        .await
+        .unwrap();
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(5)).await;
+    tokio::time::resume();
+    assert!(tokio::time::timeout(Duration::from_secs(5), tick)
+        .await
+        .unwrap()
+        .unwrap()
+        .is_err());
+    let delivery = eh_download_queue::Entity::find_by_id(deliveries[0].id)
+        .one(repo.db())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(delivery.status, STATUS_DONE);
+    assert_eq!(delivery.retry_count, 0);
+    assert!(delivery.archive_sent_at.is_some());
+    assert_eq!(tg_server.received_requests().await.unwrap().len(), 1);
 }

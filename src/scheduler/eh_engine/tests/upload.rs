@@ -901,7 +901,7 @@ async fn terminal_upload_failure_preserves_configured_archive_with_any_abort_sup
         assert!(!archive_claim.delivery.telegraph);
         assert!(uploader.cleanup_calls.lock().unwrap().is_empty());
 
-        repo.mark_eh_archive_delivery_sent(archive_claim.delivery.id)
+        repo.mark_eh_archive_delivery_sent(&archive_claim.delivery)
             .await
             .unwrap();
         let ledger = eh_gallery_push_ledger::Entity::find()
