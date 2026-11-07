@@ -11,8 +11,9 @@ use crate::db::{
 use crate::scheduler::helpers::get_chat_if_should_notify;
 use anyhow::{Context, Result};
 use eh_client::EhClient;
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 use tokio::task::JoinSet;
+use tokio::time::{Duration, MissedTickBehavior};
 use tracing::{error, info, warn};
 
 pub struct EhPublishWorker {
@@ -30,7 +31,9 @@ pub struct EhPublishWorker {
 pub(super) struct EhPublishSendHook {
     pub(super) entered: Arc<tokio::sync::Notify>,
     pub(super) release: Arc<tokio::sync::Notify>,
+    pub(super) before_done: Option<EhPublishCompletionHook>,
     pub(super) after_done: Option<EhPublishCompletionHook>,
+    pub(super) panic_after_release: bool,
 }
 
 #[cfg(test)]
@@ -79,6 +82,23 @@ impl EhPublishWorker {
     pub(super) async fn tick(&self) -> Result<()> {
         let concurrency = self.config.publish_concurrency_clamped();
         let mut tasks = JoinSet::new();
+        let mut claims = HashMap::new();
+        let timeout = Duration::from_secs(self.config.publish_timeout_sec.clamp(1, 86_400));
+        let mut maintenance = tokio::time::interval(timeout.min(Duration::from_secs(60)));
+        maintenance.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        // The first sweep runs before claiming, even when there are no tasks.
+        maintenance.tick().await;
+        let recovered = self
+            .repo
+            .reset_stale_eh_publish_deliveries(
+                chrono::Local::now().naive_local()
+                    - chrono::Duration::seconds(timeout.as_secs() as i64),
+                &[],
+            )
+            .await?;
+        if recovered > 0 {
+            warn!(count = recovered, "Recovered abandoned EH publish claims");
+        }
         let mut no_more_claims = false;
         let mut first_error = None;
 
@@ -99,7 +119,15 @@ impl EhPublishWorker {
                             #[cfg(test)]
                             publish_send_hook: self.publish_send_hook.clone(),
                         };
-                        tasks.spawn(async move { worker.process_claimed(claim).await });
+                        let delivery = claim.delivery.clone();
+                        let task = tasks.spawn(async move {
+                            // Dropping the timed-out future releases its chat lock before
+                            // the supervisor can retry it. Do not detach the send task.
+                            tokio::time::timeout(timeout, worker.process_claimed(claim))
+                                .await
+                                .context("EH publish delivery timed out; Telegram acceptance may be unknown")?
+                        });
+                        claims.insert(task.id(), delivery);
                     }
                     Ok(None) => break,
                     Err(error) => {
@@ -113,24 +141,76 @@ impl EhPublishWorker {
                 };
             }
 
-            let Some(result) = tasks.join_next().await else {
+            if tasks.is_empty() {
                 break;
-            };
-            match result {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => {
-                    error!("Shared EH publish delivery task failed: {:#}", error);
-                    if first_error.is_none() {
-                        first_error = Some(error);
+            }
+            let result = tokio::select! {
+                result = tasks.join_next_with_id() => result.expect("publish tasks are nonempty"),
+                _ = maintenance.tick() => {
+                    let active_ids: Vec<_> = claims.values().map(|delivery| delivery.id).collect();
+                    match self.repo.reset_stale_eh_publish_deliveries(
+                        chrono::Local::now().naive_local()
+                            - chrono::Duration::seconds(timeout.as_secs() as i64),
+                        &active_ids,
+                    ).await {
+                        Ok(count) if count > 0 => warn!(count, "Recovered abandoned EH publish claims"),
+                        Ok(_) => {},
+                        Err(error) => error!("EH publish claim recovery failed: {:#}", error),
                     }
+                    continue;
                 }
-                Err(error) => {
-                    let error =
-                        anyhow::Error::new(error).context("shared EH publish task join failed");
-                    error!("Shared EH publish delivery task join failed: {:#}", error);
-                    if first_error.is_none() {
-                        first_error = Some(error);
+            };
+            let (id, result) = match result {
+                Ok((id, result)) => (id, result),
+                Err(error) => (
+                    error.id(),
+                    Err(anyhow::Error::new(error).context("shared EH publish task join failed")),
+                ),
+            };
+            let delivery = claims.remove(&id).expect("every publish task has a claim");
+            if let Err(error) = result {
+                error!(
+                    "Shared EH publish delivery {} failed: {:#}",
+                    delivery.id, error
+                );
+                // The task has stopped, so recovery cannot race its send or
+                // marker writes. Re-read with its original generation: a late
+                // failure must never reset a newer claim or a completed wave.
+                let _chat_guard = EH_CHAT_LOCKS.lock_chat(delivery.chat_id).await;
+                match self
+                    .repo
+                    .get_eh_delivery_publish_claim(&delivery, self.config.send_archive)
+                    .await
+                {
+                    Ok(Some(claim)) => {
+                        let delivered = (!self.config.send_archive
+                            || claim.delivery.archive_sent_at.is_some())
+                            && (!claim.delivery.telegraph
+                                || claim.delivery.telegraph_sent_at.is_some());
+                        let recovery = if delivered {
+                            self.repo
+                                .mark_eh_delivery_done(&claim.delivery, self.config.send_archive)
+                                .await
+                                .map(|_| ())
+                        } else {
+                            self.retry_delivery_after_send_failure(&claim.delivery, &error)
+                                .await
+                        };
+                        if let Err(recovery_error) = recovery {
+                            error!(
+                                "Failed to release EH publish claim {}: {:#}",
+                                delivery.id, recovery_error
+                            );
+                        }
                     }
+                    Ok(None) => {}
+                    Err(recovery_error) => error!(
+                        "Failed to reread failed EH publish claim {}: {:#}",
+                        delivery.id, recovery_error
+                    ),
+                }
+                if first_error.is_none() {
+                    first_error = Some(error);
                 }
             }
         }
@@ -146,7 +226,7 @@ impl EhPublishWorker {
         let _chat_guard = EH_CHAT_LOCKS.lock_chat(claim.delivery.chat_id).await;
         let Some(EhDeliveryClaim { delivery, job }) = self
             .repo
-            .get_eh_delivery_publish_claim(claim.delivery.id, self.config.send_archive)
+            .get_eh_delivery_publish_claim(&claim.delivery, self.config.send_archive)
             .await?
         else {
             return Ok(());
@@ -169,7 +249,7 @@ impl EhPublishWorker {
         {
             self.repo
                 .schedule_eh_delivery_retry(
-                    delivery.id,
+                    &delivery,
                     "No configured EH delivery publish surface",
                     0,
                     self.config.send_archive,
@@ -183,7 +263,7 @@ impl EhPublishWorker {
         {
             self.repo
                 .defer_eh_delivery_publish(
-                    delivery.id,
+                    &delivery,
                     self.config.download_poll_interval_sec.max(10) as i64,
                 )
                 .await?;
@@ -201,7 +281,7 @@ impl EhPublishWorker {
         {
             self.repo
                 .defer_eh_delivery_publish(
-                    delivery.id,
+                    &delivery,
                     self.config.download_poll_interval_sec.max(10) as i64,
                 )
                 .await?;
@@ -210,7 +290,7 @@ impl EhPublishWorker {
         if archive_required && (job.status != JOB_STATUS_DOWNLOADED || job.zip_path.is_none()) {
             self.repo
                 .defer_eh_delivery_publish(
-                    delivery.id,
+                    &delivery,
                     self.config.download_poll_interval_sec.max(10) as i64,
                 )
                 .await?;
@@ -243,6 +323,7 @@ impl EhPublishWorker {
             if let Some(hook) = &self.publish_send_hook {
                 hook.entered.notify_one();
                 hook.release.notified().await;
+                assert!(!hook.panic_after_release, "injected EH publish panic");
             }
             if let Err(error) = self
                 .notifier
@@ -250,11 +331,11 @@ impl EhPublishWorker {
                 .await
                 .context("Failed to send archive document")
             {
-                self.retry_delivery_after_send_failure(&delivery, error)
+                self.retry_delivery_after_send_failure(&delivery, &error)
                     .await?;
                 return Ok(());
             }
-            self.repo.mark_eh_archive_delivery_sent(delivery.id).await?;
+            self.repo.mark_eh_archive_delivery_sent(&delivery).await?;
         }
 
         if telegraph_required {
@@ -273,21 +354,29 @@ impl EhPublishWorker {
                 .await
                 .context("Failed to send Telegraph link")
             {
-                self.retry_delivery_after_send_failure(&delivery, error)
+                self.retry_delivery_after_send_failure(&delivery, &error)
                     .await?;
                 return Ok(());
             }
             self.repo
                 .mark_eh_telegraph_delivery_sent(
-                    delivery.id,
-                    job.id,
+                    &delivery,
                     self.rewrite_delay_sec.map(|delay| delay as i64),
                 )
                 .await?;
         }
 
+        #[cfg(test)]
+        if let Some(hook) = self
+            .publish_send_hook
+            .as_ref()
+            .and_then(|hook| hook.before_done.as_ref())
+        {
+            hook.entered.notify_one();
+            hook.release.notified().await;
+        }
         self.repo
-            .mark_eh_delivery_done(delivery.id, job.id, self.config.send_archive)
+            .mark_eh_delivery_done(&delivery, self.config.send_archive)
             .await?;
         #[cfg(test)]
         if let Some(hook) = self
@@ -312,7 +401,7 @@ impl EhPublishWorker {
     ) -> Result<()> {
         self.repo
             .defer_eh_delivery_publish(
-                delivery.id,
+                delivery,
                 self.config.download_poll_interval_sec.max(10) as i64,
             )
             .await?;
@@ -355,12 +444,12 @@ impl EhPublishWorker {
     async fn retry_delivery_after_send_failure(
         &self,
         delivery: &eh_download_queue::Model,
-        error: anyhow::Error,
+        error: &anyhow::Error,
     ) -> Result<()> {
         let (_updated, terminal) = self
             .repo
             .schedule_eh_delivery_retry(
-                delivery.id,
+                delivery,
                 &format!("{:#}", error),
                 self.config.max_retry_count,
                 self.config.send_archive,

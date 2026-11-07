@@ -7,7 +7,7 @@ async fn first_telegraph_delivery_schedules_one_job_rewrite() {
     let (job, deliveries) =
         seed_ready_telegraph_job_with_deliveries(&repo, 712, &[(-100, None), (-200, None)]).await;
 
-    repo.mark_eh_telegraph_delivery_sent(deliveries[0].id, job.id, Some(0))
+    repo.mark_eh_telegraph_delivery_sent(&deliveries[0], Some(0))
         .await
         .unwrap();
     let after_first = eh_gallery_jobs::Entity::find_by_id(job.id)
@@ -33,11 +33,11 @@ async fn first_telegraph_delivery_schedules_one_job_rewrite() {
     assert!(marked_first.telegraph_sent_at.is_some());
     assert!(untouched_second.telegraph_sent_at.is_none());
 
-    repo.mark_eh_telegraph_delivery_sent(deliveries[0].id, job.id, Some(7200))
+    repo.mark_eh_telegraph_delivery_sent(&deliveries[0], Some(7200))
         .await
         .unwrap();
 
-    repo.mark_eh_telegraph_delivery_sent(deliveries[1].id, job.id, Some(3600))
+    repo.mark_eh_telegraph_delivery_sent(&deliveries[1], Some(3600))
         .await
         .unwrap();
     let after_second = eh_gallery_jobs::Entity::find_by_id(job.id)
@@ -127,7 +127,7 @@ async fn job_telegraph_rewrite_worker_attempts_each_migrated_payload_independent
         .exec(repo.db())
         .await
         .unwrap();
-    repo.mark_eh_telegraph_delivery_sent(deliveries[0].id, job.id, Some(0))
+    repo.mark_eh_telegraph_delivery_sent(&deliveries[0], Some(0))
         .await
         .unwrap();
 
@@ -196,7 +196,7 @@ async fn final_delivery_with_delayed_rewrite_keeps_payload_until_rewrite_is_term
     let (job, deliveries) =
         seed_ready_telegraph_job_with_deliveries(&repo, 713, &[(-100, Some(812))]).await;
 
-    repo.mark_eh_telegraph_delivery_sent(deliveries[0].id, job.id, Some(60))
+    repo.mark_eh_telegraph_delivery_sent(&deliveries[0], Some(60))
         .await
         .unwrap();
     repo.cancel_eh_subscription_queue_entries(812, true)

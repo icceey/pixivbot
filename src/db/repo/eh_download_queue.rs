@@ -160,7 +160,7 @@ fn next_claim_generation(now: DateTime, previous: Option<DateTime>) -> Result<Da
     Ok(now_second.max(following_generation))
 }
 
-fn claim_generation_filter(previous: Option<DateTime>) -> sea_orm::Condition {
+pub(super) fn claim_generation_filter(previous: Option<DateTime>) -> sea_orm::Condition {
     match previous {
         Some(generation) => {
             sea_orm::Condition::all().add(eh_download_queue::Column::StartedAt.eq(generation))
@@ -1291,17 +1291,49 @@ impl Repo {
         }
     }
 
+    /// Recover abandoned publish claims without erasing their send progress or
+    /// generation. The supervisor excludes every locally running task, including
+    /// tasks waiting for a chat lock, and cancels overdue tasks before releasing
+    /// their claims. Never use the startup reset while workers are running.
+    pub async fn reset_stale_eh_publish_deliveries(
+        &self,
+        cutoff: DateTime,
+        active_delivery_ids: &[i32],
+    ) -> Result<u64> {
+        let reset = eh_download_queue::Entity::update_many()
+            .set(eh_download_queue::ActiveModel {
+                status: Set(STATUS_WAITING.to_string()),
+                next_retry_at: Set(None),
+                error: Set(Some("Recovered abandoned EH publish claim".to_string())),
+                ..Default::default()
+            })
+            .filter(eh_download_queue::Column::Status.eq(STATUS_PUBLISHING))
+            .filter(
+                eh_download_queue::Column::StartedAt
+                    .is_null()
+                    .or(eh_download_queue::Column::StartedAt.lte(cutoff)),
+            )
+            .filter(eh_download_queue::Column::Id.is_not_in(active_delivery_ids.iter().copied()))
+            .exec(&self.db)
+            .await
+            .context("Failed to recover abandoned EH publish claims")?;
+        Ok(reset.rows_affected)
+    }
+
     /// Re-read a currently publishing delivery with its shared job. Publish
     /// workers call this after acquiring the keyed chat lock so cancellation,
     /// marker progress, and job readiness are observed as one fresh snapshot.
     pub async fn get_eh_delivery_publish_claim(
         &self,
-        delivery_id: i32,
+        expected: &eh_download_queue::Model,
         send_archive: bool,
     ) -> Result<Option<EhDeliveryClaim>> {
+        let delivery_id = expected.id;
         let Some((delivery, job)) = eh_download_queue::Entity::find()
             .find_also_related(eh_gallery_jobs::Entity)
             .filter(eh_download_queue::Column::Id.eq(delivery_id))
+            .filter(claim_generation_filter(expected.started_at))
+            .filter(job_id_filter(expected.job_id))
             .filter(eh_download_queue::Column::Status.eq(STATUS_PUBLISHING))
             .one(&self.db)
             .await
@@ -1320,6 +1352,7 @@ impl Repo {
                     ..Default::default()
                 })
                 .filter(eh_download_queue::Column::Id.eq(delivery.id))
+                .filter(claim_generation_filter(expected.started_at))
                 .filter(eh_download_queue::Column::JobId.eq(job.id))
                 .filter(eh_download_queue::Column::Status.eq(STATUS_PUBLISHING))
                 .exec(&self.db)
@@ -1345,7 +1378,12 @@ impl Repo {
 
     /// Release a claimed delivery without burning a retry. A positive delay is
     /// required so a tick that is refilling workers cannot reclaim it forever.
-    pub async fn defer_eh_delivery_publish(&self, delivery_id: i32, delay_secs: i64) -> Result<()> {
+    pub async fn defer_eh_delivery_publish(
+        &self,
+        expected: &eh_download_queue::Model,
+        delay_secs: i64,
+    ) -> Result<()> {
+        let delivery_id = expected.id;
         let retry_at = Local::now().naive_local() + chrono::Duration::seconds(delay_secs.max(1));
         let result = eh_download_queue::Entity::update_many()
             .set(eh_download_queue::ActiveModel {
@@ -1354,6 +1392,8 @@ impl Repo {
                 ..Default::default()
             })
             .filter(eh_download_queue::Column::Id.eq(delivery_id))
+            .filter(claim_generation_filter(expected.started_at))
+            .filter(job_id_filter(expected.job_id))
             .filter(eh_download_queue::Column::Status.eq(STATUS_PUBLISHING))
             .exec(&self.db)
             .await
@@ -1371,14 +1411,14 @@ impl Repo {
     /// remains on its job and is intentionally untouched.
     pub async fn schedule_eh_delivery_retry(
         &self,
-        delivery_id: i32,
+        expected: &eh_download_queue::Model,
         error: &str,
         max_retry_count: u8,
         send_archive: bool,
     ) -> Result<(eh_download_queue::Model, bool)> {
         for _ in 0..SQLITE_TRANSACTION_ATTEMPTS {
             match self
-                .schedule_eh_delivery_retry_once(delivery_id, error, max_retry_count, send_archive)
+                .schedule_eh_delivery_retry_once(expected, error, max_retry_count, send_archive)
                 .await
             {
                 Ok(outcome) => return Ok(outcome),
@@ -1389,17 +1429,18 @@ impl Repo {
                 }
             }
         }
-        self.schedule_eh_delivery_retry_once(delivery_id, error, max_retry_count, send_archive)
+        self.schedule_eh_delivery_retry_once(expected, error, max_retry_count, send_archive)
             .await
     }
 
     async fn schedule_eh_delivery_retry_once(
         &self,
-        delivery_id: i32,
+        expected: &eh_download_queue::Model,
         error: &str,
         max_retry_count: u8,
         send_archive: bool,
     ) -> Result<(eh_download_queue::Model, bool)> {
+        let delivery_id = expected.id;
         let txn = self
             .db
             .begin()
@@ -1430,8 +1471,9 @@ impl Repo {
                     ..Default::default()
                 })
                 .filter(eh_download_queue::Column::Id.eq(delivery_id))
-                .filter(eh_download_queue::Column::Status.eq(STATUS_PUBLISHING))
-                .filter(job_id_filter(delivery.job_id));
+                .filter(claim_generation_filter(expected.started_at))
+                .filter(job_id_filter(expected.job_id))
+                .filter(eh_download_queue::Column::Status.eq(STATUS_PUBLISHING));
             if terminal {
                 update = update.set(eh_download_queue::ActiveModel {
                     completed_at: Set(Some(now)),
@@ -1492,9 +1534,12 @@ impl Repo {
 
     /// Persist the archive marker for one delivery immediately after Telegram
     /// accepts its document. The marker is deliberately delivery-local.
-    pub async fn mark_eh_archive_delivery_sent(&self, delivery_id: i32) -> Result<()> {
+    pub async fn mark_eh_archive_delivery_sent(
+        &self,
+        expected: &eh_download_queue::Model,
+    ) -> Result<()> {
         for _ in 0..SQLITE_TRANSACTION_ATTEMPTS {
-            match self.mark_eh_archive_delivery_sent_once(delivery_id).await {
+            match self.mark_eh_archive_delivery_sent_once(expected).await {
                 Ok(()) => return Ok(()),
                 Err(error) => {
                     if !is_retryable_sqlite_lock_error(&error) {
@@ -1503,10 +1548,14 @@ impl Repo {
                 }
             }
         }
-        self.mark_eh_archive_delivery_sent_once(delivery_id).await
+        self.mark_eh_archive_delivery_sent_once(expected).await
     }
 
-    async fn mark_eh_archive_delivery_sent_once(&self, delivery_id: i32) -> Result<()> {
+    async fn mark_eh_archive_delivery_sent_once(
+        &self,
+        expected: &eh_download_queue::Model,
+    ) -> Result<()> {
+        let delivery_id = expected.id;
         let txn = self
             .db
             .begin()
@@ -1525,6 +1574,8 @@ impl Repo {
                     Expr::value(Some(sent_at)),
                 )
                 .filter(eh_download_queue::Column::Id.eq(delivery_id))
+                .filter(claim_generation_filter(expected.started_at))
+                .filter(job_id_filter(expected.job_id))
                 .filter(eh_download_queue::Column::Status.eq(STATUS_PUBLISHING))
                 .filter(eh_download_queue::Column::ArchiveSentAt.is_null())
                 .exec(&txn)
@@ -1564,13 +1615,12 @@ impl Repo {
     /// have durable sent markers.
     pub async fn mark_eh_delivery_done(
         &self,
-        delivery_id: i32,
-        expected_job_id: i32,
+        expected: &eh_download_queue::Model,
         send_archive: bool,
     ) -> Result<eh_download_queue::Model> {
         for _ in 0..SQLITE_TRANSACTION_ATTEMPTS {
             match self
-                .mark_eh_delivery_done_once(delivery_id, expected_job_id, send_archive)
+                .mark_eh_delivery_done_once(expected, send_archive)
                 .await
             {
                 Ok(delivery) => return Ok(delivery),
@@ -1581,16 +1631,19 @@ impl Repo {
                 }
             }
         }
-        self.mark_eh_delivery_done_once(delivery_id, expected_job_id, send_archive)
+        self.mark_eh_delivery_done_once(expected, send_archive)
             .await
     }
 
     async fn mark_eh_delivery_done_once(
         &self,
-        delivery_id: i32,
-        expected_job_id: i32,
+        expected: &eh_download_queue::Model,
         send_archive: bool,
     ) -> Result<eh_download_queue::Model> {
+        let delivery_id = expected.id;
+        let expected_job_id = expected
+            .job_id
+            .context("EH delivery completion requires a shared job")?;
         let txn = self
             .db
             .begin()
@@ -1606,6 +1659,7 @@ impl Repo {
                     ..Default::default()
                 })
                 .filter(eh_download_queue::Column::Id.eq(delivery_id))
+                .filter(claim_generation_filter(expected.started_at))
                 .filter(eh_download_queue::Column::JobId.eq(expected_job_id))
                 .filter(eh_download_queue::Column::Status.eq(STATUS_PUBLISHING))
                 .exec(&txn)
@@ -1948,6 +2002,80 @@ mod tests {
             .unwrap()
     }
 
+    #[tokio::test]
+    async fn stale_publish_recovery_preserves_progress_and_fences_the_previous_generation() {
+        let repo = tests_helpers::setup_test_db().await.unwrap();
+        let (old, job) = seed_publishing_archive_delivery(&repo, 90_003).await;
+        // Keep an unsent Telegraph surface so the old worker's late marker can
+        // corrupt the replacement claim unless generation fencing is applied.
+        eh_download_queue::Entity::update_many()
+            .col_expr(eh_download_queue::Column::Telegraph, Expr::value(true))
+            .filter(eh_download_queue::Column::Id.eq(old.id))
+            .exec(repo.db())
+            .await
+            .unwrap();
+        eh_gallery_jobs::Entity::update_many()
+            .set(eh_gallery_jobs::ActiveModel {
+                telegraph_status: Set(TELEGRAPH_STATUS_READY.to_string()),
+                telegraph_url: Set(Some("https://telegra.ph/recovered".to_string())),
+                ..Default::default()
+            })
+            .filter(eh_gallery_jobs::Column::Id.eq(job.id))
+            .exec(repo.db())
+            .await
+            .unwrap();
+        repo.mark_eh_archive_delivery_sent(&old).await.unwrap();
+        let cutoff = old.started_at.unwrap() + chrono::Duration::seconds(1);
+        assert_eq!(
+            repo.reset_stale_eh_publish_deliveries(cutoff, &[old.id])
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            repo.reset_stale_eh_publish_deliveries(cutoff, &[])
+                .await
+                .unwrap(),
+            1
+        );
+        let new = repo
+            .get_next_eh_delivery_for_publish(true)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(new.delivery.id, old.id);
+        assert!(new.delivery.started_at > old.started_at);
+        assert!(new.delivery.archive_sent_at.is_some());
+        assert!(new.delivery.telegraph_sent_at.is_none());
+        assert!(repo
+            .get_eh_delivery_publish_claim(&old, true)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(repo
+            .mark_eh_telegraph_delivery_sent(&old, None)
+            .await
+            .is_err());
+        assert!(repo.defer_eh_delivery_publish(&old, 60).await.is_err());
+        assert!(repo
+            .schedule_eh_delivery_retry(&old, "late failure", 0, true)
+            .await
+            .is_err());
+        assert!(repo.mark_eh_delivery_done(&old, true).await.is_err());
+        let unchanged = eh_download_queue::Entity::find_by_id(old.id)
+            .one(repo.db())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(unchanged, new.delivery);
+        repo.mark_eh_telegraph_delivery_sent(&new.delivery, None)
+            .await
+            .unwrap();
+        repo.mark_eh_delivery_done(&new.delivery, true)
+            .await
+            .unwrap();
+    }
+
     /// Deferred read→write transactions on a WAL database deterministically
     /// fail with SQLITE_BUSY_SNAPSHOT (517) when another connection commits
     /// between the candidate SELECT and the claiming UPDATE. The publish
@@ -2031,12 +2159,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (repo, outside) = setup_wal_file_db(&dir).await;
         let (delivery, job) = seed_publishing_archive_delivery(&repo, 90_002).await;
-        repo.mark_eh_archive_delivery_sent(delivery.id)
-            .await
-            .unwrap();
-        repo.mark_eh_delivery_done(delivery.id, job.id, true)
-            .await
-            .unwrap();
+        repo.mark_eh_archive_delivery_sent(&delivery).await.unwrap();
+        repo.mark_eh_delivery_done(&delivery, true).await.unwrap();
         let cleanup = repo.get_next_eh_job_for_cleanup().await.unwrap().unwrap();
         let gate = std::sync::Arc::new(tokio::sync::Barrier::new(2));
         let finalize = {
@@ -3180,7 +3304,9 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(publish_claim.delivery.id, model.id);
-        repo.defer_eh_delivery_publish(model.id, 1).await.unwrap();
+        repo.defer_eh_delivery_publish(&publish_claim.delivery, 1)
+            .await
+            .unwrap();
 
         // A delivery that now needs Telegraph is not claimable until the shared
         // Telegraph page is ready, even though its archive remains downloaded.
@@ -3253,7 +3379,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        repo.mark_eh_archive_delivery_sent(claim.delivery.id)
+        repo.mark_eh_archive_delivery_sent(&claim.delivery)
             .await
             .unwrap();
         Entity::update_many()
@@ -3274,7 +3400,7 @@ mod tests {
             .expect("a requested surface with a sent marker must be claimable to finish");
         assert_eq!(marker_complete.delivery.id, delivery.id);
         let done = repo
-            .mark_eh_delivery_done(marker_complete.delivery.id, marker_complete.job.id, false)
+            .mark_eh_delivery_done(&marker_complete.delivery, false)
             .await
             .unwrap();
         assert_eq!(done.status, STATUS_DONE);
@@ -3358,7 +3484,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(first_claim.delivery.id, first_ready.id);
-        repo.defer_eh_delivery_publish(first_claim.delivery.id, 60)
+        repo.defer_eh_delivery_publish(&first_claim.delivery, 60)
             .await
             .unwrap();
 
@@ -3420,7 +3546,7 @@ mod tests {
             "another chat must receive the next publish slot"
         );
 
-        repo.defer_eh_delivery_publish(first.delivery.id, 60)
+        repo.defer_eh_delivery_publish(&first.delivery, 60)
             .await
             .unwrap();
         let third = repo
@@ -3503,7 +3629,7 @@ mod tests {
             .expect("ready Telegraph must not depend on archive cleanup");
         assert_eq!(claim.delivery.id, delivery.id);
         assert!(
-            repo.get_eh_delivery_publish_claim(delivery.id, false)
+            repo.get_eh_delivery_publish_claim(&claim.delivery, false)
                 .await
                 .unwrap()
                 .is_some(),
@@ -4023,12 +4149,14 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(claim.delivery.id, model.id);
-        repo.mark_eh_archive_delivery_sent(model.id).await.unwrap();
-        repo.mark_eh_telegraph_delivery_sent(model.id, claim.job.id, None)
+        repo.mark_eh_archive_delivery_sent(&claim.delivery)
+            .await
+            .unwrap();
+        repo.mark_eh_telegraph_delivery_sent(&claim.delivery, None)
             .await
             .unwrap();
 
-        repo.schedule_eh_delivery_retry(model.id, "telegram failed", 3, true)
+        repo.schedule_eh_delivery_retry(&claim.delivery, "telegram failed", 3, true)
             .await
             .unwrap();
         let preserved = Entity::find_by_id(model.id)
@@ -4583,14 +4711,12 @@ mod tests {
 
         let repo = tests_helpers::setup_test_db().await.unwrap();
         let (delivery, job) = seed_publishing_archive_delivery(&repo, 901).await;
-        repo.mark_eh_archive_delivery_sent(delivery.id)
-            .await
-            .unwrap();
+        repo.mark_eh_archive_delivery_sent(&delivery).await.unwrap();
 
         let error = EH_JOB_LIVENESS_UPDATE_FAILURE
             .scope(
                 Arc::new(AtomicBool::new(true)),
-                repo.mark_eh_delivery_done(delivery.id, job.id, true),
+                repo.mark_eh_delivery_done(&delivery, true),
             )
             .await
             .unwrap_err();
@@ -4612,10 +4738,7 @@ mod tests {
         assert_eq!(rolled_back_job.status, JOB_STATUS_DOWNLOADED);
         assert_eq!(rolled_back_job.cleanup_status, CLEANUP_STATUS_NONE);
 
-        let done = repo
-            .mark_eh_delivery_done(delivery.id, job.id, true)
-            .await
-            .unwrap();
+        let done = repo.mark_eh_delivery_done(&delivery, true).await.unwrap();
         let settled_job = eh_gallery_jobs::Entity::find_by_id(job.id)
             .one(repo.db())
             .await
@@ -4637,7 +4760,7 @@ mod tests {
         let error = EH_JOB_LIVENESS_UPDATE_FAILURE
             .scope(
                 Arc::new(AtomicBool::new(true)),
-                repo.schedule_eh_delivery_retry(delivery.id, "telegram failed", 0, true),
+                repo.schedule_eh_delivery_retry(&delivery, "telegram failed", 0, true),
             )
             .await
             .unwrap_err();
@@ -4661,7 +4784,7 @@ mod tests {
         assert_eq!(rolled_back_job.cleanup_status, CLEANUP_STATUS_NONE);
 
         let (failed, terminal) = repo
-            .schedule_eh_delivery_retry(delivery.id, "telegram failed", 0, true)
+            .schedule_eh_delivery_retry(&delivery, "telegram failed", 0, true)
             .await
             .unwrap();
         let settled_job = eh_gallery_jobs::Entity::find_by_id(job.id)
@@ -5695,12 +5818,14 @@ mod tests {
         )
         .await
         .unwrap();
-        let _publish_claim = repo
+        let claim = repo
             .get_next_eh_delivery_for_publish(true)
             .await
             .unwrap()
             .unwrap();
-        repo.mark_eh_archive_delivery_sent(model.id).await.unwrap();
+        repo.mark_eh_archive_delivery_sent(&claim.delivery)
+            .await
+            .unwrap();
 
         let merged = repo
             .enqueue_eh_download(
@@ -5720,7 +5845,7 @@ mod tests {
 
         assert_eq!(merged.status, STATUS_WAITING);
         assert_ne!(merged.job_id, model.job_id);
-        assert!(merged.started_at.is_none());
+        assert_eq!(merged.started_at, claim.delivery.started_at);
         assert!(merged.archive_sent_at.is_none());
         assert!(merged.telegraph_sent_at.is_none());
         assert!(merged.telegraph);
