@@ -2,9 +2,9 @@ use super::Repo;
 use crate::config::EhentaiConfig;
 use crate::db::entities::{eh_download_queue, eh_gallery_jobs, eh_gallery_push_ledger};
 use crate::db::repo::eh_download_queue::{
-    eh_pending_telegraph_delivery_filter, is_retryable_sqlite_lock_error, merge_subscription_ids,
-    merge_telegraph_subscription_ids, EH_CHAT_LOCKS, SOURCE_DIRECT, SOURCE_SUBSCRIPTION,
-    SQLITE_TRANSACTION_ATTEMPTS,
+    claim_generation_filter, eh_pending_telegraph_delivery_filter, is_retryable_sqlite_lock_error,
+    merge_subscription_ids, merge_telegraph_subscription_ids, EH_CHAT_LOCKS, SOURCE_DIRECT,
+    SOURCE_SUBSCRIPTION, SQLITE_TRANSACTION_ATTEMPTS,
 };
 use crate::db::repo::eh_gallery_push_ledger::{record_eh_push_in_txn, EhPushSurface};
 use crate::db::repo::eh_gallery_results::{
@@ -911,7 +911,7 @@ impl Repo {
                     gp_cost: Set(0_i64),
                     error: Set(None),
                     retry_count: Set(0_i32),
-                    started_at: Set(None),
+                    // Keep the last claim generation to fence delayed publishers across waves.
                     completed_at: Set(None),
                     zip_path: Set(None),
                     telegraph_url: Set(None),
@@ -951,7 +951,8 @@ impl Repo {
 
         if terminal || direct_marker_bearing_rebind || subscription_fingerprint_generation_rebind {
             // Keep `created_at` stable: delivery ordering remains attached to
-            // the chat/gid record while every wave-local field starts clean.
+            // the chat/gid record. Retain the claim generation for fencing,
+            // while other wave-local fields start clean.
             let reset_telegraph = if subscription_fingerprint_generation_rebind {
                 merged_telegraph
             } else {
@@ -998,7 +999,7 @@ impl Repo {
                     gp_cost: Set(0_i64),
                     error: Set(None),
                     retry_count: Set(0_i32),
-                    started_at: Set(None),
+                    // Keep the last claim generation to fence delayed publishers across waves.
                     completed_at: Set(None),
                     zip_path: Set(None),
                     telegraph_url: Set(None),
@@ -1916,10 +1917,13 @@ impl Repo {
     /// Telegraph rewrite exactly once.
     pub async fn mark_eh_telegraph_delivery_sent(
         &self,
-        delivery_id: i32,
-        job_id: i32,
+        expected: &eh_download_queue::Model,
         rewrite_delay_secs: Option<i64>,
     ) -> Result<()> {
+        let delivery_id = expected.id;
+        let job_id = expected
+            .job_id
+            .context("EH Telegraph sent marker requires a shared job")?;
         let txn = self
             .db
             .begin()
@@ -1928,6 +1932,7 @@ impl Repo {
         let result: Result<()> = async {
             let delivery = eh_download_queue::Entity::find()
                 .filter(eh_download_queue::Column::Id.eq(delivery_id))
+                .filter(claim_generation_filter(expected.started_at))
                 .filter(eh_download_queue::Column::JobId.eq(job_id))
                 .filter(eh_download_queue::Column::Telegraph.eq(true))
                 .filter(eh_download_queue::Column::Status.eq(DELIVERY_STATUS_PUBLISHING))
@@ -1942,6 +1947,7 @@ impl Repo {
                     Expr::value(Some(now)),
                 )
                 .filter(eh_download_queue::Column::Id.eq(delivery_id))
+                .filter(claim_generation_filter(expected.started_at))
                 .filter(eh_download_queue::Column::JobId.eq(job_id))
                 .filter(eh_download_queue::Column::Telegraph.eq(true))
                 .filter(eh_download_queue::Column::Status.eq(DELIVERY_STATUS_PUBLISHING))
@@ -1954,6 +1960,7 @@ impl Repo {
             } else {
                 let already_marked = eh_download_queue::Entity::find()
                     .filter(eh_download_queue::Column::Id.eq(delivery_id))
+                    .filter(claim_generation_filter(expected.started_at))
                     .filter(eh_download_queue::Column::JobId.eq(job_id))
                     .filter(eh_download_queue::Column::Telegraph.eq(true))
                     .filter(eh_download_queue::Column::Status.eq(DELIVERY_STATUS_PUBLISHING))
@@ -2386,7 +2393,6 @@ impl Repo {
                     );
                 } else {
                     transition = transition.set(eh_download_queue::ActiveModel {
-                        started_at: Set(None),
                         completed_at: Set(None),
                         ..Default::default()
                     });
@@ -4449,11 +4455,11 @@ mod tests {
             assert_eq!(claimed.delivery.archive_sent_at, archive_sent_at);
             assert_eq!(claimed.delivery.telegraph_sent_at, telegraph_sent_at);
             if archive_already_sent {
-                repo.mark_eh_telegraph_delivery_sent(claimed.delivery.id, claimed.job.id, None)
+                repo.mark_eh_telegraph_delivery_sent(&claimed.delivery, None)
                     .await
                     .unwrap();
             } else {
-                repo.mark_eh_archive_delivery_sent(claimed.delivery.id)
+                repo.mark_eh_archive_delivery_sent(&claimed.delivery)
                     .await
                     .unwrap();
             }
@@ -5242,7 +5248,7 @@ mod tests {
             .await
             .unwrap()
             .expect("old generation should be publishable");
-        repo.mark_eh_archive_delivery_sent(claimed.delivery.id)
+        repo.mark_eh_archive_delivery_sent(&claimed.delivery)
             .await
             .unwrap();
         let marked = eh_download_queue::Entity::find_by_id(first.id)
@@ -5368,7 +5374,7 @@ mod tests {
             .await
             .unwrap()
             .expect("existing generation should be publishable");
-        repo.mark_eh_archive_delivery_sent(claim.delivery.id)
+        repo.mark_eh_archive_delivery_sent(&claim.delivery)
             .await
             .unwrap();
 
@@ -5883,7 +5889,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(publish.delivery.id, reused.id);
-        repo.mark_eh_telegraph_delivery_sent(reused.id, ready.id, Some(0))
+        repo.mark_eh_telegraph_delivery_sent(&publish.delivery, Some(0))
             .await
             .unwrap();
         let scheduled = load_eh_job(&repo, ready.id).await;
@@ -6001,10 +6007,10 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(archive_only_claim.delivery.id, archive_only.id);
-        repo.mark_eh_archive_delivery_sent(archive_only.id)
+        repo.mark_eh_archive_delivery_sent(&archive_only_claim.delivery)
             .await
             .unwrap();
-        repo.mark_eh_delivery_done(archive_only.id, claimed_upload.id, true)
+        repo.mark_eh_delivery_done(&archive_only_claim.delivery, true)
             .await
             .unwrap();
         let late_claim = repo
@@ -6426,7 +6432,7 @@ mod tests {
             .exec(repo.db())
             .await
             .unwrap();
-        repo.mark_eh_telegraph_delivery_sent(first.id, download.id, Some(0))
+        repo.mark_eh_telegraph_delivery_sent(&first, Some(0))
             .await
             .unwrap();
         let rewrite = repo
@@ -6998,10 +7004,8 @@ mod tests {
             .exec(repo.db())
             .await
             .unwrap();
-        repo.mark_eh_archive_delivery_sent(delivery.id)
-            .await
-            .unwrap();
-        repo.mark_eh_telegraph_delivery_sent(delivery.id, job.id, Some(0))
+        repo.mark_eh_archive_delivery_sent(&delivery).await.unwrap();
+        repo.mark_eh_telegraph_delivery_sent(&delivery, Some(0))
             .await
             .unwrap();
         eh_download_queue::Entity::update_many()
@@ -7178,10 +7182,8 @@ mod tests {
             .exec(repo.db())
             .await
             .unwrap();
-        repo.mark_eh_archive_delivery_sent(delivery.id)
-            .await
-            .unwrap();
-        repo.mark_eh_telegraph_delivery_sent(delivery.id, job.id, Some(0))
+        repo.mark_eh_archive_delivery_sent(&delivery).await.unwrap();
+        repo.mark_eh_telegraph_delivery_sent(&delivery, Some(0))
             .await
             .unwrap();
         eh_download_queue::Entity::update_many()
@@ -7910,7 +7912,7 @@ mod tests {
             job.telegraph_rewrite_data.as_deref(),
         )
         .await;
-        repo.mark_eh_telegraph_delivery_sent(delivery.id, job.id, Some(0))
+        repo.mark_eh_telegraph_delivery_sent(&delivery, Some(0))
             .await
             .unwrap();
 
@@ -7995,7 +7997,7 @@ mod tests {
     async fn stale_job_telegraph_rewrite_preserves_payload_and_advances_generation() {
         let repo = tests_helpers::setup_test_db().await.unwrap();
         let (job, delivery) = seed_rewrite_ready_job(&repo, 75).await;
-        repo.mark_eh_telegraph_delivery_sent(delivery.id, job.id, Some(0))
+        repo.mark_eh_telegraph_delivery_sent(&delivery, Some(0))
             .await
             .unwrap();
         let claimed = repo
@@ -8041,7 +8043,7 @@ mod tests {
     async fn job_telegraph_rewrite_exhaustion_is_terminal_only_once() {
         let repo = tests_helpers::setup_test_db().await.unwrap();
         let (job, delivery) = seed_rewrite_ready_job(&repo, 76).await;
-        repo.mark_eh_telegraph_delivery_sent(delivery.id, job.id, Some(0))
+        repo.mark_eh_telegraph_delivery_sent(&delivery, Some(0))
             .await
             .unwrap();
         let claimed = repo
@@ -8967,7 +8969,7 @@ mod tests {
         assert_eq!(reenqueued.gp_cost, 0);
         assert!(reenqueued.error.is_none());
         assert_eq!(reenqueued.retry_count, 0);
-        assert!(reenqueued.started_at.is_none());
+        assert_eq!(reenqueued.started_at, Some(now));
         assert!(reenqueued.completed_at.is_none());
         assert!(reenqueued.zip_path.is_none());
         assert!(reenqueued.telegraph_url.is_none());

@@ -449,6 +449,10 @@ pub struct EhentaiConfig {
     /// sole Telegram rate-limit authority.
     #[serde(default = "default_eh_publish_concurrency")]
     pub publish_concurrency: usize,
+    /// Deadline for an entire delivery, including chat-lock and Telegram waits.
+    /// Clamped to 1..=86400 seconds at runtime; abandoned claims use the same age.
+    #[serde(default = "default_eh_publish_timeout_sec")]
+    pub publish_timeout_sec: u64,
 }
 
 impl Default for EhentaiConfig {
@@ -483,6 +487,7 @@ impl Default for EhentaiConfig {
             background_download_stale_sec: default_eh_background_download_stale_sec(),
             pushed_cap: default_eh_pushed_cap(),
             publish_concurrency: default_eh_publish_concurrency(),
+            publish_timeout_sec: default_eh_publish_timeout_sec(),
         }
     }
 }
@@ -667,6 +672,10 @@ fn default_eh_background_download_stale_sec() -> u64 {
 
 fn default_eh_pushed_cap() -> usize {
     500
+}
+
+fn default_eh_publish_timeout_sec() -> u64 {
+    600
 }
 
 fn default_eh_publish_concurrency() -> usize {
