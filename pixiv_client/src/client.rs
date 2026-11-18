@@ -146,6 +146,25 @@ impl PixivClient {
         Ok(result)
     }
 
+    async fn anonymous_get_text(&self, url: reqwest::Url) -> Result<String> {
+        let response = self
+            .client
+            .get(url)
+            // pixivision serves different article markup to the authenticated iOS app's user agent.
+            .header(USER_AGENT, concat!("PixivBot/", env!("CARGO_PKG_VERSION")))
+            .send()
+            .await?;
+        let status = response.status();
+        let text = response.text().await?;
+        if !status.is_success() {
+            return Err(Error::Api {
+                message: text,
+                status: status.as_u16(),
+            });
+        }
+        Ok(text)
+    }
+
     /// 获取用户作品列表
     ///
     /// # 参数
@@ -172,6 +191,80 @@ impl PixivClient {
         }
 
         self.get("/v1/user/illusts", &params).await
+    }
+
+    /// 获取用户公开收藏，使用 `max_bookmark_id` 游标分页。
+    pub async fn user_bookmarks_illust(
+        &self,
+        user_id: u64,
+        max_bookmark_id: Option<u64>,
+    ) -> Result<UserIllusts> {
+        let mut params = vec![
+            ("user_id", user_id.to_string()),
+            ("restrict", "public".to_string()),
+            ("filter", "for_ios".to_string()),
+        ];
+        if let Some(cursor) = max_bookmark_id {
+            params.push(("max_bookmark_id", cursor.to_string()));
+        }
+        self.get("/v1/user/bookmarks/illust", &params).await
+    }
+
+    /// 获取官方合集中的作品 ID，按页面视觉位置排序。
+    pub async fn collection_work_ids(&self, collection_id: &str) -> Result<Vec<u64>> {
+        if collection_id.is_empty() || !collection_id.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(Error::Other("Invalid Pixiv collection ID".to_string()));
+        }
+        let url = reqwest::Url::parse(&format!(
+            "https://www.pixiv.net/ajax/collection/{collection_id}"
+        ))
+        .map_err(|error| Error::Other(format!("Invalid Pixiv collection URL: {error}")))?;
+        let text = self.anonymous_get_text(url).await?;
+        crate::gallery::collection_work_ids(&text)
+    }
+
+    /// 获取作者主页中全部插画和漫画作品 ID。
+    pub async fn author_work_ids(&self, user_id: u64) -> Result<Vec<u64>> {
+        let url = reqwest::Url::parse(&format!(
+            "https://www.pixiv.net/ajax/user/{user_id}/profile/all"
+        ))
+        .map_err(|error| Error::Other(format!("Invalid Pixiv author URL: {error}")))?;
+        let text = self.anonymous_get_text(url).await?;
+        crate::gallery::author_work_ids(&text)
+    }
+
+    /// 获取 pixivision 正文中按展示顺序出现的全部作品 ID。
+    pub async fn pixivision_work_ids(&self, lang: &str, article_id: u64) -> Result<Vec<u64>> {
+        if lang.is_empty()
+            || !lang
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        {
+            return Err(Error::Other("Invalid pixivision language".to_string()));
+        }
+        let mut page_number = 1;
+        let mut work_ids = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        loop {
+            let mut url =
+                reqwest::Url::parse(&format!("https://www.pixivision.net/{lang}/a/{article_id}"))
+                    .map_err(|error| Error::Other(format!("Invalid pixivision URL: {error}")))?;
+            if page_number > 1 {
+                url.query_pairs_mut()
+                    .append_pair("p", &page_number.to_string());
+            }
+            let html = self.anonymous_get_text(url.clone()).await?;
+            let page = crate::gallery::pixivision_page(&html, &url, lang, article_id, page_number)?;
+            work_ids.extend(
+                page.work_ids
+                    .into_iter()
+                    .filter(|work_id| seen.insert(*work_id)),
+            );
+            match page.next_page {
+                Some(next_page) => page_number = next_page,
+                None => return Ok(work_ids),
+            }
+        }
     }
 
     /// 按精确标签查询指定日期范围，按作品发布时间从旧到新分页。
