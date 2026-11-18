@@ -40,7 +40,9 @@ pub enum Command {
     DisableChat(String),
     #[command(description = "显示和管理聊天设置")]
     Settings,
-    #[command(description = "下载作品原图\n  用法: /download <url|id> 或回复消息")]
+    #[command(
+        description = "下载作品或合集原图\n  用法: /download <作品URL|ID|合集URL> [limit=N] 或回复消息"
+    )]
     Download(String),
     #[command(description = "订阅 Booru 标签\n  用法: /bsub [ch=<频道ID>] <站点:标签> [过滤条件]")]
     BSub(String),
@@ -65,7 +67,7 @@ pub enum Command {
     #[command(description = "查看当前聊天的 E-Hentai 下载队列", parse_with = "split")]
     EStatus {},
     #[command(
-        description = "下载 E-Hentai 画廊并上传 Telegraph\n  用法: /telegraph <url> 或回复消息"
+        description = "发布画廊或合集到 Telegraph\n  用法: /telegraph <画廊URL|合集URL> [limit=N] 或回复消息"
     )]
     Telegraph(String),
     #[command(description = "取消当前设置操作")]
@@ -74,7 +76,11 @@ pub enum Command {
 
 impl Command {
     /// 获取普通用户可见的命令列表
-    pub fn user_commands(has_booru: bool, has_ehentai: bool) -> Vec<BotCommand> {
+    pub fn user_commands(
+        has_booru: bool,
+        has_ehentai: bool,
+        has_telegraph: bool,
+    ) -> Vec<BotCommand> {
         let mut commands = vec![
             BotCommand::new("sub", "订阅作者 - /sub [ch=<频道ID>] <id,...>"),
             BotCommand::new("subrank", "订阅排行榜 - /subrank [ch=<频道ID>] <mode>"),
@@ -94,7 +100,10 @@ impl Command {
             ),
             BotCommand::new("unsubthis", "回复消息取消对应订阅"),
             BotCommand::new("settings", "显示和管理聊天设置"),
-            BotCommand::new("download", "下载作品原图 - /download <url|id> 或回复消息"),
+            BotCommand::new(
+                "download",
+                "下载作品或合集 - /download <链接|ID> [limit=N]",
+            ),
         ];
 
         if has_booru {
@@ -127,11 +136,14 @@ impl Command {
                 BotCommand::new("eunsub", "取消EH订阅 - /eunsub <list中的完整ID>"),
                 BotCommand::new("edl", "下载EH画廊 - /edl <url> [telegraph=on]"),
                 BotCommand::new("estatus", "查看当前聊天的EH下载队列"),
-                BotCommand::new(
-                    "telegraph",
-                    "下载EH画廊上传Telegraph - /telegraph <url> 或回复消息",
-                ),
             ]);
+        }
+
+        if has_telegraph {
+            commands.push(BotCommand::new(
+                "telegraph",
+                "生成阅读链接 - /telegraph <链接> [limit=N]",
+            ));
         }
 
         commands.push(BotCommand::new("info", "查看 Bot 状态信息"));
@@ -141,8 +153,12 @@ impl Command {
     }
 
     /// 获取管理员可见的命令列表（包含普通命令 + 管理员命令）
-    pub fn admin_commands(has_booru: bool, has_ehentai: bool) -> Vec<BotCommand> {
-        let mut cmds = Self::user_commands(has_booru, has_ehentai);
+    pub fn admin_commands(
+        has_booru: bool,
+        has_ehentai: bool,
+        has_telegraph: bool,
+    ) -> Vec<BotCommand> {
+        let mut cmds = Self::user_commands(has_booru, has_ehentai, has_telegraph);
         cmds.extend([
             BotCommand::new(
                 "enablechat",
@@ -157,8 +173,12 @@ impl Command {
     }
 
     /// 获取 Owner 可见的完整命令列表（包含所有命令）
-    pub fn owner_commands(has_booru: bool, has_ehentai: bool) -> Vec<BotCommand> {
-        let mut cmds = Self::admin_commands(has_booru, has_ehentai);
+    pub fn owner_commands(
+        has_booru: bool,
+        has_ehentai: bool,
+        has_telegraph: bool,
+    ) -> Vec<BotCommand> {
+        let mut cmds = Self::admin_commands(has_booru, has_ehentai, has_telegraph);
         cmds.extend([
             BotCommand::new(
                 "setadmin",

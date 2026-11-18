@@ -135,7 +135,21 @@
   - 编辑敏感标签
   - 编辑排除标签
 - `/cancel` - 取消当前设置操作
-- `/download <url|id>` - 下载原图（或回复消息）
+- `/download <url|id>` - 下载作品原图；输入合集链接时发送 ZIP。也可回复含链接的消息。
+- `/telegraph <url>` - 将合集发布为 Telegraph 阅读页，也支持原有的 E-Hentai 画廊。集合导出使用已配置的 Telegraph 账号和 `[image_upload]` 图床，无需启用 E-Hentai 下载。
+
+两个命令每次可导出一个集合，支持以下链接：
+
+| 来源 | 链接示例 |
+| --- | --- |
+| Pixiv 官方 Collections | `https://www.pixiv.net/collections/38714613562736660400` |
+| 画师的插画和漫画 | `https://www.pixiv.net/users/33611048` |
+| 用户的公开收藏夹 | `https://www.pixiv.net/users/33611048/bookmarks/artworks` |
+| 指定日期的日／周／月榜 | `https://www.pixiv.net/ranking.php?mode=weekly&date=20260115`（`mode` 可选 `daily`、`weekly`、`monthly`） |
+| pixivision 专题文章 | `https://www.pixivision.net/ja/a/10351` |
+| 已配置的 Danbooru／Moebooru 图池 | `https://danbooru.donmai.us/pools/123`、`https://yande.re/pool/show/123` |
+
+例如，`/download https://www.pixiv.net/ranking.php?mode=weekly&date=20260115 limit=30` 按榜单顺序导出前 30 张图片。`limit` 仅用于榜单，取值 1–100，默认 100；多页作品逐张计数。其他合集导出其中的图像作品并按页展开，不包含视频、动图作品的预览封面或文章装饰图。ZIP 须符合所用 Telegram Bot API 的单文件大小限制；大合集也可用 `/telegraph` 阅读。
 
 Pixiv 标记为 AI 生成的作品会在标签首位显示 `#AI生成`，并参与标签过滤和敏感遮罩匹配：
 

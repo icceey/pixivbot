@@ -15,6 +15,12 @@ use teloxide::utils::markdown;
 use tracing::{error, info};
 
 #[derive(Clone)]
+pub(crate) struct TelegraphServices {
+    pub(crate) client: Arc<eh_client::TelegraphClient>,
+    pub(crate) image_uploader: Arc<dyn eh_client::ImageUploader>,
+}
+
+#[derive(Clone)]
 pub struct BotHandler {
     pub(crate) repo: Arc<Repo>,
     pub(crate) pixiv_client: Arc<tokio::sync::RwLock<PixivClient>>,
@@ -34,7 +40,7 @@ pub struct BotHandler {
     pub(crate) booru_registry: Arc<BooruSiteRegistry>,
     pub(crate) eh_client: Option<Arc<eh_client::EhClient>>,
     pub(crate) eh_config: Arc<EhentaiConfig>,
-    pub(crate) has_telegraph: bool,
+    pub(crate) telegraph: Option<TelegraphServices>,
 }
 
 impl BotHandler {
@@ -54,7 +60,7 @@ impl BotHandler {
         booru_registry: Arc<BooruSiteRegistry>,
         eh_client: Option<Arc<eh_client::EhClient>>,
         eh_config: Arc<EhentaiConfig>,
-        has_telegraph: bool,
+        telegraph: Option<TelegraphServices>,
     ) -> Self {
         Self {
             repo,
@@ -71,7 +77,7 @@ impl BotHandler {
             booru_registry,
             eh_client,
             eh_config,
-            has_telegraph,
+            telegraph,
         }
     }
 

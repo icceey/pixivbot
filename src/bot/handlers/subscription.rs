@@ -180,7 +180,7 @@ mod tests {
             Arc::new(BooruSiteRegistry::default()),
             None,
             Arc::new(EhentaiConfig::default()),
-            false,
+            None,
         );
 
         handler
