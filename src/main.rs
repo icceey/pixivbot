@@ -266,16 +266,30 @@ async fn main() -> Result<()> {
 
     // The provider Abort capability must exist before startup takes ownership
     // of orphaned or durable cleanup generations.
-    let eh_image_uploader = if eh_client.is_some()
+    let needs_eh_image_uploader = eh_client.is_some()
         && (telegraph_client.is_some()
             || matches!(
                 config.image_upload.provider,
                 eh_client::ImageUploadProvider::S3 | eh_client::ImageUploadProvider::IpfS3
-            )) {
+            ));
+    let image_uploader = if telegraph_client.is_some() || needs_eh_image_uploader {
         Some(config.image_upload.build_uploader().await?)
     } else {
         None
     };
+    let eh_image_uploader = if needs_eh_image_uploader {
+        image_uploader.clone()
+    } else {
+        None
+    };
+    let telegraph_for_bot =
+        telegraph_client
+            .as_ref()
+            .zip(image_uploader.as_ref())
+            .map(|(client, uploader)| bot::TelegraphServices {
+                client: std::sync::Arc::clone(client),
+                image_uploader: std::sync::Arc::clone(uploader),
+            });
     let eh_startup_abort_uploader = if matches!(
         config.image_upload.provider,
         eh_client::ImageUploadProvider::S3 | eh_client::ImageUploadProvider::IpfS3
@@ -497,7 +511,6 @@ async fn main() -> Result<()> {
     let booru_registry_for_bot = booru_registry.clone();
     let eh_client_for_bot = eh_client.clone();
     let eh_config_for_bot = std::sync::Arc::new(config.ehentai.clone());
-    let has_telegraph_for_bot = telegraph_client.is_some();
     let bot_handle = tokio::spawn(async move {
         if let Err(e) = bot::run(
             bot,
@@ -513,7 +526,7 @@ async fn main() -> Result<()> {
             booru_registry_for_bot,
             eh_client_for_bot,
             eh_config_for_bot,
-            has_telegraph_for_bot,
+            telegraph_for_bot,
         )
         .await
         {

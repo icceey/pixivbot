@@ -52,7 +52,8 @@ impl BotHandler {
 
     /// 显示帮助信息
     pub async fn handle_help(&self, bot: ThrottledBot, chat_id: ChatId) -> ResponseResult<()> {
-        let help_text = r#"
+        let mut help_text = String::from(
+            r#"
 📚 *PixivBot 帮助*
 
 *可用命令:*
@@ -94,6 +95,12 @@ impl BotHandler {
    取消订阅排行榜
    \- 示例: `/unsubrank day`
 
+📥 `/download <作品URL|ID|合集URL> [limit=N]`
+   下载单个 Pixiv 作品原图，或将有序合集打包为 ZIP
+   \- 合集支持 Pixiv 作者作品、公开收藏、合集、pixivision 与 Booru pool
+   \- 可回复包含作品或合集链接的消息
+   \- `limit` 仅用于指定日期的排行榜，范围 `1..100`，默认 `100`
+
 🔑 `/enablechat [chat_id]` / `/disablechat [chat_id]`
    全局管理员可管理聊天；群主和群管理员自动获得当前群的管理权限
    群权限不写入全局角色，不能管理其他聊天或授予全局角色
@@ -112,7 +119,22 @@ impl BotHandler {
    回复真人消息设置 Admin 可自动建档；数字 ID 和用户名须已登记
    取消管理员不建档；用户名仅支持已知且能实时验证的用户
    无法验证时请改用数字 ID 或回复；不支持匿名和频道发送者
-"#;
+"#,
+        );
+
+        if self.telegraph.is_some() {
+            let target = if self.eh_client.is_some() {
+                "E\\-Hentai 画廊或有序合集"
+            } else {
+                "有序合集"
+            };
+            help_text.push_str(&format!(
+                "\n📰 `/telegraph <链接> [limit=N]`\n\
+                 将{target}发布为 Telegraph 阅读页面并返回首页链接\n\
+                 \\- 可回复包含链接的消息\n\
+                 \\- `limit` 仅用于指定日期的排行榜，范围 `1..100`，默认 `100`\n"
+            ));
+        }
 
         bot.send_message(chat_id, help_text)
             .parse_mode(ParseMode::MarkdownV2)

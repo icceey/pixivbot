@@ -7,6 +7,7 @@
 mod auth;
 mod client;
 mod error;
+mod gallery;
 mod models;
 
 pub use client::PixivClient;

@@ -197,6 +197,13 @@ pub struct BooruPoolInfo {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum MoebooruPostTime {
+    EpochSeconds(i64),
+    Rfc3339(DateTime<Utc>),
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct MoebooruRawPost {
     pub id: u64,
     #[serde(default)]
@@ -224,7 +231,7 @@ pub struct MoebooruRawPost {
     #[serde(default)]
     pub source: Option<String>,
     #[serde(default)]
-    pub created_at: Option<i64>,
+    created_at: Option<MoebooruPostTime>,
     #[serde(default)]
     pub file_size: Option<u64>,
     #[serde(default)]
@@ -235,9 +242,10 @@ pub struct MoebooruRawPost {
 
 impl MoebooruRawPost {
     pub fn into_booru_post(self) -> BooruPost {
-        let created_at = self
-            .created_at
-            .and_then(|ts| DateTime::from_timestamp(ts, 0));
+        let created_at = self.created_at.and_then(|time| match time {
+            MoebooruPostTime::EpochSeconds(ts) => DateTime::from_timestamp(ts, 0),
+            MoebooruPostTime::Rfc3339(time) => Some(time),
+        });
         BooruPost {
             id: self.id,
             tags: self.tags,

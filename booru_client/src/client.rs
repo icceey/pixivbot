@@ -2,6 +2,7 @@ use crate::bypass::{self, BypassConfig};
 use crate::engine_type::BooruEngineType;
 use crate::error::{Error, Result};
 use crate::models::*;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 const DEFAULT_USER_AGENT: &str = "pixivbot/1.0 (booru_client)";
@@ -80,7 +81,10 @@ impl BooruClient {
 
     pub async fn get_pool(&self, pool_id: u64) -> Result<BooruPoolInfo> {
         match self.engine_type {
-            BooruEngineType::Moebooru => self.get_pool_moebooru(pool_id).await,
+            BooruEngineType::Moebooru => Ok(self
+                .get_moebooru_pool_page(pool_id, None)
+                .await?
+                .into_pool_info()),
             BooruEngineType::Danbooru => self.get_pool_danbooru(pool_id).await,
             BooruEngineType::Gelbooru => Err(Error::Api {
                 message: "Gelbooru does not support pool queries".to_string(),
@@ -115,6 +119,91 @@ impl BooruClient {
         }
     }
 
+    /// Fetch all posts in pool order, leaving media selection to the caller.
+    pub async fn pool_images(&self, pool_id: u64) -> Result<Vec<BooruPost>> {
+        match self.engine_type {
+            BooruEngineType::Danbooru => self.pool_images_danbooru(pool_id).await,
+            BooruEngineType::Moebooru => self.pool_images_moebooru(pool_id).await,
+            BooruEngineType::Gelbooru => Err(Error::Api {
+                message: "Gelbooru does not support pool queries".to_string(),
+                status: 0,
+            }),
+        }
+    }
+
+    async fn pool_images_danbooru(&self, pool_id: u64) -> Result<Vec<BooruPost>> {
+        const POSTS_PER_PAGE: u32 = 200;
+        let pool = self.get_pool(pool_id).await?;
+        let expected = pool.post_ids.len();
+        let mut remaining: HashMap<_, _> = pool
+            .post_ids
+            .into_iter()
+            .enumerate()
+            .map(|(index, id)| (id, index))
+            .collect();
+        if expected < pool.post_count as usize || remaining.len() != expected {
+            return Err(Error::Api {
+                message: format!("Danbooru pool {pool_id} has inconsistent post IDs"),
+                status: 0,
+            });
+        }
+
+        // Deleted posts may still appear in the pool metadata.
+        let tags = format!("pool:{pool_id} status:any");
+        let mut ordered = vec![None; expected];
+        for page in 1.. {
+            if remaining.is_empty() {
+                break;
+            }
+            let before = remaining.len();
+            for post in self.get_posts_danbooru(&tags, POSTS_PER_PAGE, page).await? {
+                if let Some(index) = remaining.remove(&post.id) {
+                    ordered[index] = Some(post);
+                }
+            }
+            if remaining.len() == before {
+                return Err(Error::Api {
+                    message: format!(
+                        "Danbooru pool {pool_id} is missing {} of {expected} posts at page {page}",
+                        remaining.len(),
+                    ),
+                    status: 0,
+                });
+            }
+        }
+        Ok(ordered.into_iter().flatten().collect())
+    }
+
+    async fn pool_images_moebooru(&self, pool_id: u64) -> Result<Vec<BooruPost>> {
+        let mut page = 1;
+        let mut pool = self.get_moebooru_pool_page(pool_id, Some(page)).await?;
+        let expected = pool.post_count as usize;
+        let mut posts = Vec::new();
+        let mut seen = HashSet::new();
+        // The server fixes the page size according to the user's pool browse mode.
+        loop {
+            if pool.post_count as usize != expected
+                || posts.len() + pool.posts.len() > expected
+                || (pool.posts.is_empty() && posts.len() < expected)
+                || pool.posts.iter().any(|post| !seen.insert(post.id))
+            {
+                return Err(Error::Api {
+                    message: format!(
+                        "Moebooru pool {pool_id} returned an inconsistent page {page} ({}/{expected} posts fetched)",
+                        posts.len(),
+                    ),
+                    status: 0,
+                });
+            }
+            posts.extend(pool.posts.into_iter().map(MoebooruRawPost::into_booru_post));
+            if posts.len() == expected {
+                return Ok(posts);
+            }
+            page += 1;
+            pool = self.get_moebooru_pool_page(pool_id, Some(page)).await?;
+        }
+    }
+
     async fn get_posts_moebooru(
         &self,
         tags: &str,
@@ -135,10 +224,19 @@ impl BooruClient {
         Ok(raw.into_iter().map(|r| r.into_booru_post()).collect())
     }
 
-    async fn get_pool_moebooru(&self, pool_id: u64) -> Result<BooruPoolInfo> {
+    async fn get_moebooru_pool_page(
+        &self,
+        pool_id: u64,
+        page: Option<u32>,
+    ) -> Result<MoebooruRawPool> {
         let url = format!("{}/pool/show.json", self.base_url);
-        let raw: MoebooruRawPool = self.request(&url, &[("id", &pool_id.to_string())]).await?;
-        Ok(raw.into_pool_info())
+        let id = pool_id.to_string();
+        let page = page.map(|page| page.to_string());
+        let mut params = vec![("id", id.as_str())];
+        if let Some(page) = page.as_deref() {
+            params.push(("page", page));
+        }
+        self.request(&url, &params).await
     }
 
     async fn get_pool_posts_moebooru(
@@ -147,13 +245,7 @@ impl BooruClient {
         limit: u32,
         page: u32,
     ) -> Result<Vec<BooruPost>> {
-        let url = format!("{}/pool/show.json", self.base_url);
-        let raw: MoebooruRawPool = self
-            .request(
-                &url,
-                &[("id", &pool_id.to_string()), ("page", &page.to_string())],
-            )
-            .await?;
+        let raw = self.get_moebooru_pool_page(pool_id, Some(page)).await?;
         Ok(raw
             .posts
             .into_iter()

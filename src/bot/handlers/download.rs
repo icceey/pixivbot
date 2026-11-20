@@ -40,6 +40,13 @@ impl BotHandler {
         chat_id: ChatId,
         args: String,
     ) -> ResponseResult<()> {
+        if self
+            .try_collection_export(&bot, &msg, chat_id, &args, false)
+            .await?
+        {
+            return Ok(());
+        }
+
         info!("Processing /download command from chat {}", chat_id);
 
         let has_args = !args.trim().is_empty();
@@ -76,11 +83,13 @@ impl BotHandler {
         if illust_ids.is_empty() && booru_refs.is_empty() && eh_galleries.is_empty() {
             bot.send_message(
                 chat_id,
-                "❌ 请提供作品 ID 或 URL，或回复包含作品链接的消息\n\n例如：\n\
+                "❌ 请提供作品 ID、作品链接或一个集合链接，或回复包含链接的消息\n\n例如：\n\
                  • `/download 123456789`\n\
                  • `/download https://www.pixiv.net/artworks/123456789`\n\
                  • `/download https://e-hentai.org/g/12345/token/`\n\
                  • `/download https://yande.re/post/show/123456`（需先在配置中启用）\n\
+                 • 集合：Pixiv 合集、公开收藏、作者、日期榜、pixivision 或已配置的 Danbooru/Moebooru pool\n\
+                 • 日期榜例：`/download https://www.pixiv.net/ranking.php?mode=daily&date=20260101 limit=50`\n\
                  • 回复包含链接的消息并使用 `/download`",
             )
             .parse_mode(ParseMode::MarkdownV2)

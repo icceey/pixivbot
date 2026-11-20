@@ -11,6 +11,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{error, info};
 
+#[cfg(test)]
+mod pool_tests;
+
 pub struct BooruSite {
     pub client: BooruClient,
     pub config: BooruSiteConfig,

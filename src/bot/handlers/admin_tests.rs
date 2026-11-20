@@ -98,7 +98,7 @@ async fn fixture() -> (MockServer, ThrottledBot, BotHandler) {
         Arc::new(Default::default()),
         None,
         Arc::new(Default::default()),
-        false,
+        None,
     );
     (server, bot, handler)
 }

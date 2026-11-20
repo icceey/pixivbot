@@ -2627,6 +2627,26 @@ impl TelegraphClient {
     /// created page URL (if any) instead of erroring, so the user can still
     /// access the partial gallery.
     pub async fn create_gallery_page(&self, title: &str, image_urls: &[String]) -> Result<String> {
+        self.create_gallery_page_from_urls(title, image_urls, true)
+            .await
+    }
+
+    /// Create a complete gallery or return an error if any page cannot be created.
+    pub async fn create_gallery_page_strict(
+        &self,
+        title: &str,
+        image_urls: &[String],
+    ) -> Result<String> {
+        self.create_gallery_page_from_urls(title, image_urls, false)
+            .await
+    }
+
+    async fn create_gallery_page_from_urls(
+        &self,
+        title: &str,
+        image_urls: &[String],
+        allow_partial: bool,
+    ) -> Result<String> {
         let pairs: Vec<TelegraphImageUrlPair> = image_urls
             .iter()
             .map(|url| TelegraphImageUrlPair {
@@ -2636,7 +2656,7 @@ impl TelegraphClient {
             })
             .collect();
         Ok(self
-            .create_gallery_page_with_url_pairs(title, &pairs, None, None)
+            .create_gallery_page_with_url_pairs_inner(title, &pairs, None, None, allow_partial)
             .await?
             .first_page_url)
     }
@@ -2647,6 +2667,24 @@ impl TelegraphClient {
         image_urls: &[TelegraphImageUrlPair],
         preview_gateway_url: Option<&str>,
         public_gateway_url: Option<&str>,
+    ) -> Result<TelegraphGalleryPageResult> {
+        self.create_gallery_page_with_url_pairs_inner(
+            title,
+            image_urls,
+            preview_gateway_url,
+            public_gateway_url,
+            true,
+        )
+        .await
+    }
+
+    async fn create_gallery_page_with_url_pairs_inner(
+        &self,
+        title: &str,
+        image_urls: &[TelegraphImageUrlPair],
+        preview_gateway_url: Option<&str>,
+        public_gateway_url: Option<&str>,
+        allow_partial: bool,
     ) -> Result<TelegraphGalleryPageResult> {
         if image_urls.is_empty() {
             return Err(Error::Other("no images to upload".into()));
@@ -2717,21 +2755,22 @@ impl TelegraphClient {
                     next_url = Some(url)
                 }
                 Err(e) => {
-                    // If we have at least one page created, return it instead of failing
-                    if let Some(ref url) = next_url {
-                        tracing::warn!(
-                            "Telegraph page creation failed at index {}, returning last successful page: {}",
-                            idx,
-                            e
-                        );
-                        return Ok(TelegraphGalleryPageResult {
-                            first_page_url: url.clone(),
-                            rewrite_data: build_rewrite_data(
-                                rewrite_pages,
-                                preview_gateway_url,
-                                public_gateway_url,
-                            ),
-                        });
+                    if allow_partial {
+                        if let Some(ref url) = next_url {
+                            tracing::warn!(
+                                "Telegraph page creation failed at index {}, returning last successful page: {}",
+                                idx,
+                                e
+                            );
+                            return Ok(TelegraphGalleryPageResult {
+                                first_page_url: url.clone(),
+                                rewrite_data: build_rewrite_data(
+                                    rewrite_pages,
+                                    preview_gateway_url,
+                                    public_gateway_url,
+                                ),
+                            });
+                        }
                     }
                     return Err(e);
                 }
@@ -2810,6 +2849,63 @@ mod tests {
             multipart_part_size_mb: 8,
             warm_public_gateway_after_upload: false,
             zip_extract_enabled: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn strict_gallery_rejects_intermediate_page_failure_while_default_returns_partial() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let segment = "a".repeat(MAX_PAGE_CONTENT_BYTES / 2);
+        let image_urls: Vec<_> = (1..=3)
+            .map(|index| format!("https://images.example/{index}/{segment}"))
+            .collect();
+        assert_eq!(
+            split_for_pages(&image_urls, MAX_PAGE_CONTENT_BYTES).len(),
+            3
+        );
+
+        for strict in [false, true] {
+            let server = MockServer::start().await;
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let responder_calls = Arc::clone(&calls);
+            Mock::given(method("POST"))
+                .and(path("/createPage"))
+                .respond_with(move |_: &wiremock::Request| {
+                    if responder_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                        ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                            "ok": true,
+                            "result": { "url": "https://telegra.ph/tail-page" }
+                        }))
+                    } else {
+                        ResponseTemplate::new(500)
+                    }
+                })
+                .expect(2)
+                .mount(&server)
+                .await;
+            let client = TelegraphClient::new_with_urls(
+                "token".to_string(),
+                format!("{}/upload", server.uri()),
+                server.uri(),
+            );
+
+            let result = if strict {
+                client
+                    .create_gallery_page_strict("Gallery", &image_urls)
+                    .await
+            } else {
+                client.create_gallery_page("Gallery", &image_urls).await
+            };
+
+            if strict {
+                assert!(result.is_err());
+            } else {
+                assert_eq!(result.unwrap(), "https://telegra.ph/tail-page");
+            }
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+            server.verify().await;
         }
     }
 

@@ -105,7 +105,7 @@ impl BotHandler {
         eh_filter.telegraph = telegraph_on;
 
         // Reject telegraph=on when Telegraph is not configured
-        if telegraph_on && !self.has_telegraph {
+        if telegraph_on && self.telegraph.is_none() {
             let _ = bot
                 .send_message(
                     chat_id,
@@ -384,7 +384,7 @@ impl BotHandler {
             .unwrap_or(trailing_telegraph);
 
         // Reject telegraph=on when Telegraph is not configured
-        if telegraph && !self.has_telegraph {
+        if telegraph && self.telegraph.is_none() {
             let _ = bot
                 .send_message(
                     chat_id,
@@ -490,8 +490,7 @@ impl BotHandler {
         Ok(())
     }
 
-    /// /telegraph command: download gallery and upload to Telegraph, send link.
-    /// Like /edl but always uploads to Telegraph (uses free 1280x resolution).
+    /// Publish an E-Hentai gallery or supported collection to Telegraph.
     pub async fn handle_telegraph(
         &self,
         bot: ThrottledBot,
@@ -499,16 +498,28 @@ impl BotHandler {
         chat_id: ChatId,
         args_str: String,
     ) -> ResponseResult<()> {
+        if self
+            .try_collection_export(&bot, &msg, chat_id, &args_str, true)
+            .await?
+        {
+            return Ok(());
+        }
+
         let eh_client = match &self.eh_client {
             Some(c) => c.clone(),
             None => {
-                let _ = bot.send_message(chat_id, "E-Hentai 功能未启用").await;
+                let _ = bot
+                    .send_message(
+                        chat_id,
+                        "E-Hentai 功能未启用。用法：/telegraph <集合URL> [limit=N]，或回复包含集合链接的消息。limit 仅用于 Pixiv 日期榜，默认 100。",
+                    )
+                    .await;
                 return Ok(());
             }
         };
 
         // Reject Telegraph request when no token is configured
-        if !self.has_telegraph {
+        if self.telegraph.is_none() {
             let _ = bot
                 .send_message(
                     chat_id,
@@ -539,9 +550,9 @@ impl BotHandler {
                 let _ = bot
                     .send_message(
                         chat_id,
-                        "用法: /telegraph <画廊URL>\n\n\
-                         下载画廊并上传 Telegraph，发送阅读链接。\n\
-                         也可回复包含画廊链接的消息使用 /telegraph",
+                        "用法：/telegraph <E-Hentai 画廊URL或集合URL> [limit=N]\n\n\
+                         集合：Pixiv 合集、公开收藏、作者、日期榜、pixivision 或已配置的 Danbooru/Moebooru pool。\n\
+                         limit 仅用于 Pixiv 日期榜，默认 100。也可回复包含画廊或集合链接的消息。",
                     )
                     .await;
                 return Ok(());

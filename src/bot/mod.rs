@@ -29,6 +29,7 @@ use tracing::{error, info, warn};
 
 pub use commands::Command;
 pub use handler::BotHandler;
+pub(crate) use handler::TelegraphServices;
 pub use middleware::UserChatContext;
 
 /// Handler 返回类型
@@ -49,7 +50,7 @@ pub async fn run(
     booru_registry: Arc<BooruSiteRegistry>,
     eh_client: Option<Arc<eh_client::EhClient>>,
     eh_config: Arc<EhentaiConfig>,
-    has_telegraph: bool,
+    telegraph: Option<TelegraphServices>,
 ) -> Result<()> {
     info!("Starting Telegram Bot...");
 
@@ -57,6 +58,7 @@ pub async fn run(
     let is_public_mode = config.bot_mode.is_public();
     let has_booru = !booru_registry.is_empty();
     let has_ehentai = eh_client.is_some();
+    let has_telegraph = telegraph.is_some();
 
     info!(
         "Bot mode: {:?} (new chats will be {} by default)",
@@ -88,7 +90,7 @@ pub async fn run(
         booru_registry,
         eh_client,
         eh_config,
-        has_telegraph,
+        telegraph,
     );
 
     info!("✅ Bot initialized, starting command handler");
@@ -97,7 +99,7 @@ pub async fn run(
     let settings_storage = SettingsStorage::default();
 
     // 设置命令可见性
-    setup_commands(&bot, &repo, has_booru, has_ehentai).await;
+    setup_commands(&bot, &repo, has_booru, has_ehentai, has_telegraph).await;
 
     // 构建 handler 树
     let handler_tree = build_handler_tree();
@@ -637,10 +639,20 @@ async fn handle_chat_migration(msg: Message, repo: Arc<Repo>) -> HandlerResult {
 /// - 普通用户看到基础命令
 /// - 群管理员在群内、数据库中的 Admin 在私聊看到管理员命令
 /// - 数据库中的 Owner 用户看到所有命令
-async fn setup_commands(bot: &ThrottledBot, repo: &Repo, has_booru: bool, has_ehentai: bool) {
+async fn setup_commands(
+    bot: &ThrottledBot,
+    repo: &Repo,
+    has_booru: bool,
+    has_ehentai: bool,
+    has_telegraph: bool,
+) {
     // 1. 设置默认命令（所有用户都能看到的基础命令）
     if let Err(e) = bot
-        .set_my_commands(Command::user_commands(has_booru, has_ehentai))
+        .set_my_commands(Command::user_commands(
+            has_booru,
+            has_ehentai,
+            has_telegraph,
+        ))
         .scope(BotCommandScope::Default)
         .await
     {
@@ -650,7 +662,11 @@ async fn setup_commands(bot: &ThrottledBot, repo: &Repo, has_booru: bool, has_eh
     }
 
     if let Err(e) = bot
-        .set_my_commands(Command::admin_commands(has_booru, has_ehentai))
+        .set_my_commands(Command::admin_commands(
+            has_booru,
+            has_ehentai,
+            has_telegraph,
+        ))
         .scope(BotCommandScope::AllChatAdministrators)
         .await
     {
@@ -662,8 +678,12 @@ async fn setup_commands(bot: &ThrottledBot, repo: &Repo, has_booru: bool, has_eh
         Ok(admin_users) => {
             for user in admin_users {
                 let commands = match user.role {
-                    UserRole::Owner => Command::owner_commands(has_booru, has_ehentai),
-                    UserRole::Admin => Command::admin_commands(has_booru, has_ehentai),
+                    UserRole::Owner => {
+                        Command::owner_commands(has_booru, has_ehentai, has_telegraph)
+                    }
+                    UserRole::Admin => {
+                        Command::admin_commands(has_booru, has_ehentai, has_telegraph)
+                    }
                     UserRole::User => continue, // 不应该出现，但以防万一
                 };
 
