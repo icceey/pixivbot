@@ -105,7 +105,9 @@ pub mod tests_helpers {
                 cursor TEXT,
                 status TEXT NOT NULL DEFAULT 'queued'
                     CHECK (status IN ('queued', 'preparing', 'publishing', 'waiting')),
-                queue_order INTEGER NOT NULL UNIQUE
+                queue_order INTEGER NOT NULL UNIQUE,
+                retry_count INTEGER NOT NULL DEFAULT 0,
+                next_retry_at INTEGER NULL
             );
             CREATE INDEX idx_collection_jobs_status_order ON collection_jobs(status, queue_order);",
         )

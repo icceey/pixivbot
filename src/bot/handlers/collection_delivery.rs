@@ -1,7 +1,7 @@
 use super::download::sanitize_filename;
 use crate::bot::notifier::ThrottledBot;
 use crate::bot::BotHandler;
-use crate::db::repo::collection_jobs::Model;
+use crate::db::repo::collection_jobs::{CollectionRetryStage, Model};
 use anyhow::{Context, Result};
 use eh_client::ImageUploadInput;
 use std::io;
@@ -30,7 +30,9 @@ impl BotHandler {
                 .await;
         }
 
-        let archive = create_collection_zip(files).await?;
+        let archive = create_collection_zip(files)
+            .await
+            .context(CollectionRetryStage::Preparing)?;
         self.begin_collection_delivery(job).await?;
         let archive_name = format!("{}.zip", sanitize_filename(title));
         let mut request = bot
@@ -85,7 +87,7 @@ impl BotHandler {
                 .image_uploader
                 .upload_images_with_url_pairs(&inputs)
                 .await
-                .context("Failed to upload collection images")?;
+                .context(CollectionRetryStage::UploadReturned)?;
             if url_pairs.len() != batch.len() {
                 anyhow::bail!(
                     "Image uploader returned {} URL pairs for {} collection images",

@@ -168,7 +168,10 @@ fn original_image(post: BooruPost) -> Result<Option<(String, String)>> {
                 .rsplit_once('.')
                 .map(|(_, ext)| ext)
         })
-        .with_context(|| format!("Missing original file type for post {}", post.id))?
+        .ok_or_else(|| Error::Api {
+            message: format!("Missing original file type for post {}", post.id),
+            status: 0,
+        })?
         .to_ascii_lowercase();
     if !matches!(
         ext.as_str(),
@@ -176,8 +179,9 @@ fn original_image(post: BooruPost) -> Result<Option<(String, String)>> {
     ) {
         return Ok(None);
     }
-    let url = post
-        .file_url
-        .with_context(|| format!("Missing original for post {}", post.id))?;
+    let url = post.file_url.ok_or_else(|| Error::Api {
+        message: format!("Missing original for post {}", post.id),
+        status: 0,
+    })?;
     Ok(Some((format!("{}.{ext}", post.id), url)))
 }

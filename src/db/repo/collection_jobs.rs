@@ -11,6 +11,12 @@ pub enum ResumeResult {
     Unavailable,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum CollectionRetryStage {
+    Preparing,
+    UploadReturned,
+}
+
 impl Repo {
     pub async fn enqueue_collection_job(
         &self,
@@ -34,14 +40,73 @@ impl Repo {
     pub async fn claim_collection_job(&self) -> Result<Option<Model>> {
         Ok(Model::find_by_statement(Statement::from_string(
             DbBackend::Sqlite,
-            "UPDATE collection_jobs SET status = 'preparing'
+            "UPDATE collection_jobs SET status = 'preparing', next_retry_at = NULL
              WHERE id = (
-                SELECT id FROM collection_jobs WHERE status = 'queued' ORDER BY queue_order LIMIT 1
+                SELECT id FROM collection_jobs
+                WHERE status = 'queued' AND (next_retry_at IS NULL OR next_retry_at <= unixepoch())
+                ORDER BY queue_order LIMIT 1
              )
-             RETURNING id, chat_id, user_id, source, telegraph, generation, delivered, cursor",
+             RETURNING id, chat_id, user_id, source, telegraph, generation, delivered, cursor, retry_count",
         ))
         .one(&self.db)
         .await?)
+    }
+
+    /// Returns false after deleting the current attempt on retry exhaustion.
+    pub async fn schedule_collection_retry(
+        &self,
+        job: &Model,
+        stage: CollectionRetryStage,
+        max_retries: u8,
+    ) -> Result<bool> {
+        let status = match stage {
+            CollectionRetryStage::Preparing => "preparing",
+            CollectionRetryStage::UploadReturned => "publishing",
+        };
+        let values = [
+            job.id.into(),
+            job.generation.into(),
+            job.retry_count.into(),
+            status.into(),
+        ];
+        let has_budget = job.retry_count < i32::from(max_retries);
+        let statement = if has_budget {
+            let delay = Self::backoff_delay_secs(job.retry_count + 1);
+            Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "UPDATE collection_jobs
+                 SET status = 'queued', retry_count = retry_count + 1, next_retry_at = unixepoch() + ?5
+                 WHERE id = ?1 AND generation = ?2 AND retry_count = ?3 AND status = ?4",
+                values.into_iter().chain([delay.into()]),
+            )
+        } else {
+            Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "DELETE FROM collection_jobs
+                 WHERE id = ? AND generation = ? AND retry_count = ? AND status = ?",
+                values,
+            )
+        };
+        ensure!(
+            self.db.execute(statement).await?.rows_affected() == 1,
+            "Collection job {} no longer matches its {status} retry attempt",
+            job.id
+        );
+        Ok(has_budget)
+    }
+
+    pub async fn next_collection_retry_at(&self) -> Result<Option<i64>> {
+        Ok(self
+            .db
+            .query_one(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT next_retry_at FROM collection_jobs
+                 WHERE status = 'queued' AND next_retry_at IS NOT NULL
+                 ORDER BY next_retry_at LIMIT 1",
+            ))
+            .await?
+            .map(|row| row.try_get("", "next_retry_at"))
+            .transpose()?)
     }
 
     pub async fn mark_collection_publishing(&self, id: i64) -> Result<()> {
@@ -69,7 +134,8 @@ impl Repo {
         let statement = match cursor {
             Some(cursor) => Statement::from_sql_and_values(
                 DbBackend::Sqlite,
-                "UPDATE collection_jobs SET delivered = ?, cursor = ?, status = 'waiting'
+                "UPDATE collection_jobs
+                 SET delivered = ?, cursor = ?, status = 'waiting', retry_count = 0, next_retry_at = NULL
                  WHERE id = ? AND status = 'publishing'",
                 [delivered.into(), cursor.into(), id.into()],
             ),
@@ -103,7 +169,7 @@ impl Repo {
         let interrupted = Model::find_by_statement(Statement::from_string(
             DbBackend::Sqlite,
             "DELETE FROM collection_jobs WHERE status = 'publishing'
-             RETURNING id, chat_id, user_id, source, telegraph, generation, delivered, cursor",
+             RETURNING id, chat_id, user_id, source, telegraph, generation, delivered, cursor, retry_count",
         ))
         .all(&txn)
         .await?;
@@ -159,8 +225,20 @@ impl Repo {
 mod tests {
     use super::*;
     use crate::db::repo::tests_helpers::setup_test_db;
-    use migration::MigratorTrait;
+    use chrono::Utc;
+    use migration::{Migrator, MigratorTrait};
     use sea_orm::Database;
+
+    async fn expire_retry(repo: &Repo, id: i64) -> Result<()> {
+        repo.db
+            .execute(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "UPDATE collection_jobs SET next_retry_at = 0 WHERE id = ? AND next_retry_at IS NOT NULL",
+                [id.into()],
+            ))
+            .await?;
+        Ok(())
+    }
 
     #[tokio::test]
     async fn continuation_is_single_use_and_joins_the_back_of_the_queue() -> Result<()> {
@@ -175,6 +253,12 @@ mod tests {
         };
         assert_eq!(initial.id, id);
         assert_eq!(initial.generation, 1);
+        assert!(
+            repo.schedule_collection_retry(&initial, CollectionRetryStage::Preparing, 1)
+                .await?
+        );
+        expire_retry(&repo, id).await?;
+        assert_eq!(repo.claim_collection_job().await?.unwrap().retry_count, 1);
         repo.mark_collection_publishing(id).await?;
         assert_eq!(
             repo.resume_collection_job(id, -42, 7, 1).await?,
@@ -218,6 +302,11 @@ mod tests {
         assert_eq!(resumed.generation, 2);
         assert_eq!(resumed.delivered, 12);
         assert_eq!(resumed.cursor.as_deref(), Some(cursor));
+        assert_eq!(resumed.retry_count, 0);
+        assert!(repo
+            .schedule_collection_retry(&initial, CollectionRetryStage::Preparing, 1)
+            .await
+            .is_err());
         assert_eq!(
             (resumed.source.as_str(), resumed.telegraph),
             ("first", true)
@@ -245,9 +334,127 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retry_deadline_survives_upgrade_and_restart_without_blocking_ready_work() -> Result<()>
+    {
+        let dir = tempfile::tempdir()?;
+        let url = format!(
+            "sqlite:{}?mode=rwc",
+            dir.path().join("collection.db").display()
+        );
+        let db = Database::connect(url.as_str()).await?;
+        let before_retries = Migrator::migrations()
+            .iter()
+            .position(|migration| migration.name() == "m20261101_000100_collection_job_retries")
+            .unwrap();
+        Migrator::up(&db, Some(u32::try_from(before_retries)?)).await?;
+        let repo = Repo::new(db);
+        let legacy = repo
+            .enqueue_collection_job(-42, 7, "legacy".into(), true)
+            .await?;
+        Migrator::up(&repo.db, None).await?;
+        assert_eq!(repo.next_collection_retry_at().await?, None);
+        let job = repo.claim_collection_job().await?.unwrap();
+        assert_eq!((job.id, job.retry_count), (legacy, 0));
+
+        let start = Utc::now().timestamp();
+        assert!(
+            repo.schedule_collection_retry(&job, CollectionRetryStage::Preparing, 2)
+                .await?
+        );
+        let deadline = repo.next_collection_retry_at().await?.unwrap();
+        let delay = Repo::backoff_delay_secs(1);
+        assert!((start + delay..=Utc::now().timestamp() + delay).contains(&deadline));
+        repo.db.close().await?;
+
+        let repo = Repo::new(Database::connect(url.as_str()).await?);
+        assert!(repo.recover_collection_jobs().await?.is_empty());
+        assert_eq!(repo.next_collection_retry_at().await?, Some(deadline));
+        let ready = repo
+            .enqueue_collection_job(-42, 8, "ready".into(), false)
+            .await?;
+        assert_eq!(repo.next_collection_retry_at().await?, Some(deadline));
+        assert_eq!(repo.claim_collection_job().await?.unwrap().id, ready);
+        repo.fail_collection_job(ready).await?;
+        assert!(repo.claim_collection_job().await?.is_none());
+
+        expire_retry(&repo, legacy).await?;
+        assert_eq!(repo.next_collection_retry_at().await?, Some(0));
+        let retry = repo.claim_collection_job().await?.unwrap();
+        assert_eq!((retry.id, retry.retry_count), (legacy, 1));
+        assert!(repo.recover_collection_jobs().await?.is_empty());
+        assert_eq!(repo.next_collection_retry_at().await?, None);
+        assert_eq!(repo.claim_collection_job().await?, Some(retry));
+        repo.db.close().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn retry_budget_spans_stages_and_rejects_stale_attempts() -> Result<()> {
+        let repo = setup_test_db().await?;
+        let id = repo
+            .enqueue_collection_job(-42, 7, "batch".into(), true)
+            .await?;
+        repo.claim_collection_job().await?.unwrap();
+        repo.mark_collection_publishing(id).await?;
+        repo.finish_collection_batch(id, 12, Some(r#"{"offset":12}"#.into()))
+            .await?;
+        assert_eq!(
+            repo.resume_collection_job(id, -42, 7, 1).await?,
+            ResumeResult::Queued
+        );
+        let initial = repo.claim_collection_job().await?.unwrap();
+
+        assert!(
+            repo.schedule_collection_retry(&initial, CollectionRetryStage::Preparing, 2)
+                .await?
+        );
+        expire_retry(&repo, id).await?;
+        let second = repo.claim_collection_job().await?.unwrap();
+        repo.mark_collection_publishing(id).await?;
+        assert!(repo
+            .schedule_collection_retry(&second, CollectionRetryStage::Preparing, 2)
+            .await
+            .is_err());
+        let start = Utc::now().timestamp();
+        assert!(
+            repo.schedule_collection_retry(&second, CollectionRetryStage::UploadReturned, 2)
+                .await?
+        );
+        let deadline = repo.next_collection_retry_at().await?.unwrap();
+        let delay = Repo::backoff_delay_secs(2);
+        assert!((start + delay..=Utc::now().timestamp() + delay).contains(&deadline));
+        expire_retry(&repo, id).await?;
+        let last = repo.claim_collection_job().await?.unwrap();
+        let mut expected = initial;
+        expected.retry_count = 2;
+        assert_eq!(last, expected);
+
+        repo.mark_collection_publishing(id).await?;
+        assert!(repo
+            .schedule_collection_retry(&second, CollectionRetryStage::UploadReturned, 1)
+            .await
+            .is_err());
+        assert!(
+            !repo
+                .schedule_collection_retry(&last, CollectionRetryStage::UploadReturned, 2)
+                .await?
+        );
+        assert!(repo
+            .db
+            .query_one(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "SELECT 1 FROM collection_jobs WHERE id = ?",
+                [id.into()],
+            ))
+            .await?
+            .is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn startup_requeues_preparing_without_replaying_publishing() -> Result<()> {
         let db = Database::connect("sqlite::memory:").await?;
-        migration::Migrator::up(&db, None).await?;
+        Migrator::up(&db, None).await?;
         let repo = Repo::new(db);
         let interrupted = repo
             .enqueue_collection_job(-42, 7, "interrupted".into(), true)

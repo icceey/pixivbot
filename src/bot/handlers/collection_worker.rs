@@ -1,7 +1,7 @@
 use super::{collection_export::COLLECTION_MORE_PREFIX, collection_input::CollectionSource};
 use crate::booru::pool_image_batch;
 use crate::bot::{notifier::ThrottledBot, BotHandler};
-use crate::db::repo::collection_jobs::Model;
+use crate::db::repo::collection_jobs::{CollectionRetryStage, Model};
 use crate::pixiv::PixivGallery;
 use crate::scheduler::get_chat_if_should_notify;
 use anyhow::{ensure, Context, Result};
@@ -11,7 +11,16 @@ use teloxide::{
     prelude::*,
     types::{InlineKeyboardButton, InlineKeyboardMarkup},
 };
-use tracing::error;
+use tracing::{error, warn};
+
+impl std::fmt::Display for CollectionRetryStage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Preparing => "Collection preparation failed",
+            Self::UploadReturned => "Image upload failed before Telegraph page creation",
+        })
+    }
+}
 
 const BATCH_SIZE: usize = 50;
 const IMAGE_DOWNLOAD_CONCURRENCY: usize = 4;
@@ -54,22 +63,23 @@ impl BotHandler {
             match self.repo.claim_collection_job().await {
                 Ok(Some(job)) => {
                     if let Err(e) = self.process_collection_batch(&bot, &job).await {
-                        error!(
-                            "Collection job {} batch {} failed: {e:#}",
-                            job.id, job.generation
-                        );
-                        if let Err(e) = self.repo.fail_collection_job(job.id).await {
-                            error!("Could not close failed collection {}: {e:#}", job.id);
-                        }
-                        self.notify_collection_problem(
-                            &bot,
-                            &job,
-                            "本批未能完成；请核对已收到的结果，再决定是否重新导出。",
-                        )
-                        .await;
+                        self.handle_collection_failure(&bot, &job, e).await;
                     }
                 }
-                Ok(None) => self.collection_wakeup.notified().await,
+                Ok(None) => match self.repo.next_collection_retry_at().await {
+                    Ok(Some(deadline)) => {
+                        let delay = (deadline - chrono::Utc::now().timestamp()).max(0) as u64;
+                        tokio::select! {
+                            _ = tokio::time::sleep(Duration::from_secs(delay)) => (),
+                            _ = self.collection_wakeup.notified() => (),
+                        }
+                    }
+                    Ok(None) => self.collection_wakeup.notified().await,
+                    Err(e) => {
+                        error!("Failed to read next collection retry deadline: {e:#}");
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                    }
+                },
                 Err(e) => {
                     error!("Failed to claim a collection batch: {e:#}");
                     tokio::time::sleep(Duration::from_secs(5)).await;
@@ -78,7 +88,61 @@ impl BotHandler {
         }
     }
 
+    async fn handle_collection_failure(
+        &self,
+        bot: &ThrottledBot,
+        job: &Model,
+        failure: anyhow::Error,
+    ) {
+        let notice = if let Some(&stage) = failure.downcast_ref::<CollectionRetryStage>() {
+            match self
+                .repo
+                .schedule_collection_retry(job, stage, self.eh_config.max_retry_count)
+                .await
+            {
+                Ok(true) => {
+                    warn!(
+                        "Collection job {} batch {} scheduled retry {}: {failure:#}",
+                        job.id,
+                        job.generation,
+                        job.retry_count + 1
+                    );
+                    return;
+                }
+                Ok(false) => "本批已达到重试上限，导出已停止。",
+                Err(e) => {
+                    error!("Could not schedule retry for collection {}: {e:#}; batch error: {failure:#}", job.id);
+                    self.notify_collection_problem(
+                        bot,
+                        job,
+                        "未能确认重试状态，请先核对聊天中的结果。",
+                    )
+                    .await;
+                    return;
+                }
+            }
+        } else {
+            if let Err(e) = self.repo.fail_collection_job(job.id).await {
+                error!("Could not close failed collection {}: {e:#}", job.id);
+            }
+            "本批未能完成；请核对已收到的结果，再决定是否重新导出。"
+        };
+        error!(
+            "Collection job {} batch {} stopped: {failure:#}",
+            job.id, job.generation
+        );
+        self.notify_collection_problem(bot, job, notice).await;
+    }
+
     async fn process_collection_batch(&self, bot: &ThrottledBot, job: &Model) -> Result<()> {
+        if job.retry_count > 0 {
+            ensure!(
+                get_chat_if_should_notify(&self.repo, job.chat_id)
+                    .await?
+                    .is_some(),
+                "Collection chat is no longer accessible"
+            );
+        }
         let source: CollectionSource = serde_json::from_str(&job.source)?;
         let ranking_remaining = match &source {
             CollectionSource::Pixiv(PixivGallery::Ranking { limit, .. }) => {
@@ -93,14 +157,25 @@ impl BotHandler {
                 let client = self.pixiv_client.read().await.clone();
                 let cursor: Option<crate::pixiv::GalleryCursor> =
                     raw_cursor.map(serde_json::from_str).transpose()?;
-                let (images, next) = client.gallery_image_batch(gallery, cursor, limit).await?;
+                let (images, next) = client
+                    .gallery_image_batch(gallery, cursor, limit)
+                    .await
+                    .context(CollectionRetryStage::Preparing)?;
                 (images, next.map(|c| serde_json::to_string(&c)).transpose()?)
             }
             CollectionSource::Pool { site, id } => {
                 let cursor: Option<crate::booru::PoolCursor> =
                     raw_cursor.map(serde_json::from_str).transpose()?;
                 let (images, next) =
-                    pool_image_batch(&self.booru_registry, site, *id, cursor, limit).await?;
+                    pool_image_batch(&self.booru_registry, site, *id, cursor, limit)
+                        .await
+                        .map_err(|e| {
+                            if e.is::<booru_client::Error>() {
+                                e.context(CollectionRetryStage::Preparing)
+                            } else {
+                                e
+                            }
+                        })?;
                 (images, next.map(|c| serde_json::to_string(&c)).transpose()?)
             }
         };
@@ -150,7 +225,8 @@ impl BotHandler {
                 })
                 .buffered(IMAGE_DOWNLOAD_CONCURRENCY)
                 .try_collect()
-                .await?;
+                .await
+                .context(CollectionRetryStage::Preparing)?;
             self.deliver_collection_files(
                 bot,
                 job,

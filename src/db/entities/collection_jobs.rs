@@ -10,4 +10,5 @@ pub struct Model {
     pub generation: i64,
     pub delivered: i64,
     pub cursor: Option<String>,
+    pub retry_count: i32,
 }
