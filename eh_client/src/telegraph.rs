@@ -1,7 +1,7 @@
 use crate::error::{Error, Result, UploadStateError};
 use crate::s3_multipart::{
     abort_upload_state as abort_multipart_upload_state, fingerprint_fields, put_object_stream,
-    sha256_hex, upload_multipart, uploader_identity_fingerprint,
+    retry_put_object, sha256_hex, upload_multipart, uploader_identity_fingerprint,
     zip_put_extension_is_explicitly_unsupported, CapabilityState, CompletionEvidence,
     CreateExtension, HeadRecovery, MultipartCapability, MultipartOperation, MultipartOutcome,
     MultipartUploadRequest, ProviderKind, IPFS3_DECOMPRESS_TAGGING, MAX_PART_SIZE, MIN_PART_SIZE,
@@ -1148,11 +1148,12 @@ impl S3Uploader {
         bytes: &[u8],
         content_type: &str,
     ) -> Result<String> {
-        let response = self
-            .bucket
-            .put_object_with_content_type(key, bytes, content_type)
-            .await
-            .map_err(|e| Error::Other(format!("S3 put_object failed for key {key}: {e}")))?;
+        let response = retry_put_object(|| {
+            self.bucket
+                .put_object_with_content_type(key, bytes, content_type)
+        })
+        .await
+        .map_err(|e| Error::Other(format!("S3 put_object failed for key {key}: {e}")))?;
         let status = response.status_code();
         if !(200..300).contains(&status) {
             return Err(Error::Api {
@@ -1802,11 +1803,12 @@ impl IpfS3Uploader {
         bytes: &[u8],
         content_type: &str,
     ) -> Result<String> {
-        let response = self
-            .bucket
-            .put_object_with_content_type(key, bytes, content_type)
-            .await
-            .map_err(|e| Error::Other(format!("ipfS3 put_object failed for key {key}: {e}")))?;
+        let response = retry_put_object(|| {
+            self.bucket
+                .put_object_with_content_type(key, bytes, content_type)
+        })
+        .await
+        .map_err(|e| Error::Other(format!("ipfS3 put_object failed for key {key}: {e}")))?;
         let status = response.status_code();
         if !(200..300).contains(&status) {
             return Err(Error::Api {
@@ -1931,14 +1933,16 @@ impl IpfS3Uploader {
             HeaderValue::from_static(IPFS3_DECOMPRESS_TAGGING),
         );
 
-        let response = put_object_stream(
-            upload_bucket.as_ref(),
-            key,
-            &prepared.file,
-            prepared.len,
-            &prepared.sha256,
-            "application/zip",
-        )
+        let response = retry_put_object(|| {
+            put_object_stream(
+                upload_bucket.as_ref(),
+                key,
+                &prepared.file,
+                prepared.len,
+                &prepared.sha256,
+                "application/zip",
+            )
+        })
         .await
         .map_err(|error| {
             Error::Other(format!(
@@ -3958,7 +3962,7 @@ mod tests {
         Mock::given(ImageS3Request::OrdinaryPut)
             .and(body_bytes(zip_bytes.clone()))
             .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(2)))
-            .expect(1)
+            .expect(3)
             .mount(&server)
             .await;
 
@@ -3978,9 +3982,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ipfs3_zip_archive_upload_signs_query_and_uses_ordered_entry_cids() {
+    async fn ipfs3_zip_archive_replays_signed_put_and_uses_ordered_entry_cids() {
+        use std::sync::atomic::{AtomicBool, Ordering};
         use wiremock::matchers::{body_bytes, method, path_regex};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use wiremock::{Mock, MockServer, Respond, ResponseTemplate};
 
         let server = MockServer::start().await;
         let page = vec![0x5a; 128 * 1024];
@@ -3992,11 +3997,18 @@ mod tests {
             ZipEntryFixture::deflated(b"dir/page002.png"),
             ZipEntryFixture::stored(b"notes.txt"),
         ]);
+        let first_attempt = AtomicBool::new(true);
         Mock::given(method("PUT"))
             .and(path_regex(r"^/bucket/eh/\d{14}-archive-[0-9a-f]{8}\.zip$"))
             .and(body_bytes(zip_bytes.clone()))
-            .respond_with(IpfS3ZipExtractResponder)
-            .expect(1)
+            .respond_with(move |request: &wiremock::Request| {
+                if first_attempt.swap(false, Ordering::Relaxed) {
+                    ResponseTemplate::new(503)
+                } else {
+                    IpfS3ZipExtractResponder.respond(request)
+                }
+            })
+            .expect(2)
             .mount(&server)
             .await;
         Mock::given(method("PUT"))
@@ -4059,10 +4071,18 @@ mod tests {
         );
 
         let requests = server.received_requests().await.unwrap();
-        let zip_request = requests
-            .iter()
-            .find(|request| request.url.path().ends_with(".zip"))
-            .unwrap();
+        let [zip_request, zip_retry, normal_request] = requests.as_slice() else {
+            panic!("expected two ZIP PUTs followed by one image PUT");
+        };
+        assert_eq!(zip_retry.url, zip_request.url);
+        for header in [
+            "content-type",
+            "content-length",
+            "x-amz-content-sha256",
+            "x-amz-tagging",
+        ] {
+            assert_eq!(zip_retry.headers[header], zip_request.headers[header]);
+        }
         let archive_stem = zip_request
             .url
             .path()
@@ -4153,10 +4173,7 @@ mod tests {
             reference.authorization(&signed_headers).await.unwrap()
         );
 
-        let normal_request = requests
-            .iter()
-            .find(|request| request.url.path().ends_with(".png"))
-            .unwrap();
+        assert!(normal_request.url.path().ends_with(".png"));
         assert!(normal_request.url.query().is_none());
         assert!(!normal_request
             .url
@@ -4175,7 +4192,7 @@ mod tests {
 
     #[tokio::test]
     async fn ipfs3_zip_archive_single_put_classifies_only_explicit_extension_unsupported_errors() {
-        use wiremock::matchers::{method, path_regex};
+        use wiremock::matchers::{body_bytes, method, path_regex};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let not_implemented =
@@ -4203,12 +4220,16 @@ mod tests {
             ("http_500_not_implemented", 500, not_implemented, false),
             ("raw_501", 501, "not implemented", false),
             ("malformed_501", 501, malformed_not_implemented, false),
+            ("malformed_success", 200, "<DecompressZipResult>", false),
         ] {
             let server = MockServer::start().await;
+            let zip_bytes = zip_fixture(&[ZipEntryFixture::stored(b"page001.jpg")]);
+            let expected_attempts = if status == 500 { 3 } else { 1 };
             Mock::given(method("PUT"))
                 .and(path_regex(r"^/bucket/eh/\d{14}-archive-[0-9a-f]{8}\.zip$"))
+                .and(body_bytes(zip_bytes.clone()))
                 .respond_with(ResponseTemplate::new(status).set_body_string(body))
-                .expect(1)
+                .expect(expected_attempts)
                 .mount(&server)
                 .await;
 
@@ -4219,7 +4240,6 @@ mod tests {
             .unwrap();
             uploader.standard_multipart.mark_unsupported();
             let entries = vec!["page001.jpg".to_string()];
-            let zip_bytes = zip_fixture(&[ZipEntryFixture::stored(b"page001.jpg")]);
             let result = uploader
                 .upload_zip_archive_with_url_pairs(ZipArchiveUploadInput {
                     path: zip_fixture_file(&zip_bytes).path(),
@@ -5509,12 +5529,15 @@ mod tests {
 
     #[tokio::test]
     async fn s3_request_timeout_applies_to_bucket_put() {
+        use wiremock::matchers::body_bytes;
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
+        let bytes = b"\x89PNG\r\n\x1a\n";
         let server = MockServer::start().await;
         Mock::given(ImageS3Request::OrdinaryPut)
+            .and(body_bytes(bytes.to_vec()))
             .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(2)))
-            .expect(1)
+            .expect(3)
             .mount(&server)
             .await;
         let config: ImageUploadConfig = serde_json::from_value(serde_json::json!({
@@ -5536,7 +5559,7 @@ mod tests {
             .unwrap()
             .upload_images(&[ImageUploadInput {
                 filename: "image.png",
-                bytes: b"\x89PNG\r\n\x1a\n",
+                bytes,
                 resume_context: None,
             }])
             .await;
@@ -5546,6 +5569,68 @@ mod tests {
             result.is_err(),
             "delayed successful PUT bypassed its timeout"
         );
+    }
+
+    #[tokio::test]
+    async fn s3_and_ipfs3_image_put_replays_transient_statuses_and_stops_on_forbidden() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let bytes = b"\x89PNG\r\n\x1a\n";
+        let cdn = "https://cdn.example";
+        let gateway = "https://ipfs.example/ipfs";
+        for provider in [ImageUploadProvider::S3, ImageUploadProvider::IpfS3] {
+            for statuses in [&[408u16, 429, 200][..], &[502, 403][..]] {
+                let server = MockServer::start().await;
+                let attempt = AtomicUsize::new(0);
+                Mock::given(ImageS3Request::OrdinaryPut)
+                    .respond_with(move |_: &wiremock::Request| {
+                        let status = statuses
+                            .get(attempt.fetch_add(1, Ordering::Relaxed))
+                            .copied()
+                            .unwrap_or(400);
+                        ResponseTemplate::new(status).insert_header("etag", "\"image-cid\"")
+                    })
+                    .expect(statuses.len() as u64)
+                    .mount(&server)
+                    .await;
+                let result = ImageUploadConfig {
+                    provider,
+                    s3: Some(complete_s3_config(&server.uri(), cdn)),
+                    ipfs3: Some(complete_ipfs3_config(&server.uri(), gateway)),
+                    ..Default::default()
+                }
+                .build_uploader()
+                .await
+                .unwrap()
+                .upload_images(&[ImageUploadInput {
+                    filename: "image.png",
+                    bytes,
+                    resume_context: None,
+                }])
+                .await;
+
+                let requests = server.received_requests().await.unwrap();
+                assert_eq!(requests.len(), statuses.len(), "{provider:?} {statuses:?}");
+                for request in &requests {
+                    assert_eq!(request.url, requests[0].url);
+                    assert_eq!(request.body.as_slice(), bytes);
+                }
+                if statuses.last() == Some(&403) {
+                    assert!(matches!(result, Err(Error::Api { status: 403, .. })));
+                } else {
+                    let expected = if provider == ImageUploadProvider::S3 {
+                        format!(
+                            "{cdn}{}",
+                            requests[0].url.path().strip_prefix("/bucket").unwrap()
+                        )
+                    } else {
+                        format!("{gateway}/image-cid")
+                    };
+                    assert_eq!(result.unwrap(), [expected]);
+                }
+            }
+        }
     }
 
     #[tokio::test]
