@@ -11,7 +11,9 @@ use reqwest::header::{HeaderName, HeaderValue};
 use s3::creds::Credentials;
 use s3::{Bucket, Region};
 use serde::{Deserialize, Serialize};
+use std::num::NonZeroU64;
 use std::sync::Arc;
+use std::time::Duration;
 
 /// A Telegraph content node.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -335,6 +337,8 @@ pub struct S3UploaderConfig {
     pub key_prefix: String,
     #[serde(default = "default_s3_path_style")]
     pub path_style: bool,
+    #[serde(default = "default_s3_request_timeout_sec")]
+    pub request_timeout_sec: NonZeroU64,
     #[serde(default = "default_multipart_image_threshold_mb")]
     pub multipart_image_threshold_mb: u64,
     #[serde(
@@ -346,6 +350,10 @@ pub struct S3UploaderConfig {
 
 fn default_s3_path_style() -> bool {
     true
+}
+
+fn default_s3_request_timeout_sec() -> NonZeroU64 {
+    NonZeroU64::new(300).unwrap()
 }
 
 fn default_multipart_image_threshold_mb() -> u64 {
@@ -387,6 +395,7 @@ impl Default for S3UploaderConfig {
             public_base_url: None,
             key_prefix: String::new(),
             path_style: default_s3_path_style(),
+            request_timeout_sec: default_s3_request_timeout_sec(),
             multipart_image_threshold_mb: default_multipart_image_threshold_mb(),
             multipart_part_size_mb: default_multipart_part_size_mb(),
         }
@@ -415,6 +424,7 @@ impl S3UploaderConfig {
             .to_string(),
             key_prefix: self.key_prefix.trim_matches('/').to_string(),
             path_style: self.path_style,
+            request_timeout: Duration::from_secs(self.request_timeout_sec.get()),
             multipart_image_threshold_mb: self.multipart_image_threshold_mb,
             multipart_part_size: multipart_part_size_bytes(self.multipart_part_size_mb)?,
         })
@@ -443,6 +453,8 @@ pub struct IpfS3UploaderConfig {
     pub key_prefix: String,
     #[serde(default = "default_s3_path_style")]
     pub path_style: bool,
+    #[serde(default = "default_s3_request_timeout_sec")]
+    pub request_timeout_sec: NonZeroU64,
     #[serde(default = "default_multipart_image_threshold_mb")]
     pub multipart_image_threshold_mb: u64,
     #[serde(
@@ -477,6 +489,7 @@ impl Default for IpfS3UploaderConfig {
             preview_rewrite_delay_sec: default_ipfs_preview_rewrite_delay_sec(),
             key_prefix: String::new(),
             path_style: default_s3_path_style(),
+            request_timeout_sec: default_s3_request_timeout_sec(),
             multipart_image_threshold_mb: default_multipart_image_threshold_mb(),
             multipart_part_size_mb: default_multipart_part_size_mb(),
             warm_public_gateway_after_upload: false,
@@ -524,6 +537,7 @@ impl IpfS3UploaderConfig {
             preview_rewrite_delay_sec: self.preview_rewrite_delay_sec,
             key_prefix: self.key_prefix.trim_matches('/').to_string(),
             path_style: self.path_style,
+            request_timeout: Duration::from_secs(self.request_timeout_sec.get()),
             multipart_image_threshold_mb: self.multipart_image_threshold_mb,
             multipart_part_size: multipart_part_size_bytes(self.multipart_part_size_mb)?,
             warm_public_gateway_after_upload: self.warm_public_gateway_after_upload,
@@ -544,6 +558,7 @@ struct ResolvedIpfS3UploaderConfig {
     preview_rewrite_delay_sec: u64,
     key_prefix: String,
     path_style: bool,
+    request_timeout: Duration,
     multipart_image_threshold_mb: u64,
     multipart_part_size: u64,
     warm_public_gateway_after_upload: bool,
@@ -816,6 +831,7 @@ struct ResolvedS3UploaderConfig {
     public_base_url: String,
     key_prefix: String,
     path_style: bool,
+    request_timeout: Duration,
     multipart_image_threshold_mb: u64,
     multipart_part_size: u64,
 }
@@ -1092,12 +1108,13 @@ impl S3Uploader {
             endpoint: config.endpoint_url.clone(),
         };
         let mut bucket = Bucket::new(&config.bucket, region, credentials)
+            .and_then(|bucket| bucket.with_request_timeout(config.request_timeout))
             .map_err(|e| Error::Other(format!("failed to build S3 bucket client: {e}")))?;
         if config.path_style {
             bucket = bucket.with_path_style();
         }
         let multipart_http = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(60))
+            .timeout(config.request_timeout)
             .build()?;
         let uploader_identity_sha256 = multipart_uploader_identity(
             ProviderKind::S3,
@@ -1716,6 +1733,7 @@ impl IpfS3Uploader {
             endpoint: config.endpoint_url.clone(),
         };
         let mut bucket = Bucket::new(&config.bucket, region, credentials)
+            .and_then(|bucket| bucket.with_request_timeout(config.request_timeout))
             .map_err(|e| Error::Other(format!("failed to build ipfS3 bucket client: {e}")))?;
         if config.path_style {
             bucket = bucket.with_path_style();
@@ -1724,7 +1742,7 @@ impl IpfS3Uploader {
             .timeout(std::time::Duration::from_secs(10))
             .build()?;
         let multipart_http = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(60))
+            .timeout(config.request_timeout)
             .build()?;
         let uploader_identity_sha256 = multipart_uploader_identity(
             ProviderKind::IpfS3,
@@ -2828,6 +2846,7 @@ mod tests {
             public_base_url: Some(public_base_url.to_string()),
             key_prefix: "eh".to_string(),
             path_style: true,
+            request_timeout_sec: default_s3_request_timeout_sec(),
             multipart_image_threshold_mb: 8,
             multipart_part_size_mb: 8,
         }
@@ -2845,6 +2864,7 @@ mod tests {
             preview_rewrite_delay_sec: default_ipfs_preview_rewrite_delay_sec(),
             key_prefix: "eh".to_string(),
             path_style: true,
+            request_timeout_sec: default_s3_request_timeout_sec(),
             multipart_image_threshold_mb: 8,
             multipart_part_size_mb: 8,
             warm_public_gateway_after_upload: false,
@@ -3918,6 +3938,43 @@ mod tests {
         .unwrap();
 
         assert_eq!(cids, ["cid-page-one", "cid-page-two"]);
+    }
+
+    #[tokio::test]
+    async fn ipfs3_request_timeout_applies_to_zip_single_put_fallback() {
+        use wiremock::matchers::body_bytes;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(ImageS3Request::Create)
+            .respond_with(ImageCompleteBody::Error {
+                status: 501,
+                code: "NotImplemented".to_string(),
+            })
+            .expect(1)
+            .mount(&server)
+            .await;
+        let zip_bytes = zip_fixture(&[ZipEntryFixture::stored(b"page.jpg")]);
+        Mock::given(ImageS3Request::OrdinaryPut)
+            .and(body_bytes(zip_bytes.clone()))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(2)))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut config = complete_ipfs3_config(&server.uri(), "https://public.example/ipfs");
+        config.request_timeout_sec = NonZeroU64::MIN;
+        let result = IpfS3Uploader::from_config(&config)
+            .unwrap()
+            .upload_zip_archive_with_url_pairs(ZipArchiveUploadInput {
+                path: zip_fixture_file(&zip_bytes).path(),
+                entry_names: &["page.jpg".to_string()],
+                resume_context: None,
+            })
+            .await;
+
+        server.verify().await;
+        assert!(result.is_err(), "delayed ZIP PUT bypassed its timeout");
     }
 
     #[tokio::test]
@@ -5448,6 +5505,87 @@ mod tests {
             );
             server.verify().await;
         }
+    }
+
+    #[tokio::test]
+    async fn s3_request_timeout_applies_to_bucket_put() {
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(ImageS3Request::OrdinaryPut)
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(2)))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let config: ImageUploadConfig = serde_json::from_value(serde_json::json!({
+            "provider": "s3",
+            "s3": {
+                "endpoint_url": server.uri(),
+                "bucket": "bucket",
+                "region": "auto",
+                "access_key_id": "key",
+                "secret_access_key": "secret",
+                "public_base_url": "https://cdn.example",
+                "request_timeout_sec": 1,
+            },
+        }))
+        .unwrap();
+        let result = config
+            .build_uploader()
+            .await
+            .unwrap()
+            .upload_images(&[ImageUploadInput {
+                filename: "image.png",
+                bytes: b"\x89PNG\r\n\x1a\n",
+                resume_context: None,
+            }])
+            .await;
+
+        server.verify().await;
+        assert!(
+            result.is_err(),
+            "delayed successful PUT bypassed its timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn s3_request_timeout_applies_to_presigned_list_parts() {
+        use wiremock::{Mock, MockServer, Respond, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(ImageS3Request::Create)
+            .respond_with(ImageCreateResponder)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(ImageS3Request::ListParts)
+            .respond_with(|request: &wiremock::Request| {
+                ImageEmptyListPartsResponder
+                    .respond(request)
+                    .set_delay(Duration::from_secs(2))
+            })
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(ImageS3Request::Abort)
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+
+        let mut config = complete_s3_config(&server.uri(), "https://cdn.example");
+        config.request_timeout_sec = NonZeroU64::MIN;
+        config.multipart_image_threshold_mb = 1;
+        let result = S3Uploader::from_config(&config)
+            .unwrap()
+            .upload_images(&[ImageUploadInput {
+                filename: "image.bin",
+                bytes: &one_mib_image(),
+                resume_context: None,
+            }])
+            .await;
+
+        server.verify().await;
+        assert!(matches!(result, Err(Error::Http(error)) if error.is_timeout()));
     }
 
     #[tokio::test]
