@@ -88,8 +88,9 @@ impl BotHandler {
                  • `/download https://www.pixiv.net/artworks/123456789`\n\
                  • `/download https://e-hentai.org/g/12345/token/`\n\
                  • `/download https://yande.re/post/show/123456`（需先在配置中启用）\n\
-                 • 集合：Pixiv 合集、公开收藏、作者、日期榜、pixivision 或已配置的 Danbooru/Moebooru pool\n\
-                 • 日期榜例：`/download https://www.pixiv.net/ranking.php?mode=daily&date=20260101 limit=50`\n\
+                 • 集合：Pixiv 合集、公开收藏、作者、精确标签作品、日期榜、pixivision 或已配置的 Danbooru/Moebooru pool\n\
+                 • 集合每批最多 50 张，还有图片时点击按钮续页\n\
+                 • 日期榜例：`/download https://www.pixiv.net/ranking.php?mode=daily&date=20260101 limit=80`，`limit` 为总图片上限\n\
                  • 回复包含链接的消息并使用 `/download`",
             )
             .parse_mode(ParseMode::MarkdownV2)

@@ -12,6 +12,7 @@ pub use eh_engine::{
     drain_eh_job_cleanup_maintenance, EhDownloadQueue, EhDownloadWorker, EhEngine, EhPublishWorker,
     EhTelegraphRewriteWorker, EhUploadWorker,
 };
+pub(crate) use helpers::get_chat_if_should_notify;
 pub use name_update_engine::NameUpdateEngine;
 pub use pixiv_tag_engine::PixivTagEngine;
 pub use ranking_engine::RankingEngine;

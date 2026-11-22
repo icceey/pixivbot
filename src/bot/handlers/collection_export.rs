@@ -1,130 +1,103 @@
 use super::collection_input::CollectionSource;
 use crate::bot::{notifier::ThrottledBot, BotHandler};
+use crate::db::repo::collection_jobs::ResumeResult;
 use crate::pixiv::PixivGallery;
-use anyhow::{Context, Result};
+use crate::scheduler::get_chat_if_should_notify;
 use teloxide::prelude::*;
 use tracing::error;
 
-impl BotHandler {
-    async fn collection_images(&self, source: CollectionSource) -> Result<Vec<(String, String)>> {
-        match source {
-            CollectionSource::Pixiv(gallery) => {
-                self.pixiv_client
-                    .read()
-                    .await
-                    .gallery_images(&gallery)
-                    .await
-            }
-            CollectionSource::Pool { site, id } => {
-                let site = self
-                    .booru_registry
-                    .get(&site)
-                    .context("Booru site is not configured")?;
-                let mut images = Vec::new();
-                for post in site.client.pool_images(id).await? {
-                    let parsed_url = post
-                        .file_url
-                        .as_deref()
-                        .and_then(|s| url::Url::parse(s).ok());
-                    let ext = post
-                        .file_ext
-                        .as_deref()
-                        .or_else(|| {
-                            parsed_url
-                                .as_ref()?
-                                .path_segments()?
-                                .next_back()?
-                                .rsplit_once('.')
-                                .map(|(_, ext)| ext)
-                        })
-                        .with_context(|| {
-                            format!("Missing original file type for post {}", post.id)
-                        })?
-                        .to_ascii_lowercase();
-                    if matches!(
-                        ext.as_str(),
-                        "jpg" | "jpeg" | "png" | "gif" | "webp" | "avif" | "jxl" | "bmp"
-                    ) {
-                        let url = post
-                            .file_url
-                            .with_context(|| format!("Missing original for post {}", post.id))?;
-                        images.push((format!("{}.{ext}", post.id), url));
-                    }
-                }
-                Ok(images)
-            }
-        }
-    }
+pub(in crate::bot) const COLLECTION_MORE_PREFIX: &str = "col:";
 
-    pub(super) async fn send_collection_export(
-        &self,
-        bot: &ThrottledBot,
-        chat_id: ChatId,
-        source: CollectionSource,
-        telegraph: bool,
-    ) -> ResponseResult<()> {
-        if telegraph && self.telegraph.is_none() {
-            bot.send_message(chat_id, "❌ Telegraph 未配置，无法生成阅读链接。")
-                .await?;
-            return Ok(());
-        }
-        let title = match &source {
-            CollectionSource::Pixiv(gallery) => match gallery {
+impl CollectionSource {
+    pub(super) fn title(&self) -> String {
+        match self {
+            Self::Pixiv(gallery) => match gallery {
                 PixivGallery::Author(id) => format!("Pixiv 作者 {id}"),
                 PixivGallery::Bookmarks(id) => format!("Pixiv 公开收藏 {id}"),
                 PixivGallery::Collection(id) => format!("Pixiv 合集 {id}"),
                 PixivGallery::Pixivision { id, .. } => format!("pixivision {id}"),
                 PixivGallery::Ranking { mode, date, .. } => format!("Pixiv {mode} {date}"),
+                PixivGallery::Tag(tag) => format!("Pixiv 标签 {tag}"),
             },
-            CollectionSource::Pool { site, id } => format!("{site} pool {id}"),
-        };
-        bot.send_message(chat_id, format!("正在准备「{title}」…"))
-            .await?;
-        let images = match self.collection_images(source).await {
-            Ok(images) if images.is_empty() => {
-                bot.send_message(chat_id, "合集中没有可导出的图片。")
-                    .await?;
-                return Ok(());
-            }
-            Ok(images) => images,
-            Err(e) => {
-                error!("Could not resolve {title}: {e:#}");
-                bot.send_message(
-                    chat_id,
-                    "❌ 无法读取合集的完整图片列表，请检查链接和访问权限。",
+            Self::Pool { site, id } => format!("{site} pool {id}"),
+        }
+    }
+}
+
+impl BotHandler {
+    pub(super) async fn enqueue_collection_export(
+        &self,
+        bot: &ThrottledBot,
+        chat_id: ChatId,
+        user_id: UserId,
+        source: CollectionSource,
+        telegraph: bool,
+    ) -> ResponseResult<()> {
+        let result = async {
+            let json = serde_json::to_string(&source)?;
+            self.repo
+                .enqueue_collection_job(chat_id.0, user_id.0 as i64, json, telegraph)
+                .await
+        }
+        .await;
+        let text = match result {
+            Ok(id) => {
+                self.collection_wakeup.notify_one();
+                format!(
+                    "「{}」已加入后台队列（任务 #{id}），每批最多 50 张。",
+                    source.title()
                 )
-                .await?;
-                return Ok(());
+            }
+            Err(e) => {
+                error!("Failed to queue collection for chat {chat_id}: {e:#}");
+                "❌ 无法加入集合导出队列，请稍后重试。".to_string()
             }
         };
-        let mut files = Vec::with_capacity(images.len());
-        let width = images.len().to_string().len();
-        for (i, (name, url)) in images.into_iter().enumerate() {
-            match self.notifier.get_downloader().download(&url).await {
-                Ok(path) => files.push((path, format!("{:0width$}_{name}", i + 1))),
-                Err(e) => {
-                    error!("Could not download {title} image {}: {e:#}", i + 1);
-                    bot.send_message(
-                        chat_id,
-                        format!("❌ 第 {} 张图片下载失败，已停止导出。", i + 1),
-                    )
-                    .await?;
-                    return Ok(());
+        bot.send_message(chat_id, text).await?;
+        Ok(())
+    }
+
+    pub(crate) async fn handle_collection_more(
+        &self,
+        bot: &ThrottledBot,
+        q: &CallbackQuery,
+    ) -> ResponseResult<()> {
+        let payload = q
+            .data
+            .as_deref()
+            .and_then(|s| s.strip_prefix(COLLECTION_MORE_PREFIX))
+            .and_then(|s| s.split_once(':'))
+            .and_then(|(id, batch)| Some((id.parse::<i64>().ok()?, batch.parse::<i64>().ok()?)));
+        let result = async {
+            if let (Some((id, batch)), Some(message)) = (payload, &q.message) {
+                let chat_id = message.chat().id.0;
+                if !q.from.is_bot
+                    && get_chat_if_should_notify(&self.repo, chat_id)
+                        .await?
+                        .is_some()
+                {
+                    return self
+                        .repo
+                        .resume_collection_job(id, chat_id, q.from.id.0 as i64, batch)
+                        .await;
                 }
             }
+            Ok(ResumeResult::Unavailable)
         }
-        if let Err(e) = self
-            .deliver_collection_files(bot, chat_id, &title, &files, telegraph)
-            .await
-        {
-            error!("Could not deliver {title}: {e:#}");
-            let message = if telegraph {
-                "❌ 发布 Telegraph 失败。"
-            } else {
-                "❌ 创建或发送压缩包失败，请检查文件大小限制。"
-            };
-            bot.send_message(chat_id, message).await?;
-        }
+        .await;
+        let text = match result {
+            Ok(ResumeResult::Queued) => {
+                self.collection_wakeup.notify_one();
+                "下一批已加入队列。"
+            }
+            Ok(ResumeResult::Publishing) => "上一批正在确认，请稍后再按。",
+            Ok(ResumeResult::Unavailable) => "此按钮不可用，或已处理。请由原发起人在原聊天中续取。",
+            Err(e) => {
+                error!("Could not resume collection: {e:#}");
+                "暂时无法续取，请稍后再试。"
+            }
+        };
+        bot.answer_callback_query(q.id.clone()).text(text).await?;
         Ok(())
     }
 }

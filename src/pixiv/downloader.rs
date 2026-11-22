@@ -47,7 +47,7 @@ impl Downloader {
             .context("Failed to read response bytes")?;
 
         // Save to cache
-        let path = self.cache.save(url, &bytes).await?;
+        let path = self.cache.save(url, bytes).await?;
         info!("Downloaded to: {:?}", path);
         Ok(path)
     }
@@ -129,7 +129,7 @@ impl Downloader {
             .context("MP4 encoding task failed")??;
 
         // Save to cache
-        let path = self.cache.save(&mp4_cache_key, &mp4_data).await?;
+        let path = self.cache.save(&mp4_cache_key, mp4_data).await?;
         info!("Ugoira MP4 saved to: {:?}", path);
         Ok(path)
     }

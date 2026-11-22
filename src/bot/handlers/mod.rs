@@ -22,6 +22,9 @@ mod booru_download;
 mod collection_delivery;
 mod collection_export;
 mod collection_input;
+mod collection_worker;
+
+pub(super) use collection_export::COLLECTION_MORE_PREFIX;
 
 /// Callback data prefix for download button (Pixiv illust).
 pub const DOWNLOAD_CALLBACK_PREFIX: &str = "dl:";

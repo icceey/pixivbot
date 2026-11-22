@@ -2,13 +2,75 @@ use super::PixivGallery;
 use crate::config::PixivConfig;
 use anyhow::{anyhow, Context, Result};
 use pixiv_client::{self, Illust};
+use serde::{Deserialize, Serialize};
+use std::collections::{HashSet, VecDeque};
+use std::sync::Arc;
 use tracing::info;
 
 // Pixiv's publication dates use Japan Standard Time, independent of the host TZ.
 pub const SEARCH_TIMEZONE: chrono::FixedOffset = chrono::FixedOffset::east_opt(9 * 3600).unwrap();
 
+#[derive(Clone)]
 pub struct PixivClient {
-    client: pixiv_client::PixivClient,
+    client: Arc<pixiv_client::PixivClient>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GalleryCursor {
+    next: SourcePage,
+    work_ids: VecDeque<u64>,
+    works: VecDeque<OriginalWork>,
+    pixivision_seen: HashSet<u64>,
+    tag_anchor: Option<u64>,
+}
+
+impl GalleryCursor {
+    fn queue_static_works(&mut self, illusts: impl IntoIterator<Item = Illust>) {
+        self.works
+            .extend(illusts.into_iter().filter_map(OriginalWork::from_illust));
+    }
+
+    fn queue_tag_page(
+        &mut self,
+        page: pixiv_client::SearchIllusts,
+        offset: u32,
+    ) -> Result<Option<u32>> {
+        let next = next_offset(page.next_url, offset, "Tag")?;
+        let last_id = page.illusts.last().map(|work| work.id);
+        let mut works = page.illusts.into_iter();
+        if offset > 0 {
+            let anchor = self
+                .tag_anchor
+                .context("Missing previous tag result for pagination")?;
+            anyhow::ensure!(
+                works.any(|work| work.id == anchor),
+                "Pixiv tag results changed at offset {offset}; restart the export"
+            );
+        }
+        self.tag_anchor = if next.is_some() {
+            Some(last_id.context("Empty tag page has no continuation boundary")?)
+        } else {
+            None
+        };
+        self.queue_static_works(works);
+        Ok(next)
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+enum SourcePage {
+    #[default]
+    First,
+    Next(u64),
+    End,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct OriginalWork {
+    id: u64,
+    page: u32,
+    page_count: u32,
+    originals: VecDeque<Option<String>>,
 }
 
 fn pagination_value(next_url: &str, key: &str, label: &str) -> Result<u64> {
@@ -21,7 +83,17 @@ fn pagination_value(next_url: &str, key: &str, label: &str) -> Result<u64> {
         .with_context(|| format!("Invalid {label} pagination {key}"))
 }
 
-fn image_extension(url: &str, illust_id: u64, page: usize) -> Result<String> {
+fn next_offset(next_url: Option<String>, current: u32, label: &str) -> Result<Option<u32>> {
+    next_url
+        .map(|url| {
+            let offset = u32::try_from(pagination_value(&url, "offset", label)?)?;
+            anyhow::ensure!(offset > current, "{label} pagination did not advance");
+            Ok(offset)
+        })
+        .transpose()
+}
+
+fn image_extension(url: &str, illust_id: u64, page: u32) -> Result<String> {
     let parsed = url::Url::parse(url)
         .with_context(|| format!("Invalid original URL for work {illust_id} page {page}"))?;
     let filename = parsed
@@ -47,47 +119,52 @@ fn image_extension(url: &str, illust_id: u64, page: usize) -> Result<String> {
     Ok(extension)
 }
 
-fn append_original_images(
-    illust: &Illust,
-    page_limit: Option<usize>,
-    images: &mut Vec<(String, String)>,
-) -> Result<()> {
-    if !matches!(illust.illust_type.as_str(), "illust" | "manga") {
-        return Ok(());
-    }
-    let page_count = usize::try_from(illust.page_count)?;
-    if page_count == 0 {
-        return Err(anyhow!("Static work {} has no pages", illust.id));
-    }
-    let required = page_limit.unwrap_or(page_count).min(page_count);
-    for page in 0..required {
-        let original = if page_count == 1 {
-            illust
+impl OriginalWork {
+    fn from_illust(illust: Illust) -> Option<Self> {
+        if !matches!(illust.illust_type.as_str(), "illust" | "manga") {
+            return None;
+        }
+        let originals = if illust.page_count == 1 {
+            VecDeque::from([illust
                 .meta_single_page
                 .original_image_url
-                .as_deref()
-                .or(illust.image_urls.original.as_deref())
+                .or(illust.image_urls.original)])
         } else {
             illust
                 .meta_pages
-                .get(page)
-                .and_then(|meta| meta.image_urls.original.as_deref())
-        }
-        .with_context(|| format!("Missing original for work {} page {page}", illust.id))?;
-        let extension = image_extension(original, illust.id, page)?;
-        images.push((
-            format!("{}_p{page}.{extension}", illust.id),
-            original.to_owned(),
-        ));
+                .into_iter()
+                .map(|page| page.image_urls.original)
+                .collect()
+        };
+        Some(Self {
+            id: illust.id,
+            page: 0,
+            page_count: illust.page_count,
+            originals,
+        })
     }
-    Ok(())
+
+    fn append_images(&mut self, images: &mut Vec<(String, String)>, limit: usize) -> Result<()> {
+        anyhow::ensure!(self.page_count > 0, "Static work {} has no pages", self.id);
+        while self.page < self.page_count && images.len() < limit {
+            let original = self.originals.pop_front().flatten().with_context(|| {
+                format!("Missing original for work {} page {}", self.id, self.page)
+            })?;
+            let extension = image_extension(&original, self.id, self.page)?;
+            images.push((format!("{}_p{}.{extension}", self.id, self.page), original));
+            self.page += 1;
+        }
+        Ok(())
+    }
 }
 
 impl PixivClient {
     pub fn new(config: PixivConfig) -> Result<Self> {
         let client = pixiv_client::PixivClient::new(config.refresh_token)?;
 
-        Ok(Self { client })
+        Ok(Self {
+            client: Arc::new(client),
+        })
     }
 
     /// Login using refresh token
@@ -98,96 +175,116 @@ impl PixivClient {
         Ok(())
     }
 
-    /// Enumerate original static images in gallery presentation order.
-    pub async fn gallery_images(&self, source: &PixivGallery) -> Result<Vec<(String, String)>> {
-        match source {
-            PixivGallery::Collection(collection_id) => {
-                let work_ids = self.client.collection_work_ids(collection_id).await?;
-                self.work_images(&work_ids).await
+    /// Returns at most `limit` originals. A sparse source can yield a short or empty
+    /// batch with a continuation when its metadata scan budget is spent.
+    pub async fn gallery_image_batch(
+        &self,
+        source: &PixivGallery,
+        cursor: Option<GalleryCursor>,
+        limit: usize,
+    ) -> Result<(Vec<(String, String)>, Option<GalleryCursor>)> {
+        let mut cursor = cursor.unwrap_or_default();
+        let mut images = Vec::new();
+        let mut details_left = 100;
+        let mut lists_left = 5;
+        while images.len() < limit {
+            if let Some(work) = cursor.works.front_mut() {
+                work.append_images(&mut images, limit)?;
+                if work.page == work.page_count {
+                    cursor.works.pop_front();
+                }
+            } else if let Some(&id) = cursor.work_ids.front() {
+                if details_left == 0 {
+                    break;
+                }
+                details_left -= 1;
+                let detail = self.client.illust_detail(id).await?;
+                cursor.work_ids.pop_front();
+                cursor.queue_static_works([detail.illust]);
+            } else {
+                if lists_left == 0 {
+                    break;
+                }
+                let position = match cursor.next {
+                    SourcePage::First => None,
+                    SourcePage::Next(n) => Some(n),
+                    SourcePage::End => break,
+                };
+                lists_left -= 1;
+                self.load_gallery_page(source, position, &mut cursor)
+                    .await?;
             }
-            PixivGallery::Bookmarks(user_id) => self.bookmark_images(*user_id).await,
-            PixivGallery::Author(user_id) => {
-                let work_ids = self.client.author_work_ids(*user_id).await?;
-                self.work_images(&work_ids).await
+        }
+        let more = !cursor.works.is_empty()
+            || !cursor.work_ids.is_empty()
+            || !matches!(cursor.next, SourcePage::End);
+        Ok((images, more.then_some(cursor)))
+    }
+
+    async fn load_gallery_page(
+        &self,
+        source: &PixivGallery,
+        position: Option<u64>,
+        cursor: &mut GalleryCursor,
+    ) -> Result<()> {
+        let next = match source {
+            PixivGallery::Collection(id) => {
+                cursor.work_ids = self.client.collection_work_ids(id).await?.into();
+                None
             }
-            PixivGallery::Ranking { mode, date, limit } => {
-                self.ranking_images(mode, *date, *limit).await
+            PixivGallery::Author(id) => {
+                cursor.work_ids = self.client.author_work_ids(*id).await?.into();
+                None
             }
             PixivGallery::Pixivision { lang, id } => {
-                let work_ids = self.client.pixivision_work_ids(lang, *id).await?;
-                self.work_images(&work_ids).await
+                let page = u32::try_from(position.unwrap_or(1))?;
+                let (ids, next) = self.client.pixivision_work_page(lang, *id, page).await?;
+                cursor.work_ids.extend(
+                    ids.into_iter()
+                        .filter(|id| cursor.pixivision_seen.insert(*id)),
+                );
+                next.map(u64::from)
             }
-        }
-    }
-
-    async fn work_images(&self, work_ids: &[u64]) -> Result<Vec<(String, String)>> {
-        let mut images = Vec::new();
-        for &work_id in work_ids {
-            let detail = self.client.illust_detail(work_id).await?;
-            append_original_images(&detail.illust, None, &mut images)?;
-        }
-        Ok(images)
-    }
-
-    async fn bookmark_images(&self, user_id: u64) -> Result<Vec<(String, String)>> {
-        let mut images = Vec::new();
-        let mut cursor = None;
-        loop {
-            let response = self.client.user_bookmarks_illust(user_id, cursor).await?;
-            for illust in response.illusts {
-                append_original_images(&illust, None, &mut images)?;
+            PixivGallery::Bookmarks(id) => {
+                let response = self.client.user_bookmarks_illust(*id, position).await?;
+                cursor.queue_static_works(response.illusts);
+                response
+                    .next_url
+                    .map(|url| -> Result<u64> {
+                        let next = pagination_value(&url, "max_bookmark_id", "Bookmark")?;
+                        anyhow::ensure!(
+                            position.is_none_or(|p| next < p),
+                            "Bookmark pagination did not advance"
+                        );
+                        Ok(next)
+                    })
+                    .transpose()?
             }
-            let Some(next_url) = response.next_url else {
-                return Ok(images);
-            };
-            let next_cursor = pagination_value(&next_url, "max_bookmark_id", "Bookmark")?;
-            if cursor.is_some_and(|current| next_cursor >= current) {
-                return Err(anyhow!("Bookmark pagination did not advance"));
+            PixivGallery::Ranking { mode, date, .. } => {
+                anyhow::ensure!(
+                    matches!(mode.as_str(), "day" | "week" | "month"),
+                    "Unsupported ranking mode: {mode}"
+                );
+                let offset = position.map(u32::try_from).transpose()?;
+                let response = self
+                    .client
+                    .illust_ranking(mode, Some(&date.to_string()), offset)
+                    .await?;
+                cursor.queue_static_works(response.illusts);
+                next_offset(response.next_url, offset.unwrap_or(0), "Ranking")?.map(u64::from)
             }
-            cursor = Some(next_cursor);
-        }
-    }
-
-    async fn ranking_images(
-        &self,
-        mode: &str,
-        date: chrono::NaiveDate,
-        limit: usize,
-    ) -> Result<Vec<(String, String)>> {
-        if limit == 0 {
-            return Ok(Vec::new());
-        }
-        if !matches!(mode, "day" | "week" | "month") {
-            return Err(anyhow!("Unsupported ranking mode: {mode}"));
-        }
-        let date = date.format("%Y-%m-%d").to_string();
-        let mut images = Vec::with_capacity(limit);
-        let mut offset = None;
-        loop {
-            let response = self
-                .client
-                .illust_ranking(mode, Some(&date), offset)
-                .await?;
-            for illust in response.illusts {
-                let remaining = limit - images.len();
-                if remaining == 0 {
-                    return Ok(images);
-                }
-                append_original_images(&illust, Some(remaining), &mut images)?;
+            PixivGallery::Tag(word) => {
+                let offset = u32::try_from(position.unwrap_or(0))?;
+                // Re-read the boundary: newer works may have shifted the prior page since delivery.
+                let response = self
+                    .client
+                    .search_tag_latest(word, offset.saturating_sub(1))
+                    .await?;
+                cursor.queue_tag_page(response, offset)?.map(u64::from)
             }
-            if images.len() == limit {
-                return Ok(images);
-            }
-            let Some(next_url) = response.next_url else {
-                return Ok(images);
-            };
-            let next_offset = pagination_value(&next_url, "offset", "Ranking")?;
-            let next_offset = u32::try_from(next_offset).context("Ranking offset is too large")?;
-            if offset.is_some_and(|current| next_offset <= current) {
-                return Err(anyhow!("Ranking pagination did not advance"));
-            }
-            offset = Some(next_offset);
-        }
+        };
+        cursor.next = next.map_or(SourcePage::End, SourcePage::Next);
+        Ok(())
     }
 
     /// Get latest illusts from an author
@@ -317,9 +414,9 @@ mod tests {
 
     #[test]
     fn ranking_page_cap_only_requires_pages_inside_the_limit() {
-        let illust = three_page_illust();
+        let mut work = OriginalWork::from_illust(three_page_illust()).unwrap();
         let mut images = Vec::new();
-        append_original_images(&illust, Some(2), &mut images).unwrap();
+        work.append_images(&mut images, 2).unwrap();
         assert_eq!(
             images,
             vec![
@@ -334,25 +431,95 @@ mod tests {
             ]
         );
 
-        assert!(append_original_images(&illust, None, &mut Vec::new()).is_err());
+        assert!(work.append_images(&mut Vec::new(), 1).is_err());
     }
 
     #[test]
-    fn single_page_uses_image_urls_original_when_meta_single_page_omits_it() {
-        let mut illust = three_page_illust();
-        illust.page_count = 1;
-        illust.meta_pages.clear();
-        illust.image_urls.original =
-            Some("https://i.pximg.net/img-original/123_p0.png".to_string());
+    fn latest_tag_resumes_after_the_shifted_raw_boundary_or_rejects_the_page() {
+        let page = |ids: &[u64], next: Option<u32>| pixiv_client::SearchIllusts {
+            illusts: ids
+                .iter()
+                .map(|&id| {
+                    let mut work = three_page_illust();
+                    work.id = id;
+                    if id == 7 {
+                        work.illust_type = "ugoira".into();
+                    }
+                    work
+                })
+                .collect(),
+            next_url: next.map(|offset| {
+                format!("https://app-api.pixiv.net/v1/search/illust?offset={offset}")
+            }),
+        };
+        let mut cursor = GalleryCursor::default();
+        let offset = cursor
+            .queue_tag_page(page(&[9, 8, 7], Some(3)), 0)
+            .unwrap()
+            .unwrap();
+        let saved = serde_json::to_string(&cursor).unwrap();
+        let mut cursor: GalleryCursor = serde_json::from_str(&saved).unwrap();
+        assert!(cursor
+            .queue_tag_page(page(&[8, 6, 5], Some(5)), offset)
+            .is_err());
 
-        let mut images = Vec::new();
-        append_original_images(&illust, None, &mut images).unwrap();
+        // A new result pushed work 7 (a skipped animation) one slot past the overlap.
+        let offset = cursor
+            .queue_tag_page(page(&[8, 7, 6], Some(5)), offset)
+            .unwrap()
+            .unwrap();
+        assert_eq!(offset, 5);
+        assert!(cursor
+            .queue_tag_page(page(&[6, 5], None), offset)
+            .unwrap()
+            .is_none());
         assert_eq!(
-            images,
-            vec![(
-                "123_p0.png".to_string(),
-                "https://i.pximg.net/img-original/123_p0.png".to_string()
-            )]
+            cursor
+                .works
+                .into_iter()
+                .map(|work| work.id)
+                .collect::<Vec<_>>(),
+            [9, 8, 6, 5]
         );
+    }
+
+    #[tokio::test]
+    async fn resumed_batch_finishes_manga_then_consumes_the_list_tail() {
+        let mut manga = three_page_illust();
+        manga.meta_pages[2].image_urls.original = Some("https://i.pximg.net/123_p2.jpg".into());
+        let mut single = three_page_illust();
+        single.id = 456;
+        single.page_count = 1;
+        single.meta_pages.clear();
+        single.image_urls.original = Some("https://i.pximg.net/456_p0.png".into());
+        let mut cursor = GalleryCursor {
+            next: SourcePage::End,
+            ..Default::default()
+        };
+        cursor.queue_static_works([manga, single]);
+        let client = PixivClient::new(PixivConfig {
+            refresh_token: String::new(),
+        })
+        .unwrap();
+        let source = PixivGallery::Bookmarks(1);
+        let (first, next) = client
+            .gallery_image_batch(&source, Some(cursor), 2)
+            .await
+            .unwrap();
+        assert_eq!(first.len(), 2);
+        let saved = serde_json::to_string(&next.unwrap()).unwrap();
+        let cursor = serde_json::from_str(&saved).unwrap();
+        let (second, end) = client
+            .gallery_image_batch(&source, Some(cursor), 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            second,
+            vec![
+                ("123_p2.jpg".into(), "https://i.pximg.net/123_p2.jpg".into()),
+                ("456_p0.png".into(), "https://i.pximg.net/456_p0.png".into())
+            ]
+        );
+        assert!(end.is_none());
     }
 }

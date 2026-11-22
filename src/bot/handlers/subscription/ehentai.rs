@@ -511,7 +511,7 @@ impl BotHandler {
                 let _ = bot
                     .send_message(
                         chat_id,
-                        "E-Hentai 功能未启用。用法：/telegraph <集合URL> [limit=N]，或回复包含集合链接的消息。limit 仅用于 Pixiv 日期榜，默认 100。",
+                        "E-Hentai 功能未启用。用法：/telegraph <集合URL> [limit=N]，或回复包含集合链接的消息。集合每批最多 50 张，有剩余图片时可用按钮续页；limit 仅用于 Pixiv 日期榜，是总图片上限，默认 100。",
                     )
                     .await;
                 return Ok(());
@@ -551,8 +551,8 @@ impl BotHandler {
                     .send_message(
                         chat_id,
                         "用法：/telegraph <E-Hentai 画廊URL或集合URL> [limit=N]\n\n\
-                         集合：Pixiv 合集、公开收藏、作者、日期榜、pixivision 或已配置的 Danbooru/Moebooru pool。\n\
-                         limit 仅用于 Pixiv 日期榜，默认 100。也可回复包含画廊或集合链接的消息。",
+                         集合：Pixiv 合集、公开收藏、作者、精确标签作品、日期榜、pixivision 或已配置的 Danbooru/Moebooru pool。\n\
+                         集合每批最多 50 张，有剩余图片时可用按钮续页。limit 仅用于 Pixiv 日期榜，是总图片上限，默认 100。也可回复包含画廊或集合链接的消息。",
                     )
                     .await;
                 return Ok(());

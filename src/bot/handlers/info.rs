@@ -95,11 +95,13 @@ impl BotHandler {
    取消订阅排行榜
    \- 示例: `/unsubrank day`
 
-📥 `/download <作品URL|ID|合集URL> [limit=N]`
-   下载单个 Pixiv 作品原图，或将有序合集打包为 ZIP
-   \- 合集支持 Pixiv 作者作品、公开收藏、合集、pixivision 与 Booru pool
-   \- 可回复包含作品或合集链接的消息
-   \- `limit` 仅用于指定日期的排行榜，范围 `1..100`，默认 `100`
+📥 `/download <作品URL|ID|集合URL> [limit=N]`
+   下载 Pixiv 作品原图，或将集合分批打包为 ZIP
+   \- 支持 Pixiv 作者作品、公开收藏、合集、日期榜、精确标签作品、pixivision 与 Booru pool
+   \- 标签链接使用 `/tags/<标签>/artworks`，请移除筛选参数
+   \- 可回复包含作品或集合链接的消息
+   \- 每批最多 50 张；还有图片时，原发起人可点击「下载更多」续页
+   \- `limit=N` 仅用于 Pixiv 日期榜，是累计导出的图片上限，范围 `1..100`，默认 `100`
 
 🔑 `/enablechat [chat_id]` / `/disablechat [chat_id]`
    全局管理员可管理聊天；群主和群管理员自动获得当前群的管理权限
@@ -130,9 +132,10 @@ impl BotHandler {
             };
             help_text.push_str(&format!(
                 "\n📰 `/telegraph <链接> [limit=N]`\n\
-                 将{target}发布为 Telegraph 阅读页面并返回首页链接\n\
-                 \\- 可回复包含链接的消息\n\
-                 \\- `limit` 仅用于指定日期的排行榜，范围 `1..100`，默认 `100`\n"
+                 将{target}发布为 Telegraph 阅读页面并返回链接\n\
+                 \\- 集合来源同 `/download`；可回复包含链接的消息\n\
+                 \\- 集合每批最多 50 张；还有图片时，原发起人可点击「继续生成下一批」\n\
+                 \\- `limit=N` 仅用于 Pixiv 日期榜，是累计导出的图片上限，范围 `1..100`，默认 `100`\n"
             ));
         }
 

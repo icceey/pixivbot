@@ -1,8 +1,9 @@
 use anyhow::{Context, Result};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use tokio::io::AsyncWriteExt;
+use tempfile::NamedTempFile;
 use tokio::time::Duration;
 use tracing::{error, info};
 
@@ -30,23 +31,25 @@ impl FileCacheManager {
     }
 
     /// Cache data under the URL-derived path.
-    pub async fn save(&self, url: &str, data: &[u8]) -> Result<PathBuf> {
+    pub async fn save(
+        &self,
+        url: &str,
+        data: impl AsRef<[u8]> + Send + 'static,
+    ) -> Result<PathBuf> {
         let path = self.resolve_path(url);
-
-        if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .context("Failed to create cache directory")?;
-        }
-
-        let mut file = tokio::fs::File::create(&path)
-            .await
-            .context("Failed to create cache file")?;
-        file.write_all(data)
-            .await
-            .context("Failed to write cache data")?;
-
-        Ok(path)
+        tokio::task::spawn_blocking(move || {
+            let parent = path.parent().expect("cache path has a shard directory");
+            std::fs::create_dir_all(parent).context("Failed to create cache directory")?;
+            // A resumed download treats any file at the final path as a cache hit.
+            let mut file =
+                NamedTempFile::new_in(parent).context("Failed to create temporary cache file")?;
+            file.write_all(data.as_ref())
+                .context("Failed to write cache data")?;
+            file.persist(&path)
+                .context("Failed to publish cache file")?;
+            Ok(path)
+        })
+        .await?
     }
 
     fn start_background_cleanup(root_dir: PathBuf, retention_days: u64) {
