@@ -1057,7 +1057,7 @@ async fn validate_complete_zip(path: &Path) -> Result<()> {
                     "downloaded ZIP entry {index} cannot be opened: {e}"
                 ))
             })?;
-            let name = entry.name().to_string();
+            let name = entry.name()?.into_owned();
             std::io::copy(&mut entry, &mut std::io::sink()).map_err(|e| {
                 Error::Parse(format!("downloaded ZIP entry {name} is invalid: {e}"))
             })?;

@@ -181,7 +181,7 @@ async fn collection_commands_deliver_pool_images_in_order() {
         .enumerate()
     {
         let mut entry = archive.by_index(index).unwrap();
-        assert_eq!(entry.name(), name);
+        assert_eq!(entry.name().unwrap(), name);
         let mut bytes = Vec::new();
         entry.read_to_end(&mut bytes).unwrap();
         assert_eq!(&bytes, expected);
