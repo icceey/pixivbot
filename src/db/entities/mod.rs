@@ -1,5 +1,6 @@
 //! SeaORM Entities (Placeholder)
 pub mod chats;
+pub mod collection_jobs;
 pub mod eh_download_completions;
 pub mod eh_download_queue;
 pub mod eh_gallery_jobs;

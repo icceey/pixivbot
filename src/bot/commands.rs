@@ -41,7 +41,7 @@ pub enum Command {
     #[command(description = "显示和管理聊天设置")]
     Settings,
     #[command(
-        description = "下载作品或合集原图\n  用法: /download <作品URL|ID|合集URL> [limit=N] 或回复消息"
+        description = "下载作品原图或分批导出集合 ZIP（每批最多 50 张）\n  用法: /download <作品URL|ID|集合URL> [limit=N] 或回复消息；limit 为 Pixiv 日期榜总上限"
     )]
     Download(String),
     #[command(description = "订阅 Booru 标签\n  用法: /bsub [ch=<频道ID>] <站点:标签> [过滤条件]")]
@@ -67,7 +67,7 @@ pub enum Command {
     #[command(description = "查看当前聊天的 E-Hentai 下载队列", parse_with = "split")]
     EStatus {},
     #[command(
-        description = "发布画廊或合集到 Telegraph\n  用法: /telegraph <画廊URL|合集URL> [limit=N] 或回复消息"
+        description = "发布画廊或集合到 Telegraph（集合每批最多 50 张）\n  用法: /telegraph <画廊URL|集合URL> [limit=N] 或回复消息；limit 为 Pixiv 日期榜总上限"
     )]
     Telegraph(String),
     #[command(description = "取消当前设置操作")]
@@ -102,7 +102,7 @@ impl Command {
             BotCommand::new("settings", "显示和管理聊天设置"),
             BotCommand::new(
                 "download",
-                "下载作品或合集 - /download <链接|ID> [limit=N]",
+                "下载作品或分批导出集合 ZIP - /download <链接|ID> [limit=N]",
             ),
         ];
 
@@ -142,7 +142,7 @@ impl Command {
         if has_telegraph {
             commands.push(BotCommand::new(
                 "telegraph",
-                "生成阅读链接 - /telegraph <链接> [limit=N]",
+                "生成 Telegraph 阅读链接 - /telegraph <链接> [limit=N]",
             ));
         }
 

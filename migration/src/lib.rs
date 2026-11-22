@@ -24,6 +24,7 @@ mod m20261024_000000_pixiv_tag_page_limit;
 mod m20261024_000100_pixiv_tag_scan_time;
 mod m20261024_000200_pixiv_history_retention;
 mod m20261031_000000_pixiv_tag_filters;
+mod m20261101_000000_collection_jobs;
 
 pub struct Migrator;
 
@@ -55,6 +56,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261024_000100_pixiv_tag_scan_time::Migration),
             Box::new(m20261024_000200_pixiv_history_retention::Migration),
             Box::new(m20261031_000000_pixiv_tag_filters::Migration),
+            Box::new(m20261101_000000_collection_jobs::Migration),
         ]
     }
 }
