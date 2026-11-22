@@ -48,7 +48,7 @@ pub(crate) async fn put_object_stream(
     sha256: &str,
     content_type: &str,
 ) -> Result<s3::request::ResponseData, s3::error::S3Error> {
-    use hmac::Mac;
+    use hmac::{Hmac, KeyInit, Mac};
     use s3::request::Request;
 
     let request = s3::request::tokio_backend::ReqwestRequest::new(
@@ -76,7 +76,8 @@ pub(crate) async fn put_object_stream(
     let url = request.url()?;
     let canonical = s3::signing::canonical_request("PUT", &url, &headers, sha256)?;
     let string_to_sign = request.string_to_sign(&canonical)?;
-    let mut hmac = s3::signing::HmacSha256::new_from_slice(&request.signing_key().await?)?;
+    let mut hmac = Hmac::<Sha256>::new_from_slice(&request.signing_key().await?)
+        .expect("HMAC-SHA256 accepts keys of any length");
     hmac.update(string_to_sign.as_bytes());
     let authorization = s3::signing::authorization_header(
         &bucket.access_key().await?.ok_or_else(|| {
