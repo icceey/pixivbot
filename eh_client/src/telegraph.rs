@@ -3664,7 +3664,7 @@ mod tests {
         let file = archive.by_index_raw(0).unwrap();
 
         assert_eq!(file.name_raw(), b"renamed.jpg");
-        assert_eq!(file.name(), "renamed.jpg");
+        assert_eq!(file.name().unwrap(), "renamed.jpg");
         let central_entries = ipfs3_zip_central_directory_entries(
             &mut std::io::Cursor::new(&bytes),
             central_directory_start,

@@ -50,9 +50,10 @@ pub(super) fn collect_uploadable_zip_entry_names(
     let zip_file = std::fs::File::open(zip_path).context("Failed to open zip")?;
     let archive = zip::ZipArchive::new(zip_file).context("Failed to read zip archive")?;
     let mut names = Vec::new();
-    for raw_name in archive.file_names() {
-        if !raw_name.ends_with('/') && is_uploadable_zip_image_name(&raw_name.to_lowercase()) {
-            names.push(raw_name.to_string());
+    for name in archive.file_names() {
+        let name = name?;
+        if !name.ends_with('/') && is_uploadable_zip_image_name(&name.to_lowercase()) {
+            names.push(name.into_owned());
         }
     }
     Ok(names)
@@ -388,14 +389,13 @@ impl EhUploadWorker {
             let mut archive =
                 zip::ZipArchive::new(zip_file).context("Failed to read zip archive")?;
 
-            let uploadable_image_indices = archive
-                .file_names()
-                .enumerate()
-                .filter_map(|(i, name)| {
-                    (!name.ends_with('/') && is_uploadable_zip_image_name(&name.to_lowercase()))
-                        .then_some(i)
-                })
-                .collect::<Vec<_>>();
+            let mut uploadable_image_indices = Vec::new();
+            for (index, name) in archive.file_names().enumerate() {
+                let name = name?;
+                if !name.ends_with('/') && is_uploadable_zip_image_name(&name.to_lowercase()) {
+                    uploadable_image_indices.push(index);
+                }
+            }
 
             for (uploadable_order, archive_index) in
                 uploadable_image_indices.into_iter().enumerate()
@@ -408,7 +408,7 @@ impl EhUploadWorker {
                 std::io::Read::read_to_end(&mut file, &mut data)
                     .context("Failed to read image from zip")?;
                 // ZIP paths use '/', independently of the host filesystem.
-                let filename = file.name().rsplit('/').next().unwrap().to_string();
+                let filename = file.name()?.rsplit('/').next().unwrap().to_string();
 
                 if image_tx
                     .blocking_send(ZipImageData {

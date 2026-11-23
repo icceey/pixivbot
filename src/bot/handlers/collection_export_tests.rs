@@ -71,7 +71,10 @@ fn assert_zip<'a>(
     assert_eq!(archive.len(), expected.len());
     for (index, (id, expected)) in expected.enumerate() {
         let mut entry = archive.by_index(index).unwrap();
-        assert_eq!(entry.name().split_once('_').unwrap().1, format!("{id}.png"));
+        assert_eq!(
+            entry.name().unwrap().split_once('_').unwrap().1,
+            format!("{id}.png")
+        );
         let mut bytes = Vec::new();
         entry.read_to_end(&mut bytes).unwrap();
         assert_eq!(bytes.as_slice(), expected);
