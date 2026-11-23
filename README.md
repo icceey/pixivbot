@@ -135,8 +135,8 @@
   - 编辑敏感标签
   - 编辑排除标签
 - `/cancel` - 取消当前设置操作
-- `/download <url|id>` - 下载作品原图；输入合集链接时发送 ZIP。也可回复含链接的消息。
-- `/telegraph <url>` - 将合集发布为 Telegraph 阅读页，也支持原有的 E-Hentai 画廊。集合导出使用已配置的 Telegraph 账号和 `[image_upload]` 图床，无需启用 E-Hentai 下载。
+- `/download <url|id> [limit=N]` - 下载作品原图；输入集合链接时分批发送 ZIP。也可回复含链接的消息。
+- `/telegraph <url> [limit=N]` - 将集合分批发布为 Telegraph 阅读页，也支持 E-Hentai 画廊。集合导出使用已配置的 Telegraph 账号和 `[image_upload]` 图床，无需启用 E-Hentai 下载。也可回复含链接的消息。
 
 两个命令每次可导出一个集合，支持以下链接：
 
@@ -145,11 +145,16 @@
 | Pixiv 官方 Collections | `https://www.pixiv.net/collections/38714613562736660400` |
 | 画师的插画和漫画 | `https://www.pixiv.net/users/33611048` |
 | 用户的公开收藏夹 | `https://www.pixiv.net/users/33611048/bookmarks/artworks` |
+| 单个 Pixiv 精确标签下的作品 | `https://www.pixiv.net/zh-cn/tags/%E5%8E%9F%E7%A5%9E/artworks`（使用未筛选的作品页链接） |
 | 指定日期的日／周／月榜 | `https://www.pixiv.net/ranking.php?mode=weekly&date=20260115`（`mode` 可选 `daily`、`weekly`、`monthly`） |
 | pixivision 专题文章 | `https://www.pixivision.net/ja/a/10351` |
 | 已配置的 Danbooru／Moebooru 图池 | `https://danbooru.donmai.us/pools/123`、`https://yande.re/pool/show/123` |
 
-例如，`/download https://www.pixiv.net/ranking.php?mode=weekly&date=20260115 limit=30` 按榜单顺序导出前 30 张图片。`limit` 仅用于榜单，取值 1–100，默认 100；多页作品逐张计数。其他合集导出其中的图像作品并按页展开，不包含视频、动图作品的预览封面或文章装饰图。ZIP 须符合所用 Telegram Bot API 的单文件大小限制；大合集也可用 `/telegraph` 阅读。
+集合命令会先回复任务编号，随后在后台按顺序处理。每批最多导出 50 张图片，单独发送 ZIP 或 Telegraph 阅读链接。还有条目可查看时，原发起人可在原聊天点击「下载更多」或「继续生成下一批」。如果一段里全是视频或动图，只提示继续查找，不发送空文件。
+
+集合读取、下载或打包失败，以及图床上传返回错误时，当前批次按 `ehentai.max_retry_count` 重试（默认额外 10 次）。首次等待 2 分钟，之后逐次翻倍，最长 24 小时；等待期间其他任务照常处理。重试可能再次上传该批已传的图片。为避免重复建页或发消息，已开始建页或 Telegram 投递时发生的失败不会自动重发。
+
+例如，`/download https://www.pixiv.net/ranking.php?mode=weekly&date=20260115 limit=80` 按榜单顺序导出最多 80 张图片：首批最多 50 张，续页最多 30 张。`limit=N` 仅用于 Pixiv 日期榜，取值 1–100，默认 100；这是跨批次的总图片上限，多页作品逐张计数。集合导出不包含视频、动图作品的预览封面或文章装饰图。每批 ZIP 须符合所用 Telegram Bot API 的单文件大小限制。
 
 Pixiv 标记为 AI 生成的作品会在标签首位显示 `#AI生成`，并参与标签过滤和敏感遮罩匹配：
 

@@ -41,6 +41,7 @@ pub struct BotHandler {
     pub(crate) eh_client: Option<Arc<eh_client::EhClient>>,
     pub(crate) eh_config: Arc<EhentaiConfig>,
     pub(crate) telegraph: Option<TelegraphServices>,
+    pub(crate) collection_wakeup: Arc<tokio::sync::Notify>,
 }
 
 impl BotHandler {
@@ -78,6 +79,7 @@ impl BotHandler {
             eh_client,
             eh_config,
             telegraph,
+            collection_wakeup: Arc::default(),
         }
     }
 

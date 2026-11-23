@@ -233,8 +233,16 @@ impl PixivClient {
         crate::gallery::author_work_ids(&text)
     }
 
-    /// 获取 pixivision 正文中按展示顺序出现的全部作品 ID。
-    pub async fn pixivision_work_ids(&self, lang: &str, article_id: u64) -> Result<Vec<u64>> {
+    /// 单页作品按正文顺序返回，跨页去重由遍历者负责。
+    pub async fn pixivision_work_page(
+        &self,
+        lang: &str,
+        article_id: u64,
+        page_number: u32,
+    ) -> Result<(Vec<u64>, Option<u32>)> {
+        if page_number == 0 {
+            return Err(Error::Other("Pixivision pages start at one".into()));
+        }
         if lang.is_empty()
             || !lang
                 .bytes()
@@ -242,25 +250,29 @@ impl PixivClient {
         {
             return Err(Error::Other("Invalid pixivision language".to_string()));
         }
+        let mut url =
+            reqwest::Url::parse(&format!("https://www.pixivision.net/{lang}/a/{article_id}"))
+                .map_err(|error| Error::Other(format!("Invalid pixivision URL: {error}")))?;
+        if page_number > 1 {
+            url.query_pairs_mut()
+                .append_pair("p", &page_number.to_string());
+        }
+        let html = self.anonymous_get_text(url.clone()).await?;
+        let page = crate::gallery::pixivision_page(&html, &url, lang, article_id, page_number)?;
+        Ok((page.work_ids, page.next_page))
+    }
+
+    /// 获取 pixivision 正文中按展示顺序出现的全部作品 ID。
+    pub async fn pixivision_work_ids(&self, lang: &str, article_id: u64) -> Result<Vec<u64>> {
         let mut page_number = 1;
         let mut work_ids = Vec::new();
         let mut seen = std::collections::HashSet::new();
         loop {
-            let mut url =
-                reqwest::Url::parse(&format!("https://www.pixivision.net/{lang}/a/{article_id}"))
-                    .map_err(|error| Error::Other(format!("Invalid pixivision URL: {error}")))?;
-            if page_number > 1 {
-                url.query_pairs_mut()
-                    .append_pair("p", &page_number.to_string());
-            }
-            let html = self.anonymous_get_text(url.clone()).await?;
-            let page = crate::gallery::pixivision_page(&html, &url, lang, article_id, page_number)?;
-            work_ids.extend(
-                page.work_ids
-                    .into_iter()
-                    .filter(|work_id| seen.insert(*work_id)),
-            );
-            match page.next_page {
+            let (ids, next_page) = self
+                .pixivision_work_page(lang, article_id, page_number)
+                .await?;
+            work_ids.extend(ids.into_iter().filter(|work_id| seen.insert(*work_id)));
+            match next_page {
                 Some(next_page) => page_number = next_page,
                 None => return Ok(work_ids),
             }
@@ -284,6 +296,21 @@ impl PixivClient {
                 ("filter", "for_ios".to_owned()),
                 ("start_date", start_date.to_owned()),
                 ("end_date", end_date.to_owned()),
+                ("offset", offset.to_string()),
+            ],
+        )
+        .await
+    }
+
+    /// 按精确标签查询所有日期的作品，按最新发布优先分页。
+    pub async fn search_tag_latest(&self, word: &str, offset: u32) -> Result<SearchIllusts> {
+        self.get(
+            "/v1/search/illust",
+            &[
+                ("word", word.to_owned()),
+                ("search_target", "exact_match_for_tags".to_owned()),
+                ("sort", "date_desc".to_owned()),
+                ("filter", "for_ios".to_owned()),
                 ("offset", offset.to_string()),
             ],
         )

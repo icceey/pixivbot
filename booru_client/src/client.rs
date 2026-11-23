@@ -119,6 +119,48 @@ impl BooruClient {
         }
     }
 
+    /// Fetch Danbooru post details for one pool segment, in the given ID order.
+    pub async fn get_danbooru_pool_segment(
+        &self,
+        pool_id: u64,
+        post_ids: &[u64],
+    ) -> Result<Vec<BooruPost>> {
+        let ids: Vec<_> = post_ids.iter().map(u64::to_string).collect();
+        // Pool metadata can include deleted posts.
+        let tags = format!("id:{} status:any", ids.join(","));
+        let mut posts: HashMap<_, _> = self
+            .get_posts_danbooru(&tags, post_ids.len() as u32, 1)
+            .await?
+            .into_iter()
+            .map(|post| (post.id, post))
+            .collect();
+        post_ids
+            .iter()
+            .map(|id| {
+                posts.remove(id).ok_or_else(|| Error::Api {
+                    message: format!("Danbooru pool {pool_id} is missing post {id}"),
+                    status: 0,
+                })
+            })
+            .collect()
+    }
+
+    /// Fetch one Moebooru pool page, returning its pool-wide post count and server order.
+    pub async fn get_moebooru_pool_posts_page(
+        &self,
+        pool_id: u64,
+        page: u32,
+    ) -> Result<(u32, Vec<BooruPost>)> {
+        let pool = self.get_moebooru_pool_page(pool_id, Some(page)).await?;
+        Ok((
+            pool.post_count,
+            pool.posts
+                .into_iter()
+                .map(MoebooruRawPost::into_booru_post)
+                .collect(),
+        ))
+    }
+
     /// Fetch all posts in pool order, leaving media selection to the caller.
     pub async fn pool_images(&self, pool_id: u64) -> Result<Vec<BooruPost>> {
         match self.engine_type {

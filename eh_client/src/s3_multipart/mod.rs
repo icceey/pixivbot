@@ -1,7 +1,9 @@
 use reqwest::header::{HeaderName, HeaderValue, AUTHORIZATION, CONTENT_LENGTH, DATE};
+use s3::{error::S3Error, request::ResponseData};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU8, Ordering};
 
@@ -38,6 +40,71 @@ pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
+pub(crate) async fn retry_put_object<F>(
+    mut attempt: impl FnMut() -> F,
+) -> Result<ResponseData, S3Error>
+where
+    F: Future<Output = Result<ResponseData, S3Error>>,
+{
+    let mut retries_remaining = 2;
+    loop {
+        let result = attempt().await;
+        if retries_remaining == 0 {
+            return result;
+        }
+        let retryable = match &result {
+            Ok(response) => put_object_status_is_retryable(response.status_code()),
+            Err(S3Error::HttpFailWithBody(status, _)) => put_object_status_is_retryable(*status),
+            Err(S3Error::Reqwest(error)) => put_object_transport_is_retryable(error),
+            Err(_) => false,
+        };
+        if !retryable {
+            return result;
+        }
+        retries_remaining -= 1;
+    }
+}
+
+fn put_object_status_is_retryable(status: u16) -> bool {
+    matches!(status, 408 | 429 | 500 | 502 | 503 | 504)
+}
+
+fn put_object_transport_is_retryable(error: &reqwest::Error) -> bool {
+    use std::error::Error;
+    use std::io::ErrorKind;
+
+    if let Some(status) = error.status() {
+        return put_object_status_is_retryable(status.as_u16());
+    }
+    // `Response::bytes()` classifies interrupted HTTP body transfer as decode;
+    // ETag/XML interpretation happens separately from this retry policy.
+    if error.is_decode() {
+        return true;
+    }
+    if !(error.is_timeout() || error.is_connect() || (error.is_request() && error.url().is_some()))
+    {
+        return false;
+    }
+    let mut source = error.source();
+    while let Some(cause) = source {
+        // On send, a nested reqwest body error comes from the local ZIP reader.
+        if cause
+            .downcast_ref::<reqwest::Error>()
+            .is_some_and(reqwest::Error::is_body)
+            || cause.downcast_ref::<std::io::Error>().is_some_and(|io| {
+                matches!(
+                    io.kind(),
+                    ErrorKind::InvalidData | ErrorKind::InvalidInput | ErrorKind::PermissionDenied
+                )
+            })
+        {
+            return false;
+        }
+        source = cause.source();
+    }
+    true
+}
+
 /// Sign the known payload hash without materializing the file in rust-s3's
 /// PutObject body. Keep its endpoint, credentials, headers and timeout behavior.
 pub(crate) async fn put_object_stream(
@@ -47,7 +114,7 @@ pub(crate) async fn put_object_stream(
     len: u64,
     sha256: &str,
     content_type: &str,
-) -> Result<s3::request::ResponseData, s3::error::S3Error> {
+) -> Result<ResponseData, S3Error> {
     use hmac::{Hmac, KeyInit, Mac};
     use s3::request::Request;
 
@@ -80,9 +147,10 @@ pub(crate) async fn put_object_stream(
         .expect("HMAC-SHA256 accepts keys of any length");
     hmac.update(string_to_sign.as_bytes());
     let authorization = s3::signing::authorization_header(
-        &bucket.access_key().await?.ok_or_else(|| {
-            s3::error::S3Error::HttpFailWithBody(401, "missing S3 access key".into())
-        })?,
+        &bucket
+            .access_key()
+            .await?
+            .ok_or_else(|| S3Error::HttpFailWithBody(401, "missing S3 access key".into()))?,
         &request.datetime(),
         &bucket.region(),
         &s3::signing::signed_header_string(&headers),
@@ -101,7 +169,6 @@ pub(crate) async fn put_object_stream(
     } else {
         builder
     };
-    // A lost single-PUT response is ambiguous; do not automatically replay it.
     let response = builder.send().await?;
     let status = response.status().as_u16();
     let headers = response
@@ -114,8 +181,15 @@ pub(crate) async fn put_object_stream(
             )
         })
         .collect();
-    let body = response.bytes().await?;
-    Ok(s3::request::ResponseData::new(body, status, headers))
+    let body = response.bytes().await.map_err(|error| {
+        // A known rejection controls retry eligibility even if its body could not be read.
+        if (200..300).contains(&status) {
+            S3Error::Reqwest(error)
+        } else {
+            S3Error::HttpFailWithBody(status, error.to_string())
+        }
+    })?;
+    Ok(ResponseData::new(body, status, headers))
 }
 
 pub(crate) fn uploader_identity_fingerprint(

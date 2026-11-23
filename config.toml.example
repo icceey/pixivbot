@@ -96,9 +96,10 @@ download_original_threshold = 1
 # to use Catbox, or "ipfs3" to use an ipfS3 (S3-compatible IPFS gateway) store.
 # S3 and ipfS3 use multipart upload for images at or above
 # multipart_image_threshold_mb (the comparison is inclusive); smaller images use
-# PutObject. Set the threshold to 0 to disable image multipart uploads only. The
-# ipfS3 ZIP-first path is controlled by zip_extract_enabled; set it to false to
-# disable only that path, so ZIP multipart is not attempted.
+# PutObject. A transient single-PUT failure retries the same key and data up to
+# twice, separately from the task retry budget. Set the threshold to 0 to
+# disable image multipart uploads only. Set zip_extract_enabled to false to
+# disable the ipfS3 ZIP-first path, including ZIP multipart.
 # Multipart capability is probed lazily on each real eligible object, never at
 # startup. The configured credentials need CreateMultipartUpload, UploadPart,
 # ListParts (AWS: s3:ListMultipartUploadParts), CompleteMultipartUpload, and
@@ -120,6 +121,7 @@ download_original_threshold = 1
 # public_base_url = "https://cdn.example.com/pixivbot-images"
 # key_prefix = "eh"
 # path_style = true
+# request_timeout_sec = 300               # Per storage HTTP request, including multipart (positive seconds)
 # multipart_image_threshold_mb = 8
 # # Multipart part size in MiB (5..=5120); existing uploads keep their saved size.
 # multipart_part_size_mb = 8
@@ -146,6 +148,7 @@ download_original_threshold = 1
 # preview_rewrite_delay_sec = 600
 # key_prefix = "eh"
 # path_style = true
+# request_timeout_sec = 300               # Per storage HTTP request, including multipart (positive seconds)
 # multipart_image_threshold_mb = 8
 # # Multipart part size in MiB (5..=5120); existing uploads keep their saved size.
 # multipart_part_size_mb = 8
@@ -225,7 +228,7 @@ download_original_threshold = 1
 # # Stale publish claims recover at this age; already persisted sent markers are kept.
 # # Telegram may have accepted a timed-out request: retries can duplicate an unmarked send.
 # publish_timeout_sec = 600
-# # Max EH retries after the initial attempt (default: 10).
+# # Extra attempts per EH job or collection export batch (default: 10, 0 disables task retries).
 # # Retry delay doubles from 2 minutes, capped at 24 hours.
 # max_retry_count = 10
 # # 48h scan window for rating-filtered subscriptions (default: 48)

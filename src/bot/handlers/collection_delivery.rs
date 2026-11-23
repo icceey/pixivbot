@@ -1,12 +1,13 @@
 use super::download::sanitize_filename;
 use crate::bot::notifier::ThrottledBot;
 use crate::bot::BotHandler;
+use crate::db::repo::collection_jobs::{CollectionRetryStage, Model};
 use anyhow::{Context, Result};
 use eh_client::ImageUploadInput;
 use std::io;
 use std::path::PathBuf;
 use teloxide::prelude::*;
-use teloxide::types::InputFile;
+use teloxide::types::{InlineKeyboardMarkup, InputFile};
 use tempfile::NamedTempFile;
 use tracing::warn;
 
@@ -16,27 +17,34 @@ impl BotHandler {
     pub(super) async fn deliver_collection_files(
         &self,
         bot: &ThrottledBot,
-        chat_id: ChatId,
+        job: &Model,
         title: &str,
         files: &[(PathBuf, String)],
-        telegraph: bool,
+        keyboard: Option<InlineKeyboardMarkup>,
     ) -> Result<()> {
-        if telegraph {
+        let chat_id = ChatId(job.chat_id);
+        if job.telegraph {
+            self.begin_collection_delivery(job).await?;
             return self
-                .deliver_collection_to_telegraph(bot, chat_id, title, files)
+                .deliver_collection_to_telegraph(bot, chat_id, title, files, keyboard)
                 .await;
         }
 
-        let archive = create_collection_zip(files).await?;
+        let archive = create_collection_zip(files)
+            .await
+            .context(CollectionRetryStage::Preparing)?;
+        self.begin_collection_delivery(job).await?;
         let archive_name = format!("{}.zip", sanitize_filename(title));
-        let send_result = bot
+        let mut request = bot
             .send_document(
                 chat_id,
                 InputFile::file(archive.path()).file_name(archive_name),
             )
-            .caption(format!("📦 {title}"))
-            .await
-            .context("Failed to send collection ZIP");
+            .caption(format!("📦 {title}"));
+        if let Some(markup) = keyboard {
+            request = request.reply_markup(markup);
+        }
+        let send_result = request.await.context("Failed to send collection ZIP");
 
         if let Err(error) = archive.close() {
             warn!("Failed to remove collection ZIP temporary file: {error:#}");
@@ -51,6 +59,7 @@ impl BotHandler {
         chat_id: ChatId,
         title: &str,
         files: &[(PathBuf, String)],
+        keyboard: Option<InlineKeyboardMarkup>,
     ) -> Result<()> {
         let telegraph = self
             .telegraph
@@ -78,7 +87,7 @@ impl BotHandler {
                 .image_uploader
                 .upload_images_with_url_pairs(&inputs)
                 .await
-                .context("Failed to upload collection images")?;
+                .context(CollectionRetryStage::UploadReturned)?;
             if url_pairs.len() != batch.len() {
                 anyhow::bail!(
                     "Image uploader returned {} URL pairs for {} collection images",
@@ -94,7 +103,18 @@ impl BotHandler {
             .create_gallery_page_strict(title, &public_urls)
             .await
             .context("Failed to create Telegraph collection page")?;
-        bot.send_message(chat_id, format!("📖 {title}\n{first_page_url}"))
+        // The chat may have been disabled during upload.
+        anyhow::ensure!(
+            crate::scheduler::get_chat_if_should_notify(&self.repo, chat_id.0)
+                .await?
+                .is_some(),
+            "Collection chat was disabled during upload"
+        );
+        let mut request = bot.send_message(chat_id, format!("📖 {title}\n{first_page_url}"));
+        if let Some(markup) = keyboard {
+            request = request.reply_markup(markup);
+        }
+        request
             .await
             .context("Failed to send Telegraph collection link")?;
         Ok(())

@@ -104,7 +104,12 @@ pub async fn run(
     // 构建 handler 树
     let handler_tree = build_handler_tree();
 
-    // 使用 Dispatcher
+    let worker_handler = handler.clone();
+    let worker_bot = bot.clone();
+    handler.recover_collection_exports(&bot).await?;
+    let worker =
+        tokio::spawn(async move { worker_handler.run_collection_worker(worker_bot).await });
+
     Dispatcher::builder(bot, handler_tree)
         .dependencies(dptree::deps![handler, repo, notifier, settings_storage])
         .default_handler(|_| async {})
@@ -112,6 +117,7 @@ pub async fn run(
         .build()
         .dispatch()
         .await;
+    worker.abort();
 
     Ok(())
 }
@@ -228,6 +234,19 @@ fn build_callback_handlers(
         })
         .endpoint(handle_booru_download_callback);
 
+    let collection_callback = Update::filter_callback_query()
+        .filter(|q: CallbackQuery| {
+            q.data
+                .as_deref()
+                .is_some_and(|data| data.starts_with(handlers::COLLECTION_MORE_PREFIX))
+        })
+        .endpoint(
+            |bot: ThrottledBot, q: CallbackQuery, handler: BotHandler| async move {
+                handler.handle_collection_more(&bot, &q).await?;
+                Ok(())
+            },
+        );
+
     let settings_callback_handler = Update::filter_callback_query()
         .filter_map(|q: CallbackQuery| {
             q.data
@@ -241,6 +260,7 @@ fn build_callback_handlers(
         .branch(callback_handler)
         .branch(download_callback_handler)
         .branch(booru_download_callback_handler)
+        .branch(collection_callback)
         .branch(settings_callback_handler)
 }
 

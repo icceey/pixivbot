@@ -5,6 +5,7 @@ use std::sync::Weak;
 use tokio::sync::Mutex;
 
 mod chats;
+pub mod collection_jobs;
 pub mod eh_download_completions;
 pub mod eh_download_queue;
 pub mod eh_gallery_jobs;
@@ -90,6 +91,26 @@ pub mod tests_helpers {
             )
             "#,
         ))
+        .await?;
+
+        db.execute_unprepared(
+            "CREATE TABLE collection_jobs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                chat_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                source TEXT NOT NULL,
+                telegraph BOOLEAN NOT NULL,
+                generation INTEGER NOT NULL DEFAULT 1,
+                delivered INTEGER NOT NULL DEFAULT 0,
+                cursor TEXT,
+                status TEXT NOT NULL DEFAULT 'queued'
+                    CHECK (status IN ('queued', 'preparing', 'publishing', 'waiting')),
+                queue_order INTEGER NOT NULL UNIQUE,
+                retry_count INTEGER NOT NULL DEFAULT 0,
+                next_retry_at INTEGER NULL
+            );
+            CREATE INDEX idx_collection_jobs_status_order ON collection_jobs(status, queue_order);",
+        )
         .await?;
 
         db.execute_unprepared(

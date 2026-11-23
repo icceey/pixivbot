@@ -1,10 +1,12 @@
 use crate::booru::BooruSiteRegistry;
 use crate::bot::link_handler::{parse_pixiv_links, PixivLink};
-use crate::bot::{notifier::ThrottledBot, BotHandler};
+use crate::bot::{notifier::ThrottledBot, permissions, BotHandler};
 use crate::pixiv::PixivGallery;
 use booru_client::BooruEngineType;
 use chrono::NaiveDate;
+use percent_encoding::percent_decode_str;
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::LazyLock;
 use teloxide::prelude::*;
@@ -19,6 +21,7 @@ static URLS: LazyLock<Regex> = LazyLock::new(|| {
         .expect("valid URL token regex")
 });
 
+#[derive(Debug, Serialize, Deserialize)]
 pub(super) enum CollectionSource {
     Pixiv(PixivGallery),
     Pool { site: String, id: u64 },
@@ -35,13 +38,23 @@ impl BotHandler {
         args: &str,
         telegraph: bool,
     ) -> ResponseResult<bool> {
-        match parse_collection_command(msg, args, &self.booru_registry) {
-            None => return Ok(false),
-            Some(Ok(source)) => {
-                self.send_collection_export(bot, chat_id, source, telegraph)
+        let Some(parsed) = parse_collection_command(msg, args, &self.booru_registry) else {
+            return Ok(false);
+        };
+        if telegraph && self.telegraph.is_none() {
+            bot.send_message(chat_id, "❌ Telegraph 未配置，无法生成阅读链接。")
+                .await?;
+            return Ok(true);
+        }
+        let Some(actor) = permissions::message_actor(msg) else {
+            return Ok(true);
+        };
+        match parsed {
+            Ok(source) => {
+                self.enqueue_collection_export(bot, chat_id, actor.id, source, telegraph)
                     .await?;
             }
-            Some(Err(message)) => {
+            Err(message) => {
                 bot.send_message(chat_id, format!("❌ {message}")).await?;
             }
         }
@@ -216,6 +229,18 @@ fn collection_from_url(url: &Url, registry: &BooruSiteRegistry) -> Option<Parsed
     }
 }
 
+fn decode_tag_segment(segment: &str) -> Option<String> {
+    if !segment.split('%').skip(1).all(|rest| {
+        rest.as_bytes()
+            .get(..2)
+            .is_some_and(|digits| digits.iter().all(u8::is_ascii_hexdigit))
+    }) {
+        return None;
+    }
+    let tag = percent_decode_str(segment).decode_utf8().ok()?;
+    (!tag.trim().is_empty() && !tag.chars().any(char::is_control)).then(|| tag.into_owned())
+}
+
 fn pixiv_collection(url: &Url, segments: &[&str]) -> Option<Result<PixivGallery, &'static str>> {
     let mut query = url
         .query_pairs()
@@ -244,6 +269,13 @@ fn pixiv_collection(url: &Url, segments: &[&str]) -> Option<Result<PixivGallery,
                     .ok_or("无效的 Pixiv 收藏用户 ID。")
             })
         }
+        ["tags", tag, "artworks"] => Some(if query.next().is_some() {
+            Err("仅支持未筛选的 Pixiv 标签作品链接，请移除筛选参数后重试。")
+        } else {
+            decode_tag_segment(tag)
+                .map(PixivGallery::Tag)
+                .ok_or("无效的 Pixiv 标签。")
+        }),
         ["ranking.php"] => {
             let mut mode = None;
             let mut date = None;
@@ -419,6 +451,25 @@ mod tests {
         ));
         for suffix in ["/cat", "?tag=cat", "?rest=hide"] {
             assert!(matches!(parse(&format!("{prefix}{suffix}")), Some(Err(_))));
+        }
+    }
+
+    #[test]
+    fn tag_links_decode_one_exact_tag_and_reject_filters_or_bad_encoding() {
+        let registry = BooruSiteRegistry::default();
+        let parse =
+            |input: &str| parse_collection_input(input, HashSet::new(), false, true, &registry);
+        let url = "https://www.pixiv.net/zh-cn/tags/C+%2B%2F%E7%8C%AB/artworks";
+        assert!(matches!(
+            parse(&format!("{url}?utm_source=share")),
+            Some(Ok(CollectionSource::Pixiv(PixivGallery::Tag(tag)))) if tag == "C++/猫"
+        ));
+        for input in [
+            format!("{url}?mode=r18&utm_source=share"),
+            "https://pixiv.net/tags/%FF/artworks".to_owned(),
+            "https://pixiv.net/tags/C%2/artworks".to_owned(),
+        ] {
+            assert!(matches!(parse(&input), Some(Err(_))), "{input}");
         }
     }
 

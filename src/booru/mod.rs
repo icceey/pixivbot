@@ -11,6 +11,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{error, info};
 
+mod pool;
+pub use pool::{pool_image_batch, PoolCursor};
+
 #[cfg(test)]
 mod pool_tests;
 

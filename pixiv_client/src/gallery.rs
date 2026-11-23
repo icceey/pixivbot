@@ -179,7 +179,7 @@ fn next_pixivision_page(
         .1
         .parse()
         .map_err(|error| Error::Other(format!("Invalid pixivision page number: {error}")))?;
-    if page != current_page + 1 {
+    if Some(page) != current_page.checked_add(1) {
         return Err(Error::Other(format!(
             "Pixivision pagination did not advance by one: {url}"
         )));
