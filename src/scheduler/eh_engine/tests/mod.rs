@@ -38,10 +38,10 @@ use crate::db::types::{EhFilter, EhPendingGallery, EhTagState, SubscriptionState
 use crate::pixiv::downloader::Downloader;
 use crate::scheduler::helpers::eh_tag_subscription_state;
 use chrono::Local;
-use eh_client::{
-    ArchiveArtifacts, EhClient, EhClientBuilder, EhCookies, EhGallery, ImageUploadInput,
-    ImageUploader, IpfS3PreviewRewriteConfig, TelegraphClient, TelegraphImageUrlPair,
-    ZipArchiveUploadInput,
+use eh_client::{ArchiveArtifacts, EhClient, EhClientBuilder, EhCookies, EhGallery};
+use media_publish::{
+    ImageUploadInput, ImageUploader, IpfS3PreviewRewriteConfig, TelegraphClient,
+    TelegraphImageUrlPair, ZipArchiveUploadInput,
 };
 use reqwest::Client;
 use sea_orm::sea_query::Expr;

@@ -1,28 +1,10 @@
-use super::collection_input::CollectionSource;
 use crate::bot::{notifier::ThrottledBot, BotHandler};
 use crate::db::repo::collection_jobs::ResumeResult;
-use crate::pixiv::PixivGallery;
-use crate::scheduler::get_chat_if_should_notify;
+use crate::scheduler::{get_chat_if_should_notify, CollectionSource};
 use teloxide::prelude::*;
 use tracing::error;
 
-pub(in crate::bot) const COLLECTION_MORE_PREFIX: &str = "col:";
-
-impl CollectionSource {
-    pub(super) fn title(&self) -> String {
-        match self {
-            Self::Pixiv(gallery) => match gallery {
-                PixivGallery::Author(id) => format!("Pixiv 作者 {id}"),
-                PixivGallery::Bookmarks(id) => format!("Pixiv 公开收藏 {id}"),
-                PixivGallery::Collection(id) => format!("Pixiv 合集 {id}"),
-                PixivGallery::Pixivision { id, .. } => format!("pixivision {id}"),
-                PixivGallery::Ranking { mode, date, .. } => format!("Pixiv {mode} {date}"),
-                PixivGallery::Tag(tag) => format!("Pixiv 标签 {tag}"),
-            },
-            Self::Pool { site, id } => format!("{site} pool {id}"),
-        }
-    }
-}
+pub(crate) const COLLECTION_MORE_PREFIX: &str = "col:";
 
 impl BotHandler {
     pub(super) async fn enqueue_collection_export(

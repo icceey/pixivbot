@@ -25,8 +25,8 @@ use teloxide::types::BotCommandScope;
 use tracing::{error, info, warn};
 
 pub use commands::Command;
-pub(crate) use handler::TelegraphServices;
 pub use handler::{BotHandler, BotHandlerConfig};
+pub(crate) use handlers::{sanitize_filename, COLLECTION_MORE_PREFIX};
 pub use middleware::UserChatContext;
 
 /// Handler 返回类型
@@ -41,7 +41,7 @@ pub async fn run(
 
     let has_booru = !handler.booru_registry.is_empty();
     let has_ehentai = handler.eh_client.is_some();
-    let has_telegraph = handler.telegraph.is_some();
+    let has_telegraph = handler.has_telegraph;
 
     info!(
         "Bot mode: {} (new chats will be {} by default)",
@@ -79,24 +79,13 @@ pub async fn run(
     // 构建 handler 树
     let handler_tree = build_handler_tree();
 
-    let worker_handler = handler.clone();
-    let worker_bot = bot.clone();
-    handler.recover_collection_exports(&bot).await?;
-    if *shutdown.borrow() {
-        return Ok(());
-    }
-    let worker =
-        tokio::spawn(async move { worker_handler.run_collection_worker(worker_bot).await });
-
     let mut dispatcher = Dispatcher::builder(bot, handler_tree)
         .dependencies(dptree::deps![handler, repo, notifier, settings_storage])
         .default_handler(|_| async {})
         .build();
     let shutdown_token = dispatcher.shutdown_token();
-    let worker_abort = worker.abort_handle();
     let shutdown_watcher = tokio::spawn(async move {
         if *shutdown.borrow() || shutdown.changed().await.is_ok() {
-            worker_abort.abort();
             while shutdown_token.shutdown().is_err() {
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
@@ -105,7 +94,6 @@ pub async fn run(
 
     dispatcher.dispatch().await;
     shutdown_watcher.abort();
-    worker.abort();
 
     Ok(())
 }

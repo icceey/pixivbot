@@ -572,7 +572,7 @@ impl BotHandler {
 }
 
 /// Sanitize filename by replacing illegal filesystem characters with underscore
-pub(super) fn sanitize_filename(name: &str) -> String {
+pub(crate) fn sanitize_filename(name: &str) -> String {
     name.replace(
         |c: char| {
             c.is_control() || matches!(c, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*')

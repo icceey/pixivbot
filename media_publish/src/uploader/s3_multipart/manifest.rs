@@ -338,7 +338,7 @@ fn is_lowercase_sha256(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use crate::s3_multipart::fingerprint_fields;
+    use crate::uploader::s3_multipart::fingerprint_fields;
 
     #[test]
     fn fingerprints_disambiguate_field_boundaries_and_requested_entry_order() {

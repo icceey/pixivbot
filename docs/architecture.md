@@ -22,6 +22,7 @@ flowchart LR
 | `src/db` | Entities, persisted state, and transactional Repo operations |
 | `migration` | Ordered schema and data migrations, applied at startup |
 | `pixiv_client`, `booru_client`, `eh_client` | Service protocols, authentication, parsing, and transport |
+| `media_publish` | Shared Telegraph publishing and image-hosting backends (Pixi, Catbox, S3, ipfS3) |
 | `src/pixiv`, `src/booru`, `src/cache` | Application client wiring, downloads, and cached files |
 
 ## Pixiv and Booru subscriptions

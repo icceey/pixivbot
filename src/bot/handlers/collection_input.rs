@@ -2,11 +2,11 @@ use crate::booru::BooruSiteRegistry;
 use crate::bot::link_handler::{parse_pixiv_links, PixivLink};
 use crate::bot::{notifier::ThrottledBot, permissions, BotHandler};
 use crate::pixiv::PixivGallery;
+use crate::scheduler::CollectionSource;
 use booru_client::BooruEngineType;
 use chrono::NaiveDate;
 use percent_encoding::percent_decode_str;
 use regex::Regex;
-use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::LazyLock;
 use teloxide::prelude::*;
@@ -20,12 +20,6 @@ static URLS: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?i)[a-z][a-z0-9+.-]*://[^\s<>"'`(){}，。；！？、（）【】《》]+"#)
         .expect("valid URL token regex")
 });
-
-#[derive(Debug, Serialize, Deserialize)]
-pub(super) enum CollectionSource {
-    Pixiv(PixivGallery),
-    Pool { site: String, id: u64 },
-}
 
 type ParsedSource = Result<CollectionSource, &'static str>;
 
@@ -41,7 +35,7 @@ impl BotHandler {
         let Some(parsed) = parse_collection_command(msg, args, &self.booru_registry) else {
             return Ok(false);
         };
-        if telegraph && self.telegraph.is_none() {
+        if telegraph && !self.has_telegraph {
             bot.send_message(chat_id, "❌ Telegraph 未配置，无法生成阅读链接。")
                 .await?;
             return Ok(true);

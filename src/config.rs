@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use booru_client::{BooruEngineType, BypassConfig};
+use eh_client::EhCookies;
+use media_publish::ImageUploadConfig;
 use serde::Deserialize;
-
-use eh_client::{EhCookies, ImageUploadConfig};
 
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
@@ -32,7 +32,20 @@ pub struct Config {
     #[serde(default)]
     pub ehentai: EhentaiConfig,
     #[serde(default)]
+    pub telegraph: TelegraphConfig,
+    #[serde(default)]
     pub image_upload: ImageUploadConfig,
+}
+
+/// Shared Telegraph publishing configuration used across Pixiv, Booru, and EH flows.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct TelegraphConfig {
+    /// Telegraph access token for creating and editing Telegraph pages.
+    #[serde(default)]
+    pub access_token: Option<String>,
+    /// Auto-create an ephemeral Telegraph account at startup when no token is configured.
+    #[serde(default)]
+    pub auto_create_account: bool,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -116,6 +129,9 @@ pub struct SchedulerConfig {
     /// Updates author names daily to sync with Pixiv profile changes
     #[serde(default = "default_author_name_update_time")]
     pub author_name_update_time: String,
+    /// Extra retry attempts per collection export batch (defaults to `ehentai.max_retry_count`).
+    #[serde(default)]
+    pub collection_max_retry_count: Option<u8>,
 }
 
 fn default_tick_interval_sec() -> u64 {
@@ -706,6 +722,27 @@ impl Config {
             "Pixiv tag scan target, page budget and minimum interval must be positive; maximum interval must be >= minimum"
         );
         Ok(config)
+    }
+
+    pub fn telegraph_access_token(&self) -> Option<&str> {
+        self.telegraph
+            .access_token
+            .as_deref()
+            .or(self.ehentai.telegraph_access_token.as_deref())
+    }
+
+    pub fn uses_legacy_eh_telegraph_token(&self) -> bool {
+        self.telegraph.access_token.is_none() && self.ehentai.telegraph_access_token.is_some()
+    }
+
+    pub fn should_auto_create_telegraph_account(&self) -> bool {
+        self.telegraph.auto_create_account || self.ehentai.upload_telegraph
+    }
+
+    pub fn collection_max_retry_count(&self) -> u8 {
+        self.scheduler
+            .collection_max_retry_count
+            .unwrap_or(self.ehentai.max_retry_count)
     }
 
     pub fn log_level(&self) -> tracing::Level {

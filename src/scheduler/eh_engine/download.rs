@@ -8,9 +8,8 @@ use crate::db::repo::eh_gallery_jobs::{
 use crate::db::{entities::eh_gallery_jobs, repo::Repo};
 use crate::scheduler::helpers::get_chat_if_should_notify;
 use anyhow::{Context, Result};
-use eh_client::{
-    parser::DownloadCost, ArchiveArtifacts, ArchiveDownloadOptions, EhClient, ImageUploader,
-};
+use eh_client::{parser::DownloadCost, ArchiveArtifacts, ArchiveDownloadOptions, EhClient};
+use media_publish::ImageUploader;
 use sea_orm::prelude::DateTime;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;

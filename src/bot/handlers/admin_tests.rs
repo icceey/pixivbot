@@ -96,7 +96,8 @@ async fn fixture() -> (MockServer, ThrottledBot, BotHandler) {
         booru_registry: Arc::new(Default::default()),
         eh_client: None,
         eh_config: Arc::new(Default::default()),
-        telegraph: None,
+        has_telegraph: false,
+        collection_wakeup: Arc::default(),
     });
     (server, bot, handler)
 }

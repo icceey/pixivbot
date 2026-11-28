@@ -178,7 +178,8 @@ mod tests {
             booru_registry: Arc::new(BooruSiteRegistry::default()),
             eh_client: None,
             eh_config: Arc::new(EhentaiConfig::default()),
-            telegraph: None,
+            has_telegraph: false,
+            collection_wakeup: Arc::default(),
         });
 
         handler

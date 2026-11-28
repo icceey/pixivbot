@@ -3,7 +3,8 @@ use crate::db::{
     repo::{eh_gallery_jobs::EhCleanupFinalizeOutcome, Repo},
 };
 use anyhow::{Context, Result};
-use eh_client::{ArchiveArtifacts, ImageUploader};
+use eh_client::ArchiveArtifacts;
+use media_publish::ImageUploader;
 use tracing::warn;
 
 /// Require a provider-specific terminal Abort before deleting persisted multipart

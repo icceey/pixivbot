@@ -1,5 +1,6 @@
 mod author_engine;
 mod booru_engine;
+mod collection_engine;
 mod eh_engine;
 mod helpers;
 mod name_update_engine;
@@ -8,6 +9,8 @@ mod ranking_engine;
 
 pub use author_engine::AuthorEngine;
 pub use booru_engine::BooruEngine;
+pub(crate) use collection_engine::CollectionSource;
+pub use collection_engine::{CollectionEngine, CollectionEngineConfig};
 pub use eh_engine::{
     drain_eh_job_cleanup_maintenance, EhDownloadQueue, EhDownloadWorker, EhEngine, EhPublishWorker,
     EhTelegraphRewriteWorker, EhUploadWorker,

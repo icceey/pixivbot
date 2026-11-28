@@ -1,9 +1,8 @@
-use super::download::sanitize_filename;
-use crate::bot::notifier::ThrottledBot;
-use crate::bot::BotHandler;
+use super::CollectionEngine;
+use crate::bot::sanitize_filename;
 use crate::db::repo::collection_jobs::{CollectionRetryStage, Model};
 use anyhow::{Context, Result};
-use eh_client::ImageUploadInput;
+use media_publish::ImageUploadInput;
 use std::io;
 use std::path::PathBuf;
 use teloxide::prelude::*;
@@ -13,10 +12,9 @@ use tracing::warn;
 
 const TELEGRAPH_UPLOAD_BATCH_SIZE: usize = 5;
 
-impl BotHandler {
+impl CollectionEngine {
     pub(super) async fn deliver_collection_files(
         &self,
-        bot: &ThrottledBot,
         job: &Model,
         title: &str,
         files: &[(PathBuf, String)],
@@ -26,7 +24,7 @@ impl BotHandler {
         if job.telegraph {
             self.begin_collection_delivery(job).await?;
             return self
-                .deliver_collection_to_telegraph(bot, chat_id, title, files, keyboard)
+                .deliver_collection_to_telegraph(chat_id, title, files, keyboard)
                 .await;
         }
 
@@ -35,7 +33,8 @@ impl BotHandler {
             .context(CollectionRetryStage::Preparing)?;
         self.begin_collection_delivery(job).await?;
         let archive_name = format!("{}.zip", sanitize_filename(title));
-        let mut request = bot
+        let mut request = self
+            .bot
             .send_document(
                 chat_id,
                 InputFile::file(archive.path()).file_name(archive_name),
@@ -55,7 +54,6 @@ impl BotHandler {
 
     async fn deliver_collection_to_telegraph(
         &self,
-        bot: &ThrottledBot,
         chat_id: ChatId,
         title: &str,
         files: &[(PathBuf, String)],
@@ -110,7 +108,9 @@ impl BotHandler {
                 .is_some(),
             "Collection chat was disabled during upload"
         );
-        let mut request = bot.send_message(chat_id, format!("📖 {title}\n{first_page_url}"));
+        let mut request = self
+            .bot
+            .send_message(chat_id, format!("📖 {title}\n{first_page_url}"));
         if let Some(markup) = keyboard {
             request = request.reply_markup(markup);
         }
