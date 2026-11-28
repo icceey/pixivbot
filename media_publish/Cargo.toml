@@ -1,0 +1,30 @@
+[package]
+name = "media_publish"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+chrono.workspace = true
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+hex = "0.4.3"
+hmac = "0.13.0"
+quick-xml = { version = "0.42.0", features = ["serialize"] }
+reqwest = { workspace = true, features = ["multipart", "stream"] }
+rust-s3 = { version = "0.38.0", default-features = false, features = ["tokio-rustls-tls"] }
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.11.0"
+tempfile.workspace = true
+tokio = { workspace = true, features = ["fs", "io-util", "macros", "rt", "sync", "time"] }
+tokio-util.workspace = true
+tracing.workspace = true
+urlencoding.workspace = true
+zip.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }
+wiremock.workspace = true

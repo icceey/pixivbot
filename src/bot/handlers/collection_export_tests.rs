@@ -1,16 +1,16 @@
-use super::CollectionSource;
 use crate::booru::BooruSiteRegistry;
 use crate::bot::{
     notifier::{Notifier, ThrottledBot},
-    BotHandler, TelegraphServices,
+    BotHandler,
 };
 use crate::cache::FileCacheManager;
 use crate::config::{BooruSiteConfig, EhentaiConfig, PixivConfig};
 use crate::db::repo::{tests_helpers::setup_test_db, Repo};
 use crate::db::types::UserRole;
 use crate::pixiv::{client::PixivClient, downloader::Downloader};
-use eh_client::{PixiUploader, TelegraphClient};
+use crate::scheduler::{CollectionEngine, CollectionEngineConfig, CollectionSource};
 use image::ImageEncoder;
+use media_publish::{PixiUploader, TelegraphClient, TelegraphPublisher};
 use sea_orm::{ConnectionTrait, DbBackend, Statement};
 use serde_json::{json, Value};
 use std::io::{Cursor, Read};
@@ -143,24 +143,30 @@ async fn wait_for_job_status(repo: &Repo, job_id: i64, expected: Option<&str>) {
     .unwrap_or_else(|_| panic!("collection job {job_id} did not reach {expected:?}"));
 }
 
-fn collection_handler(repo: Arc<Repo>, bot: ThrottledBot, base: &str, cache: &Path) -> BotHandler {
+fn collection_harness(
+    repo: Arc<Repo>,
+    bot: ThrottledBot,
+    base: &str,
+    cache: &Path,
+) -> (BotHandler, CollectionEngine) {
     let site: BooruSiteConfig = serde_json::from_value(json!({
         "name": "pool-test", "engine_type": "danbooru", "base_url": base
     }))
     .unwrap();
-    BotHandler::new(crate::bot::BotHandlerConfig {
-        repo,
-        pixiv_client: PixivClient::new(PixivConfig {
-            refresh_token: "fake".into(),
-        })
-        .unwrap(),
-        notifier: Notifier::new(
-            bot,
-            Arc::new(Downloader::new(
-                reqwest::Client::new(),
-                FileCacheManager::new(cache, 7),
-            )),
-        ),
+    let pixiv_client = PixivClient::new(PixivConfig {
+        refresh_token: "fake".into(),
+    })
+    .unwrap();
+    let downloader = Arc::new(Downloader::new(
+        reqwest::Client::new(),
+        FileCacheManager::new(cache, 7),
+    ));
+    let booru_registry = BooruSiteRegistry::from_configs(&[site]);
+    let wakeup = Arc::new(tokio::sync::Notify::new());
+    let handler = BotHandler::new(crate::bot::BotHandlerConfig {
+        repo: repo.clone(),
+        pixiv_client: pixiv_client.clone(),
+        notifier: Notifier::new(bot.clone(), downloader.clone()),
         default_sensitive_tags: vec![],
         owner_id: None,
         is_public_mode: false,
@@ -169,21 +175,30 @@ fn collection_handler(repo: Arc<Repo>, bot: ThrottledBot, base: &str, cache: &Pa
         require_mention_in_group: true,
         cache_dir: String::new(),
         log_dir: String::new(),
-        booru_registry: BooruSiteRegistry::from_configs(&[site]),
+        booru_registry: booru_registry.clone(),
         eh_client: None,
-        eh_config: Arc::new(EhentaiConfig {
-            max_retry_count: 1,
-            ..Default::default()
-        }),
-        telegraph: Some(TelegraphServices {
-            client: Arc::new(TelegraphClient::new_with_urls(
+        eh_config: Arc::new(EhentaiConfig::default()),
+        has_telegraph: true,
+        collection_wakeup: wakeup.clone(),
+    });
+    let engine = CollectionEngine::new(CollectionEngineConfig {
+        repo,
+        bot,
+        pixiv_client,
+        downloader,
+        booru_registry,
+        telegraph: Some(TelegraphPublisher::new(
+            Arc::new(TelegraphClient::new_with_urls(
                 "fake".into(),
                 format!("{base}/unused-upload"),
                 base.into(),
             )),
-            image_uploader: Arc::new(PixiUploader::new_with_url(format!("{base}/image-host"))),
-        }),
-    })
+            Arc::new(PixiUploader::new_with_url(format!("{base}/image-host"))),
+        )),
+        max_retry_count: 1,
+        wakeup,
+    });
+    (handler, engine)
 }
 
 fn page_delivery(chat_id: ChatId, page_url: String) -> MockBuilder {
@@ -311,7 +326,7 @@ async fn collection_worker_delivers_ordered_zip_batches_and_retries_telegraph_up
     for id in [42, 43] {
         repo.upsert_user(id, None, UserRole::User).await.unwrap();
     }
-    let handler = collection_handler(repo.clone(), bot.clone(), &base, cache.path());
+    let (handler, engine) = collection_harness(repo.clone(), bot.clone(), &base, cache.path());
     let download = serde_json::from_value(message.clone()).unwrap();
     handler
         .handle_download(bot.clone(), download, chat_id, format!("{base}/pools/9"))
@@ -321,11 +336,7 @@ async fn collection_worker_delivers_ordered_zip_batches_and_retries_telegraph_up
     assert_eq!(queued.len(), 1);
     assert_eq!(queued[0].url.path(), "/botfake_token/SendMessage");
 
-    let worker = tokio::spawn({
-        let handler = handler.clone();
-        let bot = bot.clone();
-        async move { handler.run_collection_worker(bot).await }
-    });
+    let worker = tokio::spawn(async move { engine.run().await });
     let first = timeout(DELIVERY_TIMEOUT, documents_rx.recv())
         .await
         .expect("worker did not send the first ZIP")
@@ -449,7 +460,7 @@ async fn collection_worker_delivers_ordered_zip_batches_and_retries_telegraph_up
     worker.abort();
     assert!(worker.await.unwrap_err().is_cancelled());
 
-    let handler = collection_handler(repo.clone(), bot.clone(), &base, cache.path());
+    let (_handler, engine) = collection_harness(repo.clone(), bot.clone(), &base, cache.path());
     let retry_at = chrono::Utc::now().timestamp() + 2;
     repo.db()
         .execute(Statement::from_sql_and_values(
@@ -459,8 +470,8 @@ async fn collection_worker_delivers_ordered_zip_batches_and_retries_telegraph_up
         ))
         .await
         .unwrap();
-    handler.recover_collection_exports(&bot).await.unwrap();
-    let worker = tokio::spawn(async move { handler.run_collection_worker(bot).await });
+    engine.recover().await.unwrap();
+    let worker = tokio::spawn(async move { engine.run().await });
     let retried_at = timeout(DELIVERY_TIMEOUT, retry_uploads_rx.recv())
         .await
         .expect("restarted worker did not wake up for the retry")
@@ -577,8 +588,8 @@ async fn collection_worker_does_not_retry_publication_errors() {
             .set_api_url(base.parse().unwrap())
             .throttle(Limits::default());
         let cache = tempfile::tempdir().unwrap();
-        let handler = collection_handler(repo.clone(), bot.clone(), &base, cache.path());
-        let worker = tokio::spawn(async move { handler.run_collection_worker(bot).await });
+        let (_handler, engine) = collection_harness(repo.clone(), bot.clone(), &base, cache.path());
+        let worker = tokio::spawn(async move { engine.run().await });
         timeout(DELIVERY_TIMEOUT, failure_notice.wait_until_satisfied())
             .await
             .unwrap_or_else(|_| {

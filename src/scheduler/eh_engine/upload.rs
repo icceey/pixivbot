@@ -5,8 +5,9 @@ use crate::db::repo::eh_gallery_jobs::{EhJobUploadFailureOutcome, EhMissingZipRe
 use crate::db::{entities::eh_gallery_jobs, repo::Repo};
 use crate::scheduler::helpers::get_chat_if_should_notify;
 use anyhow::{Context, Result};
-use eh_client::{
-    ArchiveArtifacts, ImageUploadInput, ImageUploader, IpfS3PreviewRewriteConfig, TelegraphClient,
+use eh_client::ArchiveArtifacts;
+use media_publish::{
+    ImageUploadInput, ImageUploader, IpfS3PreviewRewriteConfig, TelegraphClient,
     TelegraphImageUrlPair, UploadResumeContext, ZipArchiveUploadInput,
 };
 use std::sync::Arc;

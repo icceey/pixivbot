@@ -565,7 +565,7 @@ pub(super) struct SeenResumeContext {
 }
 
 pub(super) fn copy_resume_context(
-    context: eh_client::UploadResumeContext<'_>,
+    context: media_publish::UploadResumeContext<'_>,
 ) -> SeenResumeContext {
     SeenResumeContext {
         manifest_path: context.manifest_path.to_path_buf(),
@@ -597,7 +597,7 @@ impl ImageUploader for ZipFirstMockUploader {
     async fn upload_images(
         &self,
         images: &[ImageUploadInput<'_>],
-    ) -> eh_client::Result<Vec<String>> {
+    ) -> media_publish::Result<Vec<String>> {
         let image_call = self
             .image_calls
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -609,7 +609,7 @@ impl ImageUploader for ZipFirstMockUploader {
         );
         drop(seen_contexts);
         if self.fail_image_call == Some(image_call) {
-            return Err(eh_client::Error::Other(
+            return Err(media_publish::Error::Other(
                 "mock image upload failure".to_string(),
             ));
         }
@@ -622,7 +622,7 @@ impl ImageUploader for ZipFirstMockUploader {
     async fn upload_images_with_url_pairs(
         &self,
         images: &[ImageUploadInput<'_>],
-    ) -> eh_client::Result<Vec<TelegraphImageUrlPair>> {
+    ) -> media_publish::Result<Vec<TelegraphImageUrlPair>> {
         let urls = self.upload_images(images).await?;
         Ok(urls
             .into_iter()
@@ -640,7 +640,7 @@ impl ImageUploader for ZipFirstMockUploader {
     async fn upload_zip_archive_with_url_pairs(
         &self,
         archive: ZipArchiveUploadInput<'_>,
-    ) -> eh_client::Result<Option<Vec<TelegraphImageUrlPair>>> {
+    ) -> media_publish::Result<Option<Vec<TelegraphImageUrlPair>>> {
         self.zip_calls
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if let Some(context) = archive.resume_context {
@@ -684,9 +684,9 @@ impl ImageUploader for AlwaysFailUploader {
     async fn upload_images(
         &self,
         _images: &[ImageUploadInput<'_>],
-    ) -> eh_client::Result<Vec<String>> {
+    ) -> media_publish::Result<Vec<String>> {
         self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Err(eh_client::Error::Other(self.message.clone()))
+        Err(media_publish::Error::Other(self.message.clone()))
     }
 }
 
@@ -695,8 +695,8 @@ impl ImageUploader for TerminalCleanupMockUploader {
     async fn upload_images(
         &self,
         _images: &[ImageUploadInput<'_>],
-    ) -> eh_client::Result<Vec<String>> {
-        Err(eh_client::Error::Other(
+    ) -> media_publish::Result<Vec<String>> {
+        Err(media_publish::Error::Other(
             "mock image upload failure".to_string(),
         ))
     }
@@ -704,14 +704,14 @@ impl ImageUploader for TerminalCleanupMockUploader {
     async fn abort_upload_state(
         &self,
         uploads_dir: &std::path::Path,
-    ) -> Result<(), eh_client::UploadStateError> {
+    ) -> Result<(), media_publish::UploadStateError> {
         self.cleanup_calls
             .lock()
             .unwrap()
             .push((uploads_dir.to_path_buf(), uploads_dir.exists()));
         self.cleanup_attempted.notify_one();
         if self.fail_abort {
-            return Err(eh_client::UploadStateError::AbortHttp(503));
+            return Err(media_publish::UploadStateError::AbortHttp(503));
         }
         Ok(())
     }

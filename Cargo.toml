@@ -1,11 +1,31 @@
 [workspace]
-members = [".", "migration", "pixiv_client", "booru_client", "eh_client"]
+members = [".", "migration", "pixiv_client", "booru_client", "eh_client", "media_publish"]
 
 [workspace.package]
 version = "0.3.0"
 edition = "2021"
 authors = ["icceey", "Hugefiver <i@iruri.moe>"]
 license = "MIT"
+rust-version = "1.94"
+
+[workspace.dependencies]
+async-trait = "0.1.89"
+chrono = { version = "0.4.44", default-features = false, features = ["clock"] }
+futures-util = "0.3"
+md5 = "0.8.0"
+regex = "1.12.3"
+reqwest = { version = "0.12.28", default-features = false, features = ["json", "rustls-tls"] }
+sea-orm = { version = "1.1.20", features = ["sqlx-sqlite", "runtime-tokio-rustls", "macros"] }
+sea-orm-migration = { version = "1.1.20", features = ["runtime-tokio-rustls", "sqlx-sqlite"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+tempfile = "3.27.0"
+tokio = "1.52.3"
+tokio-util = { version = "0.7", features = ["io"] }
+tracing = "0.1.44"
+urlencoding = "2.1.3"
+wiremock = "0.6"
+zip = { version = "9.0.5", default-features = false }
 
 [package]
 name = "pixivbot"
@@ -13,7 +33,7 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
-rust-version = "1.94"
+rust-version.workspace = true
 
 [features]
 default = []
@@ -23,36 +43,36 @@ ffmpeg-codec = ["dep:ffmpeg-next"]
 
 [dependencies]
 anyhow = "1.0.102"
-chrono = { version = "0.4.44", features = ["serde"] }
+chrono = { workspace = true, features = ["serde"] }
 config = { version = "0.15.23", features = ["toml"], default-features = false }
 ffmpeg-next = { version = "9.0.0", default-features = false, features = ["codec", "format", "software-scaling"], optional = true }
-futures-util = "0.3"
+futures-util.workspace = true
 humantime = "2.4.0"
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
-md5 = "0.8.0"
+md5.workspace = true
 migration = { path = "migration" }
 booru_client = { path = "booru_client" }
 eh_client = { path = "eh_client" }
+media_publish = { path = "media_publish" }
 pixiv_client = { path = "pixiv_client" }
 percent-encoding = "2"
 rand = "0.10.1"
-regex = "1.12.3"
-reqwest = { version = "0.12.28", default-features = false, features = ["json", "rustls-tls"] }
-sea-orm = { version = "1.1.20", features = ["sqlx-sqlite", "runtime-tokio-rustls", "macros", "sqlx-dep"] }
-sea-orm-migration = { version = "1.1.20", features = ["runtime-tokio-rustls", "sqlx-sqlite"] }
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.150"
-teloxide = { version = "0.17.0", features = ["macros", "ctrlc_handler", "rustls", "throttle"], default-features = false}
-tempfile = "3.27.0"
-tokio = { version = "1.52.3", features = ["macros", "rt", "time"] }
-tokio-cron-scheduler = "0.15.1"
-tracing = "0.1.44"
+regex.workspace = true
+reqwest.workspace = true
+sea-orm = { workspace = true, features = ["sqlx-dep"] }
+sea-orm-migration.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+teloxide = { version = "0.17.0", features = ["macros", "rustls", "throttle"], default-features = false }
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "signal", "time"] }
+tracing.workspace = true
 tracing-appender = "0.2.5"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "chrono"] }
 url = "2.5.8"
-zip = "9.0.5"
+zip = { workspace = true, features = ["deflate"] }
 
 [dev-dependencies]
-async-trait = "0.1.89"
-tokio = { version = "1.52.3", features = ["test-util"] }
-wiremock = "0.6"
+async-trait.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+wiremock.workspace = true

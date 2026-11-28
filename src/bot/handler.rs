@@ -14,12 +14,6 @@ use teloxide::types::ParseMode;
 use teloxide::utils::markdown;
 use tracing::{error, info};
 
-#[derive(Clone)]
-pub(crate) struct TelegraphServices {
-    pub(crate) client: Arc<eh_client::TelegraphClient>,
-    pub(crate) image_uploader: Arc<dyn eh_client::ImageUploader>,
-}
-
 pub struct BotHandlerConfig {
     pub repo: Arc<Repo>,
     pub pixiv_client: PixivClient,
@@ -35,7 +29,8 @@ pub struct BotHandlerConfig {
     pub booru_registry: Arc<BooruSiteRegistry>,
     pub eh_client: Option<Arc<eh_client::EhClient>>,
     pub eh_config: Arc<EhentaiConfig>,
-    pub(crate) telegraph: Option<TelegraphServices>,
+    pub has_telegraph: bool,
+    pub collection_wakeup: Arc<tokio::sync::Notify>,
 }
 
 #[derive(Clone)]
@@ -58,7 +53,7 @@ pub struct BotHandler {
     pub(crate) booru_registry: Arc<BooruSiteRegistry>,
     pub(crate) eh_client: Option<Arc<eh_client::EhClient>>,
     pub(crate) eh_config: Arc<EhentaiConfig>,
-    pub(crate) telegraph: Option<TelegraphServices>,
+    pub(crate) has_telegraph: bool,
     pub(crate) collection_wakeup: Arc<tokio::sync::Notify>,
 }
 
@@ -79,8 +74,8 @@ impl BotHandler {
             booru_registry: config.booru_registry,
             eh_client: config.eh_client,
             eh_config: config.eh_config,
-            telegraph: config.telegraph,
-            collection_wakeup: Arc::default(),
+            has_telegraph: config.has_telegraph,
+            collection_wakeup: config.collection_wakeup,
         }
     }
 

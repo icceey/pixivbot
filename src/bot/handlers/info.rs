@@ -124,7 +124,7 @@ impl BotHandler {
 "#,
         );
 
-        if self.telegraph.is_some() {
+        if self.has_telegraph {
             let target = if self.eh_client.is_some() {
                 "E\\-Hentai 画廊或有序合集"
             } else {

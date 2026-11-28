@@ -1,7 +1,7 @@
 use crate::config::EhentaiConfig;
 use crate::db::{entities::eh_gallery_jobs, repo::Repo};
 use anyhow::{Context, Result};
-use eh_client::{rewrite_ipfs_gateway_nodes, TelegraphClient, TelegraphRewriteData};
+use media_publish::{rewrite_ipfs_gateway_nodes, TelegraphClient, TelegraphRewriteData};
 use std::sync::Arc;
 use tracing::{error, info, warn};
 

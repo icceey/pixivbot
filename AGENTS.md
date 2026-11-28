@@ -34,7 +34,7 @@
 
 ## Workspace
 
-- Workspace crates are root `pixivbot` app, the `pixiv_client`, `booru_client`, and `eh_client` service clients, and `migration` SeaORM migrations.
+- Workspace crates are root `pixivbot` app, the `pixiv_client`, `booru_client`, and `eh_client` service clients, `media_publish` (shared Telegraph and image-upload backends), and `migration` SeaORM migrations.
 - Root `pixivbot` owns Telegram bot wiring, scheduler engines, persistence, Pixiv downloads, and booru integration.
 - `pixiv_client` is the low-level Pixiv API client; `booru_client` is the booru API client; keep protocol/client changes inside those crates when possible.
 - `migration` owns SeaORM migrations and is invoked from the app at startup, not by an external migration runner.

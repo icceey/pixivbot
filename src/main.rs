@@ -237,20 +237,26 @@ async fn main() -> Result<()> {
         None
     };
 
-    let telegraph_client = if let Some(token) = config.ehentai.telegraph_access_token.as_ref() {
-        Some(std::sync::Arc::new(eh_client::TelegraphClient::new(
-            token.clone(),
+    let telegraph_client = if let Some(token) = config.telegraph_access_token() {
+        if config.uses_legacy_eh_telegraph_token() {
+            warn!(
+                "Using legacy ehentai.telegraph_access_token; consider moving it to [telegraph].access_token"
+            );
+        }
+        Some(std::sync::Arc::new(media_publish::TelegraphClient::new(
+            token.to_string(),
         )))
-    } else if config.ehentai.upload_telegraph {
-        match eh_client::TelegraphClient::create_account("PixivBot", Some("PixivBot"), None).await {
+    } else if config.should_auto_create_telegraph_account() {
+        match media_publish::TelegraphClient::create_account("PixivBot", Some("PixivBot"), None)
+            .await
+        {
             Ok(client) => {
                 info!("✅ Telegraph account auto-created for this process");
                 Some(std::sync::Arc::new(client))
             }
             Err(e) => {
                 warn!(
-                    "ehentai.upload_telegraph=true but Telegraph account auto-creation failed; \
-                     Telegraph upload is disabled: {:#}",
+                    "Telegraph account auto-creation failed; Telegraph publishing is disabled: {:#}",
                     e
                 );
                 None
@@ -269,7 +275,7 @@ async fn main() -> Result<()> {
         && (telegraph_client.is_some()
             || matches!(
                 config.image_upload.provider,
-                eh_client::ImageUploadProvider::S3 | eh_client::ImageUploadProvider::IpfS3
+                media_publish::ImageUploadProvider::S3 | media_publish::ImageUploadProvider::IpfS3
             ));
     let image_uploader = if telegraph_client.is_some() || needs_eh_image_uploader {
         Some(config.image_upload.build_uploader().await?)
@@ -285,13 +291,15 @@ async fn main() -> Result<()> {
         telegraph_client
             .as_ref()
             .zip(image_uploader.as_ref())
-            .map(|(client, uploader)| bot::TelegraphServices {
-                client: std::sync::Arc::clone(client),
-                image_uploader: std::sync::Arc::clone(uploader),
+            .map(|(client, uploader)| {
+                media_publish::TelegraphPublisher::new(
+                    std::sync::Arc::clone(client),
+                    std::sync::Arc::clone(uploader),
+                )
             });
     let eh_startup_abort_uploader = if matches!(
         config.image_upload.provider,
-        eh_client::ImageUploadProvider::S3 | eh_client::ImageUploadProvider::IpfS3
+        media_publish::ImageUploadProvider::S3 | media_publish::ImageUploadProvider::IpfS3
     ) {
         eh_image_uploader.clone()
     } else {
@@ -489,8 +497,6 @@ async fn main() -> Result<()> {
         None
     };
 
-    info!("🤖 Starting Telegram Bot...");
-
     // Single Ctrl+C shutdown signal shared with the Telegram dispatcher.
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
     tokio::spawn(async move {
@@ -501,6 +507,30 @@ async fn main() -> Result<()> {
         info!("Received Ctrl+C, shutting down...");
         let _ = shutdown_tx.send(true);
     });
+
+    let collection_wakeup = std::sync::Arc::new(tokio::sync::Notify::new());
+    let has_telegraph = telegraph_for_bot.is_some();
+    let collection_engine = scheduler::CollectionEngine::new(scheduler::CollectionEngineConfig {
+        repo: repo.clone(),
+        bot: bot.clone(),
+        pixiv_client: pixiv_client.clone(),
+        downloader: notifier.get_downloader().clone(),
+        booru_registry: booru_registry.clone(),
+        telegraph: telegraph_for_bot,
+        max_retry_count: config.collection_max_retry_count(),
+        wakeup: collection_wakeup.clone(),
+    });
+    collection_engine.recover().await?;
+    let collection_engine_handle = if !*shutdown_rx.borrow() {
+        info!("✅ Collection export engine initialized");
+        Some(tokio::spawn(async move {
+            collection_engine.run().await;
+        }))
+    } else {
+        None
+    };
+
+    info!("🤖 Starting Telegram Bot...");
 
     let bot_handler = bot::BotHandler::new(bot::BotHandlerConfig {
         repo: repo.clone(),
@@ -517,7 +547,8 @@ async fn main() -> Result<()> {
         booru_registry: booru_registry.clone(),
         eh_client: eh_client.clone(),
         eh_config: std::sync::Arc::new(config.ehentai.clone()),
-        telegraph: telegraph_for_bot,
+        has_telegraph,
+        collection_wakeup,
     });
     let bot_shutdown_rx = shutdown_rx.clone();
     let mut bot_handle = tokio::spawn(async move {
@@ -537,6 +568,7 @@ async fn main() -> Result<()> {
     pixiv_tag_engine_handle.abort();
     name_update_engine_handle.abort();
     for handle in [
+        collection_engine_handle,
         booru_engine_handle,
         eh_engine_handle,
         eh_download_worker_handle,

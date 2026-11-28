@@ -105,11 +105,11 @@ impl BotHandler {
         eh_filter.telegraph = telegraph_on;
 
         // Reject telegraph=on when Telegraph is not configured
-        if telegraph_on && self.telegraph.is_none() {
+        if telegraph_on && !self.has_telegraph {
             let _ = bot
                 .send_message(
                     chat_id,
-                    "❌ Telegraph 未配置，无法启用 telegraph=on。请配置 ehentai.telegraph_access_token 后重试。",
+                    "❌ Telegraph 未配置，无法启用 telegraph=on。请配置 telegraph.access_token 后重试。",
                 )
                 .await;
             return Ok(());
@@ -384,11 +384,11 @@ impl BotHandler {
             .unwrap_or(trailing_telegraph);
 
         // Reject telegraph=on when Telegraph is not configured
-        if telegraph && self.telegraph.is_none() {
+        if telegraph && !self.has_telegraph {
             let _ = bot
                 .send_message(
                     chat_id,
-                    "❌ Telegraph 未配置，无法启用 telegraph=on。请配置 ehentai.telegraph_access_token 后重试。",
+                    "❌ Telegraph 未配置，无法启用 telegraph=on。请配置 telegraph.access_token 后重试。",
                 )
                 .await;
             return Ok(());
@@ -519,11 +519,11 @@ impl BotHandler {
         };
 
         // Reject Telegraph request when no token is configured
-        if self.telegraph.is_none() {
+        if !self.has_telegraph {
             let _ = bot
                 .send_message(
                     chat_id,
-                    "❌ Telegraph 未配置。请配置 ehentai.telegraph_access_token 后重试。",
+                    "❌ Telegraph 未配置。请配置 telegraph.access_token 后重试。",
                 )
                 .await;
             return Ok(());
