@@ -145,12 +145,10 @@ async fn filtered_deliveries_can_qualify_again_after_candidate_refresh() {
     let server = MockServer::start().await;
     let engine = PixivTagEngine::new(
         repo.clone(),
-        Arc::new(RwLock::new(
-            PixivClient::new(PixivConfig {
-                refresh_token: "unused".to_string(),
-            })
-            .unwrap(),
-        )),
+        PixivClient::new(PixivConfig {
+            refresh_token: "unused".to_string(),
+        })
+        .unwrap(),
         Notifier::new(
             Bot::new("fake_token")
                 .set_api_url(url::Url::parse(&server.uri()).unwrap())
@@ -228,12 +226,10 @@ async fn scan_timing_catches_up_with_the_advancing_window() {
     );
     let engine = PixivTagEngine::new(
         repo.clone(),
-        Arc::new(RwLock::new(
-            PixivClient::new(PixivConfig {
-                refresh_token: "unused".to_string(),
-            })
-            .unwrap(),
-        )),
+        PixivClient::new(PixivConfig {
+            refresh_token: "unused".to_string(),
+        })
+        .unwrap(),
         notifier,
         &serde_json::from_value(serde_json::json!({
             "pixiv_tag_window_days": 1,
@@ -365,12 +361,10 @@ async fn failed_download_and_interrupted_send_resume_after_reopen() {
             FileCacheManager::new(dir.path().join("cache"), 7),
         )),
     );
-    let pixiv = Arc::new(RwLock::new(
-        PixivClient::new(PixivConfig {
-            refresh_token: "unused".to_string(),
-        })
-        .unwrap(),
-    ));
+    let pixiv = PixivClient::new(PixivConfig {
+        refresh_token: "unused".to_string(),
+    })
+    .unwrap();
     let config: SchedulerConfig = serde_json::from_value(serde_json::json!({})).unwrap();
     let repo = Arc::new(open_repo(&url).await);
     let (task, sub, chat) = subscribe(&repo).await;
@@ -692,12 +686,10 @@ async fn expired_history_waits_for_pending_deliveries_and_author_checkpoints() {
             FileCacheManager::new(cache.path(), 7),
         )),
     );
-    let pixiv = Arc::new(RwLock::new(
-        PixivClient::new(PixivConfig {
-            refresh_token: "unused".to_string(),
-        })
-        .unwrap(),
-    ));
+    let pixiv = PixivClient::new(PixivConfig {
+        refresh_token: "unused".to_string(),
+    })
+    .unwrap();
     assert!(matches!(
         process_illust_push(
             &repo,
@@ -809,12 +801,10 @@ async fn concurrent_author_and_tag_pushes_send_once() {
             FileCacheManager::new(dir.path().join("cache"), 7),
         )),
     );
-    let pixiv = Arc::new(RwLock::new(
-        PixivClient::new(PixivConfig {
-            refresh_token: "unused".to_string(),
-        })
-        .unwrap(),
-    ));
+    let pixiv = PixivClient::new(PixivConfig {
+        refresh_token: "unused".to_string(),
+    })
+    .unwrap();
     let repo = Arc::new(open_repo("sqlite::memory:").await);
     let (_, sub, chat) = subscribe(&repo).await;
     let author = repo

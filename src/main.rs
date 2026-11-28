@@ -72,7 +72,6 @@ async fn main() -> Result<()> {
     // Initialize Pixiv Client
     let mut pixiv_client = pixiv::client::PixivClient::new(config.pixiv.clone())?;
     pixiv_client.login().await?;
-    let pixiv_client = std::sync::Arc::new(tokio::sync::RwLock::new(pixiv_client));
     info!("✅ Pixiv client initialized");
 
     // Initialize cache manager (starts background cleanup task)
@@ -492,54 +491,47 @@ async fn main() -> Result<()> {
 
     info!("🤖 Starting Telegram Bot...");
 
-    // Setup Ctrl+C handler
-    let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
+    // Single Ctrl+C shutdown signal shared with the Telegram dispatcher.
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
     tokio::spawn(async move {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("Failed to listen for Ctrl+C");
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            error!("Failed to listen for Ctrl+C: {:#}", e);
+            return;
+        }
         info!("Received Ctrl+C, shutting down...");
-        let _ = shutdown_tx.send(()).await;
+        let _ = shutdown_tx.send(true);
     });
 
-    // Start Bot in a separate task (non-blocking)
-    let sensitive_tags_for_bot = config.content.sensitive_tags.clone();
-    let image_size_for_bot = config.content.image_size.to_pixiv_image_size();
-    let download_threshold_for_bot = config.content.download_threshold();
-    let cache_dir_for_bot = config.scheduler.cache_dir.clone();
-    let log_dir_for_bot = config.logging.dir.clone();
-    let booru_registry_for_bot = booru_registry.clone();
-    let eh_client_for_bot = eh_client.clone();
-    let eh_config_for_bot = std::sync::Arc::new(config.ehentai.clone());
-    let bot_handle = tokio::spawn(async move {
-        if let Err(e) = bot::run(
-            bot,
-            config.telegram,
-            repo.clone(),
-            pixiv_client.clone(),
-            notifier.clone(),
-            sensitive_tags_for_bot,
-            image_size_for_bot,
-            download_threshold_for_bot,
-            cache_dir_for_bot,
-            log_dir_for_bot,
-            booru_registry_for_bot,
-            eh_client_for_bot,
-            eh_config_for_bot,
-            telegraph_for_bot,
-        )
-        .await
-        {
+    let bot_handler = bot::BotHandler::new(bot::BotHandlerConfig {
+        repo: repo.clone(),
+        pixiv_client: pixiv_client.clone(),
+        notifier: notifier.clone(),
+        default_sensitive_tags: config.content.sensitive_tags.clone(),
+        owner_id: config.telegram.owner_id,
+        is_public_mode: config.telegram.bot_mode.is_public(),
+        image_size: config.content.image_size.to_pixiv_image_size(),
+        download_original_threshold: config.content.download_threshold(),
+        require_mention_in_group: config.telegram.require_mention_in_group,
+        cache_dir: config.scheduler.cache_dir.clone(),
+        log_dir: config.logging.dir.clone(),
+        booru_registry: booru_registry.clone(),
+        eh_client: eh_client.clone(),
+        eh_config: std::sync::Arc::new(config.ehentai.clone()),
+        telegraph: telegraph_for_bot,
+    });
+    let bot_shutdown_rx = shutdown_rx.clone();
+    let mut bot_handle = tokio::spawn(async move {
+        if let Err(e) = bot::run(bot, bot_handler, bot_shutdown_rx).await {
             error!("Bot error: {:#}", e);
         }
     });
 
     // Wait for shutdown signal
-    shutdown_rx.recv().await;
+    let _ = shutdown_rx.changed().await;
     info!("Shutting down gracefully...");
 
-    // Abort tasks
-    bot_handle.abort();
+    // Stop background schedulers first so they do not claim new work while
+    // waiting for the Telegram dispatcher to drain.
     author_engine_handle.abort();
     ranking_engine_handle.abort();
     pixiv_tag_engine_handle.abort();
@@ -557,6 +549,15 @@ async fn main() -> Result<()> {
     .flatten()
     {
         handle.abort();
+    }
+
+    // Give the Telegram dispatcher a brief window to shut down cleanly before aborting.
+    if tokio::time::timeout(std::time::Duration::from_secs(5), &mut bot_handle)
+        .await
+        .is_err()
+    {
+        warn!("Telegram bot shutdown timed out, aborting task");
+        bot_handle.abort();
     }
 
     info!("✅ Shutdown complete");

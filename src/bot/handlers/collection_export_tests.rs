@@ -148,36 +148,34 @@ fn collection_handler(repo: Arc<Repo>, bot: ThrottledBot, base: &str, cache: &Pa
         "name": "pool-test", "engine_type": "danbooru", "base_url": base
     }))
     .unwrap();
-    BotHandler::new(
+    BotHandler::new(crate::bot::BotHandlerConfig {
         repo,
-        Arc::new(tokio::sync::RwLock::new(
-            PixivClient::new(PixivConfig {
-                refresh_token: "fake".into(),
-            })
-            .unwrap(),
-        )),
-        Notifier::new(
+        pixiv_client: PixivClient::new(PixivConfig {
+            refresh_token: "fake".into(),
+        })
+        .unwrap(),
+        notifier: Notifier::new(
             bot,
             Arc::new(Downloader::new(
                 reqwest::Client::new(),
                 FileCacheManager::new(cache, 7),
             )),
         ),
-        vec![],
-        None,
-        false,
-        pixiv_client::ImageSize::Large,
-        3,
-        true,
-        String::new(),
-        String::new(),
-        BooruSiteRegistry::from_configs(&[site]),
-        None,
-        Arc::new(EhentaiConfig {
+        default_sensitive_tags: vec![],
+        owner_id: None,
+        is_public_mode: false,
+        image_size: pixiv_client::ImageSize::Large,
+        download_original_threshold: 3,
+        require_mention_in_group: true,
+        cache_dir: String::new(),
+        log_dir: String::new(),
+        booru_registry: BooruSiteRegistry::from_configs(&[site]),
+        eh_client: None,
+        eh_config: Arc::new(EhentaiConfig {
             max_retry_count: 1,
             ..Default::default()
         }),
-        Some(TelegraphServices {
+        telegraph: Some(TelegraphServices {
             client: Arc::new(TelegraphClient::new_with_urls(
                 "fake".into(),
                 format!("{base}/unused-upload"),
@@ -185,7 +183,7 @@ fn collection_handler(repo: Arc<Repo>, bot: ThrottledBot, base: &str, cache: &Pa
             )),
             image_uploader: Arc::new(PixiUploader::new_with_url(format!("{base}/image-host"))),
         }),
-    )
+    })
 }
 
 fn page_delivery(chat_id: ChatId, page_url: String) -> MockBuilder {

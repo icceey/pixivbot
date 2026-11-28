@@ -72,34 +72,32 @@ async fn fixture() -> (MockServer, ThrottledBot, BotHandler) {
         .await
         .unwrap();
     }
-    let handler = BotHandler::new(
+    let handler = BotHandler::new(crate::bot::BotHandlerConfig {
         repo,
-        Arc::new(tokio::sync::RwLock::new(
-            PixivClient::new(PixivConfig {
-                refresh_token: "fake".into(),
-            })
-            .unwrap(),
-        )),
-        Notifier::new(
+        pixiv_client: PixivClient::new(PixivConfig {
+            refresh_token: "fake".into(),
+        })
+        .unwrap(),
+        notifier: Notifier::new(
             bot.clone(),
             Arc::new(Downloader::new(
                 reqwest::Client::new(),
                 FileCacheManager::new("/tmp/pixivbot-admin-test-cache", 7),
             )),
         ),
-        vec![],
-        Some(1),
-        false,
-        pixiv_client::ImageSize::Large,
-        3,
-        true,
-        String::new(),
-        String::new(),
-        Arc::new(Default::default()),
-        None,
-        Arc::new(Default::default()),
-        None,
-    );
+        default_sensitive_tags: vec![],
+        owner_id: Some(1),
+        is_public_mode: false,
+        image_size: pixiv_client::ImageSize::Large,
+        download_original_threshold: 3,
+        require_mention_in_group: true,
+        cache_dir: String::new(),
+        log_dir: String::new(),
+        booru_registry: Arc::new(Default::default()),
+        eh_client: None,
+        eh_config: Arc::new(Default::default()),
+        telegraph: None,
+    });
     (server, bot, handler)
 }
 

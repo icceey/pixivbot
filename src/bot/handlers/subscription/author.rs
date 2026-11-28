@@ -76,15 +76,12 @@ impl BotHandler {
                 }
             };
 
-            let author_name = {
-                let pixiv = self.pixiv_client.read().await;
-                match pixiv.get_user_detail(author_id).await {
-                    Ok(user) => user.name,
-                    Err(e) => {
-                        error!("Failed to get user detail for {}: {:#}", author_id, e);
-                        result.add_failure(format!("`{}` \\(未找到\\)", author_id));
-                        continue;
-                    }
+            let author_name = match self.pixiv_client.get_user_detail(author_id).await {
+                Ok(user) => user.name,
+                Err(e) => {
+                    error!("Failed to get user detail for {}: {:#}", author_id, e);
+                    result.add_failure(format!("`{}` \\(未找到\\)", author_id));
+                    continue;
                 }
             };
 

@@ -13,7 +13,6 @@ use anyhow::Result;
 use chrono::{DateTime, Days, Local, NaiveDate, Utc};
 use pixiv_client::{Illust, ImageSize};
 use std::sync::Arc;
-use tokio::sync::RwLock;
 use tokio::time::{sleep, Duration};
 use tracing::{error, warn};
 
@@ -22,7 +21,7 @@ mod tests;
 
 pub struct PixivTagEngine {
     repo: Arc<Repo>,
-    pixiv: Arc<RwLock<PixivClient>>,
+    pixiv: PixivClient,
     notifier: Notifier,
     tick_interval_sec: u64,
     window_days: u16,
@@ -37,7 +36,7 @@ pub struct PixivTagEngine {
 impl PixivTagEngine {
     pub fn new(
         repo: Arc<Repo>,
-        pixiv: Arc<RwLock<PixivClient>>,
+        pixiv: PixivClient,
         notifier: Notifier,
         config: &SchedulerConfig,
         image_size: ImageSize,
@@ -261,8 +260,6 @@ impl PixivTagEngine {
             }
             let (illusts, next) = self
                 .pixiv
-                .read()
-                .await
                 .search_illusts(
                     &task.value,
                     scan.cursor_date,

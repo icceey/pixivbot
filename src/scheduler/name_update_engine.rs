@@ -10,16 +10,12 @@ use tracing::{error, info, warn};
 /// Engine responsible for daily author name updates
 pub struct NameUpdateEngine {
     repo: Arc<Repo>,
-    pixiv_client: Arc<tokio::sync::RwLock<PixivClient>>,
+    pixiv_client: PixivClient,
     execution_time: String,
 }
 
 impl NameUpdateEngine {
-    pub fn new(
-        repo: Arc<Repo>,
-        pixiv_client: Arc<tokio::sync::RwLock<PixivClient>>,
-        execution_time: String,
-    ) -> Self {
+    pub fn new(repo: Arc<Repo>, pixiv_client: PixivClient, execution_time: String) -> Self {
         Self {
             repo,
             pixiv_client,
@@ -116,15 +112,13 @@ impl NameUpdateEngine {
             };
 
             // Fetch latest author info from Pixiv
-            let pixiv = self.pixiv_client.read().await;
-            match pixiv.get_user_detail(author_id).await {
+            match self.pixiv_client.get_user_detail(author_id).await {
                 Ok(user) => {
                     let new_name = user.name;
                     let old_name = task.author_name.clone();
 
                     // Only update if name changed or was empty
                     if old_name.as_ref() != Some(&new_name) {
-                        drop(pixiv); // Release read lock before database operation
                         if let Err(e) = self
                             .repo
                             .update_task_author_name(task.id, Some(new_name.clone()))

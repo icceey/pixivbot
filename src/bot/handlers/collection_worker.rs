@@ -154,10 +154,10 @@ impl BotHandler {
         let raw_cursor = job.cursor.as_deref();
         let (images, mut next) = match &source {
             CollectionSource::Pixiv(gallery) => {
-                let client = self.pixiv_client.read().await.clone();
                 let cursor: Option<crate::pixiv::GalleryCursor> =
                     raw_cursor.map(serde_json::from_str).transpose()?;
-                let (images, next) = client
+                let (images, next) = self
+                    .pixiv_client
                     .gallery_image_batch(gallery, cursor, limit)
                     .await
                     .context(CollectionRetryStage::Preparing)?;

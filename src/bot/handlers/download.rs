@@ -358,8 +358,8 @@ impl BotHandler {
         info!("Downloading illust {}", illust_id);
 
         // Get illust details
-        let pixiv = self.pixiv_client.read().await;
-        let illust = pixiv
+        let illust = self
+            .pixiv_client
             .get_illust_detail(illust_id)
             .await
             .context("Failed to fetch illust details")?;
@@ -368,11 +368,11 @@ impl BotHandler {
         if illust.is_ugoira() {
             #[cfg(feature = "ffmpeg-codec")]
             {
-                let metadata = pixiv
+                let metadata = self
+                    .pixiv_client
                     .get_ugoira_metadata(illust_id)
                     .await
                     .context("Failed to fetch ugoira metadata")?;
-                drop(pixiv);
 
                 let title = illust.title.clone();
                 let artist = illust.user.name.clone();
@@ -391,15 +391,12 @@ impl BotHandler {
 
             #[cfg(not(feature = "ffmpeg-codec"))]
             {
-                drop(pixiv);
                 anyhow::bail!(
                     "Ugoira MP4 download requires the ffmpeg-codec feature, \
                      which is not enabled in this build"
                 );
             }
         }
-
-        drop(pixiv);
 
         let title = illust.title.clone();
         let artist = illust.user.name.clone();

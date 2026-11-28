@@ -22,25 +22,6 @@ pub struct EhPublishWorker {
     client: Arc<EhClient>,
     rewrite_delay_sec: Option<u64>,
     config: Arc<EhentaiConfig>,
-    #[cfg(test)]
-    publish_send_hook: Option<EhPublishSendHook>,
-}
-
-#[cfg(test)]
-#[derive(Clone)]
-pub(super) struct EhPublishSendHook {
-    pub(super) entered: Arc<tokio::sync::Notify>,
-    pub(super) release: Arc<tokio::sync::Notify>,
-    pub(super) before_done: Option<EhPublishCompletionHook>,
-    pub(super) after_done: Option<EhPublishCompletionHook>,
-    pub(super) panic_after_release: bool,
-}
-
-#[cfg(test)]
-#[derive(Clone)]
-pub(super) struct EhPublishCompletionHook {
-    pub(super) entered: Arc<tokio::sync::Notify>,
-    pub(super) release: Arc<tokio::sync::Notify>,
 }
 
 impl EhPublishWorker {
@@ -57,15 +38,7 @@ impl EhPublishWorker {
             client,
             rewrite_delay_sec,
             config,
-            #[cfg(test)]
-            publish_send_hook: None,
         }
-    }
-
-    #[cfg(test)]
-    pub(super) fn with_test_send_hook(mut self, publish_send_hook: EhPublishSendHook) -> Self {
-        self.publish_send_hook = Some(publish_send_hook);
-        self
     }
 
     pub async fn run(self) {
@@ -116,8 +89,6 @@ impl EhPublishWorker {
                             client: Arc::clone(&self.client),
                             rewrite_delay_sec: self.rewrite_delay_sec,
                             config: Arc::clone(&self.config),
-                            #[cfg(test)]
-                            publish_send_hook: self.publish_send_hook.clone(),
                         };
                         let delivery = claim.delivery.clone();
                         let task = tasks.spawn(async move {
@@ -319,12 +290,6 @@ impl EhPublishWorker {
                     .title
                     .replace(['/', '\\', ':', '*', '?', '"', '<', '>', '|'], "_")
             );
-            #[cfg(test)]
-            if let Some(hook) = &self.publish_send_hook {
-                hook.entered.notify_one();
-                hook.release.notified().await;
-                assert!(!hook.panic_after_release, "injected EH publish panic");
-            }
             if let Err(error) = self
                 .notifier
                 .send_document(chat_id, zip_path, &filename, &caption)
@@ -366,27 +331,9 @@ impl EhPublishWorker {
                 .await?;
         }
 
-        #[cfg(test)]
-        if let Some(hook) = self
-            .publish_send_hook
-            .as_ref()
-            .and_then(|hook| hook.before_done.as_ref())
-        {
-            hook.entered.notify_one();
-            hook.release.notified().await;
-        }
         self.repo
             .mark_eh_delivery_done(&delivery, self.config.send_archive)
             .await?;
-        #[cfg(test)]
-        if let Some(hook) = self
-            .publish_send_hook
-            .as_ref()
-            .and_then(|hook| hook.after_done.as_ref())
-        {
-            hook.entered.notify_one();
-            hook.release.notified().await;
-        }
         info!(
             "Published shared EH gallery gid={} job={} to chat {}",
             job.gid, job.id, delivery.chat_id

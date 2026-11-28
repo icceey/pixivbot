@@ -11,8 +11,6 @@ mod upload;
 
 use super::cleanup::run_eh_job_cleanup_maintenance_once;
 use super::download::archive_artifacts_for_job;
-use super::publish::{EhPublishCompletionHook, EhPublishSendHook};
-use super::upload::collect_uploadable_zip_entry_names;
 use super::*;
 use crate::bot::notifier::Notifier;
 use crate::cache::FileCacheManager;
@@ -23,18 +21,17 @@ use crate::db::entities::{
 };
 use crate::db::repo::eh_download_queue::{
     SOURCE_DIRECT, SOURCE_SUBSCRIPTION, STATUS_CANCELED, STATUS_DONE, STATUS_DOWNLOADED,
-    STATUS_FAILED, STATUS_PENDING, STATUS_PUBLISHING,
+    STATUS_FAILED, STATUS_PENDING,
 };
 use crate::db::repo::eh_gallery_jobs::{
-    EhCleanupFinalizeOutcome, EhEnqueueChatLockHook, EhGalleryVariant, EhJobUploadFailureOutcome,
+    EhCleanupFinalizeOutcome, EhGalleryVariant, EhJobUploadFailureOutcome,
     EhMissingZipResetOutcome, BACKGROUND_STATUS_PENDING, BACKGROUND_STATUS_RUNNING,
     CLEANUP_STATUS_FAILED, CLEANUP_STATUS_NONE, CLEANUP_STATUS_PENDING, DELIVERY_STATUS_DONE,
     DELIVERY_STATUS_FAILED, DELIVERY_STATUS_PUBLISHING, DELIVERY_STATUS_WAITING,
-    DOWNLOAD_MODE_ARCHIVE, EH_ENQUEUE_CHAT_LOCK_HOOK, JOB_STATUS_DOWNLOADED,
-    JOB_STATUS_DOWNLOADING, JOB_STATUS_FAILED, JOB_STATUS_PENDING, JOB_STATUS_RETIRED,
-    TELEGRAPH_REWRITE_STATUS_FAILED, TELEGRAPH_REWRITE_STATUS_PENDING, TELEGRAPH_STATUS_FAILED,
-    TELEGRAPH_STATUS_NOT_REQUIRED, TELEGRAPH_STATUS_PENDING, TELEGRAPH_STATUS_READY,
-    TELEGRAPH_STATUS_UPLOADING,
+    DOWNLOAD_MODE_ARCHIVE, JOB_STATUS_DOWNLOADED, JOB_STATUS_DOWNLOADING, JOB_STATUS_FAILED,
+    JOB_STATUS_PENDING, JOB_STATUS_RETIRED, TELEGRAPH_REWRITE_STATUS_FAILED,
+    TELEGRAPH_REWRITE_STATUS_PENDING, TELEGRAPH_STATUS_FAILED, TELEGRAPH_STATUS_NOT_REQUIRED,
+    TELEGRAPH_STATUS_PENDING, TELEGRAPH_STATUS_READY, TELEGRAPH_STATUS_UPLOADING,
 };
 use crate::db::repo::{tests_helpers, Repo};
 use crate::db::types::{EhFilter, EhPendingGallery, EhTagState, SubscriptionState, TaskType};
