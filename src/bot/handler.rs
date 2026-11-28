@@ -20,10 +20,28 @@ pub(crate) struct TelegraphServices {
     pub(crate) image_uploader: Arc<dyn eh_client::ImageUploader>,
 }
 
+pub struct BotHandlerConfig {
+    pub repo: Arc<Repo>,
+    pub pixiv_client: PixivClient,
+    pub notifier: Notifier,
+    pub default_sensitive_tags: Vec<String>,
+    pub owner_id: Option<i64>,
+    pub is_public_mode: bool,
+    pub image_size: pixiv_client::ImageSize,
+    pub download_original_threshold: u8,
+    pub require_mention_in_group: bool,
+    pub cache_dir: String,
+    pub log_dir: String,
+    pub booru_registry: Arc<BooruSiteRegistry>,
+    pub eh_client: Option<Arc<eh_client::EhClient>>,
+    pub eh_config: Arc<EhentaiConfig>,
+    pub(crate) telegraph: Option<TelegraphServices>,
+}
+
 #[derive(Clone)]
 pub struct BotHandler {
     pub(crate) repo: Arc<Repo>,
-    pub(crate) pixiv_client: Arc<tokio::sync::RwLock<PixivClient>>,
+    pub(crate) pixiv_client: PixivClient,
     pub(crate) notifier: Notifier,
     pub(crate) default_sensitive_tags: Vec<String>,
     pub(crate) owner_id: Option<i64>,
@@ -45,40 +63,23 @@ pub struct BotHandler {
 }
 
 impl BotHandler {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        repo: Arc<Repo>,
-        pixiv_client: Arc<tokio::sync::RwLock<PixivClient>>,
-        notifier: Notifier,
-        default_sensitive_tags: Vec<String>,
-        owner_id: Option<i64>,
-        is_public_mode: bool,
-        image_size: pixiv_client::ImageSize,
-        download_original_threshold: u8,
-        require_mention_in_group: bool,
-        cache_dir: String,
-        log_dir: String,
-        booru_registry: Arc<BooruSiteRegistry>,
-        eh_client: Option<Arc<eh_client::EhClient>>,
-        eh_config: Arc<EhentaiConfig>,
-        telegraph: Option<TelegraphServices>,
-    ) -> Self {
+    pub fn new(config: BotHandlerConfig) -> Self {
         Self {
-            repo,
-            pixiv_client,
-            notifier,
-            default_sensitive_tags,
-            owner_id,
-            is_public_mode,
-            image_size,
-            download_original_threshold,
-            require_mention_in_group,
-            cache_dir,
-            log_dir,
-            booru_registry,
-            eh_client,
-            eh_config,
-            telegraph,
+            repo: config.repo,
+            pixiv_client: config.pixiv_client,
+            notifier: config.notifier,
+            default_sensitive_tags: config.default_sensitive_tags,
+            owner_id: config.owner_id,
+            is_public_mode: config.is_public_mode,
+            image_size: config.image_size,
+            download_original_threshold: config.download_original_threshold,
+            require_mention_in_group: config.require_mention_in_group,
+            cache_dir: config.cache_dir,
+            log_dir: config.log_dir,
+            booru_registry: config.booru_registry,
+            eh_client: config.eh_client,
+            eh_config: config.eh_config,
+            telegraph: config.telegraph,
             collection_wakeup: Arc::default(),
         }
     }
@@ -231,8 +232,7 @@ impl BotHandler {
     ) -> ResponseResult<()> {
         info!("Fetching illust {} for chat {}", illust_id, chat_id);
 
-        let pixiv = self.pixiv_client.read().await;
-        let illust = match pixiv.get_illust_detail(illust_id).await {
+        let illust = match self.pixiv_client.get_illust_detail(illust_id).await {
             Ok(illust) => illust,
             Err(e) => {
                 error!("Failed to get illust {}: {:#}", illust_id, e);
@@ -241,7 +241,6 @@ impl BotHandler {
                 return Ok(());
             }
         };
-        drop(pixiv);
 
         let caption = if illust.is_ugoira() {
             caption::build_ugoira_caption(&illust)
@@ -253,9 +252,7 @@ impl BotHandler {
         let download_config = DownloadButtonConfig::for_pixiv_chat(illust.id, chat_settings);
 
         if illust.is_ugoira() {
-            let pixiv = self.pixiv_client.read().await;
-            let metadata_result = pixiv.get_ugoira_metadata(illust.id).await;
-            drop(pixiv);
+            let metadata_result = self.pixiv_client.get_ugoira_metadata(illust.id).await;
 
             let metadata = match metadata_result {
                 Ok(metadata) => metadata,
@@ -310,8 +307,7 @@ impl BotHandler {
     ) -> ResponseResult<()> {
         info!("Subscribing to user {} for chat {}", user_id, chat_id);
 
-        let pixiv = self.pixiv_client.read().await;
-        let author = match pixiv.get_user_detail(user_id).await {
+        let author = match self.pixiv_client.get_user_detail(user_id).await {
             Ok(user) => user,
             Err(e) => {
                 error!("Failed to get user {}: {:#}", user_id, e);
@@ -320,7 +316,6 @@ impl BotHandler {
                 return Ok(());
             }
         };
-        drop(pixiv);
 
         match self
             .repo

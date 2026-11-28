@@ -17,7 +17,7 @@ use tracing::{debug, error, info};
 
 pub struct RankingEngine {
     repo: Arc<Repo>,
-    pixiv_client: Arc<tokio::sync::RwLock<PixivClient>>,
+    pixiv_client: PixivClient,
     notifier: Notifier,
     execution_time: String,
     image_size: pixiv_client::ImageSize,
@@ -26,7 +26,7 @@ pub struct RankingEngine {
 impl RankingEngine {
     pub fn new(
         repo: Arc<Repo>,
-        pixiv_client: Arc<tokio::sync::RwLock<PixivClient>>,
+        pixiv_client: PixivClient,
         notifier: Notifier,
         execution_time: String,
         image_size: pixiv_client::ImageSize,
@@ -134,9 +134,7 @@ impl RankingEngine {
         let mode = &task.value;
 
         // Get ranking illusts from Pixiv API
-        let pixiv = self.pixiv_client.read().await;
-        let illusts = pixiv.get_ranking(mode, None, 10).await?;
-        drop(pixiv);
+        let illusts = self.pixiv_client.get_ranking(mode, None, 10).await?;
 
         if illusts.is_empty() {
             info!("No ranking illusts found for mode {}", mode);
@@ -394,9 +392,7 @@ impl RankingEngine {
                 && crate::utils::sensitive::contains_sensitive_tags(illust, sensitive_tags);
 
             let send_result = if illust.is_ugoira() {
-                let pixiv = self.pixiv_client.read().await;
-                let metadata_result = pixiv.get_ugoira_metadata(illust.id).await;
-                drop(pixiv);
+                let metadata_result = self.pixiv_client.get_ugoira_metadata(illust.id).await;
 
                 match metadata_result {
                     Ok(metadata) => {

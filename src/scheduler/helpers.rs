@@ -11,9 +11,7 @@ use crate::pixiv::client::PixivClient;
 use crate::utils::{caption, sensitive};
 use anyhow::{Context, Result};
 use pixiv_client::Illust;
-use std::sync::Arc;
 use teloxide::prelude::*;
-use tokio::sync::RwLock;
 use tracing::info;
 
 pub const INTER_SUBSCRIPTION_DELAY_MS: u64 = 2000;
@@ -143,7 +141,7 @@ pub async fn get_chat_if_should_notify(
 pub async fn process_illust_push(
     repo: &Repo,
     notifier: &Notifier,
-    pixiv: &Arc<RwLock<PixivClient>>,
+    pixiv: &PixivClient,
     chat: &chats::Model,
     illust: &Illust,
     subscription_id: i32,
@@ -281,19 +279,17 @@ pub async fn process_illust_push(
 /// Push a ugoira (animated) illust as an MP4 animation
 async fn process_ugoira_push(
     notifier: &Notifier,
-    pixiv: &Arc<RwLock<PixivClient>>,
+    pixiv: &PixivClient,
     chat: &chats::Model,
     illust: &Illust,
 ) -> Result<BatchSendResult> {
     let chat_id = ChatId(chat.id);
 
     // Fetch ugoira metadata (ZIP URL + frame delays)
-    let pixiv_guard = pixiv.read().await;
-    let metadata = pixiv_guard
+    let metadata = pixiv
         .get_ugoira_metadata(illust.id)
         .await
         .context("Failed to fetch ugoira metadata")?;
-    drop(pixiv_guard);
 
     // Prepare caption (same format as regular illusts, with 🎞️ indicator)
     let caption = caption::build_ugoira_caption(illust);

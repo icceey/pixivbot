@@ -7,11 +7,8 @@ pub mod notifier;
 mod permissions;
 pub mod state;
 
-use crate::booru::BooruSiteRegistry;
-use crate::config::{EhentaiConfig, TelegramConfig};
 use crate::db::repo::Repo;
 use crate::db::types::UserRole;
-use crate::pixiv::client::PixivClient;
 use anyhow::Result;
 use handlers::{
     handle_settings_callback, handle_settings_cancel, handle_settings_input,
@@ -28,42 +25,32 @@ use teloxide::types::BotCommandScope;
 use tracing::{error, info, warn};
 
 pub use commands::Command;
-pub use handler::BotHandler;
 pub(crate) use handler::TelegraphServices;
+pub use handler::{BotHandler, BotHandlerConfig};
 pub use middleware::UserChatContext;
 
 /// Handler 返回类型
 type HandlerResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
-#[allow(clippy::too_many_arguments)]
 pub async fn run(
     bot: ThrottledBot,
-    config: TelegramConfig,
-    repo: Arc<Repo>,
-    pixiv_client: Arc<tokio::sync::RwLock<PixivClient>>,
-    notifier: notifier::Notifier,
-    sensitive_tags: Vec<String>,
-    image_size: pixiv_client::ImageSize,
-    download_original_threshold: u8,
-    cache_dir: String,
-    log_dir: String,
-    booru_registry: Arc<BooruSiteRegistry>,
-    eh_client: Option<Arc<eh_client::EhClient>>,
-    eh_config: Arc<EhentaiConfig>,
-    telegraph: Option<TelegraphServices>,
+    handler: BotHandler,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
     info!("Starting Telegram Bot...");
 
-    // Parse bot mode from config
-    let is_public_mode = config.bot_mode.is_public();
-    let has_booru = !booru_registry.is_empty();
-    let has_ehentai = eh_client.is_some();
-    let has_telegraph = telegraph.is_some();
+    let has_booru = !handler.booru_registry.is_empty();
+    let has_ehentai = handler.eh_client.is_some();
+    let has_telegraph = handler.telegraph.is_some();
 
     info!(
-        "Bot mode: {:?} (new chats will be {} by default)",
-        config.bot_mode,
-        if is_public_mode {
+        "Bot mode: {} (new chats will be {} by default)",
+        if handler.is_public_mode {
+            "Public"
+        } else {
+            "Private"
+        },
+        if handler.is_public_mode {
             "enabled"
         } else {
             "disabled"
@@ -72,26 +59,11 @@ pub async fn run(
 
     info!(
         "Require mention in group: {}",
-        config.require_mention_in_group
+        handler.require_mention_in_group
     );
 
-    let handler = BotHandler::new(
-        repo.clone(),
-        pixiv_client.clone(),
-        notifier.clone(),
-        sensitive_tags,
-        config.owner_id,
-        is_public_mode,
-        image_size,
-        download_original_threshold,
-        config.require_mention_in_group,
-        cache_dir,
-        log_dir,
-        booru_registry,
-        eh_client,
-        eh_config,
-        telegraph,
-    );
+    let repo = handler.repo.clone();
+    let notifier = handler.notifier.clone();
 
     info!("✅ Bot initialized, starting command handler");
 
@@ -100,6 +72,9 @@ pub async fn run(
 
     // 设置命令可见性
     setup_commands(&bot, &repo, has_booru, has_ehentai, has_telegraph).await;
+    if *shutdown.borrow() {
+        return Ok(());
+    }
 
     // 构建 handler 树
     let handler_tree = build_handler_tree();
@@ -107,16 +82,29 @@ pub async fn run(
     let worker_handler = handler.clone();
     let worker_bot = bot.clone();
     handler.recover_collection_exports(&bot).await?;
+    if *shutdown.borrow() {
+        return Ok(());
+    }
     let worker =
         tokio::spawn(async move { worker_handler.run_collection_worker(worker_bot).await });
 
-    Dispatcher::builder(bot, handler_tree)
+    let mut dispatcher = Dispatcher::builder(bot, handler_tree)
         .dependencies(dptree::deps![handler, repo, notifier, settings_storage])
         .default_handler(|_| async {})
-        .enable_ctrlc_handler()
-        .build()
-        .dispatch()
-        .await;
+        .build();
+    let shutdown_token = dispatcher.shutdown_token();
+    let worker_abort = worker.abort_handle();
+    let shutdown_watcher = tokio::spawn(async move {
+        if *shutdown.borrow() || shutdown.changed().await.is_ok() {
+            worker_abort.abort();
+            while shutdown_token.shutdown().is_err() {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }
+    });
+
+    dispatcher.dispatch().await;
+    shutdown_watcher.abort();
     worker.abort();
 
     Ok(())
@@ -387,6 +375,52 @@ async fn handle_list_callback(
     Ok(())
 }
 
+/// Authorize a download button callback and return its target chat ID when allowed.
+async fn authorize_download_callback(
+    bot: &ThrottledBot,
+    q: &CallbackQuery,
+    repo: &Repo,
+    kind: &str,
+) -> Option<ChatId> {
+    let Some(msg) = &q.message else {
+        warn!("No message found in {kind} callback query");
+        return None;
+    };
+    let chat_id = msg.chat().id;
+    let user_id = q.from.id.0 as i64;
+    match repo.get_chat(chat_id.0).await {
+        Ok(Some(chat)) => {
+            if !chat.enabled
+                && (q.from.is_bot
+                    || !permissions::can_manage_chat(bot, repo, msg.chat(), q.from.id).await)
+            {
+                warn!(
+                    "User {} attempted {} in disabled chat {}",
+                    user_id, kind, chat_id
+                );
+                let _ = bot
+                    .send_message(chat_id, "❌ 此聊天未启用，无法使用下载功能")
+                    .await;
+                return None;
+            }
+            Some(chat_id)
+        }
+        Ok(None) => {
+            warn!("Chat {} not found in database for {kind} callback", chat_id);
+            let _ = bot.send_message(chat_id, "❌ 无法处理下载请求").await;
+            None
+        }
+        Err(e) => {
+            error!(
+                "Failed to get chat {} for authorization check: {:#}",
+                chat_id, e
+            );
+            let _ = bot.send_message(chat_id, "❌ 无法处理下载请求").await;
+            None
+        }
+    }
+}
+
 /// 处理下载按钮回调
 async fn handle_download_callback(
     bot: ThrottledBot,
@@ -395,18 +429,11 @@ async fn handle_download_callback(
     handler: BotHandler,
     repo: Arc<Repo>,
 ) -> HandlerResult {
-    // Answer the callback immediately to remove the loading indicator and avoid timeouts
-    // Use cache_time so Telegram can reuse this answer and avoid duplicate server-side processing on rapid repeated clicks
-    if let Err(e) = bot
-        .answer_callback_query(q.id.clone())
-        .cache_time(10) // Cache for 10 seconds to prevent duplicate server-side processing of rapid clicks
-        .await
-    {
+    // Use cache_time so Telegram can reuse this answer on rapid repeated clicks.
+    if let Err(e) = bot.answer_callback_query(q.id.clone()).cache_time(10).await {
         warn!("Failed to answer callback query: {:#}", e);
     }
 
-    // Parse illust_id from callback data (format: "dl:12345678")
-    // The prefix is guaranteed to exist since we filtered by it in the handler tree
     let Some(illust_id_str) = callback_data.strip_prefix(DOWNLOAD_CALLBACK_PREFIX) else {
         warn!("Callback data missing expected prefix: {}", callback_data);
         return Ok(());
@@ -420,64 +447,15 @@ async fn handle_download_callback(
         }
     };
 
-    // Get chat_id from the callback query message
-    let chat_id = match &q.message {
-        Some(msg) => msg.chat().id,
-        None => {
-            warn!("No message found in download callback query");
-            return Ok(());
-        }
+    let Some(chat_id) = authorize_download_callback(&bot, &q, &repo, "download").await else {
+        return Ok(());
     };
-
-    // Authorization check: verify the chat is enabled and accessible
-    // This prevents malicious users from crafting callback queries to access other chats
-    let user_id = q.from.id.0 as i64;
-    match repo.get_chat(chat_id.0).await {
-        Ok(Some(chat)) => {
-            if !chat.enabled
-                && (q.from.is_bot
-                    || !permissions::can_manage_chat(
-                        &bot,
-                        &repo,
-                        q.message.as_ref().unwrap().chat(),
-                        q.from.id,
-                    )
-                    .await)
-            {
-                warn!(
-                    "User {} attempted download in disabled chat {}",
-                    user_id, chat_id
-                );
-                let _ = bot
-                    .send_message(chat_id, "❌ 此聊天未启用，无法使用下载功能")
-                    .await;
-                return Ok(());
-            }
-        }
-        Ok(None) => {
-            warn!(
-                "Chat {} not found in database for download callback",
-                chat_id
-            );
-            let _ = bot.send_message(chat_id, "❌ 无法处理下载请求").await;
-            return Ok(());
-        }
-        Err(e) => {
-            error!(
-                "Failed to get chat {} for authorization check: {:#}",
-                chat_id, e
-            );
-            let _ = bot.send_message(chat_id, "❌ 无法处理下载请求").await;
-            return Ok(());
-        }
-    }
 
     info!(
         "Download button clicked: illust_id={} chat_id={} user={:?}",
         illust_id, chat_id, q.from.id
     );
 
-    // Process the download and handle errors gracefully so the user gets feedback
     if let Err(e) = handler
         .handle_download_callback(bot.clone(), chat_id, illust_id)
         .await
@@ -486,8 +464,6 @@ async fn handle_download_callback(
             "Failed to handle download callback for illust {} in chat {}: {:#}",
             illust_id, chat_id, e
         );
-
-        // Try to notify the user with a generic error message
         if let Err(send_err) = bot.send_message(chat_id, "❌ 下载失败，请稍后重试").await
         {
             error!(
@@ -529,54 +505,9 @@ async fn handle_booru_download_callback(
         }
     };
 
-    let chat_id = match &q.message {
-        Some(msg) => msg.chat().id,
-        None => {
-            warn!("No message found in booru download callback query");
-            return Ok(());
-        }
+    let Some(chat_id) = authorize_download_callback(&bot, &q, &repo, "booru download").await else {
+        return Ok(());
     };
-
-    let user_id = q.from.id.0 as i64;
-    match repo.get_chat(chat_id.0).await {
-        Ok(Some(chat)) => {
-            if !chat.enabled
-                && (q.from.is_bot
-                    || !permissions::can_manage_chat(
-                        &bot,
-                        &repo,
-                        q.message.as_ref().unwrap().chat(),
-                        q.from.id,
-                    )
-                    .await)
-            {
-                warn!(
-                    "User {} attempted booru download in disabled chat {}",
-                    user_id, chat_id
-                );
-                let _ = bot
-                    .send_message(chat_id, "❌ 此聊天未启用，无法使用下载功能")
-                    .await;
-                return Ok(());
-            }
-        }
-        Ok(None) => {
-            warn!(
-                "Chat {} not found in database for booru download callback",
-                chat_id
-            );
-            let _ = bot.send_message(chat_id, "❌ 无法处理下载请求").await;
-            return Ok(());
-        }
-        Err(e) => {
-            error!(
-                "Failed to get chat {} for authorization check: {:#}",
-                chat_id, e
-            );
-            let _ = bot.send_message(chat_id, "❌ 无法处理下载请求").await;
-            return Ok(());
-        }
-    }
 
     info!(
         "Booru download button clicked: site={} post_id={} chat_id={} user={:?}",
@@ -591,7 +522,6 @@ async fn handle_booru_download_callback(
             "Failed to handle booru download callback for site={} post={} in chat {}: {:#}",
             site_name, post_id, chat_id, e
         );
-
         if let Err(send_err) = bot.send_message(chat_id, "❌ 下载失败，请稍后重试").await
         {
             error!(

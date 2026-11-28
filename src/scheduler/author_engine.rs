@@ -17,7 +17,7 @@ use tracing::{debug, error, info, warn};
 
 pub struct AuthorEngine {
     repo: Arc<Repo>,
-    pixiv_client: Arc<tokio::sync::RwLock<PixivClient>>,
+    pixiv_client: PixivClient,
     notifier: Notifier,
     tick_interval_sec: u64,
     min_task_interval_sec: u64,
@@ -30,7 +30,7 @@ impl AuthorEngine {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         repo: Arc<Repo>,
-        pixiv_client: Arc<tokio::sync::RwLock<PixivClient>>,
+        pixiv_client: PixivClient,
         notifier: Notifier,
         tick_interval_sec: u64,
         min_task_interval_sec: u64,
@@ -110,9 +110,7 @@ impl AuthorEngine {
         let author_id: u64 = task.value.parse()?;
 
         // Get latest illusts from Pixiv API
-        let pixiv = self.pixiv_client.read().await;
-        let illusts = pixiv.get_user_illusts(author_id, 10).await?;
-        drop(pixiv);
+        let illusts = self.pixiv_client.get_user_illusts(author_id, 10).await?;
 
         if illusts.is_empty() {
             self.schedule_next_poll(task.id).await?;

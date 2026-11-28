@@ -160,28 +160,26 @@ mod tests {
             Client::new(),
             FileCacheManager::new("data/test_cache", 7),
         ));
-        let handler = BotHandler::new(
-            Arc::clone(&repo),
-            Arc::new(tokio::sync::RwLock::new(
-                PixivClient::new(PixivConfig {
-                    refresh_token: "fake_refresh_token".to_string(),
-                })
-                .unwrap(),
-            )),
-            Notifier::new(bot.clone(), downloader),
-            Vec::new(),
-            None,
-            false,
-            pixiv_client::ImageSize::Large,
-            3,
-            true,
-            "data/test_cache".to_string(),
-            "data/test_logs".to_string(),
-            Arc::new(BooruSiteRegistry::default()),
-            None,
-            Arc::new(EhentaiConfig::default()),
-            None,
-        );
+        let handler = BotHandler::new(crate::bot::BotHandlerConfig {
+            repo: Arc::clone(&repo),
+            pixiv_client: PixivClient::new(PixivConfig {
+                refresh_token: "fake_refresh_token".to_string(),
+            })
+            .unwrap(),
+            notifier: Notifier::new(bot.clone(), downloader),
+            default_sensitive_tags: Vec::new(),
+            owner_id: None,
+            is_public_mode: false,
+            image_size: pixiv_client::ImageSize::Large,
+            download_original_threshold: 3,
+            require_mention_in_group: true,
+            cache_dir: "data/test_cache".to_string(),
+            log_dir: "data/test_logs".to_string(),
+            booru_registry: Arc::new(BooruSiteRegistry::default()),
+            eh_client: None,
+            eh_config: Arc::new(EhentaiConfig::default()),
+            telegraph: None,
+        });
 
         handler
             .handle_list(bot.clone(), ChatId(-100), None, String::new())

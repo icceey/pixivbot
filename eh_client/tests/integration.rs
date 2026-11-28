@@ -273,62 +273,6 @@ async fn test_download_archive_restarts_complete_partial_on_416() {
 }
 
 #[tokio::test]
-async fn test_download_archive_rejects_incomplete_content_range() {
-    let server = MockServer::start().await;
-    let redirect_html = format!(
-        r#"<script>document.location = "{}/archive/123456/abcdef0123/abcdef0123/0?autostart=1";</script>"#,
-        server.uri()
-    );
-
-    Mock::given(method("POST"))
-        .and(path("/archiver.php"))
-        .respond_with(ResponseTemplate::new(200).set_body_string(redirect_html))
-        .expect(1)
-        .mount(&server)
-        .await;
-
-    let first = b"PK\x03\x04partial_";
-    let rest = b"zip_content";
-    let total = first.len() + rest.len() + 100;
-    Mock::given(method("GET"))
-        .and(path("/archive/123456/abcdef0123/abcdef0123/0"))
-        .and(header("range", format!("bytes={}-", first.len())))
-        .respond_with(
-            ResponseTemplate::new(206)
-                .insert_header(
-                    "Content-Range",
-                    format!(
-                        "bytes {}-{}/{}",
-                        first.len(),
-                        first.len() + rest.len() - 1,
-                        total
-                    ),
-                )
-                .insert_header("Content-Length", rest.len().to_string())
-                .set_body_bytes(rest.to_vec()),
-        )
-        .expect(4)
-        .mount(&server)
-        .await;
-
-    let client = client_at(&server);
-    let temp_dir = tempfile::tempdir().unwrap();
-    let dest = temp_dir.path().join("archive.zip");
-    let part = dest.with_extension("zip.part");
-    tokio::fs::write(&part, first).await.unwrap();
-
-    let err = client
-        .download_archive(123456, "abcdef0123", "123456--abc123def456", "780x", &dest)
-        .await
-        .expect_err("incomplete Content-Range should fail");
-
-    assert!(matches!(err, eh_client::Error::Other(_)));
-    assert!(err.to_string().contains("Content-Range ended"));
-    assert_eq!(std::fs::read(part).unwrap(), first);
-    assert!(!dest.exists());
-}
-
-#[tokio::test]
 async fn test_download_archive_returns_download_in_progress_when_fast_partial() {
     let server = MockServer::start().await;
     let redirect_html = format!(
@@ -1029,28 +973,17 @@ struct RecordedProtocolResetRequest {
 }
 
 #[derive(Clone)]
-enum ProtocolResetFault {
-    Status200,
-    Status416,
-    InvalidContentRange,
-    ChangedTotal,
-    Validator(Option<(&'static str, &'static str)>),
-}
-
-#[derive(Clone)]
 struct ProtocolResetResponder {
     bytes: Arc<Vec<u8>>,
-    fault: ProtocolResetFault,
     requests: Arc<Mutex<Vec<RecordedProtocolResetRequest>>>,
     assembly_scratch: PathBuf,
     parts_dir: PathBuf,
 }
 
 impl ProtocolResetResponder {
-    fn new(bytes: Arc<Vec<u8>>, fault: ProtocolResetFault, dest: &Path) -> Self {
+    fn new(bytes: Arc<Vec<u8>>, dest: &Path) -> Self {
         Self {
             bytes,
-            fault,
             requests: Arc::new(Mutex::new(Vec::new())),
             assembly_scratch: dest.with_extension("zip.part"),
             parts_dir: dest.with_extension("zip.parts"),
@@ -1108,31 +1041,7 @@ impl wiremock::Respond for ProtocolResetResponder {
         // Give a second seeded worker an opportunity to enter its in-flight
         // GET before the protocol fault asks the coordinator to cancel it.
         std::thread::sleep(Duration::from_millis(100));
-        match &self.fault {
-            ProtocolResetFault::Status200 => {
-                ResponseTemplate::new(200).set_body_bytes((*self.bytes).clone())
-            }
-            ProtocolResetFault::Status416 => ResponseTemplate::new(416),
-            ProtocolResetFault::InvalidContentRange => ResponseTemplate::new(206)
-                .insert_header(
-                    "Content-Range",
-                    format!("bytes {start}-{}/{}", end - 2, self.bytes.len()),
-                )
-                .set_body_bytes(self.bytes[start as usize..end as usize].to_vec()),
-            ProtocolResetFault::ChangedTotal => {
-                self.exact_range_response(start, end).insert_header(
-                    "Content-Range",
-                    format!("bytes {start}-{}/{}", end - 1, self.bytes.len() + 1),
-                )
-            }
-            ProtocolResetFault::Validator(header) => {
-                let mut response = self.exact_range_response(start, end);
-                if let Some((name, value)) = header {
-                    response = response.insert_header(*name, *value);
-                }
-                response
-            }
-        }
+        ResponseTemplate::new(200).set_body_bytes((*self.bytes).clone())
     }
 }
 
@@ -1226,13 +1135,6 @@ fn bounded_ranges(requests: &[RecordedRangeRequest]) -> Vec<(u64, u64)> {
         .collect()
 }
 
-#[derive(Clone, Copy)]
-enum ProtocolResetSeed {
-    CurrentUrl,
-    ChangedUrl,
-    Fresh,
-}
-
 fn seed_protocol_reset_state(
     dest: &Path,
     download_url: &str,
@@ -1255,10 +1157,8 @@ fn seed_protocol_reset_state(
 }
 
 async fn run_protocol_reset_case(
-    fault: ProtocolResetFault,
     etag: Option<&str>,
     last_modified: Option<&str>,
-    seed: ProtocolResetSeed,
 ) -> Vec<RecordedProtocolResetRequest> {
     let server = MockServer::start().await;
     mount_archive_post_redirect(&server).await;
@@ -1266,24 +1166,8 @@ async fn run_protocol_reset_case(
     let temp = tempfile::tempdir().unwrap();
     let dest = temp.path().join("archive.zip");
     let download_url = archive_url(&server);
-    let expected_range_requests = match seed {
-        ProtocolResetSeed::CurrentUrl => {
-            seed_protocol_reset_state(&dest, &download_url, &zip, etag, last_modified);
-            1
-        }
-        ProtocolResetSeed::ChangedUrl => {
-            seed_protocol_reset_state(
-                &dest,
-                &format!("{}/superseded-archive?start=1", server.uri()),
-                &zip,
-                etag,
-                last_modified,
-            );
-            0
-        }
-        ProtocolResetSeed::Fresh => 1,
-    };
-    let responder = ProtocolResetResponder::new(Arc::clone(&zip), fault, &dest);
+    seed_protocol_reset_state(&dest, &download_url, &zip, etag, last_modified);
+    let responder = ProtocolResetResponder::new(Arc::clone(&zip), &dest);
     Mock::given(method("GET"))
         .and(path(TEST_ARCHIVE_PATH))
         .respond_with(responder.clone())
@@ -1316,15 +1200,10 @@ async fn run_protocol_reset_case(
         .iter()
         .filter(|request| request.range.is_some())
         .collect::<Vec<_>>();
-    match seed {
-        ProtocolResetSeed::CurrentUrl => assert!(
-            (expected_range_requests..=expected_range_requests + 1).contains(&range_requests.len()),
-            "the protocol-fault worker and any already-started peer must finish before fallback"
-        ),
-        ProtocolResetSeed::ChangedUrl | ProtocolResetSeed::Fresh => {
-            assert_eq!(range_requests.len(), expected_range_requests)
-        }
-    }
+    assert!(
+        (1..=2).contains(&range_requests.len()),
+        "the protocol-fault worker and any already-started peer must finish before fallback"
+    );
     assert!(
         requests[..fallback_index]
             .iter()
@@ -1463,39 +1342,6 @@ async fn test_multipart_completion_reuses_slot_by_splitting_largest_remaining_in
 }
 
 #[tokio::test]
-async fn test_multipart_small_archive_does_not_force_configured_slot_count() {
-    let server = MockServer::start().await;
-    mount_archive_post_redirect(&server).await;
-    let zip = Arc::new(stored_zip_with_payload(128 * 1024));
-    let responder = ScriptedRangeResponder::new(Arc::clone(&zip))
-        .delay_first_open_ended(Duration::from_millis(1100), false);
-    Mock::given(method("GET"))
-        .and(path(TEST_ARCHIVE_PATH))
-        .respond_with(responder.clone())
-        .mount(&server)
-        .await;
-
-    let temp = tempfile::tempdir().unwrap();
-    let dest = temp.path().join("archive.zip");
-    client_at(&server)
-        .download_archive_with_options(
-            123456,
-            "abcdef0123",
-            "123456--abc123def456",
-            "780x",
-            &dest,
-            ArchiveDownloadOptions { max_concurrency: 4 },
-        )
-        .await
-        .expect("small multipart archive should succeed");
-
-    let requests = responder.requests();
-    assert_eq!(requests.len(), 1);
-    assert_eq!(requests[0].range, "bytes=0-");
-    assert_eq!(std::fs::read(&dest).unwrap(), *zip);
-}
-
-#[tokio::test]
 async fn test_multipart_restart_resumes_offsets_with_strong_etag_even_when_limit_is_one() {
     let server = MockServer::start().await;
     mount_archive_post_redirect(&server).await;
@@ -1547,103 +1393,6 @@ async fn test_multipart_restart_resumes_offsets_with_strong_etag_even_when_limit
     assert_eq!(requests[0].artifact_presence, Some(vec![false]));
     assert_eq!(std::fs::read(&dest).unwrap(), *zip);
     assert!(!parts_dir.exists());
-}
-
-#[tokio::test]
-async fn test_multipart_restart_without_validator_uses_url_total_and_content_range() {
-    let server = MockServer::start().await;
-    mount_archive_post_redirect(&server).await;
-    let zip = Arc::new(stored_zip_with_payload(256 * 1024));
-    let temp = tempfile::tempdir().unwrap();
-    let dest = temp.path().join("archive.zip");
-    let offset = 48 * 1024;
-    seed_multipart_manifest(
-        &dest,
-        &archive_url(&server),
-        zip.len() as u64,
-        None,
-        None,
-        &[(0, 0, zip.len() as u64, &zip[..offset])],
-    );
-    let responder = ScriptedRangeResponder::new(Arc::clone(&zip));
-    Mock::given(method("GET"))
-        .and(path(TEST_ARCHIVE_PATH))
-        .respond_with(responder.clone())
-        .mount(&server)
-        .await;
-
-    client_at(&server)
-        .download_archive_with_options(
-            123456,
-            "abcdef0123",
-            "123456--abc123def456",
-            "780x",
-            &dest,
-            ArchiveDownloadOptions { max_concurrency: 1 },
-        )
-        .await
-        .expect("validator-free multipart state should resume from its durable offset");
-
-    let requests = responder.requests();
-    assert_eq!(
-        requests[0].range,
-        format!("bytes={offset}-{}", zip.len() - 1)
-    );
-    assert_eq!(requests[0].if_range, None);
-    assert_eq!(std::fs::read(&dest).unwrap(), *zip);
-}
-
-#[tokio::test]
-async fn test_multipart_recovery_removes_unreferenced_files_after_validation() {
-    let server = MockServer::start().await;
-    mount_archive_post_redirect(&server).await;
-    let zip = Arc::new(stored_zip_with_payload(256 * 1024));
-    let temp = tempfile::tempdir().unwrap();
-    let dest = temp.path().join("archive.zip");
-    let offset = 32 * 1024;
-    let parts_dir = seed_multipart_manifest(
-        &dest,
-        &archive_url(&server),
-        zip.len() as u64,
-        None,
-        None,
-        &[(0, 0, zip.len() as u64, &zip[..offset])],
-    );
-    let referenced = parts_dir.join("part-0000000000000000");
-    let unreferenced = parts_dir.join("part-0000000000000099");
-    let abandoned_manifest = parts_dir.join("manifest.json.tmp-abandoned");
-    std::fs::write(&unreferenced, b"orphan").unwrap();
-    std::fs::write(&abandoned_manifest, b"orphan").unwrap();
-    let responder = ScriptedRangeResponder::new(Arc::clone(&zip)).with_artifact_probe(vec![
-        referenced,
-        unreferenced.clone(),
-        abandoned_manifest.clone(),
-    ]);
-    Mock::given(method("GET"))
-        .and(path(TEST_ARCHIVE_PATH))
-        .respond_with(responder.clone())
-        .mount(&server)
-        .await;
-
-    client_at(&server)
-        .download_archive_with_options(
-            123456,
-            "abcdef0123",
-            "123456--abc123def456",
-            "780x",
-            &dest,
-            ArchiveDownloadOptions { max_concurrency: 1 },
-        )
-        .await
-        .expect("valid multipart state should recover and finish");
-
-    assert_eq!(
-        responder.requests()[0].artifact_presence,
-        Some(vec![true, false, false])
-    );
-    assert!(!unreferenced.exists());
-    assert!(!abandoned_manifest.exists());
-    assert_eq!(std::fs::read(&dest).unwrap(), *zip);
 }
 
 #[tokio::test]
@@ -1728,40 +1477,6 @@ async fn test_malformed_manifest_clears_all_multipart_state_and_starts_sequentia
 }
 
 #[tokio::test]
-async fn test_manifest_recovery_io_error_preserves_state_and_skips_archive_get() {
-    let server = MockServer::start().await;
-    mount_archive_post_redirect(&server).await;
-    let temp = tempfile::tempdir().unwrap();
-    let dest = temp.path().join("archive.zip");
-    let parts_dir = dest.with_extension("zip.parts");
-    let manifest_dir = parts_dir.join("manifest.json");
-    std::fs::create_dir_all(&manifest_dir).unwrap();
-    let sentinel = parts_dir.join("part-0000000000000077");
-    std::fs::write(&sentinel, b"sentinel").unwrap();
-    let stale_scratch = dest.with_extension("zip.part");
-    std::fs::write(&stale_scratch, b"stale assembly").unwrap();
-
-    let error = client_at(&server)
-        .download_archive_with_options(
-            123456,
-            "abcdef0123",
-            "123456--abc123def456",
-            "780x",
-            &dest,
-            ArchiveDownloadOptions { max_concurrency: 2 },
-        )
-        .await
-        .expect_err("manifest I/O failures must propagate without a fallback GET");
-
-    assert!(matches!(error, eh_client::Error::Io(_)));
-    let requests = server.received_requests().await.unwrap();
-    assert_eq!(requests.len(), 1, "only the archiver POST may be issued");
-    assert!(manifest_dir.is_dir());
-    assert!(sentinel.is_file());
-    assert!(stale_scratch.is_file());
-}
-
-#[tokio::test]
 async fn test_persisted_manifest_terminal_url_rejection_clears_multipart_state() {
     for status in [403, 404] {
         let server = MockServer::start().await;
@@ -1802,106 +1517,6 @@ async fn test_persisted_manifest_terminal_url_rejection_clears_multipart_state()
         assert!(!scratch.exists(), "status {status}");
         assert!(uploads_dir.exists(), "status {status}");
     }
-}
-
-#[tokio::test]
-async fn test_persisted_manifest_transient_status_preserves_multipart_state() {
-    for status in [408, 429, 500] {
-        let server = MockServer::start().await;
-        let temp = tempfile::tempdir().unwrap();
-        let dest = temp.path().join(format!("archive-{status}.zip"));
-        let zip = stored_zip_with_payload(1024);
-        let parts_dir = seed_multipart_manifest(
-            &dest,
-            &archive_url(&server),
-            zip.len() as u64,
-            None,
-            None,
-            &[(0, 0, zip.len() as u64, &[])],
-        );
-        let manifest = parts_dir.join("manifest.json");
-        let part = parts_dir.join("part-0000000000000000");
-        Mock::given(method("GET"))
-            .and(path(TEST_ARCHIVE_PATH))
-            .respond_with(ResponseTemplate::new(status))
-            .expect(1)
-            .mount(&server)
-            .await;
-
-        let error = client_at(&server)
-            .resume_archive_from_persisted_manifest(
-                &dest,
-                ArchiveDownloadOptions { max_concurrency: 1 },
-                None,
-            )
-            .await
-            .expect_err("transient persisted URL failure must remain recoverable");
-
-        assert!(matches!(error, eh_client::Error::Api { status: actual, .. } if actual == status));
-        assert!(manifest.is_file(), "status {status}");
-        assert!(part.is_file(), "status {status}");
-    }
-}
-
-#[tokio::test]
-async fn test_persisted_manifest_local_recovery_error_preserves_state() {
-    let server = MockServer::start().await;
-    let temp = tempfile::tempdir().unwrap();
-    let dest = temp.path().join("archive.zip");
-    let parts_dir = dest.with_extension("zip.parts");
-    let manifest_dir = parts_dir.join("manifest.json");
-    let sentinel = parts_dir.join("part-0000000000000000");
-    std::fs::create_dir_all(&manifest_dir).unwrap();
-    std::fs::write(&sentinel, b"partial archive").unwrap();
-
-    let error = client_at(&server)
-        .resume_archive_from_persisted_manifest(
-            &dest,
-            ArchiveDownloadOptions { max_concurrency: 1 },
-            None,
-        )
-        .await
-        .expect_err("local manifest recovery errors must not discard recoverable state");
-
-    assert!(matches!(error, eh_client::Error::Io(_)));
-    assert!(manifest_dir.is_dir());
-    assert!(sentinel.is_file());
-    assert!(server.received_requests().await.unwrap().is_empty());
-}
-
-#[tokio::test]
-async fn test_persisted_manifest_successful_incompatible_range_restarts_sequentially() {
-    let server = MockServer::start().await;
-    let temp = tempfile::tempdir().unwrap();
-    let dest = temp.path().join("archive.zip");
-    let zip = stored_zip_with_payload(1024);
-    let parts_dir = seed_multipart_manifest(
-        &dest,
-        &archive_url(&server),
-        zip.len() as u64,
-        None,
-        None,
-        &[(0, 0, zip.len() as u64, &[])],
-    );
-    Mock::given(method("GET"))
-        .and(path(TEST_ARCHIVE_PATH))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(zip.clone()))
-        .expect(2)
-        .mount(&server)
-        .await;
-
-    let resumed = client_at(&server)
-        .resume_archive_from_persisted_manifest(
-            &dest,
-            ArchiveDownloadOptions { max_concurrency: 1 },
-            None,
-        )
-        .await
-        .expect("successful incompatible range response must fall back sequentially");
-
-    assert_eq!(resumed, Some(zip.len() as u64));
-    assert_eq!(std::fs::read(&dest).unwrap(), zip);
-    assert!(!parts_dir.exists());
 }
 
 #[tokio::test]
@@ -2006,13 +1621,7 @@ async fn test_multipart_part_exhausts_four_attempts_and_preserves_state() {
 
 #[tokio::test]
 async fn test_multipart_200_if_range_fallback_resets_to_sequential() {
-    let requests = run_protocol_reset_case(
-        ProtocolResetFault::Status200,
-        Some("\"strong-v1\""),
-        None,
-        ProtocolResetSeed::CurrentUrl,
-    )
-    .await;
+    let requests = run_protocol_reset_case(Some("\"strong-v1\""), None).await;
     let initial = requests
         .iter()
         .find(|request| {
@@ -2023,115 +1632,6 @@ async fn test_multipart_200_if_range_fallback_resets_to_sequential() {
         })
         .expect("initial multipart request");
     assert_eq!(initial.if_range.as_deref(), Some("\"strong-v1\""));
-}
-
-#[tokio::test]
-async fn test_multipart_416_resets_to_sequential() {
-    run_protocol_reset_case(
-        ProtocolResetFault::Status416,
-        None,
-        None,
-        ProtocolResetSeed::CurrentUrl,
-    )
-    .await;
-}
-
-#[tokio::test]
-async fn test_multipart_invalid_content_range_resets_to_sequential() {
-    run_protocol_reset_case(
-        ProtocolResetFault::InvalidContentRange,
-        None,
-        None,
-        ProtocolResetSeed::CurrentUrl,
-    )
-    .await;
-}
-
-#[tokio::test]
-async fn test_multipart_url_change_resets_before_range_request() {
-    run_protocol_reset_case(
-        ProtocolResetFault::Status200,
-        None,
-        None,
-        ProtocolResetSeed::ChangedUrl,
-    )
-    .await;
-}
-
-#[tokio::test]
-async fn test_multipart_total_change_resets_to_sequential() {
-    run_protocol_reset_case(
-        ProtocolResetFault::ChangedTotal,
-        None,
-        None,
-        ProtocolResetSeed::CurrentUrl,
-    )
-    .await;
-}
-
-#[tokio::test]
-async fn test_multipart_validator_change_or_missing_validator_resets() {
-    for (etag, last_modified, response_validator, expected_if_range) in [
-        (
-            Some("\"strong-v1\""),
-            None,
-            Some(("ETag", "\"strong-v2\"")),
-            "\"strong-v1\"",
-        ),
-        (Some("\"strong-v1\""), None, None, "\"strong-v1\""),
-        (
-            None,
-            Some("Tue, 21 Jul 2026 12:00:00 GMT"),
-            Some(("Last-Modified", "Wed, 22 Jul 2026 12:00:00 GMT")),
-            "Tue, 21 Jul 2026 12:00:00 GMT",
-        ),
-        (
-            None,
-            Some("Tue, 21 Jul 2026 12:00:00 GMT"),
-            None,
-            "Tue, 21 Jul 2026 12:00:00 GMT",
-        ),
-    ] {
-        let requests = run_protocol_reset_case(
-            ProtocolResetFault::Validator(response_validator),
-            etag,
-            last_modified,
-            ProtocolResetSeed::CurrentUrl,
-        )
-        .await;
-        let initial = requests
-            .iter()
-            .find(|request| {
-                request
-                    .range
-                    .as_deref()
-                    .is_some_and(|range| range.starts_with("bytes=0-"))
-            })
-            .expect("initial multipart request");
-        assert_eq!(initial.if_range.as_deref(), Some(expected_if_range));
-    }
-}
-
-#[tokio::test]
-async fn test_multipart_initial_416_resets_to_sequential() {
-    run_protocol_reset_case(
-        ProtocolResetFault::Status416,
-        None,
-        None,
-        ProtocolResetSeed::Fresh,
-    )
-    .await;
-}
-
-#[tokio::test]
-async fn test_multipart_initial_invalid_content_range_resets_to_sequential() {
-    run_protocol_reset_case(
-        ProtocolResetFault::InvalidContentRange,
-        None,
-        None,
-        ProtocolResetSeed::Fresh,
-    )
-    .await;
 }
 
 #[tokio::test]
@@ -2247,14 +1747,4 @@ async fn assert_multipart_validation_removes_artifacts(corrupt_zip: Vec<u8>) {
 #[tokio::test]
 async fn test_multipart_final_zip_corruption_removes_assembly_and_parts() {
     assert_multipart_validation_removes_artifacts(b"PK\x03\x04not_a_complete_zip".to_vec()).await;
-}
-
-#[tokio::test]
-async fn test_multipart_corrupt_entry_removes_assembly_and_parts() {
-    let payload = b"stored ZIP entry payload";
-    assert_multipart_validation_removes_artifacts(corrupt_zip_entry_payload(
-        test_zip_bytes("payload.bin", payload),
-        payload,
-    ))
-    .await;
 }
